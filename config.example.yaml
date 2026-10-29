@@ -1,0 +1,2 @@
+# Example config for agent-spawn. Location: ~/.config/agent-spawn/config.yaml (drop-ins: config.d/*.yaml). Keys are defined in docs/interface.md once designed.
+hooks: {}
