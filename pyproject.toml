@@ -1,6 +1,6 @@
 [project]
 name = "agent-spawn"
-version = "0.0.0"
+version = "0.0.1"
 description = "Launch, resume, park and tear down Claude agents: worktree + terminal + Claude session."
 readme = "README.md"
 requires-python = ">=3.12"
