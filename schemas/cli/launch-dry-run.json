@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/cli/launch-dry-run.json",
+  "title": "agent-spawn launch --dry-run --json (also resume --dry-run)",
+  "description": "Launch order step 1 only (usage checks, tool resolution, classification and pre-start checks 2 to 4 read-only, the window preflight), plus read-only lower-tool plans (resume --dry-run: resume steps 1 to 4); no hooks run and nothing is created; the liveness check only reports. Exit 20 exactly when would_refuse is set, else 0 (exits 2 and 12 print the error envelope).",
+  "type": "object",
+  "properties": {
+    "dry_run": {
+      "const": true
+    },
+    "resume": {
+      "type": "boolean",
+      "description": "true for resume --dry-run."
+    },
+    "agent_settings": {
+      "$ref": "../defs.json#/$defs/launch_settings"
+    },
+    "reads_third_party": {
+      "type": "boolean",
+      "description": "The classification: session_plan's profile.reads_third_party or taints."
+    },
+    "session_plan": {
+      "type": "object",
+      "description": "claude-session start [--resume [--fork]] --dry-run --json result (the classification dry run), verbatim (exit 0, 12 or 20 plan)."
+    },
+    "would_refuse": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "The refusal a real run would give (exit 20, plan still printed): launch: third_party_cwd, third_party_run, or claude-session's would_refuse; resume: also live or tearing_down (claude-session's would_refuse e.g. tainted); null: no refusal found. A dry run never takes a lease."
+    },
+    "tools": {
+      "type": "object",
+      "properties": {
+        "claude-session": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "description": "Resolved argv of claude-session; null when not needed."
+        },
+        "termctl": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "description": "Resolved argv of termctl; null when not needed."
+        },
+        "wtctl": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "description": "Resolved argv of wtctl; null when not needed."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "claude-session",
+        "termctl",
+        "wtctl"
+      ],
+      "description": "The resolved lower-tool argv (tool resolution)."
+    },
+    "worktree_plan": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "wtctl create --dry-run --json result for --worktree new, verbatim; else null."
+    },
+    "term_plan": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "termctl placements --json result when a window would be opened, verbatim; else null."
+    },
+    "session_start_argv": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "The claude-session start argv that would run (never prompt text: prompts are shown as --prompt-file placeholders)."
+    },
+    "hooks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "hook": {
+            "$ref": "../defs.json#/$defs/hook_name"
+          },
+          "cmd": {
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "config",
+              "flag"
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "hook",
+          "cmd",
+          "source"
+        ]
+      },
+      "description": "The agent-spawn hooks that would run (none is run by a dry run)."
+    },
+    "warnings": {
+      "$ref": "../defs.json#/$defs/warnings"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "dry_run",
+    "resume",
+    "agent_settings",
+    "reads_third_party",
+    "session_plan",
+    "would_refuse",
+    "tools",
+    "worktree_plan",
+    "term_plan",
+    "session_start_argv",
+    "hooks",
+    "warnings"
+  ]
+}

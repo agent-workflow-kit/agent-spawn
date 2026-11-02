@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/cli/export.json",
+  "title": "agent-spawn export --json",
+  "description": "Audit records, oldest first, filtered by --since and --action.",
+  "type": "array",
+  "items": {
+    "$ref": "../audit.json"
+  }
+}

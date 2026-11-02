@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/cli/label-remove.json",
+  "title": "agent-spawn label remove --json",
+  "type": "object",
+  "properties": {
+    "agent_id": {
+      "$ref": "../defs.json#/$defs/agent_id"
+    },
+    "labels": {
+      "$ref": "../defs.json#/$defs/labels",
+      "description": "The agent's labels after the change (or as they would be, with --dry-run)."
+    },
+    "removed": {
+      "type": "array",
+      "items": {
+        "$ref": "../defs.json#/$defs/label"
+      },
+      "description": "The pairs actually removed (re-adding a present pair or removing an absent one is a no-op); possibly empty."
+    },
+    "changed": {
+      "type": "boolean",
+      "description": "false: nothing was removed (a no-op)."
+    },
+    "warnings": {
+      "$ref": "../defs.json#/$defs/warnings",
+      "description": "Mirror failures (claude-session, termctl); queued, reconcile re-syncs."
+    },
+    "dry_run": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "agent_id",
+    "labels",
+    "removed",
+    "changed",
+    "warnings",
+    "dry_run"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "changed": {
+            "const": false
+          }
+        },
+        "required": [
+          "changed"
+        ]
+      },
+      "then": {
+        "properties": {
+          "removed": {
+            "maxItems": 0
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "removed": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ]
+}

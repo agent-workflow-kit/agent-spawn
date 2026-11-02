@@ -1,0 +1,813 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/hooks/post-state-change.json",
+  "title": "post-state-change hook payload (stdin)",
+  "description": "Fired for every relayed session state change (change: session; claude-session's fields) and every change of the agent's status or needs_attention (change: agent); always with the agent object. Delivery is at least once: deduplicate on event_id. report.summary and report.reason are untrusted text; notification templates exclude them when reads_third_party or tainted is true.",
+  "type": "object",
+  "properties": {
+    "tool": {
+      "const": "agent-spawn"
+    },
+    "hook": {
+      "const": "post-state-change"
+    },
+    "object_type": {
+      "const": "agent"
+    },
+    "object_id": {
+      "$ref": "../defs.json#/$defs/agent_id",
+      "description": "The agent id."
+    },
+    "repo": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/repo_id"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "labels": {
+      "$ref": "../defs.json#/$defs/labels"
+    },
+    "kind": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/kind"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Launch kind."
+    },
+    "run_kind": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/kind"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The last run's kind; null before a run."
+    },
+    "reads_third_party": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "Of the last run; null before a run. When it or tainted is true, notification templates exclude report.summary and report.reason (also those of outcome objects)."
+    },
+    "tainted": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "The session's taint; null without a session. When it or reads_third_party is true, notification templates exclude report.summary and report.reason."
+    },
+    "mode": {
+      "$ref": "../defs.json#/$defs/mode"
+    },
+    "status": {
+      "$ref": "../defs.json#/$defs/status"
+    },
+    "needs_attention": {
+      "$ref": "../defs.json#/$defs/needs_attention"
+    },
+    "event_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "agent-spawn's event id, unique per event across agents; delivery is at least once: deduplicate on it."
+    },
+    "ts": {
+      "$ref": "../defs.json#/$defs/ts"
+    },
+    "agent": {
+      "$ref": "../defs.json#/$defs/agent"
+    },
+    "change": {
+      "enum": [
+        "session",
+        "agent"
+      ]
+    },
+    "csession_id": {
+      "$ref": "../defs.json#/$defs/csession_id"
+    },
+    "run": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "state": {
+      "$ref": "../defs.json#/$defs/cs_state"
+    },
+    "previous_state": {
+      "$ref": "../defs.json#/$defs/cs_state_or_null"
+    },
+    "activity": {
+      "$ref": "../defs.json#/$defs/cs_activity"
+    },
+    "needs_input_reason": {
+      "$ref": "../defs.json#/$defs/cs_needs_input_reason"
+    },
+    "final": {
+      "type": "boolean"
+    },
+    "cause": {
+      "$ref": "../defs.json#/$defs/cs_cause"
+    },
+    "report": {
+      "$ref": "../defs.json#/$defs/report"
+    },
+    "session_event_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "claude-session's event_id of the relayed change."
+    },
+    "event_ts": {
+      "$ref": "../defs.json#/$defs/ts",
+      "description": "claude-session's event_ts: when the change happened."
+    },
+    "phase": {
+      "enum": [
+        "launch",
+        "session"
+      ]
+    },
+    "outcome": {
+      "$ref": "../defs.json#/$defs/outcome_value_or_null",
+      "description": "claude-session's outcome; null until the event is final."
+    },
+    "end_reason": {
+      "$ref": "../defs.json#/$defs/end_reason_or_null"
+    },
+    "exit_code": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "The run's outcome code; null until the event is final."
+    },
+    "message": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "claude-session's human-readable detail. Never agent text."
+    },
+    "sandbox_active": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "previous_status": {
+      "$ref": "../defs.json#/$defs/status"
+    },
+    "previous_needs_attention": {
+      "$ref": "../defs.json#/$defs/needs_attention"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "tool",
+    "object_type",
+    "object_id",
+    "repo",
+    "labels",
+    "kind",
+    "run_kind",
+    "reads_third_party",
+    "tainted",
+    "mode",
+    "status",
+    "needs_attention",
+    "event_id",
+    "ts",
+    "hook",
+    "agent",
+    "change"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "change": {
+            "const": "session"
+          }
+        },
+        "required": [
+          "change"
+        ]
+      },
+      "then": {
+        "required": [
+          "csession_id",
+          "run",
+          "state",
+          "previous_state",
+          "activity",
+          "needs_input_reason",
+          "final",
+          "cause",
+          "report",
+          "session_event_id",
+          "event_ts",
+          "phase",
+          "outcome",
+          "end_reason",
+          "exit_code",
+          "message",
+          "sandbox_active"
+        ],
+        "properties": {
+          "previous_status": false,
+          "previous_needs_attention": false
+        }
+      },
+      "else": {
+        "required": [
+          "previous_status",
+          "previous_needs_attention"
+        ],
+        "properties": {
+          "csession_id": false,
+          "run": false,
+          "state": false,
+          "previous_state": false,
+          "activity": false,
+          "needs_input_reason": false,
+          "final": false,
+          "cause": false,
+          "report": false,
+          "session_event_id": false,
+          "event_ts": false,
+          "phase": false,
+          "outcome": false,
+          "end_reason": false,
+          "exit_code": false,
+          "message": false,
+          "sandbox_active": false
+        }
+      }
+    },
+    {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "done"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "blocked"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 13
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "needs-input"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 13
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 18
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "exited-unreported"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 14
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "killed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 15
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "timeout"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 16
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "lost"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 17
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "not-started"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 12
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "vetoed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 11
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "escalated"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 13
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "timeout"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "enum": [
+                  "timeout",
+                  "max_turns"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "lost"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "const": "lost"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "killed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "stopped",
+                      "internal_error",
+                      "forwarded_term",
+                      "forwarded_hup",
+                      "forwarded_int"
+                    ]
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^signal_[a-z0-9]+$"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "exited-unreported"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "normal",
+                      "user_exit",
+                      "api_error",
+                      "no_result",
+                      "no_report",
+                      "result_rejected",
+                      "no_session_start"
+                    ]
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^exit_[0-9]+$"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "vetoed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "enum": [
+                  "hook_veto",
+                  "hook_timeout"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "escalated"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "const": "hook_escalate"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "not-started"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "enum": [
+                  "canceled",
+                  "never_adopted",
+                  "launch_interrupted",
+                  "config_invalid",
+                  "claude_not_found",
+                  "sandbox_unavailable",
+                  "socket_path_too_long",
+                  "invalid_permission_profile",
+                  "unsafe_cwd",
+                  "unsafe_path",
+                  "unsafe_plugin_dir",
+                  "unsafe_read_dir",
+                  "plugin_dir_missing",
+                  "git_dir_changed",
+                  "no_git_cwd",
+                  "fork_cwd_unsupported",
+                  "no_tty",
+                  "tmpdir_unsafe",
+                  "unsafe_claude_args",
+                  "claude_too_old"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "launch"
+              }
+            },
+            "required": [
+              "phase"
+            ]
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "not-started",
+                  "vetoed",
+                  "escalated",
+                  null
+                ]
+              },
+              "end_reason": {
+                "enum": [
+                  "hook_veto",
+                  "hook_escalate",
+                  "hook_timeout",
+                  "canceled",
+                  "never_adopted",
+                  "launch_interrupted",
+                  "config_invalid",
+                  "claude_not_found",
+                  "sandbox_unavailable",
+                  "socket_path_too_long",
+                  "invalid_permission_profile",
+                  "unsafe_cwd",
+                  "unsafe_path",
+                  "unsafe_plugin_dir",
+                  "unsafe_read_dir",
+                  "plugin_dir_missing",
+                  "git_dir_changed",
+                  "no_git_cwd",
+                  "fork_cwd_unsupported",
+                  "no_tty",
+                  "tmpdir_unsafe",
+                  "unsafe_claude_args",
+                  "claude_too_old",
+                  null
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "session"
+              }
+            },
+            "required": [
+              "phase"
+            ]
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "not": {
+                  "enum": [
+                    "not-started",
+                    "vetoed",
+                    "escalated"
+                  ]
+                }
+              },
+              "end_reason": {
+                "not": {
+                  "enum": [
+                    "hook_veto",
+                    "hook_escalate",
+                    "hook_timeout",
+                    "canceled",
+                    "never_adopted",
+                    "launch_interrupted",
+                    "config_invalid",
+                    "claude_not_found",
+                    "sandbox_unavailable",
+                    "socket_path_too_long",
+                    "invalid_permission_profile",
+                    "unsafe_cwd",
+                    "unsafe_path",
+                    "unsafe_plugin_dir",
+                    "unsafe_read_dir",
+                    "plugin_dir_missing",
+                    "git_dir_changed",
+                    "no_git_cwd",
+                    "fork_cwd_unsupported",
+                    "no_tty",
+                    "tmpdir_unsafe",
+                    "unsafe_claude_args",
+                    "claude_too_old"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "if": {
+        "properties": {
+          "final": {
+            "const": false
+          }
+        },
+        "required": [
+          "final"
+        ]
+      },
+      "then": {
+        "properties": {
+          "outcome": {
+            "type": "null"
+          },
+          "end_reason": {
+            "type": "null"
+          },
+          "exit_code": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "final": {
+            "const": true
+          }
+        },
+        "required": [
+          "final"
+        ]
+      },
+      "then": {
+        "properties": {
+          "outcome": {
+            "type": "string"
+          },
+          "exit_code": {
+            "type": "integer"
+          }
+        }
+      }
+    }
+  ]
+}

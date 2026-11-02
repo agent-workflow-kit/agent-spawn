@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/cli/reconcile.json",
+  "title": "agent-spawn reconcile --json",
+  "type": "object",
+  "properties": {
+    "changes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "agent_id": {
+            "$ref": "../defs.json#/$defs/agent_id"
+          },
+          "kind": {
+            "enum": [
+              "parked",
+              "supervisor_lost",
+              "launch_failed",
+              "session_missing",
+              "pending_run",
+              "ambiguous_session",
+              "teardown_incomplete",
+              "fork_abandoned",
+              "labels_resynced",
+              "events_delivered",
+              "tombstone_deleted"
+            ]
+          },
+          "details": {
+            "type": "object",
+            "description": "Change-specific context."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "agent_id",
+          "kind",
+          "details"
+        ]
+      }
+    },
+    "warnings": {
+      "$ref": "../defs.json#/$defs/warnings"
+    },
+    "already_running": {
+      "type": "boolean"
+    },
+    "dry_run": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "changes",
+    "warnings",
+    "already_running",
+    "dry_run"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "already_running": {
+            "const": true
+          }
+        },
+        "required": [
+          "already_running"
+        ]
+      },
+      "then": {
+        "properties": {
+          "changes": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ]
+}

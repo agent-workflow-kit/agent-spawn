@@ -1,0 +1,215 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/hooks/pre-launch.json",
+  "title": "pre-launch hook payload (stdin)",
+  "description": "Fired at launch order step 2, before anything is created (no agent record exists: object_id and status are null; AGENT_SPAWN_ID is empty). Never fired on resume. Exit 13 escalates (launch exits 13; re-run with --override-escalation, human-only, which sets override_escalation true), any other non-zero exit or a timeout vetoes (exit 11). A decision_id on the hook's JSON stdout is recorded.",
+  "type": "object",
+  "properties": {
+    "tool": {
+      "const": "agent-spawn"
+    },
+    "hook": {
+      "const": "pre-launch"
+    },
+    "object_type": {
+      "const": "agent"
+    },
+    "object_id": {
+      "type": "null",
+      "description": "null: no agent record exists yet (launch order step 2)."
+    },
+    "repo": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/repo_id"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "labels": {
+      "$ref": "../defs.json#/$defs/labels",
+      "description": "The labels the agent will get, including job= when it will be added."
+    },
+    "kind": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/kind"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The explicit --kind; null: claude-session's default kind."
+    },
+    "run_kind": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/kind"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The run kind of claude-session's classification dry run."
+    },
+    "reads_third_party": {
+      "type": "boolean",
+      "description": "The classification of the run to be launched: claude-session start --dry-run's profile.reads_third_party or taints."
+    },
+    "tainted": {
+      "type": "null",
+      "description": "null: no session exists yet."
+    },
+    "mode": {
+      "$ref": "../defs.json#/$defs/mode"
+    },
+    "status": {
+      "type": "null",
+      "description": "null: no agent record exists yet."
+    },
+    "needs_attention": {
+      "type": "null"
+    },
+    "event_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "agent-spawn's event id, unique per event across agents; delivery is at least once: deduplicate on it."
+    },
+    "ts": {
+      "$ref": "../defs.json#/$defs/ts"
+    },
+    "placement": {
+      "$ref": "../defs.json#/$defs/placement"
+    },
+    "term_placement": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/placement_name"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "worktree": {
+      "type": "string",
+      "pattern": "^(new|none|/[^\\n]*)$",
+      "description": "Worktree mode: new, none or the absolute path to adopt."
+    },
+    "branch": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "cwd": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "name": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/name"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "--name, else --worktree-name; null when the name derives from the agent id, which is not allocated yet."
+    },
+    "skill": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "has_prompt": {
+      "type": "boolean"
+    },
+    "input_names": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "plugin_dirs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "promote": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "The explicit --promote/--no-promote choice, or null."
+    },
+    "ephemeral": {
+      "type": "boolean"
+    },
+    "wait": {
+      "type": "boolean"
+    },
+    "settings": {
+      "$ref": "../defs.json#/$defs/launch_settings",
+      "description": "The full launch settings agent-spawn will store."
+    },
+    "pass_throughs": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]*$"
+      },
+      "description": "The claude-session flags given, by name (e.g. sandbox, permission_profile, env_allowlist_only, setting_sources), with their values; never prompt text."
+    },
+    "actor": {
+      "$ref": "../defs.json#/$defs/actor"
+    },
+    "decision_ids": {
+      "$ref": "../defs.json#/$defs/decision_ids"
+    },
+    "override_escalation": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "tool",
+    "hook",
+    "object_type",
+    "object_id",
+    "repo",
+    "labels",
+    "kind",
+    "run_kind",
+    "reads_third_party",
+    "tainted",
+    "mode",
+    "status",
+    "needs_attention",
+    "event_id",
+    "ts",
+    "placement",
+    "term_placement",
+    "worktree",
+    "branch",
+    "cwd",
+    "name",
+    "skill",
+    "has_prompt",
+    "input_names",
+    "plugin_dirs",
+    "promote",
+    "ephemeral",
+    "wait",
+    "settings",
+    "pass_throughs",
+    "actor",
+    "decision_ids",
+    "override_escalation"
+  ]
+}

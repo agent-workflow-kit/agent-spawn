@@ -37,11 +37,13 @@ shared contracts package.
 
 ## Workflow
 
-1. Start with a design session that resolves the open topics in `docs/design.md` and records
-   decisions there.
-2. Write `docs/interface.md` and `schemas/` (the interface spec), and register it in
-   `../awkit-docs/interface-registry.md`.
-3. Implement test-first.
+1. The design session is done: `docs/interface.md` (normative), `schemas/` and `docs/design.md`
+   (decisions, live verification) are the contract.
+2. Implement test-first, following `docs/plan.md` and the repo's GitHub issues.
+3. Process and tmux behavior this tool relies on is covered by process tests and `live` tests
+   (never in CI); run the `live` suite after tmux, Claude Code or sibling-tool upgrades.
+4. Never write to the supervisor's terminal, and signal only exact verified PIDs (see
+   `docs/interface.md`, Signals).
 
 ## Repository workflow
 

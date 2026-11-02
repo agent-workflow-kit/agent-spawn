@@ -1,0 +1,399 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/cli/error.json",
+  "title": "Error envelope (any command with --json)",
+  "description": "Printed on stdout for exits 1 and 2 (any command); for 10, 11, 12, 13, 20 and 21 except where launch or resume prints its result object (a run created by this invocation was adopted), wait prints its result, or a dry run prints its plan; and for 130/143 of a launcher interrupted before any supervisor existed (code launch_failed, details.cause interrupted). Every field is always present (null or empty when not applicable).",
+  "type": "object",
+  "properties": {
+    "error": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "enum": [
+            "usage",
+            "config_invalid",
+            "not_found",
+            "vetoed",
+            "escalated",
+            "confirmation_required",
+            "refused",
+            "ambiguous",
+            "tool_missing",
+            "handoff_failed",
+            "no_window",
+            "no_run",
+            "worktree_gone",
+            "partial",
+            "launch_failed",
+            "failed",
+            "schema_newer",
+            "internal"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "description": "Human-readable; never agent text."
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "description": "Refusal reason with code refused (exit 20): agent-spawn's live, tearing_down, third_party_cwd, third_party_run, or a lower tool's reason passed through (e.g. tainted, or wtctl's repo_config_changed at teardown). null otherwise."
+        },
+        "agent_id": {
+          "oneOf": [
+            {
+              "$ref": "../defs.json#/$defs/agent_id"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set when an agent record exists (e.g. a launch that parked); null otherwise, also for a refused or failed fork."
+        },
+        "tool": {
+          "oneOf": [
+            {
+              "$ref": "../defs.json#/$defs/tool"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The tool whose failure is passed through; agent-spawn for its own errors."
+        },
+        "lower_code": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The lower tool's error code (tool other than agent-spawn); else null."
+        },
+        "lower_error": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "The lower tool's whole error object, verbatim (its details, wtctl's checks, items and processes, claude-session's end_reason, hint, csession_id and run, a lower tool's ambiguous ids and hook stderr). null when tool is agent-spawn and no lower call was involved.",
+          "x-untrusted": true
+        },
+        "details": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "torn_down",
+                "session_missing",
+                "parked",
+                "launching",
+                "tearing_down",
+                null
+              ]
+            },
+            "cause": {
+              "enum": [
+                "interrupted",
+                "no_pane_pid",
+                "pane_gone",
+                "classification_mismatch",
+                "classification_unknown",
+                "worktree_state",
+                null
+              ]
+            },
+            "retryable": {
+              "type": "boolean"
+            },
+            "hint": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "description": "agent-spawn's own context only (hint: a suggested next step): status (torn_down, session_missing, or the agent's status for attach), cause (interrupted, no_pane_pid, pane_gone, classification_mismatch, classification_unknown, worktree_state), retryable (e.g. wtctl busy). Lower tools' details are in lower_error."
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "$ref": "../defs.json#/$defs/agent_id"
+          },
+          "description": "Matching agents for agent-spawn's own ambiguous (exit 21); empty otherwise, also for a lower tool's ambiguity (its ids are in lower_error)."
+        },
+        "hook": {
+          "oneOf": [
+            {
+              "enum": [
+                "pre-launch",
+                "pre-teardown"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The agent-spawn pre-hook that vetoed or escalated; else null."
+        },
+        "hook_stderr": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096,
+          "x-untrusted": true,
+          "description": "Untrusted: the hook's stderr, cut to 4096 bytes (maxLength counts code points and approximates it); with hook only."
+        },
+        "decision_ids": {
+          "$ref": "../defs.json#/$defs/decision_ids"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "reason",
+        "agent_id",
+        "tool",
+        "lower_code",
+        "lower_error",
+        "details",
+        "candidates",
+        "hook",
+        "hook_stderr",
+        "decision_ids"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "refused"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "type": "string"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "ambiguous"
+              },
+              "tool": {
+                "const": "agent-spawn"
+              }
+            },
+            "required": [
+              "code",
+              "tool"
+            ]
+          },
+          "then": {
+            "properties": {
+              "candidates": {
+                "minItems": 2
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "candidates": {
+                "maxItems": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "hook": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "hook"
+            ]
+          },
+          "then": {
+            "properties": {
+              "hook_stderr": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "hook": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "hook"
+            ]
+          },
+          "then": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "vetoed",
+                  "escalated"
+                ]
+              },
+              "tool": {
+                "const": "agent-spawn"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "tool": {
+                "const": "agent-spawn"
+              }
+            },
+            "required": [
+              "tool"
+            ]
+          },
+          "then": {
+            "properties": {
+              "lower_code": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "lower_code": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "lower_code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "lower_error": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "third_party_cwd",
+                  "third_party_run"
+                ]
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "properties": {
+              "tool": {
+                "const": "agent-spawn"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "details": {
+                "type": "object",
+                "properties": {
+                  "cause": {
+                    "enum": [
+                      "classification_mismatch",
+                      "classification_unknown"
+                    ]
+                  }
+                },
+                "required": [
+                  "cause"
+                ]
+              }
+            },
+            "required": [
+              "details"
+            ]
+          },
+          "then": {
+            "properties": {
+              "code": {
+                "const": "launch_failed"
+              },
+              "tool": {
+                "const": "agent-spawn"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "details": {
+                "type": "object",
+                "properties": {
+                  "cause": {
+                    "const": "worktree_state"
+                  }
+                },
+                "required": [
+                  "cause"
+                ]
+              }
+            },
+            "required": [
+              "details"
+            ]
+          },
+          "then": {
+            "properties": {
+              "code": {
+                "const": "failed"
+              },
+              "tool": {
+                "const": "agent-spawn"
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "error"
+  ]
+}

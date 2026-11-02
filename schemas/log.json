@@ -1,15 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "agent-spawn/log",
+  "$id": "agent-spawn/log.json",
   "title": "agent-spawn log.jsonl record",
+  "description": "Never contains environment values, secrets, prompt text, report summaries or reasons.",
   "type": "object",
   "properties": {
     "ts": {
-      "type": "string",
-      "format": "date-time"
+      "$ref": "defs.json#/$defs/ts"
     },
     "level": {
-      "type": "string",
       "enum": [
         "debug",
         "info",
@@ -18,16 +17,124 @@
       ]
     },
     "event": {
-      "type": "string"
+      "enum": [
+        "launch",
+        "resume",
+        "fork",
+        "adopt",
+        "holder_added",
+        "status_change",
+        "attention_set",
+        "attention_cleared",
+        "ack",
+        "stop",
+        "label_change",
+        "relay_event",
+        "relay_event_ignored",
+        "promotion",
+        "auto_report_resume",
+        "third_party_refused",
+        "classification_mismatch",
+        "classification_unknown",
+        "fork_abandoned",
+        "teardown",
+        "teardown_retry",
+        "prune",
+        "reconcile_change",
+        "handoff_failed",
+        "handoff_rejected",
+        "signal_sent",
+        "interrupted",
+        "hook_delivered",
+        "hook_failed",
+        "hook_timeout",
+        "hook_veto",
+        "hook_escalate",
+        "schema_older",
+        "warning",
+        "migration"
+      ]
+    },
+    "agent_id": {
+      "oneOf": [
+        {
+          "$ref": "defs.json#/$defs/agent_id"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "csession_id": {
+      "oneOf": [
+        {
+          "$ref": "defs.json#/$defs/csession_id"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "run": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "actor": {
+      "oneOf": [
+        {
+          "$ref": "defs.json#/$defs/actor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "decision_ids": {
+      "$ref": "defs.json#/$defs/decision_ids"
+    },
+    "hook": {
+      "oneOf": [
+        {
+          "$ref": "defs.json#/$defs/hook_name"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "pid": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "The exact PID for signal_sent."
+    },
+    "signal": {
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "message": {
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "details": {
+      "type": "object",
+      "description": "Event-specific context (e.g. previous and new status, label changes, hook exit code). Never secrets or agent text; may hold untrusted paths or hook stderr.",
+      "x-untrusted": true
     }
   },
+  "additionalProperties": false,
   "required": [
     "ts",
     "level",
-    "event"
-  ],
-  "additionalProperties": true
+    "event",
+    "agent_id"
+  ]
 }

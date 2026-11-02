@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/hooks/post-park.json",
+  "title": "post-park hook payload (stdin)",
+  "description": "Fired when the agent became parked.",
+  "type": "object",
+  "properties": {
+    "tool": {
+      "const": "agent-spawn"
+    },
+    "hook": {
+      "const": "post-park"
+    },
+    "object_type": {
+      "const": "agent"
+    },
+    "object_id": {
+      "$ref": "../defs.json#/$defs/agent_id",
+      "description": "The agent id."
+    },
+    "repo": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/repo_id"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "labels": {
+      "$ref": "../defs.json#/$defs/labels"
+    },
+    "kind": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/kind"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Launch kind."
+    },
+    "run_kind": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/kind"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The last run's kind; null before a run."
+    },
+    "reads_third_party": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "Of the last run; null before a run. When it or tainted is true, notification templates exclude report.summary and report.reason (also those of outcome objects)."
+    },
+    "tainted": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "The session's taint; null without a session. When it or reads_third_party is true, notification templates exclude report.summary and report.reason."
+    },
+    "mode": {
+      "$ref": "../defs.json#/$defs/mode"
+    },
+    "status": {
+      "$ref": "../defs.json#/$defs/status"
+    },
+    "needs_attention": {
+      "$ref": "../defs.json#/$defs/needs_attention"
+    },
+    "event_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "agent-spawn's event id, unique per event across agents; delivery is at least once: deduplicate on it."
+    },
+    "ts": {
+      "$ref": "../defs.json#/$defs/ts"
+    },
+    "agent": {
+      "$ref": "../defs.json#/$defs/agent"
+    },
+    "reason": {
+      "enum": [
+        "done",
+        "blocked",
+        "escalated",
+        "failed",
+        "unreported",
+        "killed",
+        "timeout",
+        "lost",
+        "vetoed",
+        "launch_failed",
+        "session_missing"
+      ],
+      "description": "= agent.park_reason."
+    },
+    "outcome": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/outcome"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The last run's outcome object; null when the agent parked without a final run (e.g. a launch failure before the session)."
+    },
+    "teardown_refused": {
+      "type": "boolean",
+      "description": "true: an ephemeral agent's automatic teardown was refused, so it stays parked; false otherwise."
+    },
+    "chain_failure": {
+      "$ref": "../defs.json#/$defs/chain_failure"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "tool",
+    "hook",
+    "object_type",
+    "object_id",
+    "repo",
+    "labels",
+    "kind",
+    "run_kind",
+    "reads_third_party",
+    "tainted",
+    "mode",
+    "status",
+    "needs_attention",
+    "event_id",
+    "ts",
+    "agent",
+    "reason",
+    "outcome",
+    "teardown_refused",
+    "chain_failure"
+  ]
+}

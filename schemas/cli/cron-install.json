@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/cli/cron-install.json",
+  "title": "agent-spawn cron install --json",
+  "type": "object",
+  "properties": {
+    "action": {
+      "enum": [
+        "installed",
+        "updated",
+        "unchanged"
+      ]
+    },
+    "block": {
+      "type": "string",
+      "description": "The managed block as it is in the crontab after the command, or would be with --dry-run."
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "interval_minutes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 59
+    },
+    "env_file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Absolute path; owned by the user and not group- or world-writable (else exit 2)."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "action",
+    "block",
+    "dry_run",
+    "interval_minutes",
+    "env_file"
+  ]
+}

@@ -1,0 +1,647 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/cli/launch.json",
+  "title": "agent-spawn launch --json",
+  "description": "The result object, printed when a run created by this invocation was adopted: exit 0 (without --wait: the run started, run null), the run's outcome code 11-18, or 22 (--wait-timeout). Every other exit prints the error envelope. Callers treat an envelope, or phase launch, as a failed launch.",
+  "type": "object",
+  "properties": {
+    "agent": {
+      "$ref": "../defs.json#/$defs/agent"
+    },
+    "phase": {
+      "enum": [
+        "launch",
+        "session",
+        null
+      ],
+      "description": "run.phase (design guide section 4.2); null when run is null."
+    },
+    "outcome": {
+      "$ref": "../defs.json#/$defs/outcome_value_or_null",
+      "description": "run.outcome, a string; null when run is null."
+    },
+    "end_reason": {
+      "$ref": "../defs.json#/$defs/end_reason_or_null",
+      "description": "run.end_reason; null when run is null."
+    },
+    "exit_code": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "run.exit_code, the command's exit code; null when run is null."
+    },
+    "run": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/outcome"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The last run's outcome object; null without --wait once the run started (exit 0), and when timed out (exit 22)."
+    },
+    "first_working_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time",
+      "description": "The delivery signal: the first_working_at of the first run this invocation started (wait: of the run chain's first run); null if it never reached working."
+    },
+    "timed_out": {
+      "type": "boolean",
+      "description": "true only with exit 22: the wait timed out while the agent was live (run null; the agent keeps running)."
+    },
+    "warnings": {
+      "$ref": "../defs.json#/$defs/warnings"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "agent",
+    "phase",
+    "outcome",
+    "end_reason",
+    "exit_code",
+    "run",
+    "first_working_at",
+    "timed_out",
+    "warnings"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "timed_out": {
+            "const": true
+          }
+        },
+        "required": [
+          "timed_out"
+        ]
+      },
+      "then": {
+        "properties": {
+          "run": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "run": {
+            "type": "null"
+          }
+        },
+        "required": [
+          "run"
+        ]
+      },
+      "then": {
+        "properties": {
+          "phase": {
+            "type": "null"
+          },
+          "outcome": {
+            "type": "null"
+          },
+          "end_reason": {
+            "type": "null"
+          },
+          "exit_code": {
+            "type": "null"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "phase": {
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string"
+          },
+          "end_reason": {
+            "type": "string"
+          },
+          "exit_code": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "done"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "blocked"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 13
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "needs-input"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 13
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 18
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "exited-unreported"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 14
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "killed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 15
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "timeout"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 16
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "lost"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 17
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "not-started"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 12
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "vetoed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 11
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "escalated"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 13
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "timeout"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "enum": [
+                  "timeout",
+                  "max_turns"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "lost"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "const": "lost"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "killed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "stopped",
+                      "internal_error",
+                      "forwarded_term",
+                      "forwarded_hup",
+                      "forwarded_int"
+                    ]
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^signal_[a-z0-9]+$"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "exited-unreported"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "normal",
+                      "user_exit",
+                      "api_error",
+                      "no_result",
+                      "no_report",
+                      "result_rejected",
+                      "no_session_start"
+                    ]
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^exit_[0-9]+$"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "vetoed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "enum": [
+                  "hook_veto",
+                  "hook_timeout"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "escalated"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "const": "hook_escalate"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "not-started"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "enum": [
+                  "canceled",
+                  "never_adopted",
+                  "launch_interrupted",
+                  "config_invalid",
+                  "claude_not_found",
+                  "sandbox_unavailable",
+                  "socket_path_too_long",
+                  "invalid_permission_profile",
+                  "unsafe_cwd",
+                  "unsafe_path",
+                  "unsafe_plugin_dir",
+                  "unsafe_read_dir",
+                  "plugin_dir_missing",
+                  "git_dir_changed",
+                  "no_git_cwd",
+                  "fork_cwd_unsupported",
+                  "no_tty",
+                  "tmpdir_unsafe",
+                  "unsafe_claude_args",
+                  "claude_too_old"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "launch"
+              }
+            },
+            "required": [
+              "phase"
+            ]
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "not-started",
+                  "vetoed",
+                  "escalated",
+                  null
+                ]
+              },
+              "end_reason": {
+                "enum": [
+                  "hook_veto",
+                  "hook_escalate",
+                  "hook_timeout",
+                  "canceled",
+                  "never_adopted",
+                  "launch_interrupted",
+                  "config_invalid",
+                  "claude_not_found",
+                  "sandbox_unavailable",
+                  "socket_path_too_long",
+                  "invalid_permission_profile",
+                  "unsafe_cwd",
+                  "unsafe_path",
+                  "unsafe_plugin_dir",
+                  "unsafe_read_dir",
+                  "plugin_dir_missing",
+                  "git_dir_changed",
+                  "no_git_cwd",
+                  "fork_cwd_unsupported",
+                  "no_tty",
+                  "tmpdir_unsafe",
+                  "unsafe_claude_args",
+                  "claude_too_old",
+                  null
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "session"
+              }
+            },
+            "required": [
+              "phase"
+            ]
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "not": {
+                  "enum": [
+                    "not-started",
+                    "vetoed",
+                    "escalated"
+                  ]
+                }
+              },
+              "end_reason": {
+                "not": {
+                  "enum": [
+                    "hook_veto",
+                    "hook_escalate",
+                    "hook_timeout",
+                    "canceled",
+                    "never_adopted",
+                    "launch_interrupted",
+                    "config_invalid",
+                    "claude_not_found",
+                    "sandbox_unavailable",
+                    "socket_path_too_long",
+                    "invalid_permission_profile",
+                    "unsafe_cwd",
+                    "unsafe_path",
+                    "unsafe_plugin_dir",
+                    "unsafe_read_dir",
+                    "plugin_dir_missing",
+                    "git_dir_changed",
+                    "no_git_cwd",
+                    "fork_cwd_unsupported",
+                    "no_tty",
+                    "tmpdir_unsafe",
+                    "unsafe_claude_args",
+                    "claude_too_old"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

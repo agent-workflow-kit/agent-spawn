@@ -1,0 +1,2289 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/defs.json",
+  "title": "agent-spawn shared definitions",
+  "description": "Not an output on its own. Shared definitions referenced by the CLI, hook, audit and log schemas: the agent object, the outcome object (claude-session's shape plus agent_id, promoted, auto_resumed, first_working_at), ids, labels, enums and durations. config.json embeds its own copies.",
+  "$defs": {
+    "agent_id": {
+      "type": "string",
+      "pattern": "^ag-[a-z2-7]{8}$",
+      "description": "agent_id; allocated by launch and resume --fork, never reused (also after tombstone deletion)."
+    },
+    "csession_id": {
+      "type": "string",
+      "pattern": "^cs-[a-z2-7]{8}$",
+      "description": "claude-session's session id."
+    },
+    "term_id": {
+      "type": "string",
+      "pattern": "^tc-[a-z2-7]{8}$",
+      "description": "termctl's managed-pane id."
+    },
+    "wt_record_id": {
+      "type": "string",
+      "pattern": "^wt-[a-z2-7]{8}$",
+      "description": "wtctl's worktree record id."
+    },
+    "kind": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+      "description": "A claude-session kind name."
+    },
+    "repo_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?(?:/(?!\\.\\.?(?:/|$))[A-Za-z0-9._-]+)+$",
+      "description": "claude-session's repo-id grammar: lowercase host, optional :port, then '/' and one or more path segments of [A-Za-z0-9._-], none equal to '.' or '..'."
+    },
+    "abs_path": {
+      "type": "string",
+      "pattern": "^/[^\\n]*$",
+      "description": "Absolute path without a newline."
+    },
+    "socket_path": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 100,
+      "pattern": "^(?!.*/$)/(?!.*;$)[^\\u0000-\\u001f\\u007f-\\u009f]*$",
+      "description": "termctl's canonical absolute tmux socket path (termctl's grammar)."
+    },
+    "placement_name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+      "description": "A termctl placement rule name."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^(?!.*#\\[)[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+      "description": "Window name: 1-64 code points, no control characters (C0, DEL, C1), not containing '#[' (termctl's name rules). Never derived from labels or third-party text."
+    },
+    "label_key": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"
+    },
+    "label": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}$",
+      "description": "key=value; split at the first '='."
+    },
+    "labels": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/label"
+      },
+      "maxItems": 64,
+      "description": "Multiset of key=value pairs in stored order, verbatim; at most 64."
+    },
+    "actor": {
+      "type": "string",
+      "pattern": "^(human|auto):[A-Za-z0-9._@-]{1,64}$",
+      "description": "human:<user> or auto:<policy>. An audited honor system, not authentication."
+    },
+    "decision_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:@/-]{1,128}$"
+    },
+    "decision_ids": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/decision_id"
+      },
+      "maxItems": 32,
+      "description": "Decision ids from --decision-id and from pre-hook stdout."
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Full 40-hex commit sha."
+    },
+    "duration": {
+      "anyOf": [
+        {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)\\d+(\\.\\d+)?(ms|s|m|h|d)$"
+        },
+        {
+          "type": "string",
+          "pattern": "^(?!0+(\\.0+)?$)\\d+(\\.\\d+)?$"
+        }
+      ],
+      "description": "Seconds as a positive number (fractions allowed), a string <number><unit> with unit ms, s, m, h or d (e.g. '30s', '10m'), or a bare number string meaning seconds (e.g. '90'); zero is refused (exit 2)."
+    },
+    "env_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Non-fatal warnings. Never contain environment values, secrets or prompt text."
+    },
+    "tool": {
+      "enum": [
+        "agent-spawn",
+        "claude-session",
+        "termctl",
+        "wtctl"
+      ],
+      "description": "The tool whose result or failure this is."
+    },
+    "mode": {
+      "enum": [
+        "interactive",
+        "headless"
+      ]
+    },
+    "status": {
+      "enum": [
+        "launching",
+        "live",
+        "parked",
+        "tearing_down",
+        "torn_down"
+      ],
+      "description": "launching: a launch or a resume in progress (its run not started yet); live: a supervisor is alive or the session is live; parked: no live session, resumable; tearing_down: teardown in progress or interrupted (teardown_step); torn_down: tombstone."
+    },
+    "needs_attention": {
+      "enum": [
+        "unreported",
+        "escalated",
+        "blocked",
+        "failed",
+        "timeout",
+        "lost",
+        "launch_failed",
+        "session_missing",
+        null
+      ],
+      "description": "Set by the outcome table (which sets it to the table's value; none clears it), a failed launch or resume, liveness (lost, session_missing) and a refused, failed or launch-phase-ended supervisor-initiated run (chain_failure); cleared when a later run is started, by teardown and by ack. post-escalate fires when it changes to a non-null value."
+    },
+    "park_reason": {
+      "enum": [
+        "done",
+        "blocked",
+        "escalated",
+        "failed",
+        "unreported",
+        "killed",
+        "timeout",
+        "lost",
+        "vetoed",
+        "launch_failed",
+        "session_missing",
+        null
+      ],
+      "description": "Why the agent last parked; null if it never parked."
+    },
+    "placement": {
+      "enum": [
+        "window",
+        "here",
+        null
+      ],
+      "description": "The last run's placement (before a run: the launch's): window or here for interactive runs (a promoted run is window); null for headless runs."
+    },
+    "hook_name": {
+      "enum": [
+        "pre-launch",
+        "pre-teardown",
+        "post-launch",
+        "post-state-change",
+        "post-escalate",
+        "post-park",
+        "post-teardown"
+      ]
+    },
+    "worktree_action": {
+      "enum": [
+        "removed",
+        "forgotten",
+        "released",
+        "none"
+      ],
+      "description": "removed: the owned record was removed; forgotten: releasing the hold forgot the record; released: the hold was dropped and the record stays; none: already done on a retry."
+    },
+    "baseline_class": {
+      "enum": [
+        "git",
+        "claude"
+      ],
+      "description": "wtctl's baseline classes."
+    },
+    "escalated_by": {
+      "enum": [
+        "wtctl",
+        "termctl",
+        "claude-session",
+        null
+      ],
+      "description": "The tool whose hook escalation parked the agent (wtctl, termctl, or claude-session for a launch-phase escalated run); non-null only when a hook escalation parked it (park_reason escalated), so null after a needs-input park. resume --override-escalation goes only to this tool."
+    },
+    "teardown_step": {
+      "enum": [
+        "started",
+        "hooks_done",
+        "worktree_partial",
+        "worktree_done",
+        "windows_done",
+        "session_done",
+        null
+      ],
+      "description": "While status is tearing_down: the named marker of the teardown order (started after the compare-and-set, then hooks_done, worktree_partial, worktree_done, windows_done, session_done); a retried teardown continues after it. null otherwise."
+    },
+    "cs_state": {
+      "enum": [
+        "starting",
+        "working",
+        "idle",
+        "needs-input",
+        "reported",
+        "exited",
+        "exited-unreported",
+        "killed",
+        "timeout",
+        "lost",
+        "not-started"
+      ],
+      "description": "claude-session state. Live: starting, working, idle, needs-input, reported. Final: the rest."
+    },
+    "cs_state_or_null": {
+      "enum": [
+        "starting",
+        "working",
+        "idle",
+        "needs-input",
+        "reported",
+        "exited",
+        "exited-unreported",
+        "killed",
+        "timeout",
+        "lost",
+        "not-started",
+        null
+      ]
+    },
+    "cs_final_state": {
+      "enum": [
+        "exited",
+        "exited-unreported",
+        "killed",
+        "timeout",
+        "lost",
+        "not-started"
+      ]
+    },
+    "cs_activity": {
+      "enum": [
+        "working",
+        "idle",
+        null
+      ],
+      "description": "claude-session activity; null in starting and in final states."
+    },
+    "cs_needs_input_reason": {
+      "enum": [
+        "permission",
+        "question",
+        "elicitation",
+        "escalation",
+        null
+      ],
+      "description": "Set when state is needs-input; null otherwise."
+    },
+    "cs_report_status": {
+      "enum": [
+        "done",
+        "blocked",
+        "needs-input",
+        "failed"
+      ]
+    },
+    "cs_cause": {
+      "enum": [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PermissionRequest",
+        "Notification",
+        "PostToolUse",
+        "Stop",
+        "SessionEnd",
+        "report",
+        "launch",
+        "adopt",
+        "exit",
+        "timeout",
+        "auto_exit",
+        "stop",
+        "forget",
+        "reconcile",
+        "liveness"
+      ],
+      "description": "claude-session's cause of a state event (Claude Code hook event or internal cause)."
+    },
+    "outcome_value": {
+      "enum": [
+        "done",
+        "blocked",
+        "needs-input",
+        "failed",
+        "exited-unreported",
+        "killed",
+        "timeout",
+        "lost",
+        "not-started",
+        "vetoed",
+        "escalated"
+      ],
+      "description": "claude-session run outcome (its interface, Outcome mapping). not-started, vetoed and escalated only for runs that ended in the launch phase."
+    },
+    "outcome_value_or_null": {
+      "enum": [
+        "done",
+        "blocked",
+        "needs-input",
+        "failed",
+        "exited-unreported",
+        "killed",
+        "timeout",
+        "lost",
+        "not-started",
+        "vetoed",
+        "escalated",
+        null
+      ]
+    },
+    "end_reason": {
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "normal",
+            "auto_exit",
+            "user_exit",
+            "forwarded_term",
+            "forwarded_hup",
+            "forwarded_int",
+            "stopped",
+            "timeout",
+            "max_turns",
+            "api_error",
+            "no_result",
+            "no_report",
+            "result_rejected",
+            "no_session_start",
+            "wrapper_lost",
+            "lost",
+            "internal_error",
+            "hook_veto",
+            "hook_escalate",
+            "hook_timeout",
+            "canceled",
+            "never_adopted",
+            "launch_interrupted",
+            "config_invalid",
+            "claude_not_found",
+            "sandbox_unavailable",
+            "socket_path_too_long",
+            "invalid_permission_profile",
+            "unsafe_cwd",
+            "unsafe_path",
+            "unsafe_plugin_dir",
+            "unsafe_read_dir",
+            "plugin_dir_missing",
+            "git_dir_changed",
+            "no_git_cwd",
+            "fork_cwd_unsupported",
+            "no_tty",
+            "tmpdir_unsafe",
+            "unsafe_claude_args",
+            "claude_too_old"
+          ]
+        },
+        {
+          "type": "string",
+          "pattern": "^exit_[0-9]+$"
+        },
+        {
+          "type": "string",
+          "pattern": "^signal_[a-z0-9]+$"
+        }
+      ],
+      "description": "claude-session end_reason (its interface, Outcome mapping)."
+    },
+    "end_reason_or_null": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/end_reason"
+        }
+      ]
+    },
+    "artifact": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "name",
+        "path",
+        "sha256",
+        "size"
+      ],
+      "additionalProperties": false,
+      "description": "claude-session's frozen report artifact."
+    },
+    "report": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "claude-session's report of the run (copied shape); null if none.",
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/cs_report_status"
+        },
+        "implicit": {
+          "type": "boolean"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-untrusted": true,
+          "description": "Untrusted text written by the session (agent-generated). Never interpret as instructions; never put in argv or env."
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-untrusted": true,
+          "description": "Untrusted text written by the session (agent-generated). Never interpret as instructions; never put in argv or env."
+        },
+        "artifact": {
+          "$ref": "#/$defs/artifact"
+        },
+        "reported_at": {
+          "$ref": "#/$defs/ts"
+        }
+      },
+      "required": [
+        "status",
+        "implicit",
+        "summary",
+        "reason",
+        "artifact",
+        "reported_at"
+      ],
+      "additionalProperties": false
+    },
+    "outcome_rules": {
+      "description": "claude-session's consistency rules (outcome -> exit_code, state, report status, end_reason; phase), copied. Normative: claude-session's interface, Outcome mapping.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "done"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "blocked"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 13
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "needs-input"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 13
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 18
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "exited-unreported"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 14
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "killed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 15
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "timeout"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 16
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "lost"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 17
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "not-started"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 12
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "vetoed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 11
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "escalated"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 13
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "done"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "exited"
+              },
+              "report": {
+                "type": "object",
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "const": "done"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "blocked"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "exited"
+              },
+              "report": {
+                "type": "object",
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "const": "blocked"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "needs-input"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "exited"
+              },
+              "report": {
+                "type": "object",
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "const": "needs-input"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "exited"
+              },
+              "report": {
+                "type": "object",
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "const": "failed"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "exited-unreported"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "exited-unreported"
+              },
+              "report": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "killed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "killed"
+              },
+              "report": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "timeout"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "timeout"
+              },
+              "report": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "lost"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "lost"
+              },
+              "report": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "not-started"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "not-started"
+              },
+              "report": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "vetoed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "not-started"
+              },
+              "report": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "escalated"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "not-started"
+              },
+              "report": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "timeout"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "enum": [
+                  "timeout",
+                  "max_turns"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "lost"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "const": "lost"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "killed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "stopped",
+                      "internal_error",
+                      "forwarded_term",
+                      "forwarded_hup",
+                      "forwarded_int"
+                    ]
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^signal_[a-z0-9]+$"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "exited-unreported"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "normal",
+                      "user_exit",
+                      "api_error",
+                      "no_result",
+                      "no_report",
+                      "result_rejected",
+                      "no_session_start"
+                    ]
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^exit_[0-9]+$"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "vetoed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "enum": [
+                  "hook_veto",
+                  "hook_timeout"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "escalated"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "const": "hook_escalate"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "not-started"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "enum": [
+                  "canceled",
+                  "never_adopted",
+                  "launch_interrupted",
+                  "config_invalid",
+                  "claude_not_found",
+                  "sandbox_unavailable",
+                  "socket_path_too_long",
+                  "invalid_permission_profile",
+                  "unsafe_cwd",
+                  "unsafe_path",
+                  "unsafe_plugin_dir",
+                  "unsafe_read_dir",
+                  "plugin_dir_missing",
+                  "git_dir_changed",
+                  "no_git_cwd",
+                  "fork_cwd_unsupported",
+                  "no_tty",
+                  "tmpdir_unsafe",
+                  "unsafe_claude_args",
+                  "claude_too_old"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "launch"
+              }
+            },
+            "required": [
+              "phase"
+            ]
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "not-started",
+                  "vetoed",
+                  "escalated"
+                ]
+              },
+              "end_reason": {
+                "enum": [
+                  "hook_veto",
+                  "hook_escalate",
+                  "hook_timeout",
+                  "canceled",
+                  "never_adopted",
+                  "launch_interrupted",
+                  "config_invalid",
+                  "claude_not_found",
+                  "sandbox_unavailable",
+                  "socket_path_too_long",
+                  "invalid_permission_profile",
+                  "unsafe_cwd",
+                  "unsafe_path",
+                  "unsafe_plugin_dir",
+                  "unsafe_read_dir",
+                  "plugin_dir_missing",
+                  "git_dir_changed",
+                  "no_git_cwd",
+                  "fork_cwd_unsupported",
+                  "no_tty",
+                  "tmpdir_unsafe",
+                  "unsafe_claude_args",
+                  "claude_too_old"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "session"
+              }
+            },
+            "required": [
+              "phase"
+            ]
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "not": {
+                  "enum": [
+                    "not-started",
+                    "vetoed",
+                    "escalated"
+                  ]
+                }
+              },
+              "end_reason": {
+                "not": {
+                  "enum": [
+                    "hook_veto",
+                    "hook_escalate",
+                    "hook_timeout",
+                    "canceled",
+                    "never_adopted",
+                    "launch_interrupted",
+                    "config_invalid",
+                    "claude_not_found",
+                    "sandbox_unavailable",
+                    "socket_path_too_long",
+                    "invalid_permission_profile",
+                    "unsafe_cwd",
+                    "unsafe_path",
+                    "unsafe_plugin_dir",
+                    "unsafe_read_dir",
+                    "plugin_dir_missing",
+                    "git_dir_changed",
+                    "no_git_cwd",
+                    "fork_cwd_unsupported",
+                    "no_tty",
+                    "tmpdir_unsafe",
+                    "unsafe_claude_args",
+                    "claude_too_old"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "outcome": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "$ref": "#/$defs/agent_id"
+        },
+        "csession_id": {
+          "$ref": "#/$defs/csession_id"
+        },
+        "run": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "forked_from": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/csession_id"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Source session when the session is a fork; else null."
+        },
+        "claude_session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Latest captured Claude Code session id; null if SessionStart was never seen."
+        },
+        "phase": {
+          "enum": [
+            "launch",
+            "session"
+          ],
+          "description": "launch: the run ended before claude was spawned; session: claude was spawned."
+        },
+        "outcome": {
+          "$ref": "#/$defs/outcome_value"
+        },
+        "end_reason": {
+          "$ref": "#/$defs/end_reason"
+        },
+        "exit_code": {
+          "type": "integer",
+          "description": "The run's outcome code (the outcome table), also the exit code of launch --wait, resume --wait and wait."
+        },
+        "state": {
+          "$ref": "#/$defs/cs_final_state"
+        },
+        "report": {
+          "$ref": "#/$defs/report"
+        },
+        "session_started_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "cost_usd": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "claude-session's human-readable detail (launch-phase hint, or its pre-launch hook's stderr, capped). Never agent text."
+        },
+        "warnings": {
+          "$ref": "#/$defs/warnings"
+        },
+        "promoted": {
+          "type": "boolean",
+          "description": "The run was a promotion (interactive resume of a headless run that ended blocked or needs-input)."
+        },
+        "auto_resumed": {
+          "type": "boolean",
+          "description": "The run was the automatic report resume."
+        },
+        "first_working_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "description": "agent-spawn's addition: the run's first working activity (relay records, else claude-session status recent_events), or null. The chain's delivery signal is the result object's top-level first_working_at."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agent_id",
+        "csession_id",
+        "run",
+        "forked_from",
+        "claude_session_id",
+        "phase",
+        "outcome",
+        "end_reason",
+        "exit_code",
+        "state",
+        "report",
+        "session_started_at",
+        "cost_usd",
+        "message",
+        "warnings",
+        "promoted",
+        "auto_resumed",
+        "first_working_at"
+      ],
+      "description": "claude-session's outcome object for one final run of the agent (its interface, section Outcome object), plus agent_id, promoted, auto_resumed and first_working_at. agent-spawn only reports final runs: outcome, end_reason and exit_code are never null.",
+      "allOf": [
+        {
+          "$ref": "#/$defs/outcome_rules"
+        }
+      ]
+    },
+    "worktree_ref": {
+      "type": "object",
+      "properties": {
+        "record_id": {
+          "$ref": "#/$defs/wt_record_id"
+        },
+        "path": {
+          "$ref": "#/$defs/abs_path",
+          "description": "The worktree root."
+        },
+        "owned": {
+          "type": "boolean",
+          "description": "true: created by the agent (--worktree new), removed at teardown; false: adopted (--worktree <path>, held for a cwd, or an in-place fork), released at teardown (wtctl forget --holder)."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "record_id",
+        "path",
+        "owned"
+      ],
+      "description": "A wtctl worktree record the agent created or holds."
+    },
+    "teardown_worktree": {
+      "type": "object",
+      "properties": {
+        "record_id": {
+          "$ref": "#/$defs/wt_record_id"
+        },
+        "path": {
+          "$ref": "#/$defs/abs_path",
+          "description": "The worktree root."
+        },
+        "owned": {
+          "type": "boolean",
+          "description": "true: created by the agent (--worktree new), removed at teardown; false: adopted (--worktree <path>, held for a cwd, or an in-place fork), released at teardown (wtctl forget --holder)."
+        },
+        "action": {
+          "$ref": "#/$defs/worktree_action"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "record_id",
+        "path",
+        "owned",
+        "action"
+      ],
+      "description": "A record teardown processed (or would process): removed (the owned record), forgotten (the release forgot the record), released (the hold was dropped and the record stays) or none (already done on a retry).",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "owned": {
+                "const": true
+              }
+            },
+            "required": [
+              "owned"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "enum": [
+                  "removed",
+                  "none"
+                ]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "action": {
+                "enum": [
+                  "forgotten",
+                  "released",
+                  "none"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "window_ref": {
+      "type": "object",
+      "properties": {
+        "term_id": {
+          "$ref": "#/$defs/term_id"
+        },
+        "socket_path": {
+          "$ref": "#/$defs/socket_path"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "term_id",
+        "socket_path"
+      ],
+      "description": "A run's termctl managed pane; on the agent object, the current (or last) run's window."
+    },
+    "chain_failure": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "tool": {
+              "$ref": "#/$defs/tool",
+              "description": "The tool that refused or failed; agent-spawn for its own checks."
+            },
+            "reason": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]*$",
+              "description": "The refusal reason (e.g. third_party_run, third_party_cwd, tainted) or the error code (e.g. classification_mismatch, classification_unknown, launch_failed, handoff_failed)."
+            },
+            "run": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1,
+              "description": "The chain run's number when it was allocated; else null."
+            },
+            "end_reason": {
+              "$ref": "#/$defs/end_reason_or_null",
+              "description": "The chain run's end reason when it ran; else null."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "tool",
+            "reason",
+            "run",
+            "end_reason"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Why a supervisor-initiated run (automatic report resume or promotion) stopped early: refused or failed before or at its start, or ended in its launch phase; the agent then parks per the triggering run's outcome-table row (interface: Supervision, chain runs that stop early). null for every other park."
+    },
+    "agent": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "$ref": "#/$defs/agent_id"
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "needs_attention": {
+          "$ref": "#/$defs/needs_attention"
+        },
+        "park_reason": {
+          "$ref": "#/$defs/park_reason"
+        },
+        "kind": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/kind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Launch kind (null when the kind was left to claude-session's default and no session was allocated yet)."
+        },
+        "run_kind": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/kind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last run's kind; null before a run."
+        },
+        "escalated_by": {
+          "$ref": "#/$defs/escalated_by"
+        },
+        "mode": {
+          "$ref": "#/$defs/mode",
+          "description": "The last run's mode (a promoted run is interactive); before a run, the launch's."
+        },
+        "placement": {
+          "$ref": "#/$defs/placement"
+        },
+        "term_placement": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/placement_name"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "--term-placement, stored."
+        },
+        "name": {
+          "$ref": "#/$defs/name",
+          "description": "--name, else --worktree-name, else '<kind> <first 6 id characters>' (kind: the explicit --kind or 'agent'). Never null."
+        },
+        "repo": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/repo_id"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "--repo, else the classification dry run's repo, confirmed by status after start."
+        },
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^(/[^\\n]*|session-dir)$",
+          "description": "The resolved cwd: a realpath, or session-dir for the session's own work/ directory; null until known."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels"
+        },
+        "csession_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/csession_id"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Recorded when the session is allocated."
+        },
+        "run": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "The current or last claude-session run number; null before a session."
+        },
+        "session_state": {
+          "$ref": "#/$defs/cs_state_or_null",
+          "description": "The last relayed claude-session state of the current run; null before one (from relay records, no claude-session call)."
+        },
+        "activity": {
+          "$ref": "#/$defs/cs_activity",
+          "description": "The last relayed activity."
+        },
+        "needs_input_reason": {
+          "$ref": "#/$defs/cs_needs_input_reason",
+          "description": "The last relayed needs_input_reason."
+        },
+        "forked_from": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/agent_id"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The source agent of a fork."
+        },
+        "worktree": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/worktree_ref"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The record created or adopted at launch, else the nearest record the agent holds for its cwd; null without one."
+        },
+        "holds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/worktree_ref"
+          },
+          "description": "Every wtctl worktree record the agent holds now (throwaways are never held); empty when none. Teardown releases the held ones in stored order, then removes the owned one."
+        },
+        "window": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/window_ref"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The current (or last) run's window, null when that run had none; for any mode (a promotion opens one for a headless agent)."
+        },
+        "promote": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "The explicit --promote/--no-promote choice; null: resolved from config per run kind at promotion time."
+        },
+        "promotion_pending": {
+          "type": "boolean",
+          "description": "true from the decision to promote until the promoted run ends or the promotion fails."
+        },
+        "ephemeral": {
+          "type": "boolean"
+        },
+        "last_outcome": {
+          "$ref": "#/$defs/outcome_value_or_null",
+          "description": "The last final run's outcome; null before one. Its exit code is in the outcome object."
+        },
+        "last_end_reason": {
+          "$ref": "#/$defs/end_reason_or_null"
+        },
+        "tainted": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "The session's taint, from claude-session status after each start; null without a session."
+        },
+        "supervisor_lost": {
+          "type": "boolean",
+          "description": "true: the supervisor died while the session stayed live (status live); needs_attention is set to lost on the transition into it, and ack does not clear this flag. Remedy: agent-spawn stop."
+        },
+        "teardown_step": {
+          "$ref": "#/$defs/teardown_step"
+        },
+        "created": {
+          "$ref": "#/$defs/ts"
+        },
+        "last_live_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "description": "When the last run ended (or the agent was last seen live); null before a run."
+        },
+        "updated": {
+          "$ref": "#/$defs/ts"
+        },
+        "torn_down_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "warnings": {
+          "$ref": "#/$defs/warnings"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agent_id",
+        "status",
+        "needs_attention",
+        "park_reason",
+        "kind",
+        "run_kind",
+        "escalated_by",
+        "mode",
+        "placement",
+        "term_placement",
+        "name",
+        "repo",
+        "cwd",
+        "labels",
+        "csession_id",
+        "run",
+        "session_state",
+        "activity",
+        "needs_input_reason",
+        "forked_from",
+        "worktree",
+        "holds",
+        "window",
+        "promote",
+        "promotion_pending",
+        "ephemeral",
+        "last_outcome",
+        "last_end_reason",
+        "tainted",
+        "supervisor_lost",
+        "teardown_step",
+        "created",
+        "last_live_at",
+        "updated",
+        "torn_down_at",
+        "warnings"
+      ],
+      "description": "The agent object (interface: Objects). Fields of agent-spawn's own record.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "last_outcome": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "last_outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "last_end_reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "park_reason": {
+                "not": {
+                  "const": "escalated"
+                }
+              }
+            },
+            "required": [
+              "park_reason"
+            ]
+          },
+          "then": {
+            "properties": {
+              "escalated_by": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "torn_down"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "torn_down_at": {
+                "type": "string"
+              },
+              "needs_attention": {
+                "type": "null"
+              },
+              "supervisor_lost": {
+                "const": false
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "torn_down_at": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "supervisor_lost": {
+                "const": true
+              }
+            },
+            "required": [
+              "supervisor_lost"
+            ]
+          },
+          "then": {
+            "properties": {
+              "status": {
+                "const": "live"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "not": {
+                  "const": "tearing_down"
+                }
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "teardown_step": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "headless"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "placement": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "interactive"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "placement": {
+                "enum": [
+                  "window",
+                  "here"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "hook_entry_pre": {
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Run via sh -c in its own process group; JSON payload on stdin."
+        },
+        "timeout": {
+          "$ref": "#/$defs/duration",
+          "default": "30s"
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/kind"
+          },
+          "description": "Run only when the run kind is one of these."
+        },
+        "exclude_kinds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/kind"
+          },
+          "description": "Never run for these run kinds."
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/label"
+          },
+          "description": "Run only when the agent has all these pairs (AND)."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cmd"
+      ],
+      "description": "A pre-hook entry: synchronous, never async. Exit 13 escalates; any other non-zero exit or a timeout vetoes."
+    },
+    "hook_entry_post": {
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Run via sh -c in its own process group; JSON payload on stdin."
+        },
+        "timeout": {
+          "$ref": "#/$defs/duration",
+          "default": "30s"
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/kind"
+          },
+          "description": "Run only when the run kind is one of these."
+        },
+        "exclude_kinds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/kind"
+          },
+          "description": "Never run for these run kinds."
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/label"
+          },
+          "description": "Run only when the agent has all these pairs (AND)."
+        },
+        "async": {
+          "type": "boolean",
+          "default": false,
+          "description": "Do not wait for the hook. Use true for notification hooks."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cmd"
+      ],
+      "description": "A post-hook entry. Failures are logged and never change the command's result."
+    },
+    "hook_entry_state_change": {
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Run via sh -c in its own process group; JSON payload on stdin."
+        },
+        "timeout": {
+          "$ref": "#/$defs/duration",
+          "default": "30s"
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/kind"
+          },
+          "description": "Run only when the run kind is one of these."
+        },
+        "exclude_kinds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/kind"
+          },
+          "description": "Never run for these run kinds."
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/label"
+          },
+          "description": "Run only when the agent has all these pairs (AND)."
+        },
+        "async": {
+          "type": "boolean",
+          "default": false,
+          "description": "Do not wait for the hook. Use true for notification hooks."
+        },
+        "states": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/cs_state"
+          },
+          "description": "Run only for change: session events whose session state is one of these (never for change: agent)."
+        },
+        "statuses": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/status"
+          },
+          "description": "Run only when the agent status is one of these."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cmd"
+      ],
+      "description": "A post-state-change hook entry (adds the states and statuses selectors)."
+    },
+    "launch_settings": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/kind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "--kind; null: claude-session's default kind."
+        },
+        "mode": {
+          "$ref": "#/$defs/mode"
+        },
+        "placement": {
+          "$ref": "#/$defs/placement"
+        },
+        "term_placement": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/placement_name"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/name"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "--name, else --worktree-name; null when it derives from the agent id (not allocated by a dry run)."
+        },
+        "repo": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/repo_id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "worktree": {
+          "type": "string",
+          "pattern": "^(new|none|/[^\\n]*)$",
+          "description": "--worktree: new, none or an absolute path."
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detach": {
+          "type": "boolean"
+        },
+        "worktree_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "no_bootstrap": {
+          "type": "boolean"
+        },
+        "copy_env": {
+          "type": "boolean"
+        },
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "--cwd as given (a path or session-dir); null: the default."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels"
+        },
+        "skill": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "has_prompt": {
+          "type": "boolean",
+          "description": "Whether --prompt or --prompt-file was given (the text is never included)."
+        },
+        "input_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Names of --input-file inputs (never contents)."
+        },
+        "plugin_dirs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "promote": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "The explicit --promote/--no-promote choice; null: from config at promotion time."
+        },
+        "ephemeral": {
+          "type": "boolean"
+        },
+        "wait": {
+          "type": "boolean",
+          "description": "--wait, or implied by --placement here."
+        },
+        "wait_timeout": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/duration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "mode",
+        "placement",
+        "term_placement",
+        "name",
+        "repo",
+        "worktree",
+        "branch",
+        "base",
+        "ref",
+        "detach",
+        "worktree_name",
+        "no_bootstrap",
+        "copy_env",
+        "cwd",
+        "labels",
+        "skill",
+        "has_prompt",
+        "input_names",
+        "plugin_dirs",
+        "promote",
+        "ephemeral",
+        "wait",
+        "wait_timeout"
+      ],
+      "description": "The resolved launch settings agent-spawn stores (launch --dry-run agent_settings)."
+    }
+  }
+}

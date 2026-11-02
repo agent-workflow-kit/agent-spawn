@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/cli/label-add.json",
+  "title": "agent-spawn label add --json",
+  "description": "Also the output of self-labeling (label add --session).",
+  "type": "object",
+  "properties": {
+    "agent_id": {
+      "$ref": "../defs.json#/$defs/agent_id"
+    },
+    "labels": {
+      "$ref": "../defs.json#/$defs/labels",
+      "description": "The agent's labels after the change (or as they would be, with --dry-run)."
+    },
+    "added": {
+      "type": "array",
+      "items": {
+        "$ref": "../defs.json#/$defs/label"
+      },
+      "description": "The pairs actually added (re-adding a present pair or removing an absent one is a no-op); possibly empty."
+    },
+    "changed": {
+      "type": "boolean",
+      "description": "false: nothing was added (a no-op)."
+    },
+    "warnings": {
+      "$ref": "../defs.json#/$defs/warnings",
+      "description": "Mirror failures (claude-session, termctl); queued, reconcile re-syncs."
+    },
+    "dry_run": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "agent_id",
+    "labels",
+    "added",
+    "changed",
+    "warnings",
+    "dry_run"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "changed": {
+            "const": false
+          }
+        },
+        "required": [
+          "changed"
+        ]
+      },
+      "then": {
+        "properties": {
+          "added": {
+            "maxItems": 0
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "added": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ]
+}

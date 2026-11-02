@@ -1,0 +1,307 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/cli/show.json",
+  "title": "agent-spawn show --json",
+  "description": "The agent object plus runs, session, supervisor, third_party_run, repo_config_changed and warnings.",
+  "type": "object",
+  "properties": {
+    "agent": {
+      "$ref": "../defs.json#/$defs/agent"
+    },
+    "runs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "run": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "claude-session run number."
+          },
+          "csession_id": {
+            "$ref": "../defs.json#/$defs/csession_id"
+          },
+          "run_kind": {
+            "oneOf": [
+              {
+                "$ref": "../defs.json#/$defs/kind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mode": {
+            "$ref": "../defs.json#/$defs/mode"
+          },
+          "promoted": {
+            "type": "boolean"
+          },
+          "auto_resumed": {
+            "type": "boolean"
+          },
+          "adopted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "ended_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "first_working_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "The run's first working activity, or null."
+          },
+          "window": {
+            "oneOf": [
+              {
+                "$ref": "../defs.json#/$defs/window_ref"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The run's window; null when the run had none."
+          },
+          "outcome": {
+            "oneOf": [
+              {
+                "$ref": "../defs.json#/$defs/outcome"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "null while the run is live or pending."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "run",
+          "csession_id",
+          "run_kind",
+          "mode",
+          "promoted",
+          "auto_resumed",
+          "adopted_at",
+          "ended_at",
+          "first_working_at",
+          "window",
+          "outcome"
+        ]
+      },
+      "description": "The agent's run history, oldest first."
+    },
+    "session": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "$ref": "../defs.json#/$defs/cs_state"
+            },
+            "needs_input_reason": {
+              "$ref": "../defs.json#/$defs/cs_needs_input_reason"
+            },
+            "activity": {
+              "$ref": "../defs.json#/$defs/cs_activity"
+            },
+            "run": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "report_status": {
+              "enum": [
+                "done",
+                "blocked",
+                "needs-input",
+                "failed",
+                null
+              ]
+            },
+            "sandbox_active": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "tainted": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "needs_input_reason",
+            "activity",
+            "run",
+            "report_status",
+            "sandbox_active",
+            "tainted"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "claude-session status --json's run summary; null without a session, when claude-session reports it not found (the agent then parks session_missing), or for a tombstone."
+    },
+    "supervisor": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "pid": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "alive": {
+              "type": "boolean"
+            },
+            "exec_pid": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "pid",
+            "alive",
+            "exec_pid"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "null for a tombstone or an agent that never had a supervisor."
+    },
+    "third_party_run": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "Whether the agent's cwd lies inside a live wtctl throwaway record, so trusted runs of the agent are refused (third_party_run); null when the cwd is not known yet or the records lookup failed (with a warning)."
+    },
+    "repo_config_changed": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "changed": {
+              "type": "boolean"
+            },
+            "changed_classes": {
+              "type": "array",
+              "items": {
+                "$ref": "../defs.json#/$defs/baseline_class"
+              },
+              "uniqueItems": true
+            },
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "description": "wtctl's baseline item, verbatim.",
+                "x-untrusted": true
+              },
+              "x-untrusted": true
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "changed",
+            "changed_classes",
+            "items"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "changed": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "changed_classes": {
+                    "maxItems": 0
+                  },
+                  "items": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Informational: from wtctl baseline check of the agent's own worktree record (the agent object's worktree); null without a worktree record, when the check could not run (with a warning), or for a tombstone."
+    },
+    "warnings": {
+      "$ref": "../defs.json#/$defs/warnings"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "agent",
+    "runs",
+    "session",
+    "supervisor",
+    "third_party_run",
+    "repo_config_changed",
+    "warnings"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "agent": {
+            "properties": {
+              "status": {
+                "const": "torn_down"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "agent"
+        ]
+      },
+      "then": {
+        "properties": {
+          "session": {
+            "type": "null"
+          },
+          "supervisor": {
+            "type": "null"
+          },
+          "repo_config_changed": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ]
+}

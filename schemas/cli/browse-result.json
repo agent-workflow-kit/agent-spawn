@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/cli/browse-result.json",
+  "title": "agent-spawn browse --result-file",
+  "description": "Written to browse --result-file when a and r only record the intent; nothing is written without the flag.",
+  "type": "object",
+  "properties": {
+    "intent": {
+      "enum": [
+        "attach",
+        "resume",
+        "back"
+      ],
+      "description": "The action the user chose: attach or resume the selected agents, or back (left without choosing)."
+    },
+    "selected": {
+      "type": "array",
+      "items": {
+        "$ref": "../defs.json#/$defs/agent_id"
+      },
+      "uniqueItems": true,
+      "description": "The selected agent ids; exactly one for attach, possibly empty for back."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "intent",
+    "selected"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "intent": {
+            "const": "attach"
+          }
+        },
+        "required": [
+          "intent"
+        ]
+      },
+      "then": {
+        "properties": {
+          "selected": {
+            "minItems": 1,
+            "maxItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "intent": {
+            "const": "resume"
+          }
+        },
+        "required": [
+          "intent"
+        ]
+      },
+      "then": {
+        "properties": {
+          "selected": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ]
+}

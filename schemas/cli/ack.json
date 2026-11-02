@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/cli/ack.json",
+  "title": "agent-spawn ack --json",
+  "description": "The agent object (after the change) and changed. ack never clears supervisor_lost.",
+  "type": "object",
+  "properties": {
+    "agent": {
+      "$ref": "../defs.json#/$defs/agent"
+    },
+    "changed": {
+      "type": "boolean",
+      "description": "false: needs_attention was already null (no-op)."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "agent",
+    "changed"
+  ]
+}

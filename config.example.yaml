@@ -1,2 +1,85 @@
-# Example config for agent-spawn. Location: ~/.config/agent-spawn/config.yaml (drop-ins: config.d/*.yaml). Keys are defined in docs/interface.md once designed.
+# agent-spawn example config: every key with its built-in default.
+# Location: ~/.config/agent-spawn/config.yaml (drop-ins: config.d/*.yaml, merged after it in
+# lexical order). Merging: maps are merged; hooks.* lists append; other lists are replaced.
+# Environment overrides AGENT_SPAWN_<KEY> apply only to these top-level scalar keys:
+# handoff_timeout, tombstone_days, job_id_env, auto_report_resume
+# (e.g. AGENT_SPAWN_HANDOFF_TIMEOUT=45s). Lists and maps cannot be set from the environment.
+# Precedence: flags > per-repo override > environment > config > built-in defaults.
+# Durations: seconds as a positive number, or <number><unit> with unit ms, s, m, h or d
+# ("30s", "10m", "0.5s"); a bare number string ("90") means seconds; zero is refused.
+# Schema: schemas/config.json. Invalid config exits 2 (config_invalid) naming the key.
+
+me:
+  # The <user> in the default actor human:<user> (used when stdin is a TTY). null: the OS username.
+  name: null
+
+# argv of the sibling tools. Each is resolved to an absolute path on PATH at launch and stored with
+# the agent (internal processes use the stored paths).
+# claude-session is always needed; termctl only when a window is opened; wtctl for worktrees and
+# throwaways, to look up the records of a cwd: when that lookup is needed and wtctl cannot be
+# resolved, the command exits 12 (tool_missing). wtctl_cmd: null declares that there is no wtctl on
+# this machine (standalone use): the records of every cwd are empty, a third-party-reading run needs
+# --cwd session-dir, and the worktree flags exit 2.
+claude_session_cmd: [claude-session]
+termctl_cmd: [termctl]
+wtctl_cmd: [wtctl]
+
+# Environment variable whose value becomes the label job=<value> at launch and plain resume (ignored
+# with a warning when the value does not fit the label value grammar; not taken when CSESSION_ID is
+# set, nor for forks, unless --label job=... is given).
+job_id_env: JOBSCTL_JOB_ID
+
+# Label keys an agent may add to itself from inside its session (label add --session).
+self_label_keys: [pr]
+
+# How long the launcher waits for a window's process to complete the environment handoff. It bounds
+# only the handoff; waiting for the run to start is bounded by claude-session (pending-run expiry,
+# hook timeouts).
+handoff_timeout: 30s
+
+# Resume a headless run once with a fixed prompt when it ended without a status report.
+auto_report_resume: true
+
+# Days a torn-down agent's tombstone is kept before reconcile deletes it (its id stays reserved).
+tombstone_days: 30
+
+prune:
+  # Default for prune --older-than. null: prune does nothing (and warns) without the flag.
+  older_than: null
+  # Label keys or key=value pairs that protect an agent from prune (unless --include-owned).
+  protect_labels: [owner]
+
+# Per-kind settings. Kind names follow claude-session's grammar.
+# promote: when a headless run of this kind ends blocked or needs-input, resume it once
+# interactively in a window (default false; --promote/--no-promote override it per agent). Example:
+#   kinds:
+#     implement:
+#       promote: true
+kinds: {}
+
+# Per-repo overrides, keyed by claude-session repo id (host/<full project path>). A kind without
+# promote here falls through to kinds.<kind>.promote. Example:
+#   repos:
+#     example.com/group/project:
+#       kinds:
+#         implement:
+#           promote: false
+repos: {}
+
+# Hooks: pre-launch, pre-teardown (synchronous; exit 13 escalates, any other non-zero exit or a
+# timeout vetoes), post-launch, post-state-change, post-escalate, post-park, post-teardown.
+# Entry keys: cmd (run via sh -c, JSON payload on stdin), timeout (default 30s), async (post-hooks
+# only, default false), selectors kinds, exclude_kinds, labels, and for post-state-change only,
+# states and statuses (an entry with states fires only for session changes). Hooks are fired by the
+# CLI and the supervisor (never by the state relay) and run with the environment of the process that
+# fires them: use absolute paths in cmd, and configure notification hooks with async: true.
+# pre-launch never runs on resume. Example:
+#   hooks:
+#     post-escalate:
+#       - cmd: "my-notify"
+#         async: true
+#     post-state-change:
+#       - cmd: "my-notify"
+#         async: true
+#         states: [needs-input]
 hooks: {}
