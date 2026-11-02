@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/cli/stop.json",
+  "title": "agent-spawn stop --json",
+  "description": "Exit 0: the agent is parked per the outcome table (a stopped run: killed, stopped, no attention; a run that had already reported keeps its outcome; never resumed automatically or promoted), was already parked, or its record was removed (removed true). stop records nothing on the agent. Exit 12 (still live after the wait) and claude-session's 10 and 20 print the error envelope.",
+  "type": "object",
+  "properties": {
+    "agent": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/agent"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The agent after the stop; null exactly when removed is true."
+    },
+    "action": {
+      "enum": [
+        "session_stop",
+        "signal_supervisor",
+        "signal_launcher",
+        "none"
+      ],
+      "description": "session_stop: claude-session stop of the pending or live current run (a promotion's pending run and supervisor_lost included); signal_supervisor: SIGTERM to the verified supervisor between runs (no pending run); signal_launcher: SIGTERM to the verified launcher (launching, before start returned); none: nothing to stop."
+    },
+    "session_stop": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "claude-session stop --json result (with --dry-run: stop --dry-run), verbatim; null unless action is session_stop."
+    },
+    "already_parked": {
+      "type": "boolean",
+      "description": "true: the agent was parked, or tearing_down without a pending or live run; a no-op (action none)."
+    },
+    "removed": {
+      "type": "boolean",
+      "description": "true: the agent's record disappeared during the wait (a launching fork deleted by its launcher before its session existed, or an abandoned fork); counts as done (exit 0)."
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "warnings": {
+      "$ref": "../defs.json#/$defs/warnings"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "agent",
+    "action",
+    "session_stop",
+    "already_parked",
+    "removed",
+    "dry_run",
+    "warnings"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "already_parked": {
+            "const": true
+          }
+        },
+        "required": [
+          "already_parked"
+        ]
+      },
+      "then": {
+        "properties": {
+          "action": {
+            "const": "none"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "action": {
+            "not": {
+              "const": "none"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "not": {
+              "const": "session_stop"
+            }
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "properties": {
+          "session_stop": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "removed": {
+            "const": true
+          }
+        },
+        "required": [
+          "removed"
+        ]
+      },
+      "then": {
+        "properties": {
+          "agent": {
+            "type": "null"
+          },
+          "action": {
+            "const": "signal_launcher"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "agent": {
+            "type": "object"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/cli/list.json",
+  "title": "agent-spawn list --json",
+  "description": "Agents ordered by created descending, ties by agent_id. Without --status, torn-down agents are excluded.",
+  "type": "object",
+  "properties": {
+    "agents": {
+      "type": "array",
+      "items": {
+        "$ref": "../defs.json#/$defs/agent"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "agents"
+  ]
+}

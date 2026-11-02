@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/cli/prune.json",
+  "title": "agent-spawn prune --json",
+  "description": "Exit 0 whatever the per-agent results.",
+  "type": "object",
+  "properties": {
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "agent_id": {
+            "$ref": "../defs.json#/$defs/agent_id"
+          },
+          "result": {
+            "enum": [
+              "torn_down",
+              "refused",
+              "skipped",
+              "failed"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why refused, skipped or failed (agent-spawn's or a lower tool's reason, e.g. protected, needs_attention, live, dirty); null for torn_down."
+          },
+          "tool": {
+            "oneOf": [
+              {
+                "$ref": "../defs.json#/$defs/tool"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "details": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The lower tool's details, verbatim.",
+            "x-untrusted": true
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "agent_id",
+          "result",
+          "reason",
+          "tool",
+          "details"
+        ]
+      }
+    },
+    "warnings": {
+      "$ref": "../defs.json#/$defs/warnings"
+    },
+    "dry_run": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "results",
+    "warnings",
+    "dry_run"
+  ]
+}

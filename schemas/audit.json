@@ -1,47 +1,110 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "agent-spawn/audit",
+  "$id": "agent-spawn/audit.json",
   "title": "agent-spawn audit.jsonl record",
-  "description": "Audit record for agent-spawn. Whether this tool writes audit records is decided in its design session (architecture §14).",
+  "description": "teardown (when it removed a worktree or used --force), stop, launch_escalation_override, resume_escalation_override, teardown_escalation_override, resume_tainted (claude-session audits that as well).",
   "type": "object",
   "properties": {
     "ts": {
-      "type": "string",
-      "format": "date-time"
+      "$ref": "defs.json#/$defs/ts"
     },
     "actor": {
-      "type": "string"
+      "$ref": "defs.json#/$defs/actor"
     },
     "decision_id": {
-      "oneOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
-      ]
+      "$ref": "defs.json#/$defs/decision_ids",
+      "description": "Decision ids (from --decision-id and pre-hook stdout); possibly empty."
     },
     "target": {
-      "type": "string"
+      "$ref": "defs.json#/$defs/agent_id",
+      "description": "The agent id (for launch_escalation_override: the agent the launch allocated)."
     },
     "action": {
-      "type": "string"
+      "enum": [
+        "teardown",
+        "stop",
+        "launch_escalation_override",
+        "resume_escalation_override",
+        "teardown_escalation_override",
+        "resume_tainted"
+      ]
     },
     "inputs": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "labels": {
+          "$ref": "defs.json#/$defs/labels"
+        },
+        "repo": {
+          "oneOf": [
+            {
+              "$ref": "defs.json#/$defs/repo_id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "worktree": {
+          "oneOf": [
+            {
+              "$ref": "defs.json#/$defs/worktree_ref"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "csession_id": {
+          "oneOf": [
+            {
+              "$ref": "defs.json#/$defs/csession_id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "merged_head": {
+          "oneOf": [
+            {
+              "$ref": "defs.json#/$defs/sha"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "force": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "labels",
+        "repo",
+        "worktree",
+        "csession_id",
+        "merged_head",
+        "force"
+      ]
     },
-    "result": {}
+    "result": {
+      "enum": [
+        "ok",
+        "refused",
+        "error"
+      ]
+    }
   },
+  "additionalProperties": false,
   "required": [
     "ts",
     "actor",
+    "decision_id",
     "target",
     "action",
+    "inputs",
     "result"
-  ],
-  "additionalProperties": true
+  ]
 }

@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/cli/attach.json",
+  "title": "agent-spawn attach --json",
+  "description": "Built from termctl focus --json. Without --json, action attach replaces the process with argv.",
+  "type": "object",
+  "properties": {
+    "agent_id": {
+      "$ref": "../defs.json#/$defs/agent_id"
+    },
+    "action": {
+      "enum": [
+        "switched",
+        "attach"
+      ],
+      "description": "termctl focus's action."
+    },
+    "client": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^/?[A-Za-z0-9_./-]{1,100}$"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The tmux client switched; null for attach."
+    },
+    "argv": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      },
+      "description": "attach: the command to exec (termctl's argv); null for switched."
+    },
+    "term_id": {
+      "$ref": "../defs.json#/$defs/term_id"
+    },
+    "socket_path": {
+      "$ref": "../defs.json#/$defs/socket_path"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "agent_id",
+    "action",
+    "client",
+    "argv",
+    "term_id",
+    "socket_path"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "attach"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "properties": {
+          "argv": {
+            "type": "array",
+            "minItems": 1
+          },
+          "client": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "switched"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "properties": {
+          "argv": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/cli/cron-uninstall.json",
+  "title": "agent-spawn cron uninstall --json",
+  "type": "object",
+  "properties": {
+    "action": {
+      "enum": [
+        "removed",
+        "unchanged"
+      ]
+    },
+    "block": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "removed: the block removed (or that would be); unchanged: null."
+    },
+    "dry_run": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "action",
+    "block",
+    "dry_run"
+  ]
+}

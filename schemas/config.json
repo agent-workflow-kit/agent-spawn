@@ -1,12 +1,454 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "agent-spawn/config",
+  "$id": "agent-spawn/config.json",
   "title": "agent-spawn config",
+  "description": "~/.config/agent-spawn/config.yaml plus config.d/*.yaml (lexical order): maps merged, hooks lists appended, other lists replaced. Environment overrides AGENT_SPAWN_<KEY> only for handoff_timeout, tombstone_days, job_id_env, auto_report_resume (a bare number string for a duration means seconds).",
   "type": "object",
   "properties": {
+    "me": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9._@-]{1,64}$",
+          "default": null,
+          "description": "The <user> of the default actor human:<user>; null: the OS username."
+        }
+      },
+      "additionalProperties": false,
+      "required": [],
+      "default": {}
+    },
+    "claude_session_cmd": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1,
+      "default": [
+        "claude-session"
+      ],
+      "description": "argv of claude-session; resolved once per invocation to an absolute path on PATH."
+    },
+    "termctl_cmd": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1,
+      "default": [
+        "termctl"
+      ]
+    },
+    "wtctl_cmd": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1,
+      "default": [
+        "wtctl"
+      ],
+      "description": "argv of wtctl. null: no wtctl on this machine (standalone use): records of any cwd are empty, a third-party-reading run needs --cwd session-dir, and worktree flags exit 2."
+    },
+    "job_id_env": {
+      "$ref": "#/$defs/env_name",
+      "default": "JOBSCTL_JOB_ID",
+      "description": "Variable whose value becomes the label job=<value> at launch and resume."
+    },
+    "self_label_keys": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/label_key"
+      },
+      "uniqueItems": true,
+      "default": [
+        "pr"
+      ],
+      "description": "Keys an agent may add to itself (label add --session)."
+    },
+    "handoff_timeout": {
+      "$ref": "#/$defs/duration",
+      "default": "30s",
+      "description": "Bounds only the environment handoff to a window."
+    },
+    "auto_report_resume": {
+      "type": "boolean",
+      "default": true
+    },
+    "tombstone_days": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 30
+    },
+    "prune": {
+      "type": "object",
+      "properties": {
+        "older_than": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/duration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Default for prune --older-than; null: prune does nothing without the flag."
+        },
+        "protect_labels": {
+          "type": "array",
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/label_key"
+              },
+              {
+                "$ref": "#/$defs/label"
+              }
+            ]
+          },
+          "default": [
+            "owner"
+          ],
+          "description": "Label keys or key=value pairs that protect an agent from prune."
+        }
+      },
+      "additionalProperties": false,
+      "required": [],
+      "default": {}
+    },
+    "kinds": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/kind"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "promote": {
+            "type": "boolean",
+            "description": "Promote headless runs of this kind that end blocked or needs-input.",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "required": []
+      },
+      "default": {}
+    },
+    "repos": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/repo_id"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "kinds": {
+            "type": "object",
+            "propertyNames": {
+              "$ref": "#/$defs/kind"
+            },
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "promote": {
+                  "type": "boolean",
+                  "description": "Promote headless runs of this kind that end blocked or needs-input. Absent: kinds.<kind>.promote applies."
+                }
+              },
+              "additionalProperties": false,
+              "required": []
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": []
+      },
+      "default": {},
+      "description": "Per-repo overrides."
+    },
     "hooks": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "pre-launch": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/hook_entry_pre"
+          },
+          "default": []
+        },
+        "pre-teardown": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/hook_entry_pre"
+          },
+          "default": []
+        },
+        "post-launch": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/hook_entry_post"
+          },
+          "default": []
+        },
+        "post-state-change": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/hook_entry_state_change"
+          },
+          "default": []
+        },
+        "post-escalate": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/hook_entry_post"
+          },
+          "default": []
+        },
+        "post-park": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/hook_entry_post"
+          },
+          "default": []
+        },
+        "post-teardown": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/hook_entry_post"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false,
+      "required": [],
+      "description": "Hook entries per hook; lists from config.d append.",
+      "default": {}
     }
   },
-  "additionalProperties": true
+  "additionalProperties": false,
+  "required": [],
+  "$defs": {
+    "cs_state": {
+      "enum": [
+        "starting",
+        "working",
+        "idle",
+        "needs-input",
+        "reported",
+        "exited",
+        "exited-unreported",
+        "killed",
+        "timeout",
+        "lost",
+        "not-started"
+      ],
+      "description": "claude-session state. Live: starting, working, idle, needs-input, reported. Final: the rest."
+    },
+    "duration": {
+      "anyOf": [
+        {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)\\d+(\\.\\d+)?(ms|s|m|h|d)$"
+        },
+        {
+          "type": "string",
+          "pattern": "^(?!0+(\\.0+)?$)\\d+(\\.\\d+)?$"
+        }
+      ],
+      "description": "Seconds as a positive number (fractions allowed), a string <number><unit> with unit ms, s, m, h or d (e.g. '30s', '10m'), or a bare number string meaning seconds (e.g. '90'); zero is refused (exit 2)."
+    },
+    "env_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "hook_entry_post": {
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Run via sh -c in its own process group; JSON payload on stdin."
+        },
+        "timeout": {
+          "$ref": "#/$defs/duration",
+          "default": "30s"
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/kind"
+          },
+          "description": "Run only when the run kind is one of these."
+        },
+        "exclude_kinds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/kind"
+          },
+          "description": "Never run for these run kinds."
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/label"
+          },
+          "description": "Run only when the agent has all these pairs (AND)."
+        },
+        "async": {
+          "type": "boolean",
+          "default": false,
+          "description": "Do not wait for the hook. Use true for notification hooks."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cmd"
+      ],
+      "description": "A post-hook entry. Failures are logged and never change the command's result."
+    },
+    "hook_entry_pre": {
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Run via sh -c in its own process group; JSON payload on stdin."
+        },
+        "timeout": {
+          "$ref": "#/$defs/duration",
+          "default": "30s"
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/kind"
+          },
+          "description": "Run only when the run kind is one of these."
+        },
+        "exclude_kinds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/kind"
+          },
+          "description": "Never run for these run kinds."
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/label"
+          },
+          "description": "Run only when the agent has all these pairs (AND)."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cmd"
+      ],
+      "description": "A pre-hook entry: synchronous, never async. Exit 13 escalates; any other non-zero exit or a timeout vetoes."
+    },
+    "hook_entry_state_change": {
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Run via sh -c in its own process group; JSON payload on stdin."
+        },
+        "timeout": {
+          "$ref": "#/$defs/duration",
+          "default": "30s"
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/kind"
+          },
+          "description": "Run only when the run kind is one of these."
+        },
+        "exclude_kinds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/kind"
+          },
+          "description": "Never run for these run kinds."
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/label"
+          },
+          "description": "Run only when the agent has all these pairs (AND)."
+        },
+        "async": {
+          "type": "boolean",
+          "default": false,
+          "description": "Do not wait for the hook. Use true for notification hooks."
+        },
+        "states": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/cs_state"
+          },
+          "description": "Run only for change: session events whose session state is one of these (never for change: agent)."
+        },
+        "statuses": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/status"
+          },
+          "description": "Run only when the agent status is one of these."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cmd"
+      ],
+      "description": "A post-state-change hook entry (adds the states and statuses selectors)."
+    },
+    "kind": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+      "description": "A claude-session kind name."
+    },
+    "label": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}$",
+      "description": "key=value; split at the first '='."
+    },
+    "label_key": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"
+    },
+    "repo_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?(?:/(?!\\.\\.?(?:/|$))[A-Za-z0-9._-]+)+$",
+      "description": "claude-session's repo-id grammar: lowercase host, optional :port, then '/' and one or more path segments of [A-Za-z0-9._-], none equal to '.' or '..'."
+    },
+    "status": {
+      "enum": [
+        "launching",
+        "live",
+        "parked",
+        "tearing_down",
+        "torn_down"
+      ],
+      "description": "launching: a launch or a resume in progress (its run not started yet); live: a supervisor is alive or the session is live; parked: no live session, resumable; tearing_down: teardown in progress or interrupted (teardown_step); torn_down: tombstone."
+    }
+  }
 }
