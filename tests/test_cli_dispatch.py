@@ -319,7 +319,7 @@ def test_result_file_through_a_symlinked_parent_swapped_in_after_the_check_warns
     monkeypatch.setitem(HANDLERS, "wait", handler)
     argv = ["wait", "ag-abcdefgh", "--result-file", str(parent / "r.json")]
     assert cli.main(argv) == 0
-    assert "link" in capsys.readouterr().err
+    assert "path component 'out' is a symbolic link" in capsys.readouterr().err
     assert list(victim.iterdir()) == []
 
 

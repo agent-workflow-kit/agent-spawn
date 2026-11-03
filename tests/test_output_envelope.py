@@ -1,3 +1,4 @@
+import io
 import json
 from pathlib import Path
 from typing import Any
@@ -216,8 +217,8 @@ def test_lower_error_is_not_copied_so_later_mutation_cannot_leak_in() -> None:
         ),
         ("wtctl", 1, {"code": "partial"}, "partial", 12),
         ("wtctl", 1, {"code": "internal"}, "internal", 1),
-        ("termctl", 2, {"code": "not_supported"}, "usage", 2),
-        ("claude-session", 2, {"code": "usage"}, "usage", 2),
+        ("termctl", 2, {"code": "not_supported"}, "internal", 1),
+        ("claude-session", 2, {"code": "usage"}, "internal", 1),
     ],
 )
 def test_lower_tool_exit_codes_map_to_agent_spawn_codes(
@@ -351,7 +352,7 @@ def test_timed_out_result_must_not_carry_a_run() -> None:
 
 
 def test_render_json_is_ascii_one_line_and_round_trips_hostile_text() -> None:
-    payload = {"a": "line\nbreak   \U0001f600 \udcff", "b": [1, None, True]}
+    payload = {"a": "line\nbreak \u2028 \u202e \U0001f600 \x1b", "b": [1, None, True]}
     text = output.render_json(payload)
     assert "\n" not in text
     assert text.isascii()
@@ -376,3 +377,132 @@ def test_cut_utf8_property_over_mixed_widths() -> None:
         assert text.startswith(cut)
         assert len(cut.encode("utf-8")) <= 4096
         assert len(text.encode("utf-8")) <= 4096 or len(text[: len(cut) + 1].encode("utf-8")) > 4096
+
+
+# --- review round 1 ------------------------------------------------------------------------------
+
+
+def test_render_json_replaces_lone_surrogates_with_a_visible_escape() -> None:
+    text = output.render_json({"a\udcfe": ["x\udcff"], "b": "\U0001f600"})
+    json.loads(text, parse_constant=lambda name: pytest.fail(name))
+    assert "\\udc" not in text.replace("\\\\udc", "")  # no surrogate escapes, only literal text
+    assert json.loads(text) == {"a\\udcfe": ["x\\udcff"], "b": "\U0001f600"}
+    text.encode("utf-8")  # strict: valid Unicode
+
+
+def test_render_json_refuses_non_finite_numbers() -> None:
+    for value in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            output.render_json({"a": value})
+
+
+def test_non_finite_numbers_in_lower_error_are_replaced_deterministically() -> None:
+    lower = {"code": "busy", "n": float("nan"), "d": {"x": [float("inf"), float("-inf")]}}
+    error = output.from_lower_tool("wtctl", 12, lower)
+    text = output.render_json(error.envelope())
+    assert json.loads(text)["error"]["lower_error"] == {
+        "code": "busy",
+        "n": "NaN",
+        "d": {"x": ["Infinity", "-Infinity"]},
+    }
+
+
+@pytest.mark.parametrize("reason", ["third_party_cwd", "third_party_run"])
+def test_a_lower_third_party_reason_becomes_unknown(reason: str) -> None:
+    error = output.from_lower_tool("claude-session", 20, {"code": "refused", "reason": reason})
+    envelope = _check(error)["error"]
+    assert envelope["reason"] == "unknown"
+    assert envelope["lower_error"]["reason"] == reason
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        {"status": "gone"},
+        {"cause": "bad"},
+        {"retryable": "yes"},
+        {"retryable": None},
+        {"hint": 3},
+        {"hint": None},
+    ],
+)
+def test_details_reject_values_outside_the_schema(details: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match="details"):
+        CliError.of("failed", "m", details=details)
+
+
+def test_details_accept_every_schema_value() -> None:
+    for status in ("torn_down", "session_missing", "parked", "launching", "tearing_down", None):
+        _check(CliError.of("not_found", "m", details={"status": status, "retryable": False}))
+    for cause in ("interrupted", "no_pane_pid", "pane_gone", None):
+        _check(CliError.of("no_window", "m", details={"cause": cause, "hint": "h"}))
+
+
+@pytest.mark.parametrize("exit_code", [130, 143])
+def test_an_interrupted_envelope_is_launch_failed_with_cause_interrupted(exit_code: int) -> None:
+    with pytest.raises(ValueError, match="interrupted"):
+        CliError.of("internal", "m", exit_code=exit_code)
+    with pytest.raises(ValueError, match="interrupted"):
+        CliError.of("launch_failed", "m", exit_code=exit_code)
+    with pytest.raises(ValueError, match="interrupted"):
+        CliError.of("launch_failed", "m", exit_code=exit_code, details={"cause": "pane_gone"})
+    error = CliError.of("launch_failed", "m", exit_code=exit_code, details={"cause": "interrupted"})
+    assert error.exit_code == exit_code
+    _check(error)
+
+
+@pytest.mark.parametrize(
+    ("tool", "lower"), [("claude-session", {"code": "usage"}), ("wtctl", {"code": "usage"})]
+)
+def test_a_lower_usage_error_is_agent_spawns_internal_error(
+    tool: str, lower: dict[str, Any]
+) -> None:
+    error = output.from_lower_tool(tool, 2, lower)
+    envelope = _check(error)["error"]
+    assert (envelope["code"], error.exit_code) == ("internal", 1)
+    assert envelope["lower_error"] == lower
+
+
+def test_termctl_window_preflight_usage_error_stays_usage() -> None:
+    lower = {"code": "not_supported"}
+    error = output.from_lower_tool("termctl", 2, lower, window_preflight=True)
+    assert (error.code, error.exit_code) == ("usage", 2)
+    plain = output.from_lower_tool("termctl", 2, lower)
+    assert (plain.code, plain.exit_code) == ("internal", 1)
+
+
+UNSAFE = {
+    "newline": "\n",
+    "tab": "\t",
+    "carriage return": "\r",
+    "escape": "\x1b",
+    "c1": "\x9b",
+    "bidi override": "‮",
+    "bidi isolate": "⁦",
+    "zero width": "​",
+    "bom": "﻿",
+    "line separator": " ",
+    "paragraph separator": " ",
+    "tag": "\U000e0041",
+}
+
+
+@pytest.mark.parametrize("char", UNSAFE.values(), ids=UNSAFE.keys())
+def test_safe_text_escapes_every_unsafe_class_in_single_line_text(char: str) -> None:
+    text = output.safe_text(f"a{char}b")
+    assert char not in text
+    assert text.startswith("a\\") and text.endswith("b")
+
+
+@pytest.mark.parametrize("char", UNSAFE.values(), ids=UNSAFE.keys())
+def test_safe_text_multiline_keeps_only_newline_and_tab(char: str) -> None:
+    text = output.safe_text(f"a{char}b", multiline=True)
+    assert (char in text) == (char in "\n\t")
+
+
+def test_an_error_line_cannot_forge_a_second_line() -> None:
+    out, err = io.StringIO(), io.StringIO()
+    error = CliError.of("failed", "bad\nagent-spawn: error: forged x", details={"hint": "h\nh"})
+    output.emit(output.error_outcome(error), as_json=False, stdout=out, stderr=err)
+    assert err.getvalue().count("\n") == 1
+    assert " " not in err.getvalue()
