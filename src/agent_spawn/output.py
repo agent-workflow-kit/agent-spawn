@@ -110,6 +110,19 @@ def cut_utf8(value: str | bytes, limit: int = HOOK_STDERR_LIMIT) -> str:
     return encoded[:cut].decode("utf-8")
 
 
+_CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def safe_text(text: str) -> str:
+    """Make ``text`` safe to print on a terminal.
+
+    Lone surrogates (undecodable argv bytes) and control characters other than tab and newline
+    (escape sequences) are shown as ``\\x..`` escapes.
+    """
+    text = text.encode("utf-8", errors="backslashreplace").decode("utf-8")
+    return _CONTROL.sub(lambda match: f"\\x{ord(match.group()):02x}", text)
+
+
 def render_json(payload: object) -> str:
     """The one-line ASCII JSON that ``--json`` prints and ``--result-file`` stores.
 
@@ -379,11 +392,12 @@ def emit(outcome: Outcome, *, as_json: bool, stdout: TextIO, stderr: TextIO) -> 
         hint = (error.get("details") or {}).get("hint")
         if hint:
             line += f" (hint: {hint})"
-        stderr.write(line + "\n")
+        stderr.write(safe_text(line) + "\n")
     if as_json:
         stdout.write(render_json(payload) + "\n")
     elif outcome.kind is not PayloadKind.ENVELOPE:
-        stdout.write((outcome.human or json.dumps(payload, indent=2, ensure_ascii=True)) + "\n")
+        human = outcome.human or json.dumps(payload, indent=2, ensure_ascii=True)
+        stdout.write(safe_text(human) + "\n")
 
 
 # --- --result-file -----------------------------------------------------------------------------
