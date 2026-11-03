@@ -1,0 +1,24 @@
+{
+  "error": {
+    "code": "refused",
+    "message": "wtctl refused the request: dirty",
+    "reason": "dirty",
+    "agent_id": "ag-abcdefgh",
+    "tool": "wtctl",
+    "lower_code": "dirty",
+    "lower_error": {
+      "code": "dirty",
+      "message": "worktree has changes <script>",
+      "reason": "dirty",
+      "checks": [{"name": "status", "ok": false, "items": ["a.py", "é"]}],
+      "processes": [{"pid": 1, "cmd": "x"}],
+      "details": {"nested": {"deep": [1, 2, {"k": null}]}},
+      "unknown_future_field": 1.5
+    },
+    "details": null,
+    "candidates": [],
+    "hook": null,
+    "hook_stderr": null,
+    "decision_ids": []
+  }
+}
