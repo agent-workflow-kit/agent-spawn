@@ -117,7 +117,9 @@ def test_none_path_loads_the_default_location(tmp_path: Path) -> None:
 
 
 def test_dropins_merge_in_lexical_order(tmp_path: Path) -> None:
-    base = write(tmp_path / "config.yaml", "tombstone_days: 1\nme: {name: a}\nhandoff_timeout: 5s\n")
+    base = write(
+        tmp_path / "config.yaml", "tombstone_days: 1\nme: {name: a}\nhandoff_timeout: 5s\n"
+    )
     write(tmp_path / "config.d" / "20-b.yaml", "tombstone_days: 2\n")
     write(tmp_path / "config.d" / "10-a.yaml", "tombstone_days: 9\nme: {name: z}\n")
     write(tmp_path / "config.d" / "ignored.txt", "tombstone_days: 77\n")
@@ -296,7 +298,7 @@ def test_other_env_vars_are_ignored(tmp_path: Path) -> None:
         ("hooks: {post-launc: []}\n", "post-launc"),
         ("hooks: {post-launch: [{}]}\n", "hooks.post-launch.0.cmd"),
         ("hooks: {post-launch: [{cmd: ''}]}\n", "hooks.post-launch.0.cmd"),
-        ("hooks: {post-launch: [{cmd: \"a\\0b\"}]}\n", "hooks.post-launch.0.cmd"),
+        ('hooks: {post-launch: [{cmd: "a\\0b"}]}\n', "hooks.post-launch.0.cmd"),
         ("hooks: {post-launch: [{cmd: x, timeout: 0}]}\n", "hooks.post-launch.0.timeout"),
         ("hooks: {post-launch: [{cmd: x, states: [idle]}]}\n", "hooks.post-launch.0.states"),
         ("hooks: {pre-launch: [{cmd: x, async: true}]}\n", "hooks.pre-launch.0.async"),
@@ -378,7 +380,9 @@ def test_promote_flag_beats_repo_beats_kind_beats_default(tmp_path: Path) -> Non
     assert cfg.resolve_promote(kind="b", repo=repo, explicit=None) is True
     assert cfg.resolve_promote(kind="a", repo=repo, explicit=True) is True  # flag over repo
     assert cfg.resolve_promote(kind="b", repo=repo, explicit=False) is False
-    assert cfg.resolve_promote(kind="a", repo="example.com/g/q", explicit=None) is True  # falls through
+    assert (
+        cfg.resolve_promote(kind="a", repo="example.com/g/q", explicit=None) is True
+    )  # falls through
     assert cfg.resolve_promote(kind="zzz", repo=repo, explicit=None) is False  # default
     assert cfg.resolve_promote(kind=None, repo=None, explicit=None) is False
 

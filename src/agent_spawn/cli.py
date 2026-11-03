@@ -19,6 +19,7 @@ from typing import Any, NoReturn
 from . import __version__
 from .commands.base import Invocation
 from .commands.table import HANDLERS
+from .config import load_config
 from .output import (
     CliError,
     Outcome,
@@ -364,7 +365,7 @@ def stdin_is_tty() -> bool:
 
 def me_name() -> str:
     """The user name for the default actor ``human:<me.name>``, fitted to the actor grammar."""
-    # TODO(#3): config key me.name (default: the OS user name).
+    # The config key me.name, when set, takes precedence over this (see parse_invocation).
     try:
         name = getpass.getuser()
     except (OSError, KeyError, ImportError):
@@ -434,9 +435,18 @@ def parse_invocation(argv: Sequence[str]) -> Invocation:
         if len(decision_ids) > MAX_DECISION_IDS:
             raise ValueError(f"at most {MAX_DECISION_IDS} --decision-id values")
         _check_usage(args, key)
+    except ValueError as exc:
+        raise UsageError(str(exc), child.format_usage()) from None
+    # Fail fast on an invalid config (CliError config_invalid, exit 2) before anything else runs.
+    internal = key in INTERNAL_COMMANDS
+    named: str | None = getattr(args, "config", None)
+    loaded = load_config(named, warn_missing=named is not None and not internal)
+    try:
         tty = stdin_is_tty()
         explicit = args.actor is not None
-        actor: str = args.actor or (f"human:{me_name()}" if tty else "auto:unknown")
+        actor: str = args.actor or (
+            f"human:{loaded.config.me.name or me_name()}" if tty else "auto:unknown"
+        )
         _check_human_only(args, actor, explicit, tty)
     except ValueError as exc:
         raise UsageError(str(exc), child.format_usage()) from None
@@ -451,6 +461,9 @@ def parse_invocation(argv: Sequence[str]) -> Invocation:
         state_dir=getattr(args, "state_dir", None),
         verbose=bool(args.verbose),
         quiet=bool(args.quiet),
+        config=loaded.config,
+        config_file=loaded.path,
+        warnings=list(loaded.warnings),
     )
 
 
@@ -479,6 +492,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         inv = parse_invocation(argv_list)
     except _ParserExit as done:
         return done.status
+    except CliError as error:  # config_invalid
+        emit(
+            error_outcome(error),
+            as_json=_json_requested(argv_list),
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
+        return error.exit_code
     except UsageError as exc:
         if exc.usage:
             _write(sys.stderr, safe_text(exc.usage))

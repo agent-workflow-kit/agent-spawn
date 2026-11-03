@@ -16,7 +16,7 @@ import math
 import os
 import re
 import stat
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Annotated, Any
 
@@ -107,7 +107,7 @@ def _argv_item(value: str) -> str:
 Argv = Annotated[list[Annotated[str, AfterValidator(_argv_item)]], Field(min_length=1)]
 
 
-def _one_of(allowed: list[str]) -> Any:
+def _one_of(allowed: Sequence[str]) -> Any:
     def check(value: str) -> str:
         if value not in allowed:
             raise ValueError(f"must be one of: {', '.join(allowed)}")
