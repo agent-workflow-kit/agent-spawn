@@ -371,4 +371,4 @@ def test_since_rejects(text: str) -> None:
 def test_since_duration_beyond_the_epoch_range_is_rejected_not_an_overflow() -> None:
     far = datetime(1, 1, 2, tzinfo=UTC)
     with pytest.raises(GrammarError):
-        validate.parse_since("1d", far)
+        validate.parse_since("2d", far)
