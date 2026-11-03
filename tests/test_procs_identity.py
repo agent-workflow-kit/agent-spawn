@@ -226,8 +226,12 @@ def test_darwin_identity_uses_ps_and_sysctl_through_the_gateway() -> None:
 def test_identity_dict_roundtrip_and_rejects_garbage() -> None:
     identity = ProcessIdentity(5, 6, "b")
     assert ProcessIdentity.from_dict(identity.to_dict()) == identity
-    for bad in ({}, {"pid": 0, "start_time": 1, "boot_id": "b"}, {"pid": True, "start_time": 1, "boot_id": "b"},
-                {"pid": 1, "start_time": "1", "boot_id": "b"}):
+    for bad in (
+        {},
+        {"pid": 0, "start_time": 1, "boot_id": "b"},
+        {"pid": True, "start_time": 1, "boot_id": "b"},
+        {"pid": 1, "start_time": "1", "boot_id": "b"},
+    ):
         with pytest.raises(ValueError):
             ProcessIdentity.from_dict(bad)
 

@@ -178,7 +178,7 @@ class FakeGateway:
     def fork(self) -> int:
         raise NotImplementedError
 
-    def setsid(self) -> int:
+    def setsid(self) -> None:
         raise NotImplementedError
 
     def waitpid(self, pid: int, flags: int = 0) -> tuple[int, int]:

@@ -134,7 +134,10 @@ def read_boot_id(*, gateway: Gateway | None = None) -> str:
         if not boot:
             raise ProcessIdentityError("empty boot id")
         return boot
-    done = gw.run(["sysctl", "-n", "kern.boottime"], env={"LC_ALL": "C", "PATH": "/usr/sbin:/sbin:/usr/bin:/bin"})
+    done = gw.run(
+        ["sysctl", "-n", "kern.boottime"],
+        env={"LC_ALL": "C", "PATH": "/usr/sbin:/sbin:/usr/bin:/bin"},
+    )
     boot = done.stdout.strip()
     if done.returncode != 0 or not boot:
         raise ProcessIdentityError("cannot read the boot time")

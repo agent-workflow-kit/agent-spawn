@@ -45,7 +45,7 @@ _SYS_PIDFD_OPEN = 434
 _SOL_LOCAL = 0
 _LOCAL_PEERPID = 0x002
 
-SignalHandler = Callable[[int, Any], Any] | int | signal.Handlers
+SignalHandler = Callable[[int, Any], Any] | int | signal.Handlers | None
 
 
 @dataclass(frozen=True)
@@ -109,13 +109,15 @@ class Gateway(Protocol):
     def install_signal_handler(self, sig: int, handler: SignalHandler) -> SignalHandler: ...
 
     # process attributes and sockets
-    def prctl(self, option: int, arg2: int = 0, arg3: int = 0, arg4: int = 0, arg5: int = 0) -> int: ...
+    def prctl(
+        self, option: int, arg2: int = 0, arg3: int = 0, arg4: int = 0, arg5: int = 0
+    ) -> int: ...
     def peer_credentials(self, sock: socket.socket) -> PeerCredentials: ...
 
     # fork primitives (double fork)
     def pipe(self) -> tuple[int, int]: ...
     def fork(self) -> int: ...
-    def setsid(self) -> int: ...
+    def setsid(self) -> None: ...
     def waitpid(self, pid: int, flags: int = 0) -> tuple[int, int]: ...
     def exit_now(self, code: int) -> None: ...
 
@@ -208,9 +210,7 @@ class SystemGateway:
         if not self._force_syscall and hasattr(os, "pidfd_open"):
             return os.pidfd_open(pid)
         libc = self._c()
-        result = libc.syscall(
-            ctypes.c_long(_SYS_PIDFD_OPEN), ctypes.c_int(pid), ctypes.c_uint(0)
-        )
+        result = libc.syscall(ctypes.c_long(_SYS_PIDFD_OPEN), ctypes.c_int(pid), ctypes.c_uint(0))
         if result < 0:
             code = ctypes.get_errno()
             raise OSError(code, os.strerror(code))
@@ -308,8 +308,8 @@ class SystemGateway:
     def fork(self) -> int:
         return os.fork()
 
-    def setsid(self) -> int:
-        return os.setsid()
+    def setsid(self) -> None:
+        os.setsid()
 
     def waitpid(self, pid: int, flags: int = 0) -> tuple[int, int]:
         return os.waitpid(pid, flags)
