@@ -71,6 +71,32 @@ def test_refused_without_a_tty_with_an_automatic_actor(
     assert reached == []
 
 
+@pytest.mark.parametrize("actor", ["auto:policy", "auto:unknown", "auto:human"])
+@pytest.mark.parametrize("argv", GATED.values(), ids=GATED.keys())
+def test_refused_with_a_tty_with_an_explicit_automatic_actor(
+    argv: list[str],
+    actor: str,
+    reached: list[Invocation],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _tty(monkeypatch, True)
+    assert cli.main(["--json", *argv, "--actor", actor]) == 2
+    assert reached == []
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["error"]["code"] == "usage"
+    assert "human" in envelope["error"]["message"]
+
+
+@pytest.mark.parametrize("argv", GATED.values(), ids=GATED.keys())
+def test_accepted_with_a_tty_and_an_explicit_human_actor(
+    argv: list[str], reached: list[Invocation], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _tty(monkeypatch, True)
+    assert cli.main([*argv, "--actor", "human:alice"]) == 0
+    assert reached[-1].actor == "human:alice"
+
+
 @pytest.mark.parametrize("argv", GATED.values(), ids=GATED.keys())
 def test_accepted_with_a_tty(
     argv: list[str], reached: list[Invocation], monkeypatch: pytest.MonkeyPatch

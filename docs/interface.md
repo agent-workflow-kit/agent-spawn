@@ -544,7 +544,7 @@ Writes or removes the managed crontab block `# agent-spawn managed`, which runs 
 
 **Internal actor.** Every lower-tool call made by `supervise`, `prune` and `reconcile` uses `--actor auto:agent-spawn` and the decision ids stored with the launch (or the resume that started the run chain), never a TTY-derived human actor.
 
-**Human-only flags**: `--force` (teardown), `--override-escalation` (launch, resume, teardown) and `--allow-tainted` (resume) are accepted only when stdin is a TTY or with an explicit `--actor human:<user>`; otherwise exit 2. Automation never passes them. The gate is advisory ([Residual risks](#residual-risks)).
+**Human-only flags**: `--force` (teardown), `--override-escalation` (launch, resume, teardown) and `--allow-tainted` (resume) are accepted only when stdin is a TTY or with an explicit `--actor human:<user>`; otherwise exit 2. An explicit non-human `--actor` (such as `auto:<name>`) is refused even when stdin is a TTY. Automation never passes them. The gate is advisory ([Residual risks](#residual-risks)).
 
 ## Exit codes
 

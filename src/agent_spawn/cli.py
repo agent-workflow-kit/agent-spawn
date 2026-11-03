@@ -441,7 +441,7 @@ def _check_usage(args: argparse.Namespace, key: str) -> None:
 
 def _check_human_only(args: argparse.Namespace, actor: str, explicit: bool, tty: bool) -> None:
     used = [flag for dest, flag in HUMAN_ONLY_FLAGS if getattr(args, dest, False)]
-    if not used or tty or (explicit and actor.startswith("human:")):
+    if not used or (actor.startswith("human:") and (tty or explicit)):
         return
     raise ValueError(
         f"{', '.join(used)} needs a human: run it from a terminal or pass an explicit "
