@@ -546,6 +546,7 @@ def _result_file_requested(argv: Sequence[str]) -> str | None:
 
     The command is the first token that is neither a flag nor the value of a top-level global
     flag; the last ``--result-file P`` or ``--result-file=P`` after it wins (as in argparse).
+    ``P`` counts only when the command's parser would take it as a value, not as a flag.
     """
     head = _head(argv)
     index = 0
@@ -553,14 +554,25 @@ def _result_file_requested(argv: Sequence[str]) -> str | None:
         index += 2 if head[index] in _GLOBAL_VALUE_FLAGS else 1
     if index >= len(head) or head[index] not in RESULT_FILE_COMMANDS:
         return None
+    command_parser = build_parser().command_parsers[head[index]]
     found: str | None = None
     rest = head[index + 1 :]
     for position, token in enumerate(rest):
         if token == "--result-file" and position + 1 < len(rest):
-            found = rest[position + 1]
+            if _is_argparse_value(command_parser, rest[position + 1]):
+                found = rest[position + 1]
         elif token.startswith("--result-file="):
             found = token.removeprefix("--result-file=")
     return found
+
+
+def _is_argparse_value(parser: SpawnParser, token: str) -> bool:
+    """Whether ``parser`` reads ``token`` as an argument rather than a flag: argparse's own rule
+    (e.g. ``-`` and ``-1`` are values, ``--json`` is not), so the pre-scan matches it exactly."""
+    try:
+        return parser._parse_optional(token) is None  # pyright: ignore[reportPrivateUsage]
+    except UsageError:  # an ambiguous flag: argparse fails on it, so it is no value
+        return False
 
 
 def _silence(stream: Any) -> None:

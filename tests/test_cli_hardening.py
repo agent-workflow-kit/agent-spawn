@@ -135,6 +135,17 @@ def test_an_argparse_usage_error_writes_no_file_outside_launch_resume_and_wait(
     assert not path.exists()
 
 
+def test_a_dash_prefixed_token_after_result_file_is_not_pre_scanned_as_its_path(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["wait", "ag-abcdefgh", "--result-file", "--json"]) == 2
+    assert list(tmp_path.iterdir()) == []
+    envelope = json.loads(capsys.readouterr().out)
+    schema_registry.validate(envelope, ERROR_SCHEMA)
+    assert envelope["error"]["code"] == "usage"
+
+
 def test_an_unusable_pre_scanned_result_file_is_a_warning(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
