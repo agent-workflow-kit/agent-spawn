@@ -16,7 +16,7 @@ Layer 2 (composite). Launch, resume, park and tear down Claude agents: worktree 
 
 Executables are configured as argv lists (`claude_session_cmd`, `termctl_cmd`, `wtctl_cmd`), resolved once per invocation to absolute paths; every argv agent-spawn builds for a window or a hook uses absolute paths, so neither depends on its own `PATH` ([interface.md, Config](interface.md#config)). Turning the claude-session edge into binding C (a second vendor's session tool) later is a change inside the session-backend module, not an interface change.
 
-**Dependencies:** `pyyaml` (config), `pydantic` (config validation), `textual` (only `browse`). Everything else is the standard library (`sqlite3`, `socket`, `signal`, `ctypes` for the `pidfd_open` fallback).
+**Dependencies:** `pyyaml` (config), `pydantic` (config validation), `textual` (only `browse`). Everything else is the standard library (`sqlite3`, `socket`, `signal`, `ctypes` for the `pidfd_open` fallback). Test-only (dev group, never shipped): `jsonschema` and `referencing`, which validate every golden `--json` output, hook payload, log and audit record against `schemas/` through a registry keyed by `$id` (`tests/schema_registry.py`).
 
 ## Decisions
 

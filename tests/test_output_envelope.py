@@ -363,3 +363,16 @@ def test_lower_text_never_reaches_the_message() -> None:
     error = output.from_lower_tool("wtctl", 20, hostile)
     assert "IGNORE" not in error.message
     assert "dirty" in error.message
+
+
+def test_cut_utf8_property_over_mixed_widths() -> None:
+    import random
+
+    rng = random.Random(7)
+    alphabet = ["a", "\u00e9", "\u20ac", "\U0001f600", "\n"]
+    for _ in range(300):
+        text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 3000)))
+        cut = output.cut_utf8(text)
+        assert text.startswith(cut)
+        assert len(cut.encode("utf-8")) <= 4096
+        assert len(text.encode("utf-8")) <= 4096 or len(text[: len(cut) + 1].encode("utf-8")) > 4096
