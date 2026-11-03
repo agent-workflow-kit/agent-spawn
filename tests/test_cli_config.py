@@ -43,6 +43,20 @@ def test_invalid_config_exits_2_naming_the_key(
     assert "tombstone_days" in envelope["error"]["message"]
 
 
+def test_invalid_config_carries_decision_ids_and_writes_the_result_file(
+    tmp_path: Path, reached: list[Invocation], capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = tmp_path / "out.json"
+    argv = ["--config", _cfg(tmp_path, "nope: 1\n"), "--decision-id", "d-1", "wait", "ag-abcdefgh"]
+    code = cli.main([*argv, "--result-file", str(result), "--json"])
+    printed = json.loads(capsys.readouterr().out)
+    assert code == 2
+    assert reached == []
+    assert printed["error"]["code"] == "config_invalid"
+    assert printed["error"]["decision_ids"] == ["d-1"]
+    assert json.loads(result.read_text()) == printed
+
+
 def test_invalid_default_location_config_fails_every_command(
     tmp_path: Path,
     reached: list[Invocation],

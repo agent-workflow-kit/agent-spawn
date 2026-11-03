@@ -100,7 +100,7 @@ def test_symlink_swapped_into_a_parent_component_after_the_check_is_refused(
     (safe / "sub").symlink_to(victim)
     warning = output.write_result_file(target, "payload")
     assert warning is not None
-    assert "symlink" in warning.lower() or "link" in warning.lower()
+    assert "path component 'sub' is a symbolic link" in warning
     assert list(victim.iterdir()) == []
 
 

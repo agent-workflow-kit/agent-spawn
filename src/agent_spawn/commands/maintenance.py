@@ -29,4 +29,6 @@ def export(inv: Invocation) -> NoReturn:
 
 def browse(inv: Invocation) -> NoReturn:
     # TODO(#38): the Textual TUI.
+    # TODO(#38): browse writes its own intent file (schemas/cli/browse-result.json); the
+    # generic --result-file handling of cli.py covers only launch, resume and wait.
     not_implemented("browse", 38)
