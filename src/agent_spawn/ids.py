@@ -63,9 +63,7 @@ def is_agent_id(value: str) -> bool:
     return AGENT_ID.fullmatch(value) is not None
 
 
-def new_agent_id(
-    index: AgentIndex, *, random_bytes: Callable[[int], bytes] = os.urandom
-) -> str:
+def new_agent_id(index: AgentIndex, *, random_bytes: Callable[[int], bytes] = os.urandom) -> str:
     """A fresh id no stored agent, live or tombstoned, has."""
     for _ in range(_ALLOCATION_ATTEMPTS):
         candidate = "ag-" + base64.b32encode(random_bytes(5)).decode("ascii").lower()
@@ -114,7 +112,9 @@ def resolve_agent_id(text: str, index: AgentIndex) -> ResolvedId:
     except GrammarError as exc:
         raise CliError.usage(str(exc)) from None
     prefix = "ag-" + body
-    entries = [entry for entry in index.entries_with_prefix(prefix) if entry.agent_id.startswith(prefix)]
+    entries = [
+        entry for entry in index.entries_with_prefix(prefix) if entry.agent_id.startswith(prefix)
+    ]
     if len(body) == ID_CHARS:
         for entry in entries:
             if entry.agent_id == prefix:
@@ -124,9 +124,5 @@ def resolve_agent_id(text: str, index: AgentIndex) -> ResolvedId:
     if not live:
         raise CliError.of("not_found", f"no agent matches {prefix}")
     if len(live) > 1:
-        raise CliError.of(
-            "ambiguous", f"{prefix} matches {len(live)} agents", candidates=live
-        )
+        raise CliError.of("ambiguous", f"{prefix} matches {len(live)} agents", candidates=live)
     return ResolvedId(live[0], torn_down=False)
-
-

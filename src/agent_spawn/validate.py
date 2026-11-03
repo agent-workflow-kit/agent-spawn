@@ -222,8 +222,7 @@ def validate_merged_head(value: str) -> str:
     """A full 40-character lowercase hex sha (abbreviations, refs and uppercase exit 2)."""
     if _MERGED_HEAD.fullmatch(value) is None:
         raise GrammarError(
-            f"invalid --merged-head {shown(value)}: expected a full 40-character lowercase "
-            "hex sha"
+            f"invalid --merged-head {shown(value)}: expected a full 40-character lowercase hex sha"
         )
     return value
 

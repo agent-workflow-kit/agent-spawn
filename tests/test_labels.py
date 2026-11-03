@@ -58,7 +58,7 @@ def test_label_accepts(text: str, key: str, value: str) -> None:
         "a=b$c",
         "a=b%c",
         "a=b\\c",
-        "a=b\"c",
+        'a=b"c',
         "a=b'c",
         "a=b?c",
         "k" * 65 + "=v",

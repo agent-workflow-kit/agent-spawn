@@ -2,8 +2,10 @@
 
 ``main`` parses, checks usage, dispatches through ``commands.table.HANDLERS`` and prints through
 ``output``. Every usage failure, including argparse's own, exits 2 with the error envelope.
-Argument values that have a grammar owned by another module (labels, durations, ids, ...) are kept
-raw here; their handlers validate them.
+Values with a shared grammar (ids, labels, durations, names, shas, times) are checked here with
+the grammars of ``ids``, ``labels`` and ``validate`` and kept as the raw text for the handlers,
+which parse them again. Values owned by a lower tool (``--timeout``, ``--worktree-name``, ...) stay
+raw.
 """
 
 from __future__ import annotations
@@ -14,11 +16,14 @@ import re
 import sys
 import traceback
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from typing import Any, NoReturn
 
 from . import __version__
 from .commands.base import Invocation
 from .commands.table import HANDLERS
+from .ids import agent_id_arg, check_agent_id_text
+from .labels import label_arg, parse_user_labels, selector_arg
 from .output import (
     CliError,
     Outcome,
@@ -29,16 +34,23 @@ from .output import (
     safe_text,
     write_result_file,
 )
+from .validate import (
+    arg_type,
+    duration_arg,
+    parse_since,
+    validate_actor,
+    validate_decision_id,
+    validate_decision_ids,
+    validate_merged_head,
+    validate_name,
+)
 
 PROG = "agent-spawn"
 DESCRIPTION = (
     "Launch, resume, park and tear down Claude agents: worktree + terminal + Claude session."
 )
 
-_ACTOR = re.compile(r"(human|auto):[A-Za-z0-9._@-]{1,64}")
-_DECISION_ID = re.compile(r"[A-Za-z0-9._:@/-]{1,128}")
 _ME_NAME_INVALID = re.compile(r"[^A-Za-z0-9._@-]")
-MAX_DECISION_IDS = 32
 
 INTERNAL_COMMANDS = ("supervise", "_session-event")
 # (namespace attribute, flag) of the flags that need a human (interface.md, Global flags).
@@ -86,19 +98,11 @@ class SpawnParser(argparse.ArgumentParser):
 # --- argument types ---------------------------------------------------------------------------
 
 
-def _actor(value: str) -> str:
-    if not _ACTOR.fullmatch(value):
-        raise argparse.ArgumentTypeError(
-            f"invalid actor {value!r}: expected human:<name> or auto:<name> "
-            "(letters, digits and . _ @ -, at most 64 characters)"
-        )
-    return value
-
-
-def _decision_id(value: str) -> str:
-    if not _DECISION_ID.fullmatch(value):
-        raise argparse.ArgumentTypeError(f"invalid decision id {value!r}")
-    return value
+_actor = arg_type(validate_actor)
+_decision_id = arg_type(validate_decision_id)
+_name = arg_type(validate_name)
+_merged_head = arg_type(validate_merged_head)
+_since = arg_type(lambda value: parse_since(value, datetime.now(UTC)))
 
 
 def _interval(value: str) -> int:
@@ -140,8 +144,8 @@ def _add_global_flags(parser: SpawnParser, *, top: bool) -> None:
     parser.add_argument("--state-dir", metavar="PATH", help=argparse.SUPPRESS, **unset)
 
 
-def _repeatable(parser: Any, name: str, metavar: str, help_text: str) -> None:
-    parser.add_argument(name, action="append", metavar=metavar, help=help_text)
+def _repeatable(parser: Any, name: str, metavar: str, help_text: str, type_: Any = None) -> None:
+    parser.add_argument(name, action="append", metavar=metavar, help=help_text, type=type_)
 
 
 def _add_pass_throughs(parser: Any) -> None:
@@ -170,8 +174,8 @@ def _add_run_flags(parser: Any, *, with_launch_only: bool) -> None:
     parser.add_argument("--cwd", metavar="PATH|session-dir")
     parser.add_argument("--placement", choices=("window", "here"))
     parser.add_argument("--term-placement", metavar="NAME")
-    parser.add_argument("--name", metavar="TEXT", help="window name")
-    _repeatable(parser, "--label", "KEY=VALUE", "add a label")
+    parser.add_argument("--name", type=_name, metavar="TEXT", help="window name")
+    _repeatable(parser, "--label", "KEY=VALUE", "add a label", label_arg)
     prompt = parser.add_mutually_exclusive_group()
     prompt.add_argument("--prompt", metavar="TEXT", help="trusted text only")
     prompt.add_argument("--prompt-file", metavar="PATH|-")
@@ -181,7 +185,7 @@ def _add_run_flags(parser: Any, *, with_launch_only: bool) -> None:
     promote.add_argument("--no-promote", dest="promote", action="store_const", const=False)
     parser.set_defaults(promote=None)
     parser.add_argument("--wait", action="store_true")
-    parser.add_argument("--wait-timeout", metavar="DURATION")
+    parser.add_argument("--wait-timeout", type=duration_arg, metavar="DURATION")
     parser.add_argument("--result-file", metavar="PATH")
     parser.add_argument("--override-escalation", action="store_true", help="human only")
     parser.add_argument("--dry-run", action="store_true")
@@ -205,8 +209,8 @@ def _add_launch(parser: Any) -> None:
 
 def _add_resume(parser: Any) -> None:
     _add_run_flags(parser, with_launch_only=False)
-    parser.add_argument("agent_id", nargs="?", metavar="AGENT_ID")
-    _repeatable(parser, "--select", "KEY=VALUE", "select the agent by label (ANDed)")
+    parser.add_argument("agent_id", type=agent_id_arg, nargs="?", metavar="AGENT_ID")
+    _repeatable(parser, "--select", "KEY=VALUE", "select the agent by label (ANDed)", selector_arg)
     parser.add_argument("--fork", action="store_true")
     _repeatable(parser, "--reset", "SETTING", "drop a stored launch setting")
     parser.add_argument("--allow-tainted", action="store_true", help="human only")
@@ -214,25 +218,25 @@ def _add_resume(parser: Any) -> None:
 
 
 def _agent_id(parser: Any) -> None:
-    parser.add_argument("agent_id", metavar="AGENT_ID")
+    parser.add_argument("agent_id", type=agent_id_arg, metavar="AGENT_ID")
 
 
 def _add_wait(parser: Any) -> None:
     _agent_id(parser)
-    parser.add_argument("--timeout", metavar="DURATION")
+    parser.add_argument("--timeout", type=duration_arg, metavar="DURATION")
     parser.add_argument("--result-file", metavar="PATH")
 
 
 def _add_list(parser: Any) -> None:
-    _repeatable(parser, "--label", "KEY=VALUE", "match a label (ANDed)")
+    _repeatable(parser, "--label", "KEY=VALUE", "match a label (ANDed)", selector_arg)
     parser.add_argument("--needs-attention", action="store_true")
     _repeatable(parser, "--status", "STATUS", "match a status (ORed)")
     _repeatable(parser, "--session-state", "STATE", "match a session state (ORed)")
     parser.add_argument("--kind", metavar="KIND")
     parser.add_argument("--repo", metavar="REPO-ID")
     parser.add_argument("--mode", choices=("interactive", "headless"))
-    parser.add_argument("--forked-from", metavar="AGENT_ID")
-    parser.add_argument("--since", metavar="TIME|DURATION")
+    parser.add_argument("--forked-from", type=agent_id_arg, metavar="AGENT_ID")
+    parser.add_argument("--since", type=_since, metavar="TIME|DURATION")
 
 
 def _add_attach(parser: Any) -> None:
@@ -250,13 +254,13 @@ def _add_label(parser: Any, *, session: bool) -> None:
 
 def _add_stop(parser: Any) -> None:
     _agent_id(parser)
-    parser.add_argument("--grace", metavar="DURATION")
+    parser.add_argument("--grace", type=duration_arg, metavar="DURATION")
     parser.add_argument("--dry-run", action="store_true")
 
 
 def _add_teardown(parser: Any) -> None:
     _agent_id(parser)
-    parser.add_argument("--merged-head", metavar="SHA")
+    parser.add_argument("--merged-head", type=_merged_head, metavar="SHA")
     parser.add_argument("--force", action="store_true", help="human only")
     parser.add_argument("--override-escalation", action="store_true", help="human only")
     _repeatable(parser, "--hook", "NAME=CMD", "per-invocation hook (pre-teardown, post-teardown)")
@@ -264,7 +268,7 @@ def _add_teardown(parser: Any) -> None:
 
 
 def _add_prune(parser: Any) -> None:
-    parser.add_argument("--older-than", metavar="DURATION")
+    parser.add_argument("--older-than", type=duration_arg, metavar="DURATION")
     parser.add_argument("--include-owned", action="store_true")
     parser.add_argument("--include-attention", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -281,12 +285,12 @@ def _add_cron_install(parser: Any) -> None:
 
 
 def _add_export(parser: Any) -> None:
-    parser.add_argument("--since", metavar="TIME|DURATION")
+    parser.add_argument("--since", type=_since, metavar="TIME|DURATION")
     _repeatable(parser, "--action", "ACTION", "match an action (ORed)")
 
 
 def _add_browse(parser: Any) -> None:
-    parser.add_argument("--focus", metavar="AGENT_ID")
+    parser.add_argument("--focus", type=agent_id_arg, metavar="AGENT_ID")
     parser.add_argument("--result-file", metavar="PATH")
 
 
@@ -395,6 +399,8 @@ def _check_usage(args: argparse.Namespace, key: str) -> None:
 
     if key == "resume" and (args.agent_id is None) == (not args.select):
         raise ValueError("resume needs exactly one of AGENT_ID or --select")
+    if key in ("launch", "resume"):
+        parse_user_labels(args.label or [])  # the 64-pair cap over the distinct pairs
 
     if args.command == "label":
         items: list[str] = args.items
@@ -407,8 +413,10 @@ def _check_usage(args: argparse.Namespace, key: str) -> None:
                 raise ValueError(
                     f"label {args.subcommand} needs an AGENT_ID and at least one KEY=VALUE"
                 )
+            check_agent_id_text(items[0])
             args.agent_id, args.pairs = items[0], items[1:]
             args.session = None
+        parse_user_labels(args.pairs)  # grammar, reserved keys and the 64-pair cap
 
 
 def _check_human_only(args: argparse.Namespace, actor: str, explicit: bool, tty: bool) -> None:
@@ -431,8 +439,7 @@ def parse_invocation(argv: Sequence[str]) -> Invocation:
         getattr(args, "decision_id_after", None) or []
     )
     try:
-        if len(decision_ids) > MAX_DECISION_IDS:
-            raise ValueError(f"at most {MAX_DECISION_IDS} --decision-id values")
+        validate_decision_ids(decision_ids)
         _check_usage(args, key)
         tty = stdin_is_tty()
         explicit = args.actor is not None
