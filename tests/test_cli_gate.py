@@ -1,7 +1,11 @@
 """The human-only gate: --force, --override-escalation and --allow-tainted."""
 
 import json
+import os
+import pwd
 import re
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -67,6 +71,32 @@ def test_refused_without_a_tty_with_an_automatic_actor(
     assert reached == []
 
 
+@pytest.mark.parametrize("actor", ["auto:policy", "auto:unknown", "auto:human"])
+@pytest.mark.parametrize("argv", GATED.values(), ids=GATED.keys())
+def test_refused_with_a_tty_with_an_explicit_automatic_actor(
+    argv: list[str],
+    actor: str,
+    reached: list[Invocation],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _tty(monkeypatch, True)
+    assert cli.main(["--json", *argv, "--actor", actor]) == 2
+    assert reached == []
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["error"]["code"] == "usage"
+    assert "human" in envelope["error"]["message"]
+
+
+@pytest.mark.parametrize("argv", GATED.values(), ids=GATED.keys())
+def test_accepted_with_a_tty_and_an_explicit_human_actor(
+    argv: list[str], reached: list[Invocation], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _tty(monkeypatch, True)
+    assert cli.main([*argv, "--actor", "human:alice"]) == 0
+    assert reached[-1].actor == "human:alice"
+
+
 @pytest.mark.parametrize("argv", GATED.values(), ids=GATED.keys())
 def test_accepted_with_a_tty(
     argv: list[str], reached: list[Invocation], monkeypatch: pytest.MonkeyPatch
@@ -97,7 +127,7 @@ def test_ungated_commands_never_need_a_human(
     assert len(reached) == 1
 
 
-def test_the_gate_is_decided_before_the_handler_and_before_the_result_file(
+def test_the_gate_is_decided_before_the_handler_and_its_envelope_goes_to_the_result_file(
     reached: list[Invocation],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path_factory: pytest.TempPathFactory,
@@ -107,6 +137,9 @@ def test_the_gate_is_decided_before_the_handler_and_before_the_result_file(
     code = cli.main(["launch", "--skill", "s", "--override-escalation", "--result-file", str(path)])
     assert code == 2
     assert reached == []
+    envelope = json.loads(path.read_text())
+    schema_registry.validate(envelope, "agent-spawn/cli/error.json")
+    assert "human" in envelope["error"]["message"]
 
 
 def test_an_unreadable_stdin_counts_as_no_tty(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -152,14 +185,22 @@ def test_explicit_actor_wins_over_the_default(
 def test_me_name_is_sanitised_to_fit_the_actor_grammar(
     name: str, expected: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("getpass.getuser", lambda: name)
+    monkeypatch.setattr(cli.pwd, "getpwuid", lambda uid: SimpleNamespace(pw_name=name))
     assert cli.me_name() == expected
     assert re.fullmatch(r"[A-Za-z0-9._@-]{1,64}", cli.me_name())
 
 
 def test_me_name_survives_a_missing_user(monkeypatch: pytest.MonkeyPatch) -> None:
-    def boom() -> str:
-        raise OSError("no user")
+    def boom(uid: int) -> Any:
+        raise KeyError(uid)
 
-    monkeypatch.setattr("getpass.getuser", boom)
+    monkeypatch.setattr(cli.pwd, "getpwuid", boom)
     assert cli.me_name() == "unknown"
+
+
+def test_me_name_ignores_logname_and_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = pwd.getpwuid(os.geteuid()).pw_name
+    for var in ("LOGNAME", "USER", "LNAME", "USERNAME"):
+        monkeypatch.setenv(var, "someone-else")
+    assert real != "someone-else"
+    assert cli.me_name() == re.sub(r"[^A-Za-z0-9._@-]", "_", real)[:64]

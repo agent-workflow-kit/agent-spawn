@@ -10,10 +10,12 @@ from __future__ import annotations
 import copy
 import enum
 import json
+import math
 import os
 import re
 import secrets
 import stat
+import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, TextIO
@@ -82,6 +84,22 @@ TOOLS = ("agent-spawn", "claude-session", "termctl", "wtctl")
 LOWER_TOOLS = TOOLS[1:]
 HOOKS = ("pre-launch", "pre-teardown")
 DETAIL_KEYS = frozenset({"status", "cause", "retryable", "hint"})
+# Allowed values of ``details.status`` and ``details.cause`` (schemas/cli/error.json).
+DETAIL_STATUSES = frozenset(
+    {"torn_down", "session_missing", "parked", "launching", "tearing_down", None}
+)
+DETAIL_CAUSES = frozenset(
+    {
+        "interrupted",
+        "no_pane_pid",
+        "pane_gone",
+        "classification_mismatch",
+        "classification_unknown",
+        "worktree_state",
+        None,
+    }
+)
+THIRD_PARTY_REASONS = ("third_party_cwd", "third_party_run")
 HOOK_STDERR_LIMIT = 4096
 _REASON = re.compile(r"^[a-z][a-z0-9_]*$")
 
@@ -110,25 +128,72 @@ def cut_utf8(value: str | bytes, limit: int = HOOK_STDERR_LIMIT) -> str:
     return encoded[:cut].decode("utf-8")
 
 
-_CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+def _escape(char: str) -> str:
+    code = ord(char)
+    if code <= 0xFF:
+        return f"\\x{code:02x}"
+    if code <= 0xFFFF:
+        return f"\\u{code:04x}"
+    return f"\\U{code:08x}"
 
 
-def safe_text(text: str) -> str:
+def _unsafe(char: str) -> bool:
+    code = ord(char)
+    return (
+        code < 0x20
+        or 0x7F <= code <= 0x9F
+        or char in "\u2028\u2029"
+        or unicodedata.category(char) == "Cf"
+    )
+
+
+def safe_text(text: str, *, multiline: bool = False) -> str:
     """Make ``text`` safe to print on a terminal.
 
-    Lone surrogates (undecodable argv bytes) and control characters other than tab and newline
-    (escape sequences) are shown as ``\\x..`` escapes.
+    Lone surrogates (undecodable argv bytes), control characters (C0, DEL, C1), Unicode format
+    characters (category Cf: bidi controls, zero-width characters) and U+2028/U+2029 are shown
+    as backslash escapes, so the text cannot move the cursor, reorder what is shown or forge
+    lines. Single-line text (error lines, warnings) escapes newline and tab too; ``multiline``
+    keeps them for genuinely multi-line text (usage, human-readable results, tracebacks).
     """
     text = text.encode("utf-8", errors="backslashreplace").decode("utf-8")
-    return _CONTROL.sub(lambda match: f"\\x{ord(match.group()):02x}", text)
+    keep = "\n\t" if multiline else ""
+    return "".join(_escape(c) if c not in keep and _unsafe(c) else c for c in text)
+
+
+def _no_surrogates(value: object) -> object:
+    """``value`` with lone surrogates in its strings replaced by visible ``\\udcxx`` text."""
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="backslashreplace").decode("utf-8")
+    if isinstance(value, dict):
+        return {
+            _no_surrogates(k): _no_surrogates(v)
+            for k, v in value.items()  # pyright: ignore[reportUnknownVariableType]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_no_surrogates(v) for v in value]  # pyright: ignore[reportUnknownVariableType]
+    return value
+
+
+def _finite(value: object) -> object:
+    """``value`` with non-finite floats replaced by the strings ``NaN``, ``Infinity``, ..."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return "NaN" if math.isnan(value) else ("Infinity" if value > 0 else "-Infinity")
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}  # pyright: ignore[reportUnknownVariableType]
+    if isinstance(value, (list, tuple)):
+        return [_finite(v) for v in value]  # pyright: ignore[reportUnknownVariableType]
+    return value
 
 
 def render_json(payload: object) -> str:
     """The one-line ASCII JSON that ``--json`` prints and ``--result-file`` stores.
 
-    ASCII keeps stdout valid whatever untrusted text (even lone surrogates) the payload holds.
+    ASCII keeps stdout valid whatever untrusted text the payload holds; lone surrogates become
+    visible ``\\udcxx`` text, so strict parsers accept the output. Non-finite numbers are not
+    JSON and raise ``ValueError``.
     """
-    return json.dumps(payload, ensure_ascii=True)
+    return json.dumps(_no_surrogates(payload), ensure_ascii=True, allow_nan=False)
 
 
 # --- the error envelope -----------------------------------------------------------------------
@@ -180,8 +245,14 @@ class CliError(Exception):
                 raise ValueError(f"unknown hook {hook!r}")
             if code not in ("vetoed", "escalated") or tool != "agent-spawn":
                 raise ValueError("hook is only set for agent-spawn's own vetoed/escalated")
-        if details is not None and not set(details) <= DETAIL_KEYS:
-            raise ValueError(f"unknown details keys {sorted(set(details) - DETAIL_KEYS)}")
+        if details is not None:
+            _check_details(details)
+        if exit_code in (EXIT_SIGINT, EXIT_SIGTERM) and (
+            code != "launch_failed" or (details or {}).get("cause") != "interrupted"
+        ):
+            raise ValueError(
+                f"exit {exit_code} carries only launch_failed with details.cause interrupted"
+            )
         if tool == "agent-spawn" and code == "ambiguous":
             if len(candidates) < 2:
                 raise ValueError("ambiguous needs at least two candidates")
@@ -244,6 +315,20 @@ class CliError(Exception):
         }
 
 
+def _check_details(details: Mapping[str, Any]) -> None:
+    """Raise ``ValueError`` unless ``details`` fits schemas/cli/error.json."""
+    if not set(details) <= DETAIL_KEYS:
+        raise ValueError(f"unknown details keys {sorted(set(details) - DETAIL_KEYS)}")
+    if "status" in details and details["status"] not in DETAIL_STATUSES:
+        raise ValueError(f"invalid details status {details['status']!r}")
+    if "cause" in details and details["cause"] not in DETAIL_CAUSES:
+        raise ValueError(f"invalid details cause {details['cause']!r}")
+    if "retryable" in details and not isinstance(details["retryable"], bool):
+        raise ValueError("details retryable must be a boolean")
+    if "hint" in details and not isinstance(details["hint"], str):
+        raise ValueError("details hint must be a string")
+
+
 def from_lower_tool(
     tool: str,
     exit_code: int,
@@ -251,15 +336,21 @@ def from_lower_tool(
     *,
     agent_id: str | None = None,
     decision_ids: Sequence[str] | None = None,
+    window_preflight: bool = False,
 ) -> CliError:
     """Map a lower tool's failed call to agent-spawn's envelope (interface.md, Error envelope).
 
-    ``lower_error`` is the lower tool's whole ``error`` object and is carried verbatim. Its text is
-    untrusted, so the message is written here and never quotes it.
+    ``lower_error`` is the lower tool's whole ``error`` object and is carried verbatim, except
+    that non-finite numbers (not JSON) become the strings ``NaN``, ``Infinity`` and
+    ``-Infinity``. Its text is untrusted, so the message is written here and never quotes it.
+    A lower exit 2 is agent-spawn's own bug (``internal``), except for termctl's window
+    preflight (``window_preflight``), which the interface names as a usage error.
     """
     if tool not in LOWER_TOOLS:
         raise ValueError(f"{tool!r} is not a lower tool")
-    lower = copy.deepcopy(lower_error) if isinstance(lower_error, dict) else None
+    lower: dict[str, Any] | None = None
+    if isinstance(lower_error, dict):
+        lower = _finite(copy.deepcopy(lower_error))  # pyright: ignore[reportAssignmentType]
     raw_code = lower.get("code") if lower is not None else None
     lower_code = raw_code if isinstance(raw_code, str) else None
     exit_override: int | None = None
@@ -275,9 +366,12 @@ def from_lower_tool(
             code, message = "escalated", f"{tool} escalated the request"
     elif exit_code == EXIT_REFUSED:
         raw_reason = lower.get("reason") if lower is not None else None
-        reason = (
-            raw_reason if isinstance(raw_reason, str) and _REASON.match(raw_reason) else "unknown"
+        valid = (
+            isinstance(raw_reason, str)
+            and _REASON.match(raw_reason) is not None
+            and raw_reason not in THIRD_PARTY_REASONS  # agent-spawn's own, never passed through
         )
+        reason = raw_reason if valid else "unknown"  # pyright: ignore[reportAssignmentType]
         code, message = "refused", f"{tool} refused the request: {reason}"
     elif exit_code == EXIT_FAILED:
         if tool == "claude-session" and lower_code == "launch_failed":
@@ -288,8 +382,8 @@ def from_lower_tool(
         code, message = "ambiguous", f"{tool} reported an ambiguous selector (see lower_error)"
     elif exit_code == EXIT_INTERNAL and tool == "wtctl" and lower_code == "partial":
         code, message, exit_override = "partial", "wtctl removed only part of the worktree", 12
-    elif exit_code == EXIT_USAGE:
-        code, message = "usage", f"{tool} rejected the request as a usage error"
+    elif exit_code == EXIT_USAGE and tool == "termctl" and window_preflight:
+        code, message = "usage", "termctl rejected the window request as a usage error"
     else:
         code, message = "internal", f"{tool} exited with {exit_code}"
     return CliError(
@@ -392,12 +486,17 @@ def emit(outcome: Outcome, *, as_json: bool, stdout: TextIO, stderr: TextIO) -> 
         hint = (error.get("details") or {}).get("hint")
         if hint:
             line += f" (hint: {hint})"
-        stderr.write(safe_text(line) + "\n")
+        try:
+            stderr.write(safe_text(line) + "\n")
+            stderr.flush()
+        except BrokenPipeError:
+            pass  # nobody reads stderr; stdout and the exit code still matter
     if as_json:
         stdout.write(render_json(payload) + "\n")
     elif outcome.kind is not PayloadKind.ENVELOPE:
-        human = outcome.human or json.dumps(payload, indent=2, ensure_ascii=True)
-        stdout.write(safe_text(human) + "\n")
+        human = outcome.human or json.dumps(_no_surrogates(payload), indent=2, ensure_ascii=True)
+        stdout.write(safe_text(human, multiline=True) + "\n")
+    stdout.flush()
 
 
 # --- --result-file -----------------------------------------------------------------------------

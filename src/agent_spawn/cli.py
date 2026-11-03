@@ -11,7 +11,8 @@ raw.
 from __future__ import annotations
 
 import argparse
-import getpass
+import os
+import pwd
 import re
 import sys
 import traceback
@@ -27,6 +28,7 @@ from .labels import label_arg, parse_user_labels, selector_arg
 from .output import (
     CliError,
     Outcome,
+    ResultFileTarget,
     emit,
     error_outcome,
     render_json,
@@ -53,6 +55,11 @@ DESCRIPTION = (
 _ME_NAME_INVALID = re.compile(r"[^A-Za-z0-9._@-]")
 
 INTERNAL_COMMANDS = ("supervise", "_session-event")
+# Commands whose --result-file receives what --json prints (interface.md, Result file); browse's
+# file is an intent file its handler writes (interface.md, TUI).
+RESULT_FILE_COMMANDS = ("launch", "resume", "wait")
+# Top-level global flags that take a value, for the raw-argv pre-scan of argparse's own errors.
+_GLOBAL_VALUE_FLAGS = ("--config", "--actor", "--decision-id", "--state-dir")
 # (namespace attribute, flag) of the flags that need a human (interface.md, Global flags).
 HUMAN_ONLY_FLAGS = (
     ("force", "--force"),
@@ -64,10 +71,21 @@ HUMAN_ONLY_FLAGS = (
 class UsageError(Exception):
     """A usage failure; ``usage`` is the usage text of the parser that found it."""
 
-    def __init__(self, message: str, usage: str = "") -> None:
+    def __init__(
+        self,
+        message: str,
+        usage: str = "",
+        *,
+        parsed: bool = False,
+        decision_ids: Sequence[str] = (),
+        result_file: ResultFileTarget | None = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.usage = usage
+        self.parsed = parsed  # argparse succeeded; decision_ids and result_file are known
+        self.decision_ids = list(decision_ids)
+        self.result_file = result_file
 
 
 class _ParserExit(Exception):
@@ -114,11 +132,12 @@ def _interval(value: str) -> int:
 # --- the parser -------------------------------------------------------------------------------
 
 
-def _add_global_flags(parser: SpawnParser, *, top: bool) -> None:
+def _add_global_flags(parser: SpawnParser, *, top: bool, group: bool = False) -> None:
     """Global flags are accepted before and after the command.
 
     The command's parser must not overwrite what the top-level parser stored, so its defaults are
-    suppressed; ``--decision-id`` is collected in a second list and merged by ``_decision_ids``.
+    suppressed; ``--decision-id`` is collected in one list per level (top, command group such as
+    ``label``, command) and merged in that order by ``parse_invocation``.
     """
     unset: dict[str, Any] = {} if top else {"default": argparse.SUPPRESS}
     parser.add_argument("--json", action="store_true", help="machine-readable output", **unset)
@@ -136,7 +155,7 @@ def _add_global_flags(parser: SpawnParser, *, top: bool) -> None:
         "--decision-id",
         type=_decision_id,
         action="append",
-        dest="decision_id" if top else "decision_id_after",
+        dest="decision_id" if top else ("decision_id_group" if group else "decision_id_after"),
         metavar="ID",
         help="audit decision id (repeatable)",
         **decision_default,
@@ -247,6 +266,7 @@ def _add_attach(parser: Any) -> None:
 
 def _add_label(parser: Any, *, session: bool) -> None:
     parser.add_argument("items", nargs="*", metavar="[AGENT_ID] KEY=VALUE")
+    # Items may be intermixed with flags: parse_invocation appends the leftover items.
     if session:
         parser.add_argument("--session", metavar="CSESSION_ID", help="self-labeling (add only)")
     parser.add_argument("--dry-run", action="store_true")
@@ -342,7 +362,7 @@ def build_parser() -> SpawnParser:
             help="add or remove labels" if group_name == "label" else "manage the cron entry",
             allow_abbrev=False,
         )
-        _add_global_flags(group_parser, top=False)
+        _add_global_flags(group_parser, top=False, group=True)
         verb_group = group_parser.add_subparsers(dest="subcommand", metavar="<verb>", required=True)
         for verb, session in verbs:
             if group_name == "label":
@@ -369,9 +389,10 @@ def stdin_is_tty() -> bool:
 def me_name() -> str:
     """The user name for the default actor ``human:<me.name>``, fitted to the actor grammar."""
     # TODO(#3): config key me.name (default: the OS user name).
+    # The account of the effective uid, never $LOGNAME or $USER (which anyone can set).
     try:
-        name = getpass.getuser()
-    except (OSError, KeyError, ImportError):
+        name = pwd.getpwuid(os.geteuid()).pw_name
+    except (OSError, KeyError):
         name = ""
     name = _ME_NAME_INVALID.sub("_", name)[:64]
     return name or "unknown"
@@ -391,6 +412,8 @@ def _check_usage(args: argparse.Namespace, key: str) -> None:
     state_dir: str | None = getattr(args, "state_dir", None)
     config: str | None = getattr(args, "config", None)
     if internal:
+        # TODO(#14): decide relay exit on malformed argv (State relay says exit 0 always;
+        # Internal commands says exit 2).
         for flag, value in (("--state-dir", state_dir), ("--config", config)):
             if value is None or not value.startswith("/") or "\0" in value:
                 raise ValueError(f"{key} needs an absolute {flag}")
@@ -402,9 +425,14 @@ def _check_usage(args: argparse.Namespace, key: str) -> None:
     if key in ("launch", "resume"):
         parse_user_labels(args.label or [])  # the 64-pair cap over the distinct pairs
 
+    if key == "supervise" and (args.handoff is None) != (args.handoff_timeout is None):
+        raise ValueError("supervise needs --handoff and --handoff-timeout together")
+
     if args.command == "label":
         items: list[str] = args.items
         if getattr(args, "session", None) is not None:
+            if args.dry_run:
+                raise ValueError("label add --session takes no --dry-run")
             args.agent_id, args.pairs = None, items
             if not items:
                 raise ValueError("label add --session needs at least one KEY=VALUE")
@@ -421,7 +449,7 @@ def _check_usage(args: argparse.Namespace, key: str) -> None:
 
 def _check_human_only(args: argparse.Namespace, actor: str, explicit: bool, tty: bool) -> None:
     used = [flag for dest, flag in HUMAN_ONLY_FLAGS if getattr(args, dest, False)]
-    if not used or tty or (explicit and actor.startswith("human:")):
+    if not used or (actor.startswith("human:") and (tty or explicit)):
         return
     raise ValueError(
         f"{', '.join(used)} needs a human: run it from a terminal or pass an explicit "
@@ -429,15 +457,51 @@ def _check_human_only(args: argparse.Namespace, actor: str, explicit: bool, tty:
     )
 
 
+def _resolve_result_file(path: str) -> ResultFileTarget | None:
+    """Resolve ``--result-file``; an unusable cwd is a warning (never a change of exit code)."""
+    try:
+        return resolve_result_file(path)
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+        _warn(f"--result-file {path} not resolved: {reason}")
+        return None
+
+
+def _parse_args(parser: SpawnParser, argv: list[str]) -> argparse.Namespace:
+    """``parse_args``, except that ``label add|remove`` items may follow flags."""
+    args, extras = parser.parse_known_args(argv)
+    if extras and args.command == "label" and not any(e.startswith("-") for e in extras):
+        args.items = [*args.items, *extras]
+    elif extras:
+        parser.error(f"unrecognized arguments: {' '.join(extras)}")
+    return args
+
+
 def parse_invocation(argv: Sequence[str]) -> Invocation:
-    """Parse ``argv`` and run every usage check. Raises ``UsageError`` (and ``_ParserExit``)."""
+    """Parse ``argv`` and run every usage check. Raises ``UsageError`` (and ``_ParserExit``).
+
+    Once argparse succeeded, the decision ids and the result file are known, so a later usage
+    error carries them (the envelope's ``decision_ids``, and the file it is written to).
+    """
     parser = build_parser()
-    args = parser.parse_args(list(argv))
+    args = _parse_args(parser, list(argv))
     key = _command_key(args)
     child = parser.command_parsers[key]
-    decision_ids: list[str] = list(args.decision_id or []) + list(
-        getattr(args, "decision_id_after", None) or []
-    )
+    decision_ids: list[str] = [
+        *(args.decision_id or []),
+        *(getattr(args, "decision_id_group", None) or []),
+        *(getattr(args, "decision_id_after", None) or []),
+    ]
+    capped = decision_ids[:MAX_DECISION_IDS]
+    result_file: ResultFileTarget | None = None
+    raw_result_file: str | None = getattr(args, "result_file", None)
+    if key in RESULT_FILE_COMMANDS and raw_result_file is not None:
+        try:
+            result_file = _resolve_result_file(raw_result_file)
+        except CliError as exc:
+            raise UsageError(
+                exc.message, child.format_usage(), parsed=True, decision_ids=capped
+            ) from None
     try:
         validate_decision_ids(decision_ids)
         _check_usage(args, key)
@@ -446,7 +510,13 @@ def parse_invocation(argv: Sequence[str]) -> Invocation:
         actor: str = args.actor or (f"human:{me_name()}" if tty else "auto:unknown")
         _check_human_only(args, actor, explicit, tty)
     except ValueError as exc:
-        raise UsageError(str(exc), child.format_usage()) from None
+        raise UsageError(
+            str(exc),
+            child.format_usage(),
+            parsed=True,
+            decision_ids=capped,
+            result_file=result_file,
+        ) from None
     return Invocation(
         command=key,
         args=args,
@@ -458,18 +528,69 @@ def parse_invocation(argv: Sequence[str]) -> Invocation:
         state_dir=getattr(args, "state_dir", None),
         verbose=bool(args.verbose),
         quiet=bool(args.quiet),
+        result_file=result_file,
     )
 
 
 # --- main ---------------------------------------------------------------------------------------
 
 
-def _json_requested(argv: Sequence[str]) -> bool:
-    """Whether ``--json`` was given, for errors raised before parsing finished."""
+def _head(argv: Sequence[str]) -> list[str]:
+    """The tokens before ``--``."""
     head = list(argv)
     if "--" in head:
         head = head[: head.index("--")]
-    return "--json" in head
+    return head
+
+
+def _json_requested(argv: Sequence[str]) -> bool:
+    """Whether ``--json`` was given, for errors raised before parsing finished."""
+    return "--json" in _head(argv)
+
+
+def _result_file_requested(argv: Sequence[str]) -> str | None:
+    """``--result-file`` of launch, resume or wait in raw argv, for argparse's own errors.
+
+    The command is the first token that is neither a flag nor the value of a top-level global
+    flag; the last ``--result-file P`` or ``--result-file=P`` after it wins (as in argparse).
+    ``P`` counts only when the command's parser would take it as a value, not as a flag.
+    """
+    head = _head(argv)
+    index = 0
+    while index < len(head) and head[index].startswith("-"):
+        index += 2 if head[index] in _GLOBAL_VALUE_FLAGS else 1
+    if index >= len(head) or head[index] not in RESULT_FILE_COMMANDS:
+        return None
+    command_parser = build_parser().command_parsers[head[index]]
+    found: str | None = None
+    rest = head[index + 1 :]
+    for position, token in enumerate(rest):
+        if token == "--result-file" and position + 1 < len(rest):
+            if _is_argparse_value(command_parser, rest[position + 1]):
+                found = rest[position + 1]
+        elif token.startswith("--result-file="):
+            found = token.removeprefix("--result-file=")
+    return found
+
+
+def _is_argparse_value(parser: SpawnParser, token: str) -> bool:
+    """Whether ``parser`` reads ``token`` as an argument rather than a flag: argparse's own rule
+    (e.g. ``-`` and ``-1`` are values, ``--json`` is not), so the pre-scan matches it exactly."""
+    try:
+        return parser._parse_optional(token) is None  # pyright: ignore[reportPrivateUsage]
+    except UsageError:  # an ambiguous flag: argparse fails on it, so it is no value
+        return False
+
+
+def _silence(stream: Any) -> None:
+    """Point ``stream``'s descriptor at /dev/null after a broken pipe (Python docs recipe), so
+    the interpreter's final flush cannot fail and change the exit code."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, stream.fileno())
+        os.close(devnull)
+    except (OSError, ValueError, AttributeError):
+        pass  # not a real descriptor (e.g. under test capture)
 
 
 def _write(stream: Any, text: str) -> None:
@@ -477,51 +598,85 @@ def _write(stream: Any, text: str) -> None:
         stream.write(text)
         stream.flush()
     except BrokenPipeError:
-        pass
+        _silence(stream)
+
+
+def _warn(message: str) -> None:
+    _write(sys.stderr, safe_text(f"agent-spawn: warning: {message}") + "\n")
+
+
+def _emit(outcome: Outcome, as_json: bool) -> None:
+    try:
+        emit(outcome, as_json=as_json, stdout=sys.stdout, stderr=sys.stderr)
+    except BrokenPipeError:
+        _silence(sys.stdout)
+
+
+def _write_result_file(target: ResultFileTarget | None, outcome: Outcome) -> None:
+    if target is None or outcome.payload is None:
+        return
+    warning = write_result_file(target, render_json(outcome.payload) + "\n")
+    if warning is not None:
+        _warn(warning)
+
+
+def _reconfigure_streams() -> None:
+    """Never fail on text the terminal's encoding cannot show (e.g. ``PYTHONIOENCODING=ascii``)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")  # pyright: ignore[reportAttributeAccessIssue]
+        except (AttributeError, ValueError, OSError):
+            pass
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    _reconfigure_streams()
     argv_list = list(sys.argv[1:] if argv is None else argv)
     try:
         inv = parse_invocation(argv_list)
-    except _ParserExit as done:
+    except _ParserExit as done:  # --help or --version, printed by argparse
+        _write(sys.stdout, "")
         return done.status
     except UsageError as exc:
-        if exc.usage:
-            _write(sys.stderr, safe_text(exc.usage))
-        emit(
-            error_outcome(CliError.usage(exc.message)),
-            as_json=_json_requested(argv_list),
-            stdout=sys.stdout,
-            stderr=sys.stderr,
-        )
-        return 2
+        return _usage_failure(exc, argv_list)
 
     outcome = _run(inv)
-    try:
-        emit(outcome, as_json=inv.as_json, stdout=sys.stdout, stderr=sys.stderr)
-    except BrokenPipeError:
-        pass
-    if inv.result_file is not None and outcome.payload is not None:
-        warning = write_result_file(inv.result_file, render_json(outcome.payload) + "\n")
-        if warning is not None:
-            _write(sys.stderr, safe_text(f"agent-spawn: warning: {warning}") + "\n")
+    _emit(outcome, inv.as_json)
+    _write_result_file(inv.result_file, outcome)
     return outcome.exit_code
+
+
+def _usage_failure(exc: UsageError, argv: list[str]) -> int:
+    """Print a usage error (exit 2) and write it to the result file when one is known."""
+    if exc.usage:
+        _write(sys.stderr, safe_text(exc.usage, multiline=True))
+    outcome = error_outcome(CliError.usage(exc.message), exc.decision_ids)
+    _emit(outcome, _json_requested(argv))
+    target = exc.result_file
+    if not exc.parsed:
+        # argparse's own error: the namespace is unknown, so pre-scan the raw argv
+        raw = _result_file_requested(argv)
+        if raw is not None:
+            try:
+                target = _resolve_result_file(raw)
+            except CliError as error:
+                _warn(f"--result-file {raw} not written: {error.message}")
+    _write_result_file(target, outcome)
+    return 2
 
 
 def _run(inv: Invocation) -> Outcome:
     try:
-        result_file = getattr(inv.args, "result_file", None)
-        if result_file is not None:
-            inv.result_file = resolve_result_file(result_file)
         outcome = HANDLERS[inv.command](inv)
         if not isinstance(outcome, Outcome):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(f"handler of {inv.command!r} returned {type(outcome).__name__}")
+        if outcome.payload is not None:
+            render_json(outcome.payload)  # a payload that is not JSON is an internal error
         return outcome
     except CliError as error:
         return error_outcome(error, inv.decision_ids)
     except Exception as exc:
         if inv.verbose:
-            _write(sys.stderr, safe_text(traceback.format_exc()))
+            _write(sys.stderr, safe_text(traceback.format_exc(), multiline=True))
         error = CliError.of("internal", f"internal error ({type(exc).__name__})")
         return error_outcome(error, inv.decision_ids)
