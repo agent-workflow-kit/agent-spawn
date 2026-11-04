@@ -637,6 +637,12 @@ agent-spawn's post-hook events are recorded in an outbox (`events`) in the same 
 
 `~/.config/agent-spawn/config.yaml` plus `config.d/*.yaml` (lexical order, merged after it; maps merged, `hooks` lists appended, other lists replaced). Schema: [schemas/config.json](../schemas/config.json); every key with its default is in [config.example.yaml](../config.example.yaml). Invalid config exits 2 (`config_invalid`) naming the key.
 
+- **Path.** `--config <path>` names the config file (a relative path is resolved against the cwd). The default is `$XDG_CONFIG_HOME/agent-spawn/config.yaml` when `XDG_CONFIG_HOME` is absolute, else `$HOME/.config/agent-spawn/config.yaml` when `HOME` is absolute, else the same under the home directory of the effective user's passwd entry; with none of these absolute, `config_invalid`. The path in use, stored with agents and passed to internal processes, is always absolute.
+- **Missing files.** A missing default file means built-in defaults. A missing file named by `--config` is `config_invalid` naming the path; internal commands (whose `--config` is the path recorded at launch, possibly a default path that did not exist) treat a missing file as built-in defaults. A config file, config directory or `config.d` that is a dangling symlink is `config_invalid`.
+- **Drop-ins.** `config.d` is the directory beside the config file in use, including one named by `--config`. Only `*.yaml` files are read (not `.yml`); names starting with `.` are ignored; the order is the lexical order of the file names. Symlinks are followed; an entry that is not a regular file after that (a directory, a FIFO, a dangling symlink) is `config_invalid`. Each file is at most 1 MiB, and `config.d` holds at most 256 drop-ins.
+- **YAML dialect.** One document per file, read with YAML 1.2 core-schema scalars: booleans are only `true`/`True`/`TRUE`/`false`/`False`/`FALSE`, null is only `null`/`Null`/`NULL`/`~`/empty, integers are decimal (`010` is ten), floats are the 1.2 core form; every other plain scalar (`yes`, `on`, `0x10`, `1:30`, `1_0`, dates) is a string. Anchors, aliases, merge keys and explicit tags (`!!int`, `!local`, ...) are refused, and so are duplicate keys; mapping keys must be strings. A file is validated on its own (errors name the file) and again after merging. Integer keys (`tombstone_days`) take integers only, never a number with a fractional part such as `30.0`. Error messages name the file, line or key, never the value.
+- **Merging.** A map merges into a map key by key; a `hooks.<hook>` list is appended to when both values are lists; any other value, lists included, replaces the earlier one (so `wtctl_cmd: null` in a drop-in replaces a list). Keys whose schema type has no null (for example `repos.<repo-id>.kinds.<kind>.promote` or a hook entry's selectors) refuse an explicit `null`; omit the key instead.
+
 | Key | Default | Meaning |
 |---|---|---|
 | `me.name` | OS username | default actor `human:<me.name>` |
@@ -658,8 +664,8 @@ Precedence: flags > per-repo override > environment > config > built-in defaults
 
 ## Environment variables
 
-- Config overrides `AGENT_SPAWN_<KEY>` for top-level scalar keys only: `AGENT_SPAWN_HANDOFF_TIMEOUT`, `AGENT_SPAWN_TOMBSTONE_DAYS`, `AGENT_SPAWN_JOB_ID_ENV`, `AGENT_SPAWN_AUTO_REPORT_RESUME`. Lists and maps cannot be set from the environment. A bare number string for a duration means seconds.
-- Read: the variable named by `job_id_env`; `CSESSION_ID` (self-labeling, and the `job=` rule); `CSESSION_DIR` (self-labeling only); `XDG_CONFIG_HOME`, `XDG_STATE_HOME` (by the CLI only; internal processes take both paths from argv).
+- Config overrides `AGENT_SPAWN_<KEY>` for top-level scalar keys only: `AGENT_SPAWN_HANDOFF_TIMEOUT`, `AGENT_SPAWN_TOMBSTONE_DAYS`, `AGENT_SPAWN_JOB_ID_ENV`, `AGENT_SPAWN_AUTO_REPORT_RESUME`. Lists and maps cannot be set from the environment. A bare number string for a duration means seconds. A set but empty variable is invalid; `AGENT_SPAWN_AUTO_REPORT_RESUME` is exactly `true` or `false`; `AGENT_SPAWN_TOMBSTONE_DAYS` is plain ASCII digits. An invalid value is `config_invalid` naming the variable, never its value.
+- Read: the variable named by `job_id_env`; `CSESSION_ID` (self-labeling, and the `job=` rule); `CSESSION_DIR` (self-labeling only); `XDG_CONFIG_HOME`, `HOME` (the default config path, [Config](#config)), `XDG_STATE_HOME` (by the CLI only; internal processes take the state and config paths from argv).
 - Hook variables: `AGENT_SPAWN_HOOK`, `AGENT_SPAWN_ID`, `AGENT_SPAWN_OBJECT_TYPE`; never config keys.
 - agent-spawn reads no credentials. The environment it hands to windows ([Environment handoff](#environment-handoff)) may contain the caller's secrets; it never stores, logs or prints them.
 

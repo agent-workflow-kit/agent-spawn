@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import NoReturn
 
+from ..config import Config
 from ..output import CliError, Outcome, ResultFileTarget
 
 
@@ -17,7 +18,9 @@ class Invocation:
     ``command`` is the key into ``commands.table.HANDLERS`` (``launch``, ``label add``, ...).
     ``args`` is the argparse namespace. ``actor`` is the effective actor and ``decision_ids`` the
     merged ``--decision-id`` values; handlers pass both to every lower-tool call that accepts them.
-    ``result_file`` is the checked ``--result-file`` (its parent already resolved), if any.
+    ``config`` is the validated config and ``config_file`` the absolute path to store with agents
+    and pass to internal processes (the default path when no file exists). ``result_file`` is the
+    checked ``--result-file`` (its parent already resolved), if any.
     """
 
     command: str
@@ -32,6 +35,8 @@ class Invocation:
     quiet: bool = False
     result_file: ResultFileTarget | None = None
     warnings: list[str] = field(default_factory=lambda: [])
+    config: Config | None = None
+    config_file: str | None = None
 
 
 Handler = Callable[[Invocation], Outcome]

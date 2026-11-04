@@ -26,7 +26,8 @@
       "type": "array",
       "items": {
         "type": "string",
-        "minLength": 1
+        "minLength": 1,
+        "pattern": "^[^\u0000]*$"
       },
       "minItems": 1,
       "default": [
@@ -38,7 +39,8 @@
       "type": "array",
       "items": {
         "type": "string",
-        "minLength": 1
+        "minLength": 1,
+        "pattern": "^[^\u0000]*$"
       },
       "minItems": 1,
       "default": [
@@ -52,7 +54,8 @@
       ],
       "items": {
         "type": "string",
-        "minLength": 1
+        "minLength": 1,
+        "pattern": "^[^\u0000]*$"
       },
       "minItems": 1,
       "default": [
@@ -283,6 +286,7 @@
         "cmd": {
           "type": "string",
           "minLength": 1,
+          "pattern": "^[^\u0000]*$",
           "description": "Run via sh -c in its own process group; JSON payload on stdin."
         },
         "timeout": {
@@ -328,6 +332,7 @@
         "cmd": {
           "type": "string",
           "minLength": 1,
+          "pattern": "^[^\u0000]*$",
           "description": "Run via sh -c in its own process group; JSON payload on stdin."
         },
         "timeout": {
@@ -368,6 +373,7 @@
         "cmd": {
           "type": "string",
           "minLength": 1,
+          "pattern": "^[^\u0000]*$",
           "description": "Run via sh -c in its own process group; JSON payload on stdin."
         },
         "timeout": {
