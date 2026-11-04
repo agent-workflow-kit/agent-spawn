@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NoReturn
 
 from ..config import Config
@@ -34,6 +34,7 @@ class Invocation:
     verbose: bool = False
     quiet: bool = False
     result_file: ResultFileTarget | None = None
+    warnings: list[str] = field(default_factory=lambda: [])
     config: Config | None = None
     config_file: str | None = None
 
