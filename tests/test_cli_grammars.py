@@ -25,6 +25,8 @@ BAD = {
     "resume label reserved": ["resume", ID, "--label", "kind=x"],
     "resume select bad": ["resume", "--select", "nope"],
     "list label bad": ["list", "--label", "A=b"],
+    "list label reserved kind": ["list", "--label", "kind=review"],
+    "list label reserved agent": ["list", "--label", "agent=ag-abcdefgh"],
     "label add reserved": ["label", "add", ID, "agent=x"],
     "label remove reserved": ["label", "remove", ID, "kind=x"],
     "label add bad pair": ["label", "add", ID, "pr=1", "bad pair"],
@@ -32,6 +34,8 @@ BAD = {
     "label add session reserved": ["label", "add", "--session", "cs-abcdefgh", "agent=x"],
     "label add session bad pair": ["label", "add", "--session", "cs-abcdefgh", "x"],
     "label add 65 pairs": ["label", "add", ID, *[f"k={i}" for i in range(65)]],
+    "label add 65 pairs with a job": ["label", "add", ID, *[f"k={i}" for i in range(64)], "job=x"],
+    "resume 65 labels": ["resume", ID, *[x for i in range(65) for x in ("--label", f"k={i}")]],
     "wait-timeout zero": [*LAUNCH, "--wait-timeout", "0"],
     "wait-timeout negative": [*LAUNCH, "--wait-timeout", "-5"],
     "wait-timeout unit": [*LAUNCH, "--wait-timeout", "5x"],
@@ -77,7 +81,7 @@ GOOD = {
     "labels": [*LAUNCH, "--label", "pr=1", "--label", "a=b=c", "--label", "e="],
     "64 distinct labels": [*LAUNCH, *[x for i in range(64) for x in ("--label", f"k={i}")]],
     "duplicate labels do not count": [*LAUNCH, *["--label", "k=1"] * 100],
-    "list filter on reserved key": ["list", "--label", "kind=review"],
+    "select on reserved key matches nothing": ["resume", "--select", "kind=review"],
     "select": ["resume", "--select", "pr=1", "--select", "pr=2"],
     "durations": [*LAUNCH, "--wait-timeout", "1.5h"],
     "bare duration": ["wait", ID, "--timeout", "90"],
@@ -92,6 +96,18 @@ GOOD = {
     "label add": ["label", "add", ID, "pr=1", "pr=1"],
     "label add by prefix": ["label", "add", "abcd", "pr=1"],
     "label add session": ["label", "add", "--session", "cs-abcdefgh", "pr=1"],
+    "label remove 65 pairs": ["label", "remove", ID, *[f"k={i}" for i in range(65)]],
+    "launch 64 labels and a job": [
+        *LAUNCH,
+        *[x for i in range(64) for x in ("--label", f"k={i}")],
+        *["--label", "job=x", "--label", "job=y"],
+    ],
+    "resume 64 labels and a job": [
+        "resume",
+        ID,
+        *[x for i in range(64) for x in ("--label", f"k={i}")],
+        *["--label", "job=x"],
+    ],
 }
 
 

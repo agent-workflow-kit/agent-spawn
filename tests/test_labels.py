@@ -261,3 +261,46 @@ def test_parse_user_labels_checks_the_cap_over_distinct_pairs() -> None:
     assert len(labels.parse_user_labels(texts + texts)) == 64
     with pytest.raises(GrammarError, match="64"):
         labels.parse_user_labels([*texts, "k=64"])
+
+
+# --- labels given at launch and resume (job= beyond the cap is skipped) ------------------------
+
+
+def test_run_labels_skip_a_job_pair_beyond_the_cap() -> None:
+    change = LabelSet().add_run([*full_set().pairs, Label("job", "x")])
+    assert len(change.labels) == 64
+    assert Label("job", "x") not in change.labels
+    assert change.skipped is True
+
+
+def test_run_labels_add_a_job_pair_within_the_cap() -> None:
+    change = full_set(62).add_run(pairs("job=x", "a=1"))
+    assert change.applied == (Label("a", "1"), Label("job", "x"))
+    assert change.skipped is False
+
+
+def test_run_labels_refuse_non_job_pairs_beyond_the_cap() -> None:
+    with pytest.raises(GrammarError, match="64"):
+        full_set().add_run(pairs("a=1", "job=x"))
+
+
+def test_run_labels_existing_job_pair_is_a_noop_not_a_skip() -> None:
+    start = full_set(63).add(pairs("job=x")).labels
+    change = start.add_run(pairs("job=x"))
+    assert change.changed is False and change.skipped is False
+
+
+def test_parse_run_labels_caps_only_non_job_pairs() -> None:
+    texts = [f"k={index}" for index in range(64)]
+    parsed = labels.parse_run_labels([*texts, "job=x", "job=y"])
+    assert parsed[-2:] == [Label("job", "x"), Label("job", "y")]
+    with pytest.raises(GrammarError, match="64"):
+        labels.parse_run_labels([*texts, "k=64"])
+    with pytest.raises(GrammarError, match="reserved"):
+        labels.parse_run_labels(["kind=x"])
+
+
+def test_parse_user_labels_caps_job_pairs_like_any_pair() -> None:
+    texts = [f"k={index}" for index in range(64)]
+    with pytest.raises(GrammarError, match="64"):
+        labels.parse_user_labels([*texts, "job=x"])

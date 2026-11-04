@@ -1,11 +1,13 @@
 """Agent ids: grammar, allocation and prefix resolution.
 
 An id is ``ag-`` plus 8 base32 characters (``[a-z2-7]``, 40 random bits). Ids are never reused,
-also after tombstone deletion: allocation asks the lookup, which must list tombstones.
-Resolution accepts the optional ``ag-`` and a prefix of 4 to 7 characters; a prefix never matches a
-torn-down agent, a full id always does (the caller decides what a torn-down agent means).
+also after a tombstone or a fork record is deleted: allocation asks ``is_reserved``, which knows
+every id ever allocated. Resolution looks at stored records only and accepts the optional ``ag-``
+and a prefix of 4 to 7 characters; a prefix never matches a torn-down agent, a full id of a stored
+record always does (the caller decides what a torn-down agent means), and a reserved id without a
+record is unknown (exit 10).
 
-The state store (#6) provides the ``AgentIndex``; this module only needs its one lookup.
+The state store (#6) provides the ``AgentIndex``.
 """
 
 from __future__ import annotations
@@ -48,15 +50,21 @@ class IdEntry:
 class AgentIndex(Protocol):
     """What id allocation and resolution need from the state store.
 
-    ``entries_with_prefix("ag-abcd")`` returns every stored id starting with the text, tombstones
-    included; a full id gives its own entry or nothing.
+    ``entries_with_prefix("ag-abcd")`` returns every stored record whose id starts with the text,
+    live and tombstoned; a full id gives its own entry or nothing. ``is_reserved(agent_id)`` is
+    true for every id ever allocated, also when its record is gone (a deleted tombstone or a
+    deleted fork record).
     """
 
     def entries_with_prefix(self, prefix: str) -> Sequence[IdEntry]: ...
 
+    def is_reserved(self, agent_id: str) -> bool: ...
 
-# TODO(#6): implement AgentIndex on the state store (one indexed prefix query over `agents`,
-# tombstones included).
+
+# TODO(#6): implement AgentIndex on the state store: one indexed prefix query over `agents`
+# (tombstones included) and a permanent allocated-ids table for `is_reserved`. Insert the id
+# into that table with a unique constraint at launch step 3 (and at fork insertion), and on a
+# conflict allocate again: `new_agent_id` alone cannot close the race between concurrent launches.
 
 
 def is_agent_id(value: str) -> bool:
@@ -64,10 +72,10 @@ def is_agent_id(value: str) -> bool:
 
 
 def new_agent_id(index: AgentIndex, *, random_bytes: Callable[[int], bytes] = os.urandom) -> str:
-    """A fresh id no stored agent, live or tombstoned, has."""
+    """A fresh id never allocated before (live, tombstoned or deleted)."""
     for _ in range(_ALLOCATION_ATTEMPTS):
         candidate = "ag-" + base64.b32encode(random_bytes(5)).decode("ascii").lower()
-        if not index.entries_with_prefix(candidate):
+        if not index.is_reserved(candidate):
             return candidate
     raise RuntimeError("could not allocate an unused agent id")
 
@@ -104,8 +112,9 @@ agent_id_arg = arg_type(check_agent_id_text)
 def resolve_agent_id(text: str, index: AgentIndex) -> ResolvedId:
     """Resolve user input to one stored id.
 
-    Malformed or too short: exit 2. A full id: its entry, tombstone or not, else exit 10. A prefix:
-    among non-torn-down agents only; none exit 10, several exit 21 with ``candidates``.
+    Malformed or too short: exit 2. A full id: its stored entry, tombstone or not, else exit 10
+    (also for a reserved id whose record was deleted). A prefix: among non-torn-down agents only;
+    none exit 10, several exit 21 with ``candidates``.
     """
     try:
         body = check_agent_id_text(text)

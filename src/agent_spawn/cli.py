@@ -24,7 +24,7 @@ from . import __version__
 from .commands.base import Invocation
 from .commands.table import HANDLERS
 from .ids import agent_id_arg, check_agent_id_text
-from .labels import label_arg, parse_user_labels, selector_arg
+from .labels import label_arg, parse_run_labels, parse_user_label, parse_user_labels, selector_arg
 from .output import (
     CliError,
     Outcome,
@@ -248,7 +248,7 @@ def _add_wait(parser: Any) -> None:
 
 
 def _add_list(parser: Any) -> None:
-    _repeatable(parser, "--label", "KEY=VALUE", "match a label (ANDed)", selector_arg)
+    _repeatable(parser, "--label", "KEY=VALUE", "match a label (ANDed)", label_arg)
     parser.add_argument("--needs-attention", action="store_true")
     _repeatable(parser, "--status", "STATUS", "match a status (ORed)")
     _repeatable(parser, "--session-state", "STATE", "match a session state (ORed)")
@@ -424,7 +424,7 @@ def _check_usage(args: argparse.Namespace, key: str) -> None:
     if key == "resume" and (args.agent_id is None) == (not args.select):
         raise ValueError("resume needs exactly one of AGENT_ID or --select")
     if key in ("launch", "resume"):
-        parse_user_labels(args.label or [])  # the 64-pair cap over the distinct pairs
+        parse_run_labels(args.label or [])  # the cap over distinct non-job pairs
 
     if key == "supervise" and (args.handoff is None) != (args.handoff_timeout is None):
         raise ValueError("supervise needs --handoff and --handoff-timeout together")
@@ -445,7 +445,11 @@ def _check_usage(args: argparse.Namespace, key: str) -> None:
             check_agent_id_text(items[0])
             args.agent_id, args.pairs = items[0], items[1:]
             args.session = None
-        parse_user_labels(args.pairs)  # grammar, reserved keys and the 64-pair cap
+        if args.subcommand == "add":
+            parse_user_labels(args.pairs)  # grammar, reserved keys and the 64-pair cap
+        else:
+            for pair in args.pairs:  # removing absent pairs is a no-op: no cap
+                parse_user_label(pair)
 
 
 def _check_human_only(args: argparse.Namespace, actor: str, explicit: bool, tty: bool) -> None:

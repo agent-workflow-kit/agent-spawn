@@ -24,6 +24,7 @@ __all__ = [
     "job_label",
     "label_arg",
     "parse_label",
+    "parse_run_labels",
     "parse_selector",
     "parse_user_label",
     "parse_user_labels",
@@ -75,14 +76,25 @@ def parse_user_label(text: str) -> Label:
 
 
 def parse_selector(text: str) -> Label:
-    """A ``--label`` filter or ``--select`` pair: the grammar only; a reserved key just matches
-    nothing, because agent-spawn never stores it on the agent."""
+    """A ``resume --select`` pair: the grammar only; a reserved key just matches nothing, because
+    agent-spawn never stores it on the agent. (``list --label`` takes ``parse_user_label``.)"""
     return parse_label(text)
 
 
 def parse_user_labels(texts: Iterable[str]) -> list[Label]:
     """Every user label of one command, deduplicated in first-seen order and capped at 64."""
     return list(LabelSet().add([parse_user_label(text) for text in texts]).labels.pairs)
+
+
+def parse_run_labels(texts: Iterable[str]) -> list[Label]:
+    """The ``--label`` pairs of launch or resume, deduplicated in first-seen order.
+
+    Only the non-``job=`` pairs count toward the cap here: a ``job=`` pair beyond it is skipped
+    with a warning when the labels are applied (``LabelSet.add_run``), never a usage error.
+    """
+    parsed = list(dict.fromkeys(parse_user_label(text) for text in texts))
+    LabelSet().add([label for label in parsed if label.key != JOB_KEY])
+    return parsed
 
 
 def job_label(value: str) -> Label | None:
@@ -145,6 +157,17 @@ class LabelSet:
         if len(self.pairs) >= MAX_LABELS:
             return LabelChange(self, (), skipped=True)
         return LabelChange(LabelSet(self.pairs + (label,)), (label,))
+
+    def add_run(self, new: Sequence[Label]) -> LabelChange:
+        """Add the labels of a launch or resume: the non-``job=`` pairs first (over 64 raises and
+        changes nothing), then each ``job=`` pair as ``add_job`` does (skipped beyond the cap)."""
+        change = self.add([pair for pair in new if pair.key != JOB_KEY])
+        applied, skipped = list(change.applied), False
+        for pair in dict.fromkeys(pair for pair in new if pair.key == JOB_KEY):
+            change = change.labels.add_job(pair)
+            applied.extend(change.applied)
+            skipped = skipped or change.skipped
+        return LabelChange(change.labels, tuple(applied), skipped)
 
     def remove(self, gone: Sequence[Label]) -> LabelChange:
         """Remove the pairs present; absent ones are ignored."""

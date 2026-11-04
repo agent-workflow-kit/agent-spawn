@@ -109,10 +109,12 @@
         },
         {
           "type": "string",
+          "maxLength": 32,
           "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)\\d+(\\.\\d+)?(ms|s|m|h|d)$"
         },
         {
           "type": "string",
+          "maxLength": 32,
           "pattern": "^(?!0+(\\.0+)?$)\\d+(\\.\\d+)?$"
         }
       ],

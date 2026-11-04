@@ -50,8 +50,9 @@ _TIME = re.compile(
 MAX_DECISION_IDS = 32
 MAX_NAME_CODE_POINTS = 64
 MAX_DURATION_TEXT = 32
-# Ten years: far beyond any real timeout, small enough that no arithmetic on it can overflow.
-MAX_DURATION_SECONDS = 10 * 365 * 86400
+# 36500d, as in claude-session: far beyond any real timeout, small enough that no arithmetic on it
+# can overflow.
+MAX_DURATION_SECONDS = 36500 * 86400
 _UNIT_SECONDS = {
     None: Decimal(1),
     "ms": Decimal("0.001"),
@@ -69,10 +70,11 @@ class GrammarError(ValueError):
 
 def shown(value: object) -> str:
     """A bounded, escaped rendering of an untrusted value for messages."""
-    text = value if isinstance(value, str) else repr(value)
+    # Base-str methods only: a str subclass cannot supply its own (unescaped) repr or slicing.
+    text = str.__str__(value) if isinstance(value, str) else str.__str__(repr(value))
     if len(text) > _SHOWN_LIMIT:
         text = text[:_SHOWN_LIMIT] + "..."
-    return repr(text)  # repr escapes control, format and surrogate characters
+    return str.__repr__(text)  # escapes control, format and surrogate characters
 
 
 # --- durations --------------------------------------------------------------------------------
@@ -82,7 +84,8 @@ def parse_duration(text: str) -> float:
     """Seconds in ``text``: ``<number>[ms|s|m|h|d]``, a bare number meaning seconds.
 
     The number is ``digits`` or ``digits.digits`` (no sign, exponent, separator, space or
-    non-ASCII digit; leading zeros are fine). Zero exits 2, as does anything over ten years.
+    non-ASCII digit; leading zeros are fine). Zero exits 2, as does anything over ``36500d`` or
+    text over 32 characters.
     """
     if len(text) > MAX_DURATION_TEXT:
         raise GrammarError(f"invalid duration {shown(text)}: too long")
@@ -96,7 +99,7 @@ def parse_duration(text: str) -> float:
     if seconds <= 0:
         raise GrammarError(f"invalid duration {shown(text)}: must be greater than zero")
     if seconds > MAX_DURATION_SECONDS:
-        raise GrammarError(f"invalid duration {shown(text)}: longer than ten years")
+        raise GrammarError(f"invalid duration {shown(text)}: longer than 36500d")
     return float(seconds)
 
 
@@ -151,7 +154,10 @@ def _zone(text: str | None) -> timezone:
 
 # --- names ------------------------------------------------------------------------------------
 
-_NAME_FORBIDDEN = re.compile("[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
+_NAME_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")
+_SURROGATE = re.compile("[\ud800-\udfff]")
+# "<kind> <6 id characters>" fits the 64 code points with a kind of at most 57.
+_MAX_DEFAULT_KIND = MAX_NAME_CODE_POINTS - 7
 
 
 def validate_name(name: str) -> str:
@@ -163,7 +169,9 @@ def validate_name(name: str) -> str:
         raise GrammarError(
             f"invalid name {shown(name)}: expected 1 to {MAX_NAME_CODE_POINTS} characters"
         )
-    if _NAME_FORBIDDEN.search(name):
+    if _SURROGATE.search(name):
+        raise GrammarError(f"invalid name {shown(name)}: not valid Unicode text (lone surrogate)")
+    if _NAME_CONTROL.search(name):
         raise GrammarError(f"invalid name {shown(name)}: control characters are not allowed")
     if "#[" in name:
         raise GrammarError(f"invalid name {shown(name)}: must not contain '#['")
@@ -179,8 +187,10 @@ def default_name(
 ) -> str:
     """``name``, else ``worktree_name``, else ``<kind or "agent"> <6 characters after ag->``.
 
-    ``None`` means unset; an empty string is a (rejected) value. The chosen name is validated,
-    so a ``kind`` or ``worktree_name`` outside the name rules is a usage error, never a fallback.
+    ``None`` means unset; an empty string is a (rejected) value. In the derived form the kind is
+    cut to 57 code points so the name fits 64; ``name`` and ``worktree_name`` are never cut. The
+    chosen name is validated, so a candidate outside the name rules is a usage error, never a
+    fallback.
     """
     if AGENT_ID.fullmatch(agent_id) is None:
         raise GrammarError(f"invalid agent id {shown(agent_id)}")
@@ -188,7 +198,8 @@ def default_name(
         return validate_name(name)
     if worktree_name is not None:
         return validate_name(worktree_name)
-    return validate_name(f"{'agent' if kind is None else kind} {agent_id[3:9]}")
+    word = "agent" if kind is None else kind[:_MAX_DEFAULT_KIND]
+    return validate_name(f"{word} {agent_id[3:9]}")
 
 
 # --- actors, decision ids, shas ---------------------------------------------------------------

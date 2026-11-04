@@ -9,18 +9,26 @@ import pytest
 from agent_spawn import ids
 from agent_spawn.ids import IdEntry
 from agent_spawn.output import CliError
+from tests import schema_registry
 
 
 class Index:
-    """A tiny in-memory stand-in for the state store's lookup."""
+    """A tiny in-memory stand-in for the state store's lookup.
 
-    def __init__(self, *entries: IdEntry) -> None:
+    ``reserved`` are ids allocated once whose record is gone (a deleted tombstone or fork record).
+    """
+
+    def __init__(self, *entries: IdEntry, reserved: Sequence[str] = ()) -> None:
         self.entries = list(entries)
+        self.reserved = set(reserved)
         self.queries: list[str] = []
 
     def entries_with_prefix(self, prefix: str) -> Sequence[IdEntry]:
         self.queries.append(prefix)
         return [entry for entry in self.entries if entry.agent_id.startswith(prefix)]
+
+    def is_reserved(self, agent_id: str) -> bool:
+        return agent_id in self.reserved or any(e.agent_id == agent_id for e in self.entries)
 
 
 def live(agent_id: str) -> IdEntry:
@@ -83,6 +91,13 @@ def test_new_agent_id_never_reuses_a_live_or_tombstoned_id() -> None:
     assert result not in {"ag-aaaaaaaa", "ag-77777777"}
 
 
+def test_new_agent_id_never_reuses_a_reserved_id_without_a_record() -> None:
+    index = Index(reserved=["ag-aaaaaaaa"])
+    draws = iter([b"\x00" * 5, b"\x00" * 5, b"\xff" * 5])
+    assert ids.new_agent_id(index, random_bytes=lambda n: next(draws)) == "ag-77777777"
+    assert index.queries == []  # allocation asks is_reserved, not the record lookup
+
+
 def test_new_agent_id_gives_up_after_bounded_collisions() -> None:
     index = Index(live("ag-aaaaaaaa"))
     with pytest.raises(RuntimeError):
@@ -96,13 +111,13 @@ B = "ag-abcdwxyz"
 C = "ag-q2222222"
 
 
-def resolve(text: str, *entries: IdEntry) -> ids.ResolvedId:
-    return ids.resolve_agent_id(text, Index(*entries))
+def resolve(text: str, *entries: IdEntry, reserved: Sequence[str] = ()) -> ids.ResolvedId:
+    return ids.resolve_agent_id(text, Index(*entries, reserved=reserved))
 
 
-def error_of(text: str, *entries: IdEntry) -> CliError:
+def error_of(text: str, *entries: IdEntry, reserved: Sequence[str] = ()) -> CliError:
     with pytest.raises(CliError) as info:
-        resolve(text, *entries)
+        resolve(text, *entries, reserved=reserved)
     return info.value
 
 
@@ -169,6 +184,26 @@ def test_full_id_of_a_torn_down_agent_resolves_and_says_so() -> None:
     assert resolve("abcdefgh", gone(A), live(B)) == ids.ResolvedId(A, torn_down=True)
 
 
+def test_full_id_reserved_without_a_record_exits_10_without_torn_down() -> None:
+    err = error_of(A, live(B), reserved=[A])
+    assert (err.code, err.exit_code) == ("not_found", 10)
+    assert err.details is None
+
+
+def test_a_prefix_never_matches_a_reserved_id_without_a_record() -> None:
+    assert error_of("ag-abcd", reserved=[A]).exit_code == 10
+    assert resolve("ag-abcd", live(B), reserved=[A]).agent_id == B
+
+
+@pytest.mark.parametrize(
+    ("text", "code"), [("ag-ab", "usage"), ("ag-zzzz", "not_found"), ("ag-abcd", "ambiguous")]
+)
+def test_resolution_errors_fit_the_error_envelope_schema(text: str, code: str) -> None:
+    err = error_of(text, live(A), live(B))
+    assert err.code == code
+    schema_registry.validate(err.envelope(), "agent-spawn/cli/error.json")
+
+
 def test_full_id_is_never_ambiguous() -> None:
     # No id is a prefix of another (all are 8 chars), but a full id must still resolve exactly.
     assert resolve(A, live(A), live(B)).agent_id == A
@@ -198,6 +233,9 @@ def test_resolution_trusts_the_index_only_for_ids_that_start_with_the_prefix() -
     class Sloppy:
         def entries_with_prefix(self, prefix: str) -> Sequence[IdEntry]:
             return [live(A), live(C)]
+
+        def is_reserved(self, agent_id: str) -> bool:
+            return True
 
     assert ids.resolve_agent_id("ag-abcd", Sloppy()).agent_id == A
 

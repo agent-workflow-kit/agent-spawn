@@ -113,11 +113,20 @@ def test_duration_zero_message_says_zero() -> None:
         validate.parse_duration("0")
 
 
-def test_duration_upper_bound_is_ten_years() -> None:
-    ten_years = 10 * 365 * 86400
-    assert validate.parse_duration(f"{ten_years}") == ten_years
-    with pytest.raises(GrammarError):
-        validate.parse_duration(f"{ten_years + 1}")
+def test_duration_upper_bound_is_36500_days() -> None:
+    limit = 36500 * 86400
+    assert validate.parse_duration("36500d") == limit
+    assert validate.parse_duration(f"{limit}") == limit
+    with pytest.raises(GrammarError, match="36500d"):
+        validate.parse_duration("36501d")
+    with pytest.raises(GrammarError, match="36500d"):
+        validate.parse_duration(f"{limit}.001")
+
+
+def test_duration_text_is_at_most_32_characters() -> None:
+    assert validate.parse_duration("1." + "0" * 30) == 1  # 32 characters
+    with pytest.raises(GrammarError, match="too long"):
+        validate.parse_duration("1." + "0" * 31)
 
 
 def test_duration_argparse_type_returns_the_raw_string() -> None:
@@ -186,6 +195,31 @@ def test_name_rule_boundary_is_c1_end() -> None:
         validate.validate_name("a\u009f")
 
 
+@pytest.mark.parametrize("name", ["\udcff", "a\ud800b"])
+def test_name_with_a_lone_surrogate_says_so(name: str) -> None:
+    with pytest.raises(GrammarError, match="not valid Unicode text"):
+        validate.validate_name(name)
+
+
+def test_name_with_a_control_character_says_so() -> None:
+    with pytest.raises(GrammarError, match="control characters"):
+        validate.validate_name("a\x85b")
+
+
+def test_shown_escapes_a_str_subclass_whatever_its_repr() -> None:
+    class Sneaky(str):
+        def __repr__(self) -> str:
+            return "\x1b[31m"
+
+        def __str__(self) -> str:
+            return "\x1b[31m"
+
+    rendered = validate.shown(Sneaky("a\x1bb"))
+    assert "\x1b" not in rendered
+    assert rendered == repr("a\x1bb")
+    assert type(rendered) is str
+
+
 def test_name_error_does_not_echo_control_characters() -> None:
     with pytest.raises(GrammarError) as info:
         validate.validate_name("\x1b[2J" + "z" * 500)
@@ -211,9 +245,22 @@ def test_default_name_validates_the_chosen_candidate() -> None:
     with pytest.raises(GrammarError):
         validate.default_name("ag-abcdefgh", worktree_name="bad#[name")
     with pytest.raises(GrammarError):
-        validate.default_name("ag-abcdefgh", kind="x" * 80)
-    with pytest.raises(GrammarError):
         validate.default_name("ag-abcdefgh", kind="a\nb")
+
+
+def test_default_name_truncates_a_long_kind_to_fit_64_code_points() -> None:
+    kind = "k" * 30 + "\u00e9" * 34  # 64 code points, as claude-session kinds allow
+    name = validate.default_name("ag-abcdefgh", kind=kind)
+    assert len(name) == 64
+    assert name == kind[:57] + " abcdef"
+    assert validate.default_name("ag-abcdefgh", kind="k" * 57) == "k" * 57 + " abcdef"
+
+
+def test_default_name_never_truncates_an_explicit_name_or_worktree_name() -> None:
+    with pytest.raises(GrammarError):
+        validate.default_name("ag-abcdefgh", name="n" * 65)
+    with pytest.raises(GrammarError):
+        validate.default_name("ag-abcdefgh", worktree_name="w" * 65)
 
 
 def test_default_name_rejects_a_malformed_agent_id() -> None:
