@@ -535,6 +535,49 @@ def test_duration_forms(tmp_path: Path, value: Any, seconds: float) -> None:
     assert cfg.handoff_timeout == seconds
 
 
+# Duration bounds: text over 32 characters and anything over 36500d (3153600000 s) are refused,
+# both inclusive at the limit, compared in Decimal (default 28-digit context, as #4 does) rather
+# than float, so a hair over 36500d that float would round down is still refused.
+# TODO(#4): these must keep matching validate.parse_duration (and the schema duration defs) when
+# config.py's private duration copy is replaced by it in the #9 wiring.
+_MAX_TEXT_AT_LIMIT = "36500." + "0" * 25 + "d"  # 32 characters, exactly 36500d
+_JUST_OVER = "36500.0000000000000001d"  # 1e-16 d over: float rounds it to 36500d, Decimal does not
+
+
+@pytest.mark.parametrize(
+    ("value", "seconds"),
+    [(_MAX_TEXT_AT_LIMIT, 3153600000.0), ("36500d", 3153600000.0),
+     ("3153600000", 3153600000.0), ("3153600000s", 3153600000.0), (3153600000, 3153600000.0),
+     (3153600000.0, 3153600000.0)],
+)  # fmt: skip
+def test_duration_bound_matches_parse_duration_accepted(
+    tmp_path: Path, value: Any, seconds: float
+) -> None:
+    assert len(_MAX_TEXT_AT_LIMIT) == 32
+    cfg = load(tmp_path, f"handoff_timeout: {json.dumps(value)}\n")
+    assert cfg.handoff_timeout == seconds
+
+
+@pytest.mark.parametrize(
+    "value",
+    [_MAX_TEXT_AT_LIMIT[:6] + "0" + _MAX_TEXT_AT_LIMIT[6:], _JUST_OVER, "36501d",
+     "3153600001", "3153600001s", 3153600001, 3153600000.5, "0", "0.000ms", 0, 0.0],
+)  # fmt: skip
+def test_duration_bound_matches_parse_duration_refused(tmp_path: Path, value: Any) -> None:
+    assert len(_MAX_TEXT_AT_LIMIT[:6] + "0" + _MAX_TEXT_AT_LIMIT[6:]) == 33
+    message = invalid(tmp_path, f"handoff_timeout: {json.dumps(value)}\n")
+    assert "handoff_timeout" in message
+
+
+@pytest.mark.parametrize(("value", "ok"), [("36500d", True), ("36501d", False), ("0", False)])
+def test_duration_bound_matches_parse_duration_env(tmp_path: Path, value: str, ok: bool) -> None:
+    env = {"AGENT_SPAWN_HANDOFF_TIMEOUT": value}
+    if ok:
+        assert load(tmp_path, None, env).handoff_timeout == 3153600000.0
+    else:
+        assert "AGENT_SPAWN_HANDOFF_TIMEOUT" in invalid(tmp_path, "{}\n", env)
+
+
 # --- promote resolution -----------------------------------------------------------------------
 
 

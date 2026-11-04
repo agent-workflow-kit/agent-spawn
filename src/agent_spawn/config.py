@@ -20,6 +20,7 @@ import re
 import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Annotated, Any
 
 import yaml
@@ -41,10 +42,21 @@ DROPIN_DIR = "config.d"
 
 # --- grammars (shape only) ------------------------------------------------------------------
 # TODO(#4): the duration, kind, label and repo-id grammars are owned by validate.py/labels.py;
-# these private copies mirror schemas/defs.json until those modules land.
+# these private copies mirror schemas/defs.json until those modules land. The duration copy must
+# accept exactly what validate.parse_duration does: strings of at most 32 characters, values up
+# to and including 36500d (3153600000 seconds, also the number form's cap), compared exactly.
 
 _DURATION = re.compile(r"(?P<n>[0-9]+(?:\.[0-9]+)?)(?P<unit>ms|s|m|h|d)?")
-_UNIT_SECONDS = {None: 1.0, "ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
+_UNIT_SECONDS = {
+    None: Decimal(1),
+    "ms": Decimal("0.001"),
+    "s": Decimal(1),
+    "m": Decimal(60),
+    "h": Decimal(3600),
+    "d": Decimal(86400),
+}
+_MAX_DURATION_TEXT = 32
+_MAX_DURATION_SECONDS = 36500 * 86400
 _KIND = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _LABEL_KEY = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 _LABEL = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}")
@@ -66,24 +78,26 @@ def _pattern(regex: re.Pattern[str], what: str) -> Any:
 
 
 def parse_duration(value: object) -> float:
-    """Seconds from a positive number, ``<number><unit>`` or a bare number string; zero refused."""
+    """Seconds from a positive number, ``<number><unit>`` or a bare number string.
+
+    Zero, text over 32 characters and anything over 36500d are refused.
+    """
     if isinstance(value, bool) or not isinstance(value, int | float | str):
         raise ValueError("a duration is a number of seconds or a string like 30s, 10m or 90")
     if isinstance(value, str):
-        match = _DURATION.fullmatch(value)
+        match = _DURATION.fullmatch(value) if len(value) <= _MAX_DURATION_TEXT else None
         if match is None:
             raise ValueError("a duration is a number of seconds or a string like 30s, 10m or 90")
-        number: str | float = match["n"]
-        unit = _UNIT_SECONDS[match["unit"]]
-    else:
-        number, unit = value, 1.0
-    try:
-        seconds = float(number) * unit
-    except OverflowError:
-        raise ValueError("duration out of range") from None
-    if not math.isfinite(seconds) or seconds <= 0:
+        seconds = Decimal(match["n"]) * _UNIT_SECONDS[match["unit"]]
+    elif isinstance(value, float) and not math.isfinite(value):
         raise ValueError("a duration must be positive and finite (zero is refused)")
-    return seconds
+    else:
+        seconds = Decimal(value)  # exact for every int and float
+    if seconds <= 0:
+        raise ValueError("a duration must be positive and finite (zero is refused)")
+    if seconds > _MAX_DURATION_SECONDS:
+        raise ValueError("a duration must be at most 36500d")
+    return float(seconds)
 
 
 Duration = Annotated[float, BeforeValidator(parse_duration)]
