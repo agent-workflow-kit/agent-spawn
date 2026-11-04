@@ -156,5 +156,21 @@ def test_a_process_that_dies_mid_transaction_loses_the_whole_change(race: Race) 
         # the database is not left locked, and the dead process's lease is taken over
         lease = store.acquire_lease(f"agent:{ID}")
         assert lease.took_over_from is not None
-        store.update_agent(lease, ID, {"status": "live"}, events=[OutboxEvent("ok")])
+        store.compare_and_set(
+            lease,
+            ID,
+            expect_status="parked",
+            changes={"status": "launching"},
+            events=[OutboxEvent("ok")],
+        )
         store.release_lease(lease)
+
+
+def test_concurrent_open_close_loops_never_fail(race: Race) -> None:
+    seed(race.state_dir)
+    race.start("loop", 3)
+    results = race.fire()
+    assert all(r["result"] == "looped" for r in results), results
+    assert [r["failures"] for r in results] == [[], [], []]
+    assert all(int(str(r["opens"])) > 10 for r in results)
+    race.finish()

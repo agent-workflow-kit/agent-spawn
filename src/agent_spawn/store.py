@@ -79,6 +79,7 @@ _LEASE_KEY = re.compile(r"(?:agent|delivery):ag-[a-z2-7]{8}|reconcile")
 _BUSY_CODES = frozenset({5, 6})  # SQLITE_BUSY, SQLITE_LOCKED
 _IMMUTABLE = frozenset({"agent_id", "created"})
 _ALLOCATION_ATTEMPTS = 32
+_AUTOCHECKPOINT = 1000  # SQLite's default wal_autocheckpoint (pages)
 RELEASE_DEADLINE = 60.0
 _OPEN_FLAGS = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 
@@ -272,6 +273,13 @@ def _check_version(version: int | None, wanted: int, *, migrate: bool) -> None:
         raise SchemaOlder(0 if version is None else version, wanted)
 
 
+def _hold_checkpoints(conn: sqlite3.Connection, *, hold: bool) -> None:
+    """Stop (or restore) this connection's WAL checkpoints: on close and automatic ones."""
+    with _mapped():
+        conn.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, hold)
+        conn.execute(f"PRAGMA wal_autocheckpoint = {0 if hold else _AUTOCHECKPOINT}")
+
+
 def _peek_version(path: Path, file_id: tuple[int, int], busy_timeout: float) -> int | None:
     """Read the schema version on a read-only connection, which can never write the database
     or checkpoint its WAL (a newer database stays exactly as the newer agent-spawn left it)."""
@@ -348,6 +356,9 @@ class Store:
         conn = _connect(str(path), busy_timeout)
         store = cls(conn, path, gw, identity=identity)
         try:
+            # A newer agent-spawn may migrate between the peek and this open: until this
+            # connection's own version check passes, it must not checkpoint (on close or commit).
+            _hold_checkpoints(conn, hold=True)
             store._setup(
                 file_id=file_id,
                 uid=uid,
@@ -375,6 +386,7 @@ class Store:
             version = _read_version(self._conn, self.path)
         _check_same_file(self.path, file_id)
         _check_version(version, wanted, migrate=migrate)
+        _hold_checkpoints(self._conn, hold=False)
         self._enable_wal(busy_timeout)
         with _mapped():
             self._conn.execute("PRAGMA synchronous = FULL")
@@ -781,7 +793,11 @@ class Store:
         touch: bool = True,
     ) -> dict[str, Any]:
         """Write ``changes`` under the agent's lease whatever the status (``ack``, ``stop``,
-        bookkeeping). ``AgentMissing`` when the record is gone."""
+        bookkeeping). ``AgentMissing`` when the record is gone. ``status`` is not writable
+        here (``ValueError``): status changes go through ``compare_and_set`` or the lifecycle
+        helpers, which check ``TRANSITIONS``."""
+        if "status" in changes:
+            raise ValueError("update_agent cannot write status: use compare_and_set or a helper")
         return self._write(
             lease, agent_id, changes, wanted=(), expect=None, events=events, touch=touch
         )
@@ -1394,9 +1410,12 @@ def _prepare_files(state_dir: Path, *, create: bool, uid: int) -> tuple[Path, tu
 
     The state dir itself may be a symlink (the user chose that); ``state.db`` and its
     ``-wal``/``-shm``/``-journal`` files may not, and each must be a regular file of this user
-    with a single link. Each is opened with ``O_NOFOLLOW``, checked with ``fstat`` and
-    tightened with ``fchmod`` through that descriptor. Returns the path and the database's
-    ``(st_dev, st_ino)``, checked again after SQLite opened the path.
+    with a single link. Each is checked with ``lstat``; only a file whose mode is loose is
+    opened (``O_NOFOLLOW``), checked again with ``fstat`` and tightened with ``fchmod``
+    through that descriptor (closing a descriptor drops every POSIX lock this process holds
+    on the file, so a file with the right mode is never opened). A sidecar that SQLite deleted
+    meanwhile is skipped. Returns the path and the database's ``(st_dev, st_ino)``, checked
+    again after SQLite opened the path.
     """
     try:
         directory = Path(os.path.realpath(state_dir))
@@ -1413,17 +1432,18 @@ def _prepare_files(state_dir: Path, *, create: bool, uid: int) -> tuple[Path, tu
             os.chmod(directory, DIR_MODE)
         db = directory / DB_NAME
         for suffix in _SIDECARS:
-            side = Path(str(db) + suffix)
-            fd = _open_leaf(side)
-            if fd is not None:
-                _secure_fd(fd, side, uid)
-        fd = _open_leaf(db)
-        if fd is None:
+            _check_leaf(Path(str(db) + suffix), uid, sidecar=True)
+        file_id = _check_leaf(db, uid, sidecar=False)
+        if file_id is None:
             if not create:
                 raise StoreMissing(f"no database {db}")
             fd = _open_leaf(db, create=True)
-            assert fd is not None
-        return db, _secure_fd(fd, db, uid)
+            if fd is not None:
+                os.close(fd)  # just made (or made by a racer): no connection holds it yet
+            file_id = _check_leaf(db, uid, sidecar=False)
+            if file_id is None:
+                raise StoreError(f"{db} disappeared while it was created")
+        return db, file_id
     except (OSError, ValueError) as exc:
         raise StoreError(f"cannot prepare state directory {state_dir}: {exc}") from exc
 
@@ -1446,21 +1466,42 @@ def _open_leaf(path: Path, *, create: bool = False) -> int | None:
         raise
 
 
-def _secure_fd(fd: int, path: Path, uid: int) -> tuple[int, int]:
-    """Check an open leaf (regular, this user's, one link), tighten it to 0600, close it."""
+def _check_leaf(path: Path, uid: int, *, sidecar: bool) -> tuple[int, int] | None:
+    """Check a leaf by ``lstat`` (regular, this user's, one link, not a symlink) and tighten a
+    loose mode to 0600. ``None`` when it does not exist, or is a sidecar SQLite deleted while
+    it was checked (normal on a last close or WAL switch). Returns ``(st_dev, st_ino)``."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        raise StoreError(f"{path} is a symbolic link: refusing to follow it")
+    _check_info(info, path, uid)
+    if stat.S_IMODE(info.st_mode) == FILE_MODE:
+        return info.st_dev, info.st_ino
+    fd = _open_leaf(path)
+    if fd is None:
+        if sidecar:
+            return None
+        raise StoreError(f"{path} disappeared while it was checked")
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise StoreError(f"{path} is not a regular file")
-        if info.st_uid != uid:
-            raise StoreError(f"{path} is not owned by this user")
-        if info.st_nlink != 1:
-            raise StoreError(f"{path} has {info.st_nlink} hard links: refusing it")
-        if stat.S_IMODE(info.st_mode) != FILE_MODE:
-            os.fchmod(fd, FILE_MODE)
+        if info.st_nlink == 0 and sidecar:
+            return None  # SQLite deleted it between our lstat and open
+        _check_info(info, path, uid)
+        os.fchmod(fd, FILE_MODE)
         return info.st_dev, info.st_ino
     finally:
         os.close(fd)
+
+
+def _check_info(info: os.stat_result, path: Path, uid: int) -> None:
+    if not stat.S_ISREG(info.st_mode):
+        raise StoreError(f"{path} is not a regular file")
+    if info.st_uid != uid:
+        raise StoreError(f"{path} is not owned by this user")
+    if info.st_nlink != 1:
+        raise StoreError(f"{path} has {info.st_nlink} hard links: refusing it")
 
 
 def _check_same_file(path: Path, file_id: tuple[int, int]) -> None:
@@ -1474,12 +1515,23 @@ def _check_same_file(path: Path, file_id: tuple[int, int]) -> None:
 
 
 def _fix_sidecar_modes(db: Path, uid: int) -> None:
-    """Check and tighten the sidecars SQLite created (a WAL checkpoint may have removed them)."""
+    """Check the sidecars SQLite created, by ``lstat`` only: the connection is open, and
+    opening and closing a sidecar would drop its locks on the ``-shm``. SQLite gives them the
+    database's mode, so a loose one is refused (the next open tightens it before SQLite
+    opens the database); one a checkpoint removed is skipped."""
     for suffix in _SIDECARS:
         side = Path(str(db) + suffix)
         try:
-            fd = _open_leaf(side)
-            if fd is not None:
-                _secure_fd(fd, side, uid)
+            info = os.lstat(side)
+        except FileNotFoundError:
+            continue
         except OSError as exc:
             raise StoreError(f"cannot check {side}: {exc}") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise StoreError(f"{side} is a symbolic link: refusing to follow it")
+        _check_info(info, side, uid)
+        if stat.S_IMODE(info.st_mode) != FILE_MODE:
+            raise StoreError(
+                f"{side} has mode {stat.S_IMODE(info.st_mode):04o}, not "
+                f"{FILE_MODE:04o}: refusing it"
+            )

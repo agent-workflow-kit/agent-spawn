@@ -33,6 +33,24 @@ def say(**fields: object) -> None:
     print(json.dumps(fields), flush=True)
 
 
+def loop(state_dir: str, go_file: Path, seconds: float = 3.0) -> None:
+    """Open, read, write and close in a loop: every last close deletes the WAL sidecars."""
+    say(event="ready")
+    wait_for(go_file)
+    failures: list[str] = []
+    opens = 0
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            with Store.open(state_dir) as store:
+                store.get_agent("ag-abcdefgh")
+                store.record_relay_event(f"loop-{os.getpid()}", str(opens))
+            opens += 1
+        except Exception as exc:  # every failure is reported, none is retried
+            failures.append(f"{type(exc).__name__}: {exc}")
+    say(result="looped", opens=opens, failures=failures[:5])
+
+
 def main() -> None:
     state_dir, mode, go, release = sys.argv[1:5]
     agent_id = sys.argv[5] if len(sys.argv) > 5 else "ag-aaaaaaaa"
@@ -42,6 +60,9 @@ def main() -> None:
         wait_for(go_file)
         with Store.open(state_dir) as store:
             say(result="opened", version=store.schema_version())
+        return
+    if mode == "loop":
+        loop(state_dir, go_file)
         return
     with Store.open(state_dir) as store:
         say(event="ready")

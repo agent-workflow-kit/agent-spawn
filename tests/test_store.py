@@ -930,7 +930,8 @@ def test_deleting_an_agent_removes_its_dependents(store: Store) -> None:
         store.edit_labels(lease, ID, "add", lbl("a=1"))
         store.put_run(lease, ID, 1, {"mode": "headless"})
         store.put_hold(lease, ID, "wt-1", "/p", owned=True)
-        store.update_agent(lease, ID, {"status": "live"}, events=[OutboxEvent("e")])
+        store.compare_and_set(lease, ID, expect_status="parked", changes={"status": "launching"})
+        store.mark_live(lease, ID, events=[OutboxEvent("e")])
         assert store.delete_agent(lease, ID)
         assert not store.delete_agent(lease, ID)
     for table in ("agent_labels", "agent_runs", "agent_holds", "events", "label_mirror_pending"):
@@ -1572,3 +1573,149 @@ def test_a_lifecycle_helper_on_a_missing_agent_is_agent_missing(store: Store) ->
         ):
             with pytest.raises(AgentMissing):
                 call()
+
+
+# -- review round 2 -----------------------------------------------------------------------
+
+
+def _vanished_fd(tmp_path: Path) -> int:
+    """An open descriptor of a file that is already unlinked (``st_nlink == 0``)."""
+    gone = tmp_path / f"gone-{time.monotonic_ns()}"
+    gone.write_bytes(b"")
+    os.chmod(gone, 0o644)
+    fd = os.open(gone, os.O_RDWR)
+    gone.unlink()
+    return fd
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_a_sidecar_unlinked_after_it_was_opened_is_skipped(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    with Store.open(state_dir):
+        pass
+    side = state_dir / f"state.db{suffix}"
+    side.write_bytes(b"")
+    os.chmod(side, 0o644)  # loose, so the check opens it to tighten it
+    import agent_spawn.store as store_module
+
+    real_open = store_module._open_leaf
+    skipped: list[Path] = []
+
+    def vanishing(path: Path, *, create: bool = False) -> int | None:
+        fd = real_open(path, create=create)
+        if path == side:
+            skipped.append(path)
+            path.unlink()  # SQLite deleted it between our lstat and fstat
+        return fd
+
+    monkeypatch.setattr(store_module, "_open_leaf", vanishing)
+    with Store.open(state_dir) as opened:
+        assert opened.schema_version() == SCHEMA_VERSION
+    assert skipped == [side]
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_a_sidecar_gone_before_it_was_opened_is_skipped(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    with Store.open(state_dir):
+        pass
+    side = state_dir / f"state.db{suffix}"
+    side.write_bytes(b"")
+    os.chmod(side, 0o644)
+    import agent_spawn.store as store_module
+
+    real_open = store_module._open_leaf
+
+    def vanishing(path: Path, *, create: bool = False) -> int | None:
+        if path == side:
+            path.unlink()  # deleted between our lstat and open: ENOENT
+        return real_open(path, create=create)
+
+    monkeypatch.setattr(store_module, "_open_leaf", vanishing)
+    with Store.open(state_dir) as opened:
+        assert opened.schema_version() == SCHEMA_VERSION
+
+
+def test_a_state_db_unlinked_after_it_was_opened_is_refused(
+    state_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with Store.open(state_dir):
+        pass
+    os.chmod(state_dir / "state.db", 0o644)
+    import agent_spawn.store as store_module
+
+    real_open = store_module._open_leaf
+
+    def vanishing(path: Path, *, create: bool = False) -> int | None:
+        if path.name == "state.db":
+            return _vanished_fd(tmp_path)
+        return real_open(path, create=create)
+
+    monkeypatch.setattr(store_module, "_open_leaf", vanishing)
+    with pytest.raises(StoreError, match="0 hard links"):
+        Store.open(state_dir)
+
+
+def test_files_with_the_right_mode_are_checked_without_opening_them(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Closing a descriptor drops this process's POSIX locks on the file (SQLite's on the
+    ``-shm``), so a check never opens a file it need not tighten."""
+    import agent_spawn.store as store_module
+
+    with Store.open(state_dir) as first:
+        new_agent(first)
+        assert (state_dir / "state.db-shm").exists()
+        opened: list[Path] = []
+        real_open = store_module._open_leaf
+
+        def recording(path: Path, *, create: bool = False) -> int | None:
+            opened.append(path)
+            return real_open(path, create=create)
+
+        monkeypatch.setattr(store_module, "_open_leaf", recording)
+        with Store.open(state_dir) as second:
+            assert second.get_agent(ID) is not None
+        assert opened == []
+        assert first.get_agent(ID) is not None
+
+
+def test_update_agent_refuses_a_status_write(store: Store) -> None:
+    new_agent(store)
+    with store.lease(f"agent:{ID}") as lease:
+        with pytest.raises(ValueError, match="status"):
+            store.update_agent(lease, ID, {"status": "launching"})
+        with pytest.raises(ValueError, match="status"):
+            store.update_agent(lease, ID, {"status": "parked", "name": "x"})
+    agent = store.get_agent(ID)
+    assert agent is not None and agent["status"] == "parked" and agent["name"] == "agent"
+
+
+def test_a_newer_schema_seen_only_by_the_read_write_open_leaves_the_files_alone(
+    state_dir: Path, proc_tracker: ProcTracker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with Store.open(state_dir):
+        pass
+    db = state_dir / "state.db"
+    child = proc_tracker.popen(
+        [sys.executable, "-I", "-c", _NEWER_WRITER, str(db), str(SCHEMA_VERSION + 1)]
+    )
+    assert child.wait(timeout=30) == 0
+    wal = state_dir / "state.db-wal"
+    assert wal.stat().st_size > 0
+    before = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in (db, wal)}
+    import agent_spawn.store as store_module
+
+    # a newer agent-spawn migrated between the read-only peek and the read-write open
+    monkeypatch.setattr(store_module, "_peek_version", lambda *a, **k: SCHEMA_VERSION)
+    with pytest.raises(CliError) as caught:
+        Store.open(state_dir)
+    assert caught.value.code == "schema_newer"
+    assert {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in (db, wal)} == before
+
+
+def test_autocheckpoint_is_restored_after_the_version_check(store: Store) -> None:
+    assert store._conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 1000
+    assert store._conn.getconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE) is False
