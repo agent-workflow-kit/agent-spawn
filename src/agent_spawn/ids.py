@@ -7,7 +7,9 @@ and a prefix of 4 to 7 characters; a prefix never matches a torn-down agent, a f
 record always does (the caller decides what a torn-down agent means), and a reserved id without a
 record is unknown (exit 10).
 
-The state store (#6) provides the ``AgentIndex``.
+``store.Store`` provides the ``AgentIndex``: ``insert_agent`` reserves the id in a permanent table
+with a unique constraint (launch step 3), so ``Store.insert_new_agent`` re-allocates when two
+concurrent launches drew the same id.
 """
 
 from __future__ import annotations
@@ -59,12 +61,6 @@ class AgentIndex(Protocol):
     def entries_with_prefix(self, prefix: str) -> Sequence[IdEntry]: ...
 
     def is_reserved(self, agent_id: str) -> bool: ...
-
-
-# TODO(#6): implement AgentIndex on the state store: one indexed prefix query over `agents`
-# (tombstones included) and a permanent allocated-ids table for `is_reserved`. Insert the id
-# into that table with a unique constraint at launch step 3 (and at fork insertion), and on a
-# conflict allocate again: `new_agent_id` alone cannot close the race between concurrent launches.
 
 
 def is_agent_id(value: str) -> bool:
