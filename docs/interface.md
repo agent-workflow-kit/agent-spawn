@@ -152,7 +152,7 @@ agent-spawn's own launch flags:
 
 Durations: a positive number of seconds (fractions allowed), or `<number><unit>` with unit `ms`, `s`, `m`, `h` or `d`; in flags and the environment a bare number string means seconds. The number is ASCII digits, optionally `.` and more digits (no sign, exponent, whitespace, leading or trailing `.`, underscore or non-ASCII digit; leading zeros are fine). Zero exits 2 (also written as `0.000ms`), as does a duration over `36500d` (as in claude-session) or text over 32 characters.
 
-Times (`--since <time|duration>` of [`list`](#list) and [`export`](#export)): a value that is a duration is tried first and means that long ago (so bare digits such as `20240101` are seconds); otherwise `YYYY-MM-DD` or `YYYY-MM-DD[T ]HH:MM[:SS[.f]]` with 1 to 6 fraction digits and an optional `Z` or `±HH:MM` offset (uppercase `T` and `Z` only); no offset means UTC. A date or time that does not exist, an offset outside `±23:59`, or an instant out of range once the offset is applied exits 2.
+Times (`--since <time|duration>` of [`list`](#list) and [`export`](#export)): a value that is a duration is tried first and means that long ago (so bare digits such as `20240101` are seconds); otherwise `YYYY-MM-DD` or `YYYY-MM-DD[T ]HH:MM[:SS[.f]][Z|±HH:MM]` with 1 to 6 fraction digits (uppercase `T` and `Z` only); a bare date takes no offset, and no offset means UTC. A date or time that does not exist, an offset outside `±23:59`, or an instant out of range once the offset is applied exits 2.
 
 ## Resume order
 

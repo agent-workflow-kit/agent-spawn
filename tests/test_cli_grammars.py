@@ -45,6 +45,7 @@ BAD = {
     "prune older-than bad": ["prune", "--older-than", "forever"],
     "since bad": ["list", "--since", "yesterday"],
     "export since bad": ["export", "--since", "0"],
+    "since date with an offset": ["list", "--since", "2026-01-01+01:00"],
     "merged-head short": ["teardown", ID, "--merged-head", "abc123"],
     "merged-head uppercase": ["teardown", ID, "--merged-head", "A" * 40],
     "merged-head newline": ["teardown", ID, "--merged-head", "a" * 40 + "\n"],

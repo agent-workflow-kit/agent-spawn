@@ -401,6 +401,7 @@ def test_since_iso_time_is_utc_without_an_offset(text: str, expected: datetime) 
         "2026-11-01T",
         "20261101T1030",
         "2026-11-01T10:30:15 +02:00",
+        "2026-01-01+01:00",
         "２026-11-01",
         "0",
         "0m",
