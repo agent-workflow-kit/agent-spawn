@@ -160,8 +160,11 @@ def test_an_unusable_pre_scanned_result_file_is_a_warning(
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [
-        (["label", "--decision-id", "a", "add", "--decision-id", "b", "ag-x", "k=v"], ["a", "b"]),
-        (["label", "--decision-id", "a", "remove", "ag-x", "k=v"], ["a"]),
+        (
+            ["label", "--decision-id", "a", "add", "--decision-id", "b", "ag-abcd", "k=v"],
+            ["a", "b"],
+        ),
+        (["label", "--decision-id", "a", "remove", "ag-abcd", "k=v"], ["a"]),
         (
             [
                 "--decision-id",
@@ -170,7 +173,7 @@ def test_an_unusable_pre_scanned_result_file_is_a_warning(
                 "--decision-id",
                 "a",
                 "add",
-                "ag-x",
+                "ag-abcd",
                 "--decision-id=b",
                 "k=v",
             ],
@@ -234,7 +237,7 @@ def test_browse_errors_leave_its_result_file_absent(
         raise CliError.of("not_found", "no agent")
 
     monkeypatch.setitem(HANDLERS, "browse", failing)
-    assert cli.main(["browse", "--focus", "ag-x", "--result-file", str(path)]) == 10
+    assert cli.main(["browse", "--focus", "ag-abcd", "--result-file", str(path)]) == 10
     assert not path.exists()
 
 
@@ -259,10 +262,10 @@ def test_human_output_survives_an_ascii_stdout(monkeypatch: pytest.MonkeyPatch) 
     ("argv", "agent_id", "pairs"),
     [
         (["label", "add", "ag-abcd", "--json", "k=v"], "ag-abcd", ["k=v"]),
-        (["label", "remove", "ag-x", "k=v", "--dry-run", "j=w"], "ag-x", ["k=v", "j=w"]),
+        (["label", "remove", "ag-abcd", "k=v", "--dry-run", "j=w"], "ag-abcd", ["k=v", "j=w"]),
         (
-            ["label", "add", "ag-x", "--quiet", "a=1", "--json", "b=2", "c=3"],
-            "ag-x",
+            ["label", "add", "ag-abcd", "--quiet", "a=1", "--json", "b=2", "c=3"],
+            "ag-abcd",
             ["a=1", "b=2", "c=3"],
         ),
         (["label", "add", "--session", "cs-1", "--json", "pr=1"], None, ["pr=1"]),
@@ -278,9 +281,9 @@ def test_label_items_may_be_intermixed_with_flags(
 @pytest.mark.parametrize(
     "argv",
     [
-        ["label", "add", "ag-x", "k=v", "--nope"],
-        ["label", "add", "ag-x", "--json", "-k=v"],
-        ["show", "ag-x", "--json", "extra"],
+        ["label", "add", "ag-abcd", "k=v", "--nope"],
+        ["label", "add", "ag-abcd", "--json", "-k=v"],
+        ["show", "ag-abcd", "--json", "extra"],
     ],
 )
 def test_unknown_flags_and_extra_positionals_are_still_usage_errors(argv: list[str]) -> None:
@@ -300,7 +303,7 @@ def test_supervise_handoff_flags_come_as_a_pair(extra: list[str]) -> None:
 
 
 def test_supervise_with_both_handoff_flags_parses() -> None:
-    argv = [*INTERNAL_GLOBALS, "supervise", "ag-x", "--handoff", "/s", "--handoff-timeout", "5"]
+    argv = [*INTERNAL_GLOBALS, "supervise", "ag-abcd", "--handoff", "/s", "--handoff-timeout", "5"]
     assert cli.parse_invocation(argv).command == "supervise"
 
 
