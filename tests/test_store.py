@@ -1719,3 +1719,70 @@ def test_a_newer_schema_seen_only_by_the_read_write_open_leaves_the_files_alone(
 def test_autocheckpoint_is_restored_after_the_version_check(store: Store) -> None:
     assert store._conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 1000
     assert store._conn.getconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE) is False
+
+
+# -- review round 3 -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["state.db", "state.db-shm"])
+def test_a_loose_file_is_refused_unopened_while_a_store_is_open_in_process(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """Opening a file to tighten it and closing it would drop the open Store's POSIX locks on
+    it, so while a Store is open in this process a loose mode is refused instead."""
+    import agent_spawn.store as store_module
+
+    with Store.open(state_dir) as first:
+        new_agent(first)
+        os.chmod(state_dir / name, 0o644)
+        opened: list[Path] = []
+        real_open = store_module._open_leaf
+
+        def recording(path: Path, *, create: bool = False) -> int | None:
+            opened.append(path)
+            return real_open(path, create=create)
+
+        monkeypatch.setattr(store_module, "_open_leaf", recording)
+        with pytest.raises(StoreError, match=rf"{name} has mode 0644.*store is open"):
+            Store.open(state_dir)
+        assert opened == []
+        assert first.get_agent(ID) is not None
+    with Store.open(state_dir):  # closed again: the next open tightens it
+        pass
+    assert stat.S_IMODE(os.stat(state_dir / "state.db").st_mode) == 0o600
+
+
+def test_closing_a_store_twice_counts_it_once(state_dir: Path) -> None:
+    first = Store.open(state_dir)
+    second = Store.open(state_dir)
+    second.close()
+    second.close()
+    os.chmod(state_dir / "state.db", 0o644)
+    with pytest.raises(StoreError, match="store is open"):
+        Store.open(state_dir)
+    first.close()
+    with Store.open(state_dir):
+        pass
+    assert stat.S_IMODE(os.stat(state_dir / "state.db").st_mode) == 0o600
+
+
+def test_state_db_is_checked_before_its_sidecars(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A racer that saw ``state.db`` loose may create a loose ``-shm`` after a sidecar check
+    that ran first; checking the database first closes that window."""
+    import agent_spawn.store as store_module
+
+    with Store.open(state_dir):
+        pass
+    checked: list[str] = []
+    real_check = store_module._check_leaf
+
+    def recording(path: Path, uid: int, *, sidecar: bool) -> tuple[int, int] | None:
+        checked.append(path.name)
+        return real_check(path, uid, sidecar=sidecar)
+
+    monkeypatch.setattr(store_module, "_check_leaf", recording)
+    with Store.open(state_dir):
+        pass
+    assert checked == ["state.db", "state.db-wal", "state.db-shm", "state.db-journal"]

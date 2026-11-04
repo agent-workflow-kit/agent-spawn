@@ -27,6 +27,7 @@ import os
 import re
 import sqlite3
 import stat
+import threading
 import urllib.parse
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -81,6 +82,23 @@ _IMMUTABLE = frozenset({"agent_id", "created"})
 _ALLOCATION_ATTEMPTS = 32
 _AUTOCHECKPOINT = 1000  # SQLite's default wal_autocheckpoint (pages)
 RELEASE_DEADLINE = 60.0
+# Stores open in this process. While any is, a loose file is refused rather than opened to
+# tighten it: closing that descriptor would drop the open connection's POSIX locks on it.
+_open_stores = 0
+_open_stores_lock = threading.Lock()
+
+
+def _count_open_store(delta: int) -> None:
+    global _open_stores
+    with _open_stores_lock:
+        _open_stores += delta
+
+
+def _stores_open() -> bool:
+    with _open_stores_lock:
+        return _open_stores > 0
+
+
 _OPEN_FLAGS = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 
 # interface.md "Agent statuses" and "Lifecycle transitions": the statuses each status may move
@@ -310,7 +328,12 @@ def _check_columns(changes: Mapping[str, object], columns: Mapping[str, str]) ->
 
 
 class Store:
-    """An open ``state.db``. One instance per process and thread."""
+    """An open ``state.db``. One instance per process and thread.
+
+    While any Store opened by :meth:`open` is open in this process, another open refuses a
+    ``state.db`` or sidecar with a loose mode instead of opening it to tighten it (closing that
+    descriptor would drop the open connection's POSIX locks on the file).
+    """
 
     def __init__(
         self,
@@ -325,6 +348,7 @@ class Store:
         self.gateway = gateway
         self._identity = identity
         self._depth = 0  # open transaction levels: 0 none, 1 BEGIN, more are savepoints
+        self._counted = False  # counted in _open_stores until closed
 
     # -- opening -------------------------------------------------------------------------
 
@@ -369,6 +393,8 @@ class Store:
         except BaseException:
             conn.close()
             raise
+        _count_open_store(1)
+        store._counted = True
         return store
 
     def _setup(
@@ -441,6 +467,9 @@ class Store:
 
     def close(self) -> None:
         self._conn.close()
+        if self._counted:
+            self._counted = False
+            _count_open_store(-1)
 
     def __enter__(self) -> Store:
         return self
@@ -1413,9 +1442,10 @@ def _prepare_files(state_dir: Path, *, create: bool, uid: int) -> tuple[Path, tu
     with a single link. Each is checked with ``lstat``; only a file whose mode is loose is
     opened (``O_NOFOLLOW``), checked again with ``fstat`` and tightened with ``fchmod``
     through that descriptor (closing a descriptor drops every POSIX lock this process holds
-    on the file, so a file with the right mode is never opened). A sidecar that SQLite deleted
-    meanwhile is skipped. Returns the path and the database's ``(st_dev, st_ino)``, checked
-    again after SQLite opened the path.
+    on the file, so a file with the right mode is never opened, and while a Store is open in
+    this process a loose one is refused). ``state.db`` is checked before the sidecars. A
+    sidecar that SQLite deleted meanwhile is skipped. Returns the path and the database's
+    ``(st_dev, st_ino)``, checked again after SQLite opened the path.
     """
     try:
         directory = Path(os.path.realpath(state_dir))
@@ -1431,8 +1461,8 @@ def _prepare_files(state_dir: Path, *, create: bool, uid: int) -> tuple[Path, tu
         if stat.S_IMODE(info.st_mode) != DIR_MODE:
             os.chmod(directory, DIR_MODE)
         db = directory / DB_NAME
-        for suffix in _SIDECARS:
-            _check_leaf(Path(str(db) + suffix), uid, sidecar=True)
+        # The database first: a racer that saw it loose may create a loose sidecar, which a
+        # sidecar check that ran before the database's would miss.
         file_id = _check_leaf(db, uid, sidecar=False)
         if file_id is None:
             if not create:
@@ -1443,6 +1473,8 @@ def _prepare_files(state_dir: Path, *, create: bool, uid: int) -> tuple[Path, tu
             file_id = _check_leaf(db, uid, sidecar=False)
             if file_id is None:
                 raise StoreError(f"{db} disappeared while it was created")
+        for suffix in _SIDECARS:
+            _check_leaf(Path(str(db) + suffix), uid, sidecar=True)
         return db, file_id
     except (OSError, ValueError) as exc:
         raise StoreError(f"cannot prepare state directory {state_dir}: {exc}") from exc
@@ -1468,8 +1500,9 @@ def _open_leaf(path: Path, *, create: bool = False) -> int | None:
 
 def _check_leaf(path: Path, uid: int, *, sidecar: bool) -> tuple[int, int] | None:
     """Check a leaf by ``lstat`` (regular, this user's, one link, not a symlink) and tighten a
-    loose mode to 0600. ``None`` when it does not exist, or is a sidecar SQLite deleted while
-    it was checked (normal on a last close or WAL switch). Returns ``(st_dev, st_ino)``."""
+    loose mode to 0600 (refused instead while a Store is open in this process). ``None`` when
+    it does not exist, or is a sidecar SQLite deleted while it was checked (normal on a last
+    close or WAL switch). Returns ``(st_dev, st_ino)``."""
     try:
         info = os.lstat(path)
     except FileNotFoundError:
@@ -1479,6 +1512,12 @@ def _check_leaf(path: Path, uid: int, *, sidecar: bool) -> tuple[int, int] | Non
     _check_info(info, path, uid)
     if stat.S_IMODE(info.st_mode) == FILE_MODE:
         return info.st_dev, info.st_ino
+    if _stores_open():
+        raise StoreError(
+            f"{path} has mode {stat.S_IMODE(info.st_mode):04o}, not {FILE_MODE:04o}, and a "
+            "store is open in this process: refusing it (tightening it would drop that "
+            "store's locks on it)"
+        )
     fd = _open_leaf(path)
     if fd is None:
         if sidecar:
