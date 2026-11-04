@@ -270,8 +270,16 @@ def test_peer_credentials_real_socketpair() -> None:
 # ---- review round 1 ----------------------------------------------------------------------
 
 
-def test_pidfd_einval_for_a_pid_that_now_names_a_thread_reads_as_gone() -> None:
-    gw = FakeGateway(pidfd_error=OSError(errno.EINVAL, "Invalid argument"))
+# Kernels before the pidfd uapi change report a non-leader thread as EINVAL; newer ones
+# (as on current CI runners) report ENOENT. Both must read the same way.
+_NON_LEADER_ERRNOS = pytest.mark.parametrize("code", [errno.EINVAL, errno.ENOENT])
+
+
+@_NON_LEADER_ERRNOS
+def test_pidfd_non_leader_error_for_a_pid_that_now_names_a_thread_reads_as_gone(
+    code: int,
+) -> None:
+    gw = FakeGateway(pidfd_error=OSError(code, os.strerror(code)))
     gw.add(70, tgid=69, start=1000)  # PID 70 is now a non-leader thread of 69
     identity = ProcessIdentity(70, 1000, BOOT)
     assert procs.open_verified(identity, gateway=gw) is None
@@ -280,17 +288,19 @@ def test_pidfd_einval_for_a_pid_that_now_names_a_thread_reads_as_gone() -> None:
     assert gw.signals == [] and gw.killed_by_pid == []
 
 
-def test_pidfd_einval_for_a_vanished_pid_reads_as_gone() -> None:
-    gw = FakeGateway(pidfd_error=OSError(errno.EINVAL, "Invalid argument"))
+@_NON_LEADER_ERRNOS
+def test_pidfd_non_leader_error_for_a_vanished_pid_reads_as_gone(code: int) -> None:
+    gw = FakeGateway(pidfd_error=OSError(code, os.strerror(code)))
     assert procs.open_verified(ProcessIdentity(71, 1000, BOOT), gateway=gw) is None
 
 
-def test_pidfd_einval_for_a_thread_group_leader_still_raises() -> None:
-    gw = FakeGateway(pidfd_error=OSError(errno.EINVAL, "Invalid argument"))
+@_NON_LEADER_ERRNOS
+def test_pidfd_non_leader_error_for_a_thread_group_leader_still_raises(code: int) -> None:
+    gw = FakeGateway(pidfd_error=OSError(code, os.strerror(code)))
     gw.add(72, start=1000)
     with pytest.raises(OSError) as caught:
         procs.forward_signal(ProcessIdentity(72, 1000, BOOT), signal.SIGTERM, gateway=gw)
-    assert caught.value.errno == errno.EINVAL
+    assert caught.value.errno == code
     assert gw.signals == []
 
 

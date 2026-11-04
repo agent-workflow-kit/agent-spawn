@@ -342,8 +342,10 @@ class ProcHandle:
 def _open_fd(pid: int, gw: Gateway) -> int | None:
     """Open a pidfd for ``pid``; ``None`` when no such process (thread-group leader) exists.
 
-    ``EINVAL`` with a valid PID means the PID now names a thread that is not a leader (a
-    reused PID): that reads as gone. Every other failure propagates, and nothing is sent.
+    ``EINVAL`` (older kernels) or ``ENOENT`` (newer kernels) with a valid PID means the PID
+    may now name a thread that is not a leader (a reused PID): when ``/proc/<pid>/status``
+    confirms that, or the entry has vanished, it reads as gone. Every other failure
+    propagates, and nothing is sent.
     """
     if not 0 < pid <= _PID_MAX:
         return None
@@ -354,7 +356,7 @@ def _open_fd(pid: int, gw: Gateway) -> int | None:
     except OSError as exc:
         if exc.errno == errno.ESRCH:
             return None
-        if exc.errno == errno.EINVAL:
+        if exc.errno in (errno.EINVAL, errno.ENOENT):
             status = _read_status(pid, gw)
             if status is None or status.get("Tgid") != str(pid):
                 return None
