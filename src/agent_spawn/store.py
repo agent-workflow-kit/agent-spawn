@@ -5,23 +5,29 @@ Rules every method follows:
 * Untrusted text only ever travels as a bound parameter. Column names come from the fixed specs
   in ``store_schema``; a name outside them is a ``ValueError``, never interpolated.
 * Every write is one ``BEGIN IMMEDIATE`` transaction, so a change and its outbox events commit
-  together or not at all. ``transaction()`` joins an enclosing transaction.
+  together or not at all. A nested ``transaction()`` is a savepoint: a caught inner failure
+  undoes only the inner work.
 * A lifecycle entry is a compare-and-set under the agent's lease (interface.md, Lifecycle
-  transitions). The lease is verified again inside the write transaction.
+  transitions), through the named helpers (``enter_resume``, ``enter_teardown``, ``mark_live``,
+  ``park`` ...). The lease is verified again inside the write transaction.
+* Every sqlite3 error, and text that cannot be encoded or decoded, surfaces as a ``StoreError``.
 * Clocks, ``/proc`` reads and sleeping go through the gateway and ``procs``.
 
 Leases are keyed by holder identity (PID, start time, boot id). A lease whose holder is dead
-(no such process, another start time or boot id, or a zombie) is taken over at once; a live
-holder is never preempted, however long it holds. An unparseable process entry is an error,
-never "dead".
+(another boot id, no such process, another start time, or a zombie) is taken over at once; a
+live holder is never preempted, however long it holds, and a lease is not reentrant. Liveness is
+decided outside the write lock, and the takeover happens only if the stored holder is unchanged.
+An unparseable process entry or holder is an error, never "dead".
 """
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import sqlite3
 import stat
+import urllib.parse
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -58,6 +64,7 @@ __all__ = [
     "StoreCorrupt",
     "StoreError",
     "StoreMissing",
+    "TRANSITIONS",
     "default_state_dir",
 ]
 
@@ -72,6 +79,28 @@ _LEASE_KEY = re.compile(r"(?:agent|delivery):ag-[a-z2-7]{8}|reconcile")
 _BUSY_CODES = frozenset({5, 6})  # SQLITE_BUSY, SQLITE_LOCKED
 _IMMUTABLE = frozenset({"agent_id", "created"})
 _ALLOCATION_ATTEMPTS = 32
+RELEASE_DEADLINE = 60.0
+_OPEN_FLAGS = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+# interface.md "Agent statuses" and "Lifecycle transitions": the statuses each status may move
+# to. A retried teardown re-enters ``tearing_down`` over a dead teardown process.
+TRANSITIONS: Mapping[str, frozenset[str]] = {
+    "parked": frozenset({"launching", "tearing_down"}),
+    "launching": frozenset({"live", "parked"}),
+    "live": frozenset({"parked", "tearing_down"}),
+    "tearing_down": frozenset({"tearing_down", "parked", "torn_down"}),
+    "torn_down": frozenset(),
+}
+# The park fields ``enter_resume`` saves and ``restore_pre_resume`` puts back (plus ``updated``).
+_PRE_RESUME_FIELDS = (
+    "park_reason",
+    "needs_attention",
+    "escalated_by",
+    "last_outcome",
+    "name",
+    "term_placement",
+    "promote",
+)
 
 
 class StoreError(Exception):
@@ -177,6 +206,85 @@ def _map(exc: sqlite3.Error) -> Exception:
     return StoreError(f"state.db error: {exc}")
 
 
+def _translate(exc: BaseException) -> BaseException:
+    """The store error for a low-level failure; anything else unchanged."""
+    if isinstance(exc, sqlite3.Error):
+        return _map(exc)
+    if isinstance(exc, UnicodeEncodeError):
+        return StoreError(f"text cannot be stored: {exc.reason}")
+    if isinstance(exc, UnicodeDecodeError):
+        return StoreCorrupt(f"stored text is not valid UTF-8: {exc.reason}")
+    return exc
+
+
+@contextmanager
+def _mapped() -> Iterator[None]:
+    """Run reads (or statements) with every sqlite3 and text-codec error mapped."""
+    try:
+        yield
+    except (sqlite3.Error, UnicodeError) as exc:
+        mapped = _translate(exc)
+        if mapped is exc:
+            raise
+        raise mapped from exc
+
+
+def _decode_text(raw: bytes) -> str:
+    """Strict UTF-8 for every TEXT value read (a bad byte is ``UnicodeDecodeError``, mapped to
+    ``StoreCorrupt``; sqlite3's own message would quote the stored bytes)."""
+    return raw.decode("utf-8")
+
+
+def _connect(target: str, busy_timeout: float, *, uri: bool = False) -> sqlite3.Connection:
+    try:
+        conn = sqlite3.connect(
+            target, timeout=busy_timeout, isolation_level=None, check_same_thread=True, uri=uri
+        )
+    except (sqlite3.Error, ValueError) as exc:
+        raise StoreError(f"cannot open {target}: {exc}") from exc
+    conn.row_factory = sqlite3.Row
+    conn.text_factory = _decode_text
+    return conn
+
+
+def _read_version(conn: sqlite3.Connection, path: Path) -> int | None:
+    """The schema version; ``None`` if empty; ``StoreCorrupt`` for a foreign database."""
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    if not tables:
+        return None
+    if "meta" not in tables:
+        raise StoreCorrupt(f"{path} is not an agent-spawn database")
+    row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    if row is None or not str(row[0]).isascii() or not str(row[0]).isdigit():
+        raise StoreCorrupt(f"{path} has no valid schema version")
+    return int(row[0])
+
+
+def _check_version(version: int | None, wanted: int, *, migrate: bool) -> None:
+    """Refuse a newer schema (exit 12) and, without ``migrate``, an older or empty one."""
+    if version is not None and version > wanted:
+        raise CliError.of(
+            "schema_newer",
+            f"state.db has schema {version}; this agent-spawn understands up to "
+            f"{wanted}: upgrade agent-spawn",
+        )
+    if (version is None or version < wanted) and not migrate:
+        raise SchemaOlder(0 if version is None else version, wanted)
+
+
+def _peek_version(path: Path, file_id: tuple[int, int], busy_timeout: float) -> int | None:
+    """Read the schema version on a read-only connection, which can never write the database
+    or checkpoint its WAL (a newer database stays exactly as the newer agent-spawn left it)."""
+    conn = _connect(f"file:{urllib.parse.quote(str(path))}?mode=ro", busy_timeout, uri=True)
+    try:
+        with _mapped():
+            version = _read_version(conn, path)
+        _check_same_file(path, file_id)
+        return version
+    finally:
+        conn.close()
+
+
 def _row(row: sqlite3.Row, columns: Mapping[str, str], *keys: str) -> dict[str, Any]:
     out: dict[str, Any] = {key: row[key] for key in keys}
     for name, kind in columns.items():
@@ -208,7 +316,7 @@ class Store:
         self.path = path
         self.gateway = gateway
         self._identity = identity
-        self._in_txn = False
+        self._depth = 0  # open transaction levels: 0 none, 1 BEGIN, more are savepoints
 
     # -- opening -------------------------------------------------------------------------
 
@@ -226,77 +334,82 @@ class Store:
     ) -> Store:
         """Open (and with ``create``, make) the state dir and ``state.db``.
 
-        A newer schema exits 12 ``schema_newer`` before anything is written. An older one is
-        migrated when ``migrate``; otherwise ``SchemaOlder`` (the relay never migrates). A
-        missing database with ``create=False`` is ``StoreMissing``.
+        The schema version is read first on a read-only connection: a newer schema exits 12
+        ``schema_newer`` and an older (or empty) one without ``migrate`` is ``SchemaOlder``, both
+        before anything is written (no journal-mode change, no checkpoint). With ``migrate`` an
+        older schema is migrated. A missing database with ``create=False`` is ``StoreMissing``.
+        ``state.db`` and its sidecars must be regular, single-link files of this user, never
+        symlinks; a database replaced while it is opened is refused.
         """
         gw = gateway or get_gateway()
-        path = _prepare_files(Path(state_dir), create=create, uid=gw.getuid())
-        try:
-            conn = sqlite3.connect(
-                str(path),
-                timeout=busy_timeout,
-                isolation_level=None,
-                check_same_thread=True,
-            )
-        except (sqlite3.Error, ValueError) as exc:
-            raise StoreError(f"cannot open {path}: {exc}") from exc
-        conn.row_factory = sqlite3.Row
+        uid = gw.getuid()
+        path, file_id = _prepare_files(Path(state_dir), create=create, uid=uid)
+        _check_version(_peek_version(path, file_id, busy_timeout), len(migrations), migrate=migrate)
+        conn = _connect(str(path), busy_timeout)
         store = cls(conn, path, gw, identity=identity)
         try:
-            store._setup(migrate=migrate, migrations=migrations)
+            store._setup(
+                file_id=file_id,
+                uid=uid,
+                migrate=migrate,
+                migrations=migrations,
+                busy_timeout=busy_timeout,
+            )
         except BaseException:
             conn.close()
             raise
         return store
 
-    def _setup(self, *, migrate: bool, migrations: Sequence[Migration]) -> None:
+    def _setup(
+        self,
+        *,
+        file_id: tuple[int, int],
+        uid: int,
+        migrate: bool,
+        migrations: Sequence[Migration],
+        busy_timeout: float,
+    ) -> None:
         wanted = len(migrations)
-        try:
+        with _mapped():
             self._conn.execute("PRAGMA foreign_keys = ON")
-            version = self._read_version()
-            if version is not None and version > wanted:
-                raise CliError.of(
-                    "schema_newer",
-                    f"state.db has schema {version}; this agent-spawn understands up to "
-                    f"{wanted}: upgrade agent-spawn",
-                )
-            mode = self._conn.execute("PRAGMA journal_mode").fetchone()[0]
-            if str(mode).lower() != "wal":
-                if version is not None and version < wanted and not migrate:
-                    raise SchemaOlder(version, wanted)
-                mode = self._conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
-                if str(mode).lower() != "wal":
-                    raise StoreError(f"cannot enable WAL for {self.path} (journal_mode {mode})")
+            version = _read_version(self._conn, self.path)
+        _check_same_file(self.path, file_id)
+        _check_version(version, wanted, migrate=migrate)
+        self._enable_wal(busy_timeout)
+        with _mapped():
             self._conn.execute("PRAGMA synchronous = FULL")
-        except sqlite3.Error as exc:
-            raise _map(exc) from exc
         if version is None or version < wanted:
-            if not migrate:
-                raise SchemaOlder(0 if version is None else version, wanted)
             self._migrate(migrations)
-        _fix_sidecar_modes(self.path)
+        _fix_sidecar_modes(self.path, uid)
 
-    def _read_version(self) -> int | None:
-        """The schema version; ``None`` if empty; ``StoreCorrupt`` for a foreign database."""
-        tables = {
-            row[0]
-            for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-        }
-        if not tables:
-            return None
-        if "meta" not in tables:
-            raise StoreCorrupt(f"{self.path} is not an agent-spawn database")
-        row = self._conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        if row is None or not str(row[0]).isascii() or not str(row[0]).isdigit():
-            raise StoreCorrupt(f"{self.path} has no valid schema version")
-        return int(row[0])
+    def _enable_wal(self, busy_timeout: float) -> None:
+        """Switch to WAL, retrying while concurrent first opens hold the lock; a database that
+        another process already switched is accepted as it is."""
+        deadline = self.gateway.monotonic() + busy_timeout
+        delay = 0.01
+        while True:
+            try:
+                with _mapped():
+                    mode = str(self._conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+                    if mode != "wal":
+                        mode = str(
+                            self._conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+                        ).lower()
+                if mode == "wal":
+                    return
+                if self.gateway.monotonic() >= deadline:
+                    raise StoreError(f"cannot enable WAL for {self.path} (journal_mode {mode})")
+            except StoreBusy:
+                if self.gateway.monotonic() >= deadline:
+                    raise
+            self.gateway.sleep(delay)
+            delay = min(delay * 2, 0.2)
 
     def _migrate(self, migrations: Sequence[Migration]) -> None:
         wanted = len(migrations)
         with self.transaction():
             # Re-read under the write lock: another process may have migrated meanwhile.
-            version = self._read_version() or 0
+            version = _read_version(self._conn, self.path) or 0
             if version > wanted:
                 raise CliError.of(
                     "schema_newer",
@@ -311,7 +424,8 @@ class Store:
                 )
 
     def schema_version(self) -> int:
-        return self._read_version() or 0
+        with _mapped():
+            return _read_version(self._conn, self.path) or 0
 
     def close(self) -> None:
         self._conn.close()
@@ -326,30 +440,41 @@ class Store:
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
-        """``BEGIN IMMEDIATE`` .. ``COMMIT``; joins an enclosing transaction."""
-        if self._in_txn:
-            yield
-            return
+        """``BEGIN IMMEDIATE`` .. ``COMMIT``. Nested, a ``SAVEPOINT``: an inner failure rolls
+        back only the inner work (the outer transaction decides the rest). Errors are mapped
+        the same way at every level."""
+        nested = self._depth > 0
+        savepoint = f"nested_{self._depth}"
+        with _mapped():
+            self._conn.execute(f"SAVEPOINT {savepoint}" if nested else "BEGIN IMMEDIATE")
+        self._depth += 1
         try:
-            self._conn.execute("BEGIN IMMEDIATE")
-        except sqlite3.Error as exc:
-            raise _map(exc) from exc
-        self._in_txn = True
-        try:
             yield
-            self._conn.execute("COMMIT")
+            with _mapped():
+                self._conn.execute(f"RELEASE {savepoint}" if nested else "COMMIT")
         except BaseException as exc:
             try:
-                self._conn.execute("ROLLBACK")
+                if nested:
+                    self._conn.execute(f"ROLLBACK TO {savepoint}")
+                    self._conn.execute(f"RELEASE {savepoint}")
+                else:
+                    self._conn.execute("ROLLBACK")
             except sqlite3.Error:
                 pass  # a failed COMMIT may have rolled back already
-            if isinstance(exc, sqlite3.Error):
-                raise _map(exc) from exc
-            if isinstance(exc, UnicodeEncodeError):
-                raise StoreError(f"text cannot be stored: {exc}") from exc
-            raise
+            mapped = _translate(exc)
+            if mapped is exc:
+                raise
+            raise mapped from exc
         finally:
-            self._in_txn = False
+            self._depth -= 1
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._depth > 0
+
+    def _no_transaction(self, what: str) -> None:
+        if self._depth:
+            raise StoreError(f"{what} inside an open transaction (it would hold the write lock)")
 
     def _now(self) -> float:
         return self.gateway.wall_time()
@@ -359,25 +484,21 @@ class Store:
     def entries_with_prefix(self, prefix: str) -> list[IdEntry]:
         """Stored records (tombstones included) whose id starts with ``prefix``: one range scan
         of the primary key."""
-        try:
+        with _mapped():
             rows = self._conn.execute(
                 "SELECT agent_id, status FROM agents WHERE agent_id >= ? AND agent_id < ? "
                 "ORDER BY agent_id",
                 (prefix, prefix + "\U0010ffff"),
             ).fetchall()
-        except sqlite3.Error as exc:
-            raise _map(exc) from exc
         return [IdEntry(row["agent_id"], row["status"] == "torn_down") for row in rows]
 
     def is_reserved(self, agent_id: str) -> bool:
-        try:
+        with _mapped():
             row = self._conn.execute(
                 "SELECT 1 FROM allocated_ids WHERE agent_id = ? "
                 "UNION ALL SELECT 1 FROM agents WHERE agent_id = ? LIMIT 1",
                 (agent_id, agent_id),
             ).fetchone()
-        except sqlite3.Error as exc:
-            raise _map(exc) from exc
         return row is not None
 
     # -- leases --------------------------------------------------------------------------
@@ -385,7 +506,10 @@ class Store:
     def holder_identity(self) -> ProcessIdentity:
         """This process's identity (PID, start time, boot id), read once."""
         if self._identity is None:
-            found = procs.read_identity(self.gateway.getpid(), gateway=self.gateway)
+            try:
+                found = procs.read_identity(self.gateway.getpid(), gateway=self.gateway)
+            except procs.ProcessIdentityError as exc:
+                raise StoreError(f"cannot read this process's identity: {exc}") from exc
             if found is None:
                 raise StoreError("cannot read this process's identity")
             self._identity = found
@@ -402,9 +526,11 @@ class Store:
         """Take lease ``key`` for ``holder`` (default this process).
 
         Free, or held by a dead process: taken at once (``Lease.took_over_from`` names the dead
-        holder). Held by a live process, this one included: ``LeaseHeld`` once ``wait`` seconds
-        of retrying are over.
+        holder). Held by another live process: ``LeaseHeld`` once ``wait`` seconds of retrying
+        are over. Held by ``holder`` itself: ``LeaseHeld`` at once (leases are not reentrant).
+        Never inside an open transaction (``StoreError``).
         """
+        self._no_transaction("acquire_lease")
         if _LEASE_KEY.fullmatch(key) is None:
             raise ValueError(f"invalid lease key {key!r}")
         me = holder or self.holder_identity()
@@ -412,64 +538,96 @@ class Store:
         while True:
             try:
                 return self._try_acquire(key, me)
-            except LeaseHeld:
-                if self.gateway.monotonic() >= deadline:
+            except LeaseHeld as held:
+                if held.holder == me or self.gateway.monotonic() >= deadline:
                     raise
                 self.gateway.sleep(poll)
 
     def _try_acquire(self, key: str, me: ProcessIdentity) -> Lease:
+        """Read the holder and decide its liveness without the write lock (on macOS that runs
+        tools with timeouts); take over in a write transaction only if the stored holder text
+        is still the one judged dead, else judge again."""
         encoded = encode_value("proc", me)
-        with self.transaction():
-            row = self._conn.execute("SELECT holder FROM leases WHERE key = ?", (key,)).fetchone()
+        while True:
+            with _mapped():
+                row = self._conn.execute(
+                    "SELECT holder FROM leases WHERE key = ?", (key,)
+                ).fetchone()
             if row is None:
-                self._conn.execute(
-                    "INSERT INTO leases (key, holder, acquired) VALUES (?, ?, ?)",
-                    (key, encoded, self._now()),
-                )
-                return Lease(key, me)
-            try:
-                current = decode_value("proc", row["holder"])
-            except ValueDecodeError as exc:
-                raise StoreCorrupt(f"lease {key} has an unreadable holder: {exc}") from exc
-            assert isinstance(current, ProcessIdentity)
-            # A ProcessIdentityError (unparseable /proc entry) propagates: never "dead".
-            if current == me or procs.is_alive(current, gateway=self.gateway):
+                with self.transaction():
+                    inserted = self._conn.execute(
+                        "INSERT OR IGNORE INTO leases (key, holder, acquired) VALUES (?, ?, ?)",
+                        (key, encoded, self._now()),
+                    ).rowcount
+                if inserted == 1:
+                    return Lease(key, me)
+                continue  # someone took it meanwhile: judge the new holder
+            stored = row["holder"]
+            current = _decode_holder(key, stored)
+            if current == me or self._holder_alive(current):
                 raise LeaseHeld(key, current)
-            self._conn.execute(
-                "UPDATE leases SET holder = ?, acquired = ? WHERE key = ?",
-                (encoded, self._now(), key),
-            )
-            return Lease(key, me, took_over_from=current)
+            with self.transaction():
+                taken = self._conn.execute(
+                    "UPDATE leases SET holder = ?, acquired = ? WHERE key = ? AND holder = ?",
+                    (encoded, self._now(), key, stored),
+                ).rowcount
+            if taken == 1:
+                return Lease(key, me, took_over_from=current)
+
+    def _holder_alive(self, holder: ProcessIdentity) -> bool:
+        """Another boot id is dead without reading ``/proc``; an unreadable or unparseable
+        process entry is a ``StoreError``, never "dead"."""
+        try:
+            if holder.boot_id != procs.read_boot_id(gateway=self.gateway):
+                return False
+            return procs.is_alive(holder, gateway=self.gateway)
+        except procs.ProcessIdentityError as exc:
+            raise StoreError(f"cannot tell whether lease holder pid {holder.pid} is alive") from exc
 
     def release_lease(self, lease: Lease) -> bool:
-        """Release; false when the lease was no longer this holder's (nothing is deleted)."""
-        with self.transaction():
-            cursor = self._conn.execute(
-                "DELETE FROM leases WHERE key = ? AND holder = ?",
-                (lease.key, encode_value("proc", lease.holder)),
-            )
-            return cursor.rowcount == 1
+        """Release; false when the lease was no longer this holder's (nothing is deleted).
+
+        A busy database is retried with backoff (gateway clock) for up to ``RELEASE_DEADLINE``
+        seconds, since a lease that is never released locks its key out for the holder's
+        lifetime; then ``StoreBusy``. Never inside an open transaction (``StoreError``)."""
+        self._no_transaction("release_lease")
+        encoded = encode_value("proc", lease.holder)
+        deadline = self.gateway.monotonic() + RELEASE_DEADLINE
+        delay = 0.05
+        while True:
+            try:
+                with self.transaction():
+                    deleted = self._conn.execute(
+                        "DELETE FROM leases WHERE key = ? AND holder = ?", (lease.key, encoded)
+                    ).rowcount
+                return deleted == 1
+            except StoreBusy:
+                if self.gateway.monotonic() >= deadline:
+                    raise
+                self.gateway.sleep(delay)
+                delay = min(delay * 2, 1.0)
 
     @contextmanager
     def lease(
         self, key: str, *, holder: ProcessIdentity | None = None, wait: float = 0.0
     ) -> Iterator[Lease]:
+        """Hold ``key`` around the body. An exception of the body always wins: a release that
+        fails then is attached to it as a note, never raised instead of it."""
         taken = self.acquire_lease(key, holder=holder, wait=wait)
         try:
             yield taken
-        finally:
-            self.release_lease(taken)
+        except BaseException as exc:
+            try:
+                self.release_lease(taken)
+            except Exception as failed:  # noqa: BLE001 - reported on the body's exception
+                exc.add_note(f"releasing lease {key} failed too: {failed!r}")
+            raise
+        self.release_lease(taken)
 
     def lease_holder(self, key: str) -> ProcessIdentity | None:
-        row = self._conn.execute("SELECT holder FROM leases WHERE key = ?", (key,)).fetchone()
-        if row is None:
-            return None
-        try:
-            value = decode_value("proc", row["holder"])
-        except ValueDecodeError as exc:
-            raise StoreCorrupt(f"lease {key} has an unreadable holder: {exc}") from exc
-        assert isinstance(value, ProcessIdentity)
-        return value
+        with _mapped():
+            row = self._conn.execute("SELECT holder FROM leases WHERE key = ?", (key,)).fetchone()
+        return None if row is None else _decode_holder(key, row["holder"])
 
     def _require_lease(self, lease: Lease, key: str) -> None:
         if lease.key != key:
@@ -481,17 +639,15 @@ class Store:
     # -- agents --------------------------------------------------------------------------
 
     def get_agent(self, agent_id: str) -> dict[str, Any] | None:
-        try:
+        with _mapped():
             return self._get_agent(agent_id)
-        except sqlite3.Error as exc:
-            raise _map(exc) from exc
 
     def _get_agent(self, agent_id: str) -> dict[str, Any] | None:
         row = self._conn.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()
         return None if row is None else _row(row, AGENT_COLUMNS, "agent_id")
 
     def list_agents(self, *, statuses: Sequence[str] | None = None) -> list[dict[str, Any]]:
-        try:
+        with _mapped():
             if statuses is None:
                 rows = self._conn.execute("SELECT * FROM agents ORDER BY created, agent_id")
             else:
@@ -501,14 +657,12 @@ class Store:
                     tuple(statuses),
                 )
             return [_row(row, AGENT_COLUMNS, "agent_id") for row in rows.fetchall()]
-        except sqlite3.Error as exc:
-            raise _map(exc) from exc
 
     def find_agents(self, labels: Sequence[Label], *, include_torn_down: bool = False) -> list[str]:
         """Ids of the agents holding every ``labels`` pair (ANDed), in id order."""
         pairs = tuple(dict.fromkeys(labels))
         where = "" if include_torn_down else "AND a.status != 'torn_down'"
-        try:
+        with _mapped():
             if not pairs:
                 rows = self._conn.execute(
                     f"SELECT a.agent_id FROM agents a WHERE 1 = 1 {where} ORDER BY a.agent_id"  # noqa: S608
@@ -523,8 +677,6 @@ class Store:
                     (*params, len(pairs)),
                 )
             return [row[0] for row in rows.fetchall()]
-        except sqlite3.Error as exc:
-            raise _map(exc) from exc
 
     def insert_agent(
         self,
@@ -583,7 +735,10 @@ class Store:
         candidate = proposed
         for _ in range(_ALLOCATION_ATTEMPTS):
             if candidate is None:
-                candidate = new_agent_id(self, random_bytes=random_bytes)
+                try:
+                    candidate = new_agent_id(self, random_bytes=random_bytes)
+                except RuntimeError as exc:
+                    raise StoreError(f"could not allocate an agent id: {exc}") from exc
             try:
                 return self.insert_agent(candidate, fields, labels=labels, events=events)
             except IdConflict:
@@ -604,8 +759,14 @@ class Store:
         """Apply ``changes`` only if the agent's status is in ``expect_status`` (and every
         ``expect`` column equals its value), under the agent's lease, with ``events`` in the
         same transaction. Returns the new record; ``CasLost`` (carrying the current record)
-        for the loser."""
+        for the loser, ``AgentMissing`` when there is no record.
+
+        A ``status`` in ``changes`` must be reachable from every expected status
+        (``TRANSITIONS``), else ``ValueError``. Prefer the named lifecycle helpers."""
         wanted = (expect_status,) if isinstance(expect_status, str) else tuple(expect_status)
+        if not wanted:
+            raise ValueError("compare_and_set needs at least one expected status")
+        _check_transition(wanted, changes.get("status"))
         return self._write(
             lease, agent_id, changes, wanted=wanted, expect=expect, events=events, touch=touch
         )
@@ -635,10 +796,17 @@ class Store:
         expect: Mapping[str, object] | None,
         events: Sequence[OutboxEvent],
         touch: bool,
+        expect_not: Mapping[str, object] | None = None,
     ) -> dict[str, Any]:
         _check_columns(changes, AGENT_COLUMNS)
         _check_columns(expect or {}, AGENT_COLUMNS)
+        _check_columns(expect_not or {}, AGENT_COLUMNS)
         values = dict(changes)
+        if values.get("status") == "parked":
+            # interface.md, Agent statuses: every park, by any process, clears it.
+            if values.get("promotion_pending") is True:
+                raise ValueError("a park always sets promotion_pending to false")
+            values["promotion_pending"] = False
         if touch:
             values["updated"] = self._now()
         if not values:
@@ -656,6 +824,12 @@ class Store:
             else:
                 conditions.append(f"{name} = ?")
                 params.append(encode_value(AGENT_COLUMNS[name], value))
+        for name, value in (expect_not or {}).items():
+            if value is None:
+                conditions.append(f"{name} IS NOT NULL")
+            else:
+                conditions.append(f"{name} IS NOT ?")
+                params.append(encode_value(AGENT_COLUMNS[name], value))
         with self.transaction():
             self._require_lease(lease, f"agent:{agent_id}")
             cursor = self._conn.execute(
@@ -665,29 +839,270 @@ class Store:
             if cursor.rowcount != 1:
                 current = self._get_agent(agent_id)
                 if current is None:
-                    raise AgentMissing(agent_id) if not wanted else CasLost(agent_id, wanted, None)
+                    raise AgentMissing(agent_id)
                 raise CasLost(agent_id, wanted, current)
             self._add_events(agent_id, events)
             updated = self._get_agent(agent_id)
         assert updated is not None
         return updated
 
+    # -- lifecycle entries (interface.md, Lifecycle transitions) -------------------------
+
+    def enter_resume(
+        self,
+        lease: Lease,
+        agent_id: str,
+        *,
+        launcher: ProcessIdentity,
+        expect_run_after: int | None,
+        changes: Mapping[str, object] | None = None,
+        events: Sequence[OutboxEvent] = (),
+    ) -> dict[str, Any]:
+        """Plain resume: ``parked`` → ``launching``, recording the launcher and
+        ``expect_run_after`` and saving the park fields for ``restore_pre_resume``."""
+        with self.transaction():
+            self._require_lease(lease, f"agent:{agent_id}")
+            current = self._get_agent(agent_id)
+            if current is None:
+                raise AgentMissing(agent_id)
+            saved = {name: current[name] for name in (*_PRE_RESUME_FIELDS, "updated")}
+            return self.compare_and_set(
+                lease,
+                agent_id,
+                expect_status="parked",
+                changes={
+                    **(changes or {}),
+                    "status": "launching",
+                    "launcher": launcher,
+                    "expect_run_after": expect_run_after,
+                    "pre_resume": saved,
+                },
+                events=events,
+            )
+
+    def restore_pre_resume(self, lease: Lease, agent_id: str) -> dict[str, Any]:
+        """A resume that failed (or was interrupted) before its run existed: ``launching`` →
+        ``parked`` with the saved park fields and ``updated`` put back and the launcher fields
+        cleared; no events. ``CasLost`` when the agent is not a resume in ``launching``."""
+        with self.transaction():
+            self._require_lease(lease, f"agent:{agent_id}")
+            current = self._get_agent(agent_id)
+            if current is None:
+                raise AgentMissing(agent_id)
+            saved = current["pre_resume"]
+            if current["status"] != "launching" or saved is None:
+                raise CasLost(agent_id, ("launching",), current)
+            names = (*_PRE_RESUME_FIELDS, "updated")
+            if not isinstance(saved, dict) or set(saved) != set(names):
+                raise StoreCorrupt(f"agent {agent_id} has an unreadable pre-resume row")
+            return self._write(
+                lease,
+                agent_id,
+                {
+                    **saved,
+                    "status": "parked",
+                    "launcher": None,
+                    "expect_run_after": None,
+                    "pre_resume": None,
+                },
+                wanted=("launching",),
+                expect=None,
+                events=(),
+                touch=False,
+            )
+
+    def enter_teardown(
+        self,
+        lease: Lease,
+        agent_id: str,
+        *,
+        teardown_proc: ProcessIdentity,
+        retry_from: ProcessIdentity | None = None,
+        events: Sequence[OutboxEvent] = (),
+    ) -> dict[str, Any]:
+        """``teardown``: ``parked`` → ``tearing_down`` with ``teardown_step: started`` and
+        the teardown process. With ``retry_from`` (the recorded teardown process, which the
+        caller found dead before taking the lease), a retry: ``tearing_down`` stays, only the
+        teardown process changes, and only if ``retry_from`` is still the recorded one."""
+        if retry_from is not None:
+            return self.compare_and_set(
+                lease,
+                agent_id,
+                expect_status="tearing_down",
+                expect={"teardown_proc": retry_from},
+                changes={"teardown_proc": teardown_proc},
+                events=events,
+            )
+        return self.compare_and_set(
+            lease,
+            agent_id,
+            expect_status="parked",
+            changes={
+                "status": "tearing_down",
+                "teardown_step": "started",
+                "teardown_proc": teardown_proc,
+                "teardown_partial_record": None,
+            },
+            events=events,
+        )
+
+    def mark_live(
+        self,
+        lease: Lease,
+        agent_id: str,
+        *,
+        changes: Mapping[str, object] | None = None,
+        events: Sequence[OutboxEvent] = (),
+    ) -> dict[str, Any]:
+        """The run is started: ``launching`` → ``live``."""
+        return self.compare_and_set(
+            lease,
+            agent_id,
+            expect_status="launching",
+            changes={**(changes or {}), "status": "live"},
+            events=events,
+        )
+
+    def enter_ephemeral_teardown(
+        self,
+        lease: Lease,
+        agent_id: str,
+        *,
+        supervisor: ProcessIdentity,
+        events: Sequence[OutboxEvent] = (),
+    ) -> dict[str, Any]:
+        """The supervisor of an ephemeral agent whose run is ``done``: ``live`` →
+        ``tearing_down`` (``teardown_step: started``), the supervisor recorded as the
+        teardown process; only for an ephemeral agent that ``supervisor`` supervises."""
+        return self.compare_and_set(
+            lease,
+            agent_id,
+            expect_status="live",
+            expect={"ephemeral": True, "supervisor": supervisor},
+            changes={
+                "status": "tearing_down",
+                "teardown_step": "started",
+                "teardown_proc": supervisor,
+                "teardown_partial_record": None,
+            },
+            events=events,
+        )
+
+    def park(
+        self,
+        lease: Lease,
+        agent_id: str,
+        *,
+        park_reason: str,
+        needs_attention: str | None,
+        escalated_by: str | None = None,
+        from_status: str | Sequence[str] = ("launching", "live"),
+        changes: Mapping[str, object] | None = None,
+        events: Sequence[OutboxEvent] = (),
+    ) -> dict[str, Any]:
+        """``launching``/``live`` → ``parked`` with ``park_reason``, ``needs_attention`` and
+        ``escalated_by`` (non-null only for a hook escalation); ``promotion_pending`` false."""
+        wanted = (from_status,) if isinstance(from_status, str) else tuple(from_status)
+        if not wanted or not set(wanted) <= {"launching", "live"}:
+            raise ValueError(f"park is from launching or live, not {wanted!r}")
+        return self.compare_and_set(
+            lease,
+            agent_id,
+            expect_status=wanted,
+            changes={
+                **(changes or {}),
+                "status": "parked",
+                "park_reason": park_reason,
+                "needs_attention": needs_attention,
+                "escalated_by": escalated_by,
+            },
+            events=events,
+        )
+
+    def park_after_failed_placement(
+        self,
+        lease: Lease,
+        agent_id: str,
+        *,
+        park_reason: str,
+        needs_attention: str | None,
+        escalated_by: str | None = None,
+        changes: Mapping[str, object] | None = None,
+        events: Sequence[OutboxEvent] = (),
+    ) -> dict[str, Any]:
+        """``status = launching`` → ``parked``: written only by the process that wins it (a
+        loser does not park, ``CasLost``)."""
+        return self.park(
+            lease,
+            agent_id,
+            park_reason=park_reason,
+            needs_attention=needs_attention,
+            escalated_by=escalated_by,
+            from_status="launching",
+            changes=changes,
+            events=events,
+        )
+
+    def abort_teardown(
+        self, lease: Lease, agent_id: str, *, events: Sequence[OutboxEvent] = ()
+    ) -> dict[str, Any]:
+        """A teardown vetoed, escalated or refused at a step that changed nothing:
+        ``tearing_down`` → ``parked`` with the teardown fields cleared. Never once the marker
+        is ``worktree_partial`` (``CasLost``): that agent stays ``tearing_down``."""
+        return self._write(
+            lease,
+            agent_id,
+            {
+                "status": "parked",
+                "teardown_step": None,
+                "teardown_proc": None,
+                "teardown_partial_record": None,
+            },
+            wanted=("tearing_down",),
+            expect=None,
+            expect_not={"teardown_step": "worktree_partial"},
+            events=events,
+            touch=True,
+        )
+
+    def tombstone(
+        self, lease: Lease, agent_id: str, *, events: Sequence[OutboxEvent] = ()
+    ) -> dict[str, Any]:
+        """Teardown's last step: ``tearing_down`` → ``torn_down``, ``needs_attention`` and
+        ``teardown_step`` cleared, ``torn_down_at`` now."""
+        return self.compare_and_set(
+            lease,
+            agent_id,
+            expect_status="tearing_down",
+            changes={
+                "status": "torn_down",
+                "needs_attention": None,
+                "teardown_step": None,
+                "promotion_pending": False,
+                "torn_down_at": self._now(),
+            },
+            events=events,
+        )
+
     def delete_agent(self, lease: Lease, agent_id: str) -> bool:
-        """Delete the record with its runs, holds, labels and events; the id stays reserved."""
+        """Delete the record with its runs, holds, labels, mirror queue and events (undelivered
+        included); the id stays reserved."""
         with self.transaction():
             self._require_lease(lease, f"agent:{agent_id}")
             cursor = self._conn.execute("DELETE FROM agents WHERE agent_id = ?", (agent_id,))
             return cursor.rowcount == 1
 
+    def _require_agent(self, agent_id: str) -> None:
+        if self._get_agent(agent_id) is None:
+            raise AgentMissing(agent_id)
+
     # -- labels --------------------------------------------------------------------------
 
     def get_labels(self, agent_id: str) -> LabelSet:
-        try:
+        with _mapped():
             rows = self._conn.execute(
                 "SELECT key, value FROM agent_labels WHERE agent_id = ? ORDER BY pos", (agent_id,)
             ).fetchall()
-        except sqlite3.Error as exc:
-            raise _map(exc) from exc
         return LabelSet(tuple(Label(row["key"], row["value"]) for row in rows))
 
     def edit_labels(
@@ -700,12 +1115,12 @@ class Store:
         events: Sequence[OutboxEvent] = (),
     ) -> LabelChange:
         """Read-modify-write the agent's labels under its lease. The 64-pair cap is checked
-        against the stored set (``GrammarError`` beyond it, nothing written). Changed pairs are
-        queued in ``label_mirror_pending``; a pair added and removed before mirroring cancels."""
+        against the stored set (``GrammarError`` beyond it, nothing written). Each changed pair
+        is queued in ``label_mirror_pending`` with its latest op (an earlier op of the pair is
+        replaced, never cancelled: it may already be in flight)."""
         with self.transaction():
             self._require_lease(lease, f"agent:{agent_id}")
-            if self._get_agent(agent_id) is None:
-                raise AgentMissing(agent_id)
+            self._require_agent(agent_id)
             current = self.get_labels(agent_id)
             if op == "add":
                 change = current.add(labels)
@@ -731,17 +1146,7 @@ class Store:
                         (agent_id, offset, pair.key, pair.value),
                     )
             for pair in change.applied:
-                opposite = self._conn.execute(
-                    "DELETE FROM label_mirror_pending "
-                    "WHERE agent_id = ? AND key = ? AND value = ? AND op != ?",
-                    (agent_id, pair.key, pair.value, direction),
-                )
-                if opposite.rowcount == 0:
-                    self._conn.execute(
-                        "INSERT OR REPLACE INTO label_mirror_pending (agent_id, key, value, op) "
-                        "VALUES (?, ?, ?, ?)",
-                        (agent_id, pair.key, pair.value, direction),
-                    )
+                self._queue_mirror(agent_id, pair, direction, replace=True)
             if change.changed:
                 self._conn.execute(
                     "UPDATE agents SET updated = ? WHERE agent_id = ?", (self._now(), agent_id)
@@ -749,23 +1154,49 @@ class Store:
                 self._add_events(agent_id, events)
         return change
 
+    def _queue_mirror(self, agent_id: str, pair: Label, op: str, *, replace: bool) -> None:
+        # The queue is ordered by rowid: a replaced pair moves to the end, as the latest change.
+        verb = "INSERT OR REPLACE" if replace else "INSERT OR IGNORE"
+        self._conn.execute(
+            f"{verb} INTO label_mirror_pending (agent_id, key, value, op) VALUES (?, ?, ?, ?)",  # noqa: S608
+            (agent_id, pair.key, pair.value, op),
+        )
+
     def mirror_pending(self, agent_id: str) -> list[tuple[Label, str]]:
-        rows = self._conn.execute(
-            "SELECT key, value, op FROM label_mirror_pending WHERE agent_id = ? ORDER BY rowid",
-            (agent_id,),
-        ).fetchall()
+        with _mapped():
+            rows = self._conn.execute(
+                "SELECT key, value, op FROM label_mirror_pending WHERE agent_id = ? ORDER BY rowid",
+                (agent_id,),
+            ).fetchall()
         return [(Label(row["key"], row["value"]), row["op"]) for row in rows]
 
     def mirror_done(self, lease: Lease, agent_id: str, items: Sequence[tuple[Label, str]]) -> None:
-        """Drop queue entries the session or pane received (only entries still equal)."""
+        """Record pushes the session or pane received. An entry is dropped only when its op is
+        the one pushed. Then, since the stored labels are the truth, a push that disagrees with
+        them (an add of a pair the agent no longer has, a remove of one it has again: pushes
+        that landed out of order) makes sure the corrective op is queued."""
         with self.transaction():
             self._require_lease(lease, f"agent:{agent_id}")
+            self._require_agent(agent_id)
             for pair, op in items:
+                if op not in ("add", "remove"):
+                    raise ValueError(f"invalid mirror op {op!r}")
                 self._conn.execute(
                     "DELETE FROM label_mirror_pending "
                     "WHERE agent_id = ? AND key = ? AND value = ? AND op = ?",
                     (agent_id, pair.key, pair.value, op),
                 )
+                present = (
+                    self._conn.execute(
+                        "SELECT 1 FROM agent_labels WHERE agent_id = ? AND key = ? AND value = ?",
+                        (agent_id, pair.key, pair.value),
+                    ).fetchone()
+                    is not None
+                )
+                if present != (op == "add"):
+                    self._queue_mirror(
+                        agent_id, pair, "add" if present else "remove", replace=False
+                    )
 
     # -- runs and holds ------------------------------------------------------------------
 
@@ -776,8 +1207,7 @@ class Store:
         _check_columns(fields, RUN_COLUMNS)
         with self.transaction():
             self._require_lease(lease, f"agent:{agent_id}")
-            if self._get_agent(agent_id) is None:
-                raise AgentMissing(agent_id)
+            self._require_agent(agent_id)
             self._conn.execute(
                 "INSERT OR IGNORE INTO agent_runs (agent_id, run) VALUES (?, ?)", (agent_id, run)
             )
@@ -798,19 +1228,15 @@ class Store:
         return None if row is None else _row(row, RUN_COLUMNS, "agent_id", "run")
 
     def get_run(self, agent_id: str, run: int) -> dict[str, Any] | None:
-        try:
+        with _mapped():
             return self._get_run(agent_id, run)
-        except sqlite3.Error as exc:
-            raise _map(exc) from exc
 
     def get_runs(self, agent_id: str) -> list[dict[str, Any]]:
-        try:
+        with _mapped():
             rows = self._conn.execute(
                 "SELECT * FROM agent_runs WHERE agent_id = ? ORDER BY run", (agent_id,)
             ).fetchall()
-        except sqlite3.Error as exc:
-            raise _map(exc) from exc
-        return [_row(row, RUN_COLUMNS, "agent_id", "run") for row in rows]
+            return [_row(row, RUN_COLUMNS, "agent_id", "run") for row in rows]
 
     def put_hold(
         self, lease: Lease, agent_id: str, record_id: str, path: str, *, owned: bool
@@ -818,6 +1244,7 @@ class Store:
         """Record a held worktree record; false when the agent already holds it."""
         with self.transaction():
             self._require_lease(lease, f"agent:{agent_id}")
+            self._require_agent(agent_id)
             row = self._conn.execute(
                 "SELECT coalesce(max(pos), -1) FROM agent_holds WHERE agent_id = ?", (agent_id,)
             ).fetchone()
@@ -831,6 +1258,7 @@ class Store:
     def release_hold(self, lease: Lease, agent_id: str, record_id: str) -> None:
         with self.transaction():
             self._require_lease(lease, f"agent:{agent_id}")
+            self._require_agent(agent_id)
             self._conn.execute(
                 "UPDATE agent_holds SET released = 1 WHERE agent_id = ? AND record_id = ?",
                 (agent_id, record_id),
@@ -843,6 +1271,7 @@ class Store:
         (and the agent's ``wt_record_id`` follows when it named the old one)."""
         with self.transaction():
             self._require_lease(lease, f"agent:{agent_id}")
+            self._require_agent(agent_id)
             self._conn.execute(
                 "UPDATE agent_holds SET record_id = ?, path = ? "
                 "WHERE agent_id = ? AND record_id = ?",
@@ -855,11 +1284,12 @@ class Store:
             )
 
     def get_holds(self, agent_id: str, *, include_released: bool = False) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
-            "SELECT record_id, path, owned, released FROM agent_holds WHERE agent_id = ? "
-            "AND (? OR released = 0) ORDER BY pos",
-            (agent_id, int(include_released)),
-        ).fetchall()
+        with _mapped():
+            rows = self._conn.execute(
+                "SELECT record_id, path, owned, released FROM agent_holds WHERE agent_id = ? "
+                "AND (? OR released = 0) ORDER BY pos",
+                (agent_id, int(include_released)),
+            ).fetchall()
         return [
             {
                 "record_id": r["record_id"],
@@ -906,12 +1336,13 @@ class Store:
 
     def pending_events(self, agent_id: str, *, limit: int = 1000) -> list[dict[str, Any]]:
         """Undelivered events of the agent, oldest ``event_id`` first."""
-        try:
+        with _mapped():
             rows = self._conn.execute(
                 "SELECT event_id, event, payload, created FROM events "
                 "WHERE agent_id = ? AND delivered = 0 ORDER BY event_id LIMIT ?",
                 (agent_id, limit),
             ).fetchall()
+        try:
             return [
                 {
                     "event_id": r["event_id"],
@@ -922,8 +1353,6 @@ class Store:
                 }
                 for r in rows
             ]
-        except sqlite3.Error as exc:
-            raise _map(exc) from exc
         except ValueDecodeError as exc:
             raise StoreCorrupt(f"event payload: {exc}") from exc
 
@@ -939,11 +1368,35 @@ class Store:
             return cursor.rowcount == 1
 
 
-def _prepare_files(state_dir: Path, *, create: bool, uid: int) -> Path:
+def _check_transition(wanted: tuple[str, ...], target: object) -> None:
+    for status in wanted:
+        if status not in TRANSITIONS:
+            raise ValueError(f"unknown status {status!r}")
+    if target is None:
+        return
+    for status in wanted:
+        if target not in TRANSITIONS[status]:
+            raise ValueError(f"{status} -> {target} is not a lifecycle transition")
+
+
+def _decode_holder(key: str, raw: object) -> ProcessIdentity:
+    try:
+        value = decode_value("proc", raw)
+    except ValueDecodeError as exc:
+        raise StoreCorrupt(f"lease {key} has an unreadable holder: {exc}") from exc
+    if not isinstance(value, ProcessIdentity):
+        raise StoreCorrupt(f"lease {key} has no holder")
+    return value
+
+
+def _prepare_files(state_dir: Path, *, create: bool, uid: int) -> tuple[Path, tuple[int, int]]:
     """Make or check the state dir (0700) and ``state.db`` (0600) without following links.
 
     The state dir itself may be a symlink (the user chose that); ``state.db`` and its
-    ``-wal``/``-shm``/``-journal`` files may not, and everything must belong to this user.
+    ``-wal``/``-shm``/``-journal`` files may not, and each must be a regular file of this user
+    with a single link. Each is opened with ``O_NOFOLLOW``, checked with ``fstat`` and
+    tightened with ``fchmod`` through that descriptor. Returns the path and the database's
+    ``(st_dev, st_ino)``, checked again after SQLite opened the path.
     """
     try:
         directory = Path(os.path.realpath(state_dir))
@@ -959,43 +1412,74 @@ def _prepare_files(state_dir: Path, *, create: bool, uid: int) -> Path:
         if stat.S_IMODE(info.st_mode) != DIR_MODE:
             os.chmod(directory, DIR_MODE)
         db = directory / DB_NAME
-        for suffix in ("",) + _SIDECARS:
-            _check_leaf(Path(str(db) + suffix), uid)
-        if not db.exists():
+        for suffix in _SIDECARS:
+            side = Path(str(db) + suffix)
+            fd = _open_leaf(side)
+            if fd is not None:
+                _secure_fd(fd, side, uid)
+        fd = _open_leaf(db)
+        if fd is None:
             if not create:
                 raise StoreMissing(f"no database {db}")
-            try:
-                fd = os.open(db, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, FILE_MODE)
-            except FileExistsError:
-                pass  # another process created it first
-            else:
-                os.close(fd)
-            _check_leaf(db, uid)
-        if stat.S_IMODE(os.lstat(db).st_mode) != FILE_MODE:
-            os.chmod(db, FILE_MODE)
-        return db
+            fd = _open_leaf(db, create=True)
+            assert fd is not None
+        return db, _secure_fd(fd, db, uid)
     except (OSError, ValueError) as exc:
         raise StoreError(f"cannot prepare state directory {state_dir}: {exc}") from exc
 
 
-def _check_leaf(path: Path, uid: int) -> None:
+def _open_leaf(path: Path, *, create: bool = False) -> int | None:
+    """Open without following a symlink (and without blocking on a FIFO); ``None`` when the
+    file does not exist. ``create`` makes it 0600 unless another process made it first."""
+    try:
+        if create:
+            try:
+                return os.open(path, _OPEN_FLAGS | os.O_CREAT | os.O_EXCL, FILE_MODE)
+            except FileExistsError:
+                pass  # another process created it first
+        return os.open(path, _OPEN_FLAGS)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise StoreError(f"{path} is a symbolic link: refusing to follow it") from exc
+        raise
+
+
+def _secure_fd(fd: int, path: Path, uid: int) -> tuple[int, int]:
+    """Check an open leaf (regular, this user's, one link), tighten it to 0600, close it."""
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise StoreError(f"{path} is not a regular file")
+        if info.st_uid != uid:
+            raise StoreError(f"{path} is not owned by this user")
+        if info.st_nlink != 1:
+            raise StoreError(f"{path} has {info.st_nlink} hard links: refusing it")
+        if stat.S_IMODE(info.st_mode) != FILE_MODE:
+            os.fchmod(fd, FILE_MODE)
+        return info.st_dev, info.st_ino
+    finally:
+        os.close(fd)
+
+
+def _check_same_file(path: Path, file_id: tuple[int, int]) -> None:
+    """SQLite opened ``path`` by name: refuse it unless it is still the file that was checked."""
     try:
         info = os.lstat(path)
-    except FileNotFoundError:
-        return
-    if stat.S_ISLNK(info.st_mode):
-        raise StoreError(f"{path} is a symbolic link: refusing to follow it")
-    if not stat.S_ISREG(info.st_mode):
-        raise StoreError(f"{path} is not a regular file")
-    if info.st_uid != uid:
-        raise StoreError(f"{path} is not owned by this user")
+    except OSError as exc:
+        raise StoreError(f"{path} disappeared while it was opened: {exc}") from exc
+    if (info.st_dev, info.st_ino) != file_id or not stat.S_ISREG(info.st_mode):
+        raise StoreError(f"{path} was replaced while it was opened: refusing it")
 
 
-def _fix_sidecar_modes(db: Path) -> None:
+def _fix_sidecar_modes(db: Path, uid: int) -> None:
+    """Check and tighten the sidecars SQLite created (a WAL checkpoint may have removed them)."""
     for suffix in _SIDECARS:
         side = Path(str(db) + suffix)
         try:
-            if stat.S_IMODE(os.lstat(side).st_mode) != FILE_MODE:
-                os.chmod(side, FILE_MODE)
-        except OSError:
-            pass  # gone already (WAL checkpoint) or not ours to fix
+            fd = _open_leaf(side)
+            if fd is not None:
+                _secure_fd(fd, side, uid)
+        except OSError as exc:
+            raise StoreError(f"cannot check {side}: {exc}") from exc

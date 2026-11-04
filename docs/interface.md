@@ -91,6 +91,8 @@ Every lifecycle entry is a compare-and-set under the agent's lease. The liveness
 
 A `tearing_down` agent whose recorded teardown process is dead may be entered again by `teardown` or `prune` (a retry, [Teardown order](#teardown-order)); one whose teardown process is alive refuses with 20 `tearing_down`.
 
+**Leases** (`agent:<agent_id>`, `delivery:<agent_id>`, `reconcile`) have no expiry: a live holder is never preempted, however long it holds. A lease is taken over at once when its recorded holder is dead: another boot id, no such PID, another start time, or a zombie ([Liveness](#liveness)). A lease is not reentrant: a process that asks for a lease it already holds is refused. A holder entry that cannot be parsed, or whose process entry cannot be read, is an error and is never taken over.
+
 ## Launch order
 
 `launch` performs these steps in order. "Park" means: set status `parked` with the given `needs_attention` and `park_reason`, record the `post-park` event (and `post-escalate` when `needs_attention` changed to a non-null value), and exit with the code stated; the error envelope carries `agent_id`.
@@ -300,7 +302,7 @@ agent-spawn learns about session state changes from claude-session's per-invocat
 2. the agent's `run`, `session_state`, `activity` and `needs_input_reason` only when the event's `run` is at least the agent's recorded `run`; the run's own fields (`first_working_at`, its first `working` activity, and the last state, activity and `needs_input_reason` on its run row) regardless;
 3. agent-spawn's `post-state-change` outbox event ([Hooks](#hooks)).
 
-It then commits and exits 0, always (failures are logged, never returned to claude-session). It calls no lower tool and runs no hooks: the supervisor applies window markers and delivers the outbox ([Supervision](#supervision), [Hook delivery](#hook-delivery)). It runs in claude-session's hook environment and uses only the state dir and config named in its argv and the absolute tool paths stored with the agent. It never creates or migrates a database: a missing `state.db` is logged to stderr and it exits 0; with an older database schema it processes the event when the schema is readable, else logs `schema_older` and exits 0 ([Upgrades](#upgrades)). `agent-spawn reconcile` runs `claude-session reconcile` first, which delivers events that were not delivered.
+It then commits and exits 0, always (failures are logged, never returned to claude-session). It calls no lower tool and runs no hooks: the supervisor applies window markers and delivers the outbox ([Supervision](#supervision), [Hook delivery](#hook-delivery)). It runs in claude-session's hook environment and uses only the state dir and config named in its argv and the absolute tool paths stored with the agent. It never creates or migrates a database: a missing `state.db` is logged to stderr and it exits 0; with an older database schema (any schema version other than the one this agent-spawn writes) it records nothing, logs `schema_older` and exits 0 ([Upgrades](#upgrades)). `agent-spawn reconcile` runs `claude-session reconcile` first, which delivers events that were not delivered.
 
 ## Signals
 
@@ -517,7 +519,7 @@ Safe under concurrent invocation (lease `reconcile`; a second caller exits 0 wit
 3. Undelivered agent-spawn hook events are delivered ([Hook delivery](#hook-delivery)).
 4. Agents with `teardown_step` set are reported (`teardown_incomplete`), not continued.
 5. Pending label mirror changes are re-synced to sessions and live panes ([Labels on lower tools](#labels-on-lower-tools)).
-6. Tombstones older than `tombstone_days` are deleted (the id stays reserved); handoff directories whose `owner` is dead, `prompts/<id>/` directories that have no agent record and are older than one hour, and leftover prompt copies and outcome files of torn-down agents are removed.
+6. Tombstones older than `tombstone_days` are deleted with their runs, holds, labels, pending mirror changes and hook events (undelivered ones included); the id stays reserved; handoff directories whose `owner` is dead, `prompts/<id>/` directories that have no agent record and are older than one hour, and leftover prompt copies and outcome files of torn-down agents are removed.
 
 Output: `{"changes": [{"agent_id", "kind", "details"}], "warnings", "already_running", "dry_run"}` ([schemas/cli/reconcile.json](../schemas/cli/reconcile.json)); `kind` is `parked`, `supervisor_lost`, `launch_failed`, `session_missing`, `pending_run`, `ambiguous_session`, `teardown_incomplete`, `fork_abandoned`, `labels_resynced`, `events_delivered` or `tombstone_deleted`. `--dry-run` reports without changing anything. agent-spawn's reconcile does not run `wtctl reconcile`.
 
@@ -687,7 +689,7 @@ agent-spawn is the authoritative label store for agents. Labels given with `--la
 | termctl | `kind=<run kind>`, `agent=<agent_id>`, then the first 30 agent labels in stored order (the rest dropped with a warning; termctl allows at most 32 per pane); later changes to those first 30 mirrored while the window lives (a change to any other pair is not mirrored, a warning) |
 | wtctl | none; the agent's id is a holder of the record |
 
-**Mirror re-sync.** A mirror change that failed is kept in a per-agent pending-mirror queue. `reconcile` re-syncs by adding missing agent labels and removing only the pairs agent-spawn removed (from that queue). Pane re-sync covers only the first 30 stored agent labels. It never touches `kind=`, `agent=` or labels agent-spawn did not add.
+**Mirror re-sync.** A mirror change that failed is kept in a per-agent pending-mirror queue, which holds the latest op (add or remove) of each pair. An entry is dropped only when the push of that exact op succeeded; a push that disagrees with the agent's current labels when it completes (an add of a pair the agent no longer has, or a remove of one it has again, after pushes completed out of order) queues the corrective op. The stored labels are the truth. `reconcile` re-syncs by adding missing agent labels and removing only the pairs agent-spawn removed (from that queue). Pane re-sync covers only the first 30 stored agent labels. It never touches `kind=`, `agent=` or labels agent-spawn did not add.
 
 ## TUI
 
@@ -697,7 +699,7 @@ agent-spawn is the authoritative label store for agents. Labels given with `--la
 
 State directory `$XDG_STATE_HOME/agent-spawn/` (default `~/.local/state/agent-spawn/`) for the CLI; internal processes use the state dir given in their argv. Mode 0700; files 0600:
 
-- `state.db` (private, SQLite WAL: agents, runs (each with its window), holds, the hook outbox, the pending-mirror queue), `log.jsonl` ([schemas/log.json](../schemas/log.json)), `audit.jsonl` ([schemas/audit.json](../schemas/audit.json));
+- `state.db` (private, SQLite WAL: agents, runs (each with its window), holds, the hook outbox, the pending-mirror queue; `state.db` and its `-wal`, `-shm` and `-journal` files must be regular files owned by the user with a single link and are never followed as symlinks, else the command fails; a looser mode of the state directory or of these files is tightened to 0700 or 0600), `log.jsonl` ([schemas/log.json](../schemas/log.json)), `audit.jsonl` ([schemas/audit.json](../schemas/audit.json));
 - `supervise/<agent_id>.log`: the supervisor's own log (no secrets, no prompt text);
 - `handoff/<random>/`: a transient socket `s` and its `owner` file ([Environment handoff](#environment-handoff));
 - `prompts/<agent_id>/` (mode 0700): copies of the prompt and input files, made at classification (launch step 1, resume step 4) and deleted once a `claude-session start` allocated a session, at the tombstone step of teardown, or when the command exits before its agent record exists (`reconcile` removes leftovers older than one hour);
@@ -710,7 +712,7 @@ State directory `$XDG_STATE_HOME/agent-spawn/` (default `~/.local/state/agent-sp
 
 ## Upgrades
 
-Database migrations are additive within a schema major version. Every command checks the schema first: an older database is migrated, a newer one refused (`schema_newer`, exit 12). `_session-event` never migrates: with an older schema it processes the event when the schema is readable, else logs `schema_older` and exits 0. Upgrade agent-spawn while no agents are live: windows and hooks run the absolute agent-spawn path recorded at launch.
+Database migrations are additive within a schema major version. Every command checks the schema first: an older database is migrated, a newer one refused (`schema_newer`, exit 12). The schema version is one integer; a database with a larger version than this agent-spawn writes is refused before anything is written to it (not even a WAL checkpoint). `_session-event` never migrates: it processes the event only when the schema version equals the one this agent-spawn writes; with any older schema it records nothing, logs `schema_older` and exits 0. Upgrade agent-spawn while no agents are live: windows and hooks run the absolute agent-spawn path recorded at launch.
 
 ## Residual risks
 
@@ -718,6 +720,7 @@ Database migrations are additive within a schema major version. Every command ch
 - **Prompt text at rest.** Prompt and input copies stay in `<state>/prompts/<agent_id>/` (0600) from classification until a session is allocated; a launch that fails after allocation and before its session keeps them until it is resumed or torn down, and a crashed command's copies until `reconcile` removes them.
 - **Human-only flags are advisory.** `--force`, `--override-escalation` and `--allow-tainted` require a TTY or a self-declared `--actor human:*`; they stop automation that follows the rules, not a hostile caller.
 - **Overrides are stateless.** `--override-escalation` is not bound to the escalation the human saw (as in termctl): a re-run with changed settings is overridden too. Pre-hook payloads carry `override_escalation: true`, so a policy can veto overriding runs.
+- **State files swapped by the same user.** `state.db` and its sidecars are opened without following symlinks and checked (regular, owned by the user, a single link), and a database replaced between that check and SQLite's open is refused; SQLite still opens them by name, so a process of the same user that swaps them in that window can make agent-spawn use its files. Such a process can already write the state directory.
 - **Unauthenticated state.** Labels, agent-spawn's state, relay events and outcome files are not authenticated against unsandboxed processes of the same user, including trusted agents (which can run `agent-spawn label add` on any agent or write the state directory). Consumers verify links against authoritative sources (the forge, wtctl records, their own state) before destructive or external actions: for example a `pr=` label against the agent's branch, and their own forks by recorded agent ids rather than labels.
 - **`--merged-head` is trusted.** wtctl compares the worktree's HEAD with the sha given and does not verify that it was merged, so a wrong sha lets `teardown` remove unpushed work. agent-spawn only checks the grammar.
 - **SIGQUIT in a window.** Until claude-session's `exec` ignores SIGQUIT, Ctrl-\ in a window ends the run `lost` or `killed` without a forwarded signal.

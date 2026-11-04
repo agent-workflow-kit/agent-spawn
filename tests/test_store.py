@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
+import json
 import os
 import sqlite3
 import stat
@@ -606,8 +608,9 @@ def test_an_unparseable_process_entry_is_never_dead(
         raise procs.ProcessIdentityError("garbled stat")
 
     monkeypatch.setattr(procs, "inspect", broken)
-    with pytest.raises(procs.ProcessIdentityError):
+    with pytest.raises(StoreError) as caught:
         store.acquire_lease("reconcile")
+    assert isinstance(caught.value.__cause__, procs.ProcessIdentityError)
     assert store.lease_holder("reconcile") == holder  # unchanged
 
 
@@ -705,11 +708,12 @@ def test_cas_accepts_several_expected_statuses_and_extra_columns(store: Store) -
     assert agent is not None and agent["status"] == "parked"
 
 
-def test_cas_on_a_missing_agent_is_a_loss_with_no_status(store: Store) -> None:
+def test_cas_on_a_missing_agent_is_agent_missing(store: Store) -> None:
     with store.lease(f"agent:{ID}") as lease:
-        with pytest.raises(CasLost) as caught:
-            store.compare_and_set(lease, ID, expect_status="parked", changes={"status": "live"})
-    assert caught.value.current is None and caught.value.status is None
+        with pytest.raises(AgentMissing):
+            store.compare_and_set(
+                lease, ID, expect_status="parked", changes={"status": "launching"}
+            )
 
 
 def test_writes_need_the_agents_own_lease(store: Store) -> None:
@@ -841,18 +845,53 @@ def test_label_cap_is_checked_against_the_stored_set(store: Store) -> None:
         assert skipped.skipped and len(store.get_labels(ID)) == 64
 
 
-def test_mirror_queue_records_changes_and_cancels_opposites(store: Store) -> None:
+def test_mirror_queue_keeps_the_latest_op_per_pair(store: Store) -> None:
     new_agent(store)
     with store.lease(f"agent:{ID}") as lease:
         store.edit_labels(lease, ID, "add", lbl("a=1", "b=2"))
-        store.edit_labels(lease, ID, "remove", lbl("a=1"))  # never mirrored: cancels
-        pending = store.mirror_pending(ID)
-        assert pending == [(Label("b", "2"), "add")]
-        store.edit_labels(lease, ID, "remove", lbl("b=2"))
-        assert store.mirror_pending(ID) == []
-        store.edit_labels(lease, ID, "add", lbl("c=3"))
+        store.edit_labels(lease, ID, "remove", lbl("a=1"))  # replaces, never cancels
+        assert sorted(store.mirror_pending(ID)) == [
+            (Label("a", "1"), "remove"),
+            (Label("b", "2"), "add"),
+        ]
         store.mirror_done(lease, ID, store.mirror_pending(ID))
         assert store.mirror_pending(ID) == []
+
+
+def test_mirror_done_keeps_an_entry_whose_op_changed(store: Store) -> None:
+    new_agent(store)
+    with store.lease(f"agent:{ID}") as lease:
+        store.edit_labels(lease, ID, "add", lbl("a=1"))
+        in_flight = store.mirror_pending(ID)
+        store.edit_labels(lease, ID, "remove", lbl("a=1"))
+        store.mirror_done(lease, ID, in_flight)  # the add landed; the remove is still owed
+        assert store.mirror_pending(ID) == [(Label("a", "1"), "remove")]
+
+
+def test_add_in_flight_while_a_remove_lands_first_requeues_the_remove(store: Store) -> None:
+    new_agent(store)
+    with store.lease(f"agent:{ID}") as lease:
+        store.edit_labels(lease, ID, "add", lbl("a=1"))
+        add_push = store.mirror_pending(ID)
+        store.edit_labels(lease, ID, "remove", lbl("a=1"))
+        remove_push = store.mirror_pending(ID)
+        store.mirror_done(lease, ID, remove_push)  # the remove reached the session first
+        assert store.mirror_pending(ID) == []
+        store.mirror_done(lease, ID, add_push)  # then the stale add landed: the pair is back
+        assert store.mirror_pending(ID) == [(Label("a", "1"), "remove")]
+
+
+def test_remove_in_flight_while_an_add_lands_first_requeues_the_add(store: Store) -> None:
+    store.insert_agent(ID, {"name": "n", "status": "parked"}, labels=LabelSet.from_texts(["a=1"]))
+    with store.lease(f"agent:{ID}") as lease:
+        store.edit_labels(lease, ID, "remove", lbl("a=1"))
+        remove_push = store.mirror_pending(ID)
+        store.edit_labels(lease, ID, "add", lbl("a=1"))
+        add_push = store.mirror_pending(ID)
+        store.mirror_done(lease, ID, add_push)
+        store.mirror_done(lease, ID, remove_push)  # the stale remove landed last
+        assert store.mirror_pending(ID) == [(Label("a", "1"), "add")]
+        assert store.get_labels(ID).texts() == ["a=1"]
 
 
 def test_labels_with_hostile_values_roundtrip(store: Store) -> None:
@@ -979,3 +1018,557 @@ def test_outbox_is_ordered_per_agent_and_delivery_needs_its_lease(store: Store) 
 def test_events_for_an_unknown_agent_are_rejected_by_the_foreign_key(store: Store) -> None:
     with pytest.raises(StoreError):
         store.add_events(ID, [OutboxEvent("x")])
+
+
+# -- review round 1: opening ------------------------------------------------------------
+
+
+_NEWER_WRITER = """
+import os, sqlite3, sys
+conn = sqlite3.connect(sys.argv[1], isolation_level=None)
+conn.execute("PRAGMA wal_autocheckpoint = 0")
+conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (sys.argv[2],))
+conn.execute("CREATE TABLE from_the_future (x)")
+os._exit(0)  # no close: the committed frames stay in the WAL, uncheckpointed
+"""
+
+
+def test_a_newer_schema_in_the_wal_is_refused_without_a_checkpoint(
+    state_dir: Path, proc_tracker: ProcTracker
+) -> None:
+    with Store.open(state_dir):
+        pass
+    db = state_dir / "state.db"
+    child = proc_tracker.popen(
+        [sys.executable, "-I", "-c", _NEWER_WRITER, str(db), str(SCHEMA_VERSION + 1)]
+    )
+    assert child.wait(timeout=30) == 0
+    wal = state_dir / "state.db-wal"
+    assert wal.stat().st_size > 0
+    before = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in (db, wal)}
+    with pytest.raises(CliError) as caught:
+        Store.open(state_dir)
+    assert caught.value.code == "schema_newer"
+    with pytest.raises(CliError):
+        Store.open(state_dir, create=False, migrate=False)
+    assert {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in (db, wal)} == before
+    assert (state_dir / "state.db-shm").exists()
+
+
+def test_an_empty_database_without_migrate_is_left_empty(state_dir: Path) -> None:
+    state_dir.mkdir(parents=True)
+    (state_dir / "state.db").write_bytes(b"")
+    with pytest.raises(SchemaOlder) as caught:
+        Store.open(state_dir, create=False, migrate=False)
+    assert caught.value.found == 0
+    assert (state_dir / "state.db").stat().st_size == 0
+    assert not (state_dir / "state.db-wal").exists()
+
+
+def test_a_hardlinked_state_db_is_refused(state_dir: Path, tmp_path: Path) -> None:
+    with Store.open(state_dir):
+        pass
+    other = tmp_path / "other.db"
+    os.link(state_dir / "state.db", other)
+    os.chmod(other, 0o644)
+    with pytest.raises(StoreError, match="hard link"):
+        Store.open(state_dir)
+    assert stat.S_IMODE(os.stat(other).st_mode) == 0o644  # the shared inode is not changed
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+def test_a_hardlinked_sidecar_is_refused(state_dir: Path, tmp_path: Path, suffix: str) -> None:
+    with Store.open(state_dir):
+        pass
+    side = state_dir / f"state.db{suffix}"
+    side.write_bytes(b"")
+    os.link(side, tmp_path / "other")
+    with pytest.raises(StoreError, match="hard link"):
+        Store.open(state_dir)
+
+
+def test_a_fifo_state_db_is_refused_without_blocking(state_dir: Path) -> None:
+    state_dir.mkdir(parents=True)
+    os.mkfifo(state_dir / "state.db", 0o600)
+    with pytest.raises(StoreError, match="regular file"):
+        Store.open(state_dir)
+
+
+def test_a_state_db_swapped_after_the_check_is_refused(
+    state_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with Store.open(state_dir):
+        pass
+    db = state_dir / "state.db"
+    real_connect = sqlite3.connect
+    swapped: list[bool] = []
+
+    def swapping_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        if not swapped:
+            swapped.append(True)
+            os.rename(db, tmp_path / "moved.db")
+            (tmp_path / "moved.db").rename(tmp_path / "kept.db")
+            db.write_bytes((tmp_path / "kept.db").read_bytes())
+            os.chmod(db, 0o600)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", swapping_connect)
+    with pytest.raises(StoreError, match="replaced"):
+        Store.open(state_dir)
+
+
+# -- review round 1: transactions -------------------------------------------------------
+
+
+def test_a_caught_inner_failure_rolls_back_only_its_savepoint(store: Store) -> None:
+    with store.transaction():
+        store.record_relay_event("cs-1", "kept")
+        with pytest.raises(StoreError) as caught:
+            new_agent(store, status="zombie")  # reserves the id, then fails the CHECK
+        assert not isinstance(caught.value, sqlite3.Error)
+    assert not store.is_reserved(ID)  # the half-done insert did not commit with the outer
+    assert not store.record_relay_event("cs-1", "kept")  # the outer work did
+
+
+def test_lease_calls_inside_a_transaction_are_refused(store: Store) -> None:
+    lease = store.acquire_lease("reconcile")
+    with store.transaction():
+        with pytest.raises(StoreError, match="transaction"):
+            store.acquire_lease(f"agent:{ID}")
+        with pytest.raises(StoreError, match="transaction"):
+            store.release_lease(lease)
+    assert store.lease_holder("reconcile") == lease.holder
+    assert store.lease_holder(f"agent:{ID}") is None
+
+
+# -- review round 1: leases -------------------------------------------------------------
+
+
+class LockReleasingGateway(ClockGateway):
+    """Lets a blocking connection go after ``after`` sleeps on the gateway clock."""
+
+    def __init__(self, blocker: sqlite3.Connection | None = None, after: int = 1) -> None:
+        super().__init__()
+        self.blocker = blocker
+        self.after = after
+        self.sleeps = 0
+
+    def sleep(self, seconds: float) -> None:
+        super().sleep(seconds)
+        self.sleeps += 1
+        if self.blocker is not None and self.sleeps == self.after:
+            self.blocker.execute("ROLLBACK")
+
+
+def _blocker(state_dir: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(state_dir / "state.db", isolation_level=None)
+    conn.execute("BEGIN IMMEDIATE")
+    return conn
+
+
+def test_release_retries_while_another_writer_holds_the_lock(state_dir: Path) -> None:
+    with Store.open(state_dir):
+        pass
+    gateway = LockReleasingGateway(after=3)
+    with Store.open(
+        state_dir, gateway=gateway, busy_timeout=0.05, identity=ProcessIdentity(2, 7, BOOT)
+    ) as store:
+        lease = store.acquire_lease("reconcile")
+        gateway.blocker = _blocker(state_dir)
+        try:
+            assert store.release_lease(lease)
+        finally:
+            gateway.blocker.close()
+        assert gateway.sleeps >= 3
+        assert store.lease_holder("reconcile") is None
+
+
+def test_release_gives_up_as_busy_after_its_deadline(state_dir: Path) -> None:
+    with Store.open(state_dir):
+        pass
+    gateway = LockReleasingGateway(after=10**9)
+    with Store.open(
+        state_dir, gateway=gateway, busy_timeout=0.01, identity=ProcessIdentity(2, 7, BOOT)
+    ) as store:
+        lease = store.acquire_lease("reconcile")
+        blocker = _blocker(state_dir)
+        started = gateway.now
+        try:
+            with pytest.raises(StoreBusy):
+                store.release_lease(lease)
+        finally:
+            blocker.execute("ROLLBACK")
+            blocker.close()
+        assert gateway.now - started >= 60.0
+        assert store.release_lease(lease)
+
+
+def test_the_body_exception_wins_over_a_failed_release(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failing(lease: object) -> bool:
+        raise StoreBusy("state.db is busy")
+
+    monkeypatch.setattr(store, "release_lease", failing)
+    with pytest.raises(RuntimeError, match="boom") as caught:
+        with store.lease("reconcile"):
+            raise RuntimeError("boom")
+    assert any("busy" in note for note in caught.value.__notes__)
+
+
+def test_takeover_happens_only_when_the_holder_is_unchanged(
+    store: Store, state_dir: Path, proc_tracker: ProcTracker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dead = dead_identity(proc_tracker)
+    proc_tracker.popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    newcomer = proc_tracker.identities[-1]
+    store.acquire_lease("reconcile", holder=dead)
+    real_is_alive = procs.is_alive
+    checked: list[ProcessIdentity] = []
+
+    def racing_is_alive(identity: ProcessIdentity, **kwargs: Any) -> bool:
+        checked.append(identity)
+        if identity == dead:
+            # The check runs outside the write lock, so another process can take over now.
+            other = sqlite3.connect(state_dir / "state.db", isolation_level=None, timeout=0)
+            other.execute("BEGIN IMMEDIATE")
+            other.execute(
+                "UPDATE leases SET holder = ? WHERE key = 'reconcile'",
+                (json.dumps(newcomer.to_dict(), sort_keys=True, separators=(",", ":")),),
+            )
+            other.execute("COMMIT")
+            other.close()
+        return real_is_alive(identity, **kwargs)
+
+    monkeypatch.setattr(procs, "is_alive", racing_is_alive)
+    with pytest.raises(LeaseHeld) as caught:
+        store.acquire_lease("reconcile")
+    assert caught.value.holder == newcomer
+    assert store.lease_holder("reconcile") == newcomer
+    assert checked == [dead, newcomer]
+
+
+class NoProcGateway(ClockGateway):
+    """``/proc/<pid>/stat`` is unreadable (EACCES); the boot id is readable."""
+
+    def read_file(self, path: str) -> str:
+        if path.startswith("/proc/") and path.endswith("/stat"):
+            raise PermissionError(errno.EACCES, "Permission denied", path)
+        return super().read_file(path)
+
+
+def test_another_boot_id_is_dead_before_proc_is_read(state_dir: Path) -> None:
+    gateway = NoProcGateway()
+    with Store.open(state_dir, gateway=gateway, identity=ProcessIdentity(2, 7, BOOT)) as store:
+        old_boot = ProcessIdentity(1, 5, "an-earlier-boot")
+        store.acquire_lease("reconcile", holder=old_boot)
+        assert store.acquire_lease("reconcile").took_over_from == old_boot
+        store.acquire_lease(f"agent:{ID}", holder=ProcessIdentity(1, 5, BOOT))
+        with pytest.raises(StoreError):  # same boot, unreadable /proc: never "dead"
+            store.acquire_lease(f"agent:{ID}")
+
+
+def test_waiting_on_ones_own_lease_fails_at_once(state_dir: Path) -> None:
+    gateway = ClockGateway()
+    with Store.open(state_dir, gateway=gateway, identity=ProcessIdentity(2, 7, BOOT)) as store:
+        store.acquire_lease("reconcile")
+        started = gateway.now
+        with pytest.raises(LeaseHeld):
+            store.acquire_lease("reconcile", wait=30.0)
+        assert gateway.now == started
+
+
+# -- review round 1: readers and error mapping ------------------------------------------
+
+
+class BrokenConnection:
+    def execute(self, *args: object) -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        lambda s: s.lease_holder("reconcile"),
+        lambda s: s.get_holds(ID),
+        lambda s: s.mirror_pending(ID),
+        lambda s: s.schema_version(),
+        lambda s: s.get_agent(ID),
+        lambda s: s.list_agents(),
+        lambda s: s.find_agents([]),
+        lambda s: s.get_labels(ID),
+        lambda s: s.get_runs(ID),
+        lambda s: s.pending_events(ID),
+        lambda s: s.is_reserved(ID),
+        lambda s: s.entries_with_prefix("ag-"),
+    ],
+)
+def test_every_reader_maps_sqlite_errors(store: Store, read: Any) -> None:
+    real = store._conn
+    store._conn = BrokenConnection()  # type: ignore[assignment]
+    try:
+        with pytest.raises(StoreError):
+            read(store)
+    finally:
+        store._conn = real
+
+
+def test_unencodable_text_on_a_read_path_is_a_store_error(store: Store) -> None:
+    for read in (
+        lambda: store.get_agent("ag-\ud800"),
+        lambda: store.get_holds("\ud800"),
+        lambda: store.lease_holder("\ud800"),
+        lambda: store.entries_with_prefix("\ud800"),
+    ):
+        with pytest.raises(StoreError):
+            read()
+
+
+def test_invalid_utf8_in_a_stored_value_is_store_corrupt(store: Store) -> None:
+    new_agent(store)
+    store._conn.execute("UPDATE agents SET cwd = CAST(x'ff80' AS TEXT)")
+    with pytest.raises(StoreCorrupt):
+        store.get_agent(ID)
+    with pytest.raises(StoreCorrupt):
+        store.list_agents()
+
+
+def test_an_id_source_failure_is_a_store_error(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agent_spawn.store as store_module
+
+    def exhausted(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("no free id")
+
+    monkeypatch.setattr(store_module, "new_agent_id", exhausted)
+    with pytest.raises(StoreError):
+        store.insert_new_agent({"name": "x", "status": "launching"})
+
+
+def test_hold_writes_on_a_missing_agent_are_agent_missing(store: Store) -> None:
+    with store.lease(f"agent:{ID}") as lease:
+        with pytest.raises(AgentMissing):
+            store.put_hold(lease, ID, "wt-1", "/a", owned=True)
+        with pytest.raises(AgentMissing):
+            store.release_hold(lease, ID, "wt-1")
+        with pytest.raises(AgentMissing):
+            store.replace_hold_record(lease, ID, "wt-1", "wt-2", "/b")
+        with pytest.raises(AgentMissing):
+            store.mirror_done(lease, ID, [(Label("a", "1"), "add")])
+
+
+# -- review round 1: lifecycle helpers --------------------------------------------------
+
+
+def test_compare_and_set_rejects_a_status_the_table_does_not_reach(store: Store) -> None:
+    new_agent(store, status="parked")
+    with store.lease(f"agent:{ID}") as lease:
+        for target in ("live", "torn_down", "parked"):
+            with pytest.raises(ValueError, match="transition"):
+                store.compare_and_set(lease, ID, expect_status="parked", changes={"status": target})
+        with pytest.raises(ValueError):
+            store.compare_and_set(lease, ID, expect_status=(), changes={"status": "launching"})
+    agent = store.get_agent(ID)
+    assert agent is not None and agent["status"] == "parked"
+
+
+def test_every_park_clears_promotion_pending(store: Store) -> None:
+    new_agent(store, status="live", promotion_pending=True)
+    with store.lease(f"agent:{ID}") as lease:
+        row = store.compare_and_set(
+            lease, ID, expect_status="live", changes={"status": "parked", "park_reason": "done"}
+        )
+        assert row["promotion_pending"] is False
+        with pytest.raises(ValueError):
+            store.update_agent(lease, ID, {"status": "parked", "promotion_pending": True})
+
+
+def test_enter_resume_records_the_launcher_and_saves_the_park_fields(store: Store) -> None:
+    new_agent(
+        store,
+        park_reason="blocked",
+        needs_attention="blocked",
+        last_outcome={"outcome": "blocked"},
+        promote=True,
+    )
+    launcher = me(store)
+    with store.lease(f"agent:{ID}") as lease:
+        row = store.enter_resume(
+            lease, ID, launcher=launcher, expect_run_after=3, events=[OutboxEvent("x")]
+        )
+    assert row["status"] == "launching" and row["launcher"] == launcher
+    assert row["expect_run_after"] == 3 and row["pre_resume"] is not None
+    assert [e["event"] for e in store.pending_events(ID)] == ["x"]
+
+
+def test_restore_pre_resume_puts_the_park_fields_back(state_dir: Path) -> None:
+    gateway = ClockGateway()
+    with Store.open(state_dir, gateway=gateway, identity=ProcessIdentity(2, 7, BOOT)) as store:
+        new_agent(
+            store,
+            park_reason="escalated",
+            needs_attention="escalated",
+            escalated_by="wtctl",
+            last_outcome={"outcome": "escalated"},
+            name="before",
+        )
+        before = store.get_agent(ID)
+        assert before is not None
+        gateway.now += 100
+        with store.lease(f"agent:{ID}") as lease:
+            store.enter_resume(lease, ID, launcher=store.holder_identity(), expect_run_after=None)
+            store.update_agent(lease, ID, {"name": "renamed by the resume"})
+            row = store.restore_pre_resume(lease, ID)
+        assert row["status"] == "parked"
+        assert row["launcher"] is None and row["expect_run_after"] is None
+        assert row["pre_resume"] is None
+        for name in ("park_reason", "needs_attention", "escalated_by", "last_outcome", "name"):
+            assert row[name] == before[name]
+        assert row["updated"] == before["updated"]
+        assert store.pending_events(ID) == []
+
+
+def test_restore_pre_resume_of_a_launch_is_a_loss(store: Store) -> None:
+    new_agent(store, status="launching")
+    with store.lease(f"agent:{ID}") as lease:
+        with pytest.raises(CasLost):
+            store.restore_pre_resume(lease, ID)
+
+
+def test_enter_teardown_and_its_retry_over_a_dead_teardown_process(
+    store: Store, proc_tracker: ProcTracker
+) -> None:
+    new_agent(store)
+    dead = dead_identity(proc_tracker)
+    with store.lease(f"agent:{ID}") as lease:
+        row = store.enter_teardown(lease, ID, teardown_proc=dead)
+        assert (row["status"], row["teardown_step"]) == ("tearing_down", "started")
+        assert row["teardown_proc"] == dead
+        store.compare_and_set(
+            lease, ID, expect_status="tearing_down", changes={"teardown_step": "hooks_done"}
+        )
+        with pytest.raises(CasLost):  # not parked any more: a first entry loses
+            store.enter_teardown(lease, ID, teardown_proc=me(store))
+        with pytest.raises(CasLost):  # a retry must name the recorded teardown process
+            store.enter_teardown(lease, ID, teardown_proc=me(store), retry_from=me(store))
+        row = store.enter_teardown(lease, ID, teardown_proc=me(store), retry_from=dead)
+    assert row["teardown_proc"] == me(store) and row["teardown_step"] == "hooks_done"
+
+
+def test_mark_live_only_from_launching(store: Store) -> None:
+    new_agent(store, status="launching")
+    new_agent(store, OTHER, status="parked")
+    with store.lease(f"agent:{ID}") as lease:
+        assert store.mark_live(lease, ID)["status"] == "live"
+    with store.lease(f"agent:{OTHER}") as lease:
+        with pytest.raises(CasLost):
+            store.mark_live(lease, OTHER)
+
+
+def test_ephemeral_teardown_records_the_supervisor(store: Store) -> None:
+    supervisor = me(store)
+    new_agent(store, status="live", ephemeral=True, supervisor=supervisor)
+    with store.lease(f"agent:{ID}") as lease:
+        with pytest.raises(CasLost):
+            store.enter_ephemeral_teardown(lease, ID, supervisor=ProcessIdentity(1, 1, "x"))
+        row = store.enter_ephemeral_teardown(lease, ID, supervisor=supervisor)
+    assert (row["status"], row["teardown_step"]) == ("tearing_down", "started")
+    assert row["teardown_proc"] == supervisor
+
+
+def test_ephemeral_teardown_needs_an_ephemeral_agent(store: Store) -> None:
+    supervisor = me(store)
+    new_agent(store, status="live", supervisor=supervisor)
+    with store.lease(f"agent:{ID}") as lease:
+        with pytest.raises(CasLost):
+            store.enter_ephemeral_teardown(lease, ID, supervisor=supervisor)
+
+
+def test_park_sets_the_reason_and_clears_promotion_pending(store: Store) -> None:
+    new_agent(store, status="live", promotion_pending=True, escalated_by="wtctl")
+    with store.lease(f"agent:{ID}") as lease:
+        row = store.park(lease, ID, park_reason="blocked", needs_attention="blocked")
+        with pytest.raises(CasLost):
+            store.park(lease, ID, park_reason="done", needs_attention=None)
+    assert (row["status"], row["park_reason"], row["needs_attention"]) == (
+        "parked",
+        "blocked",
+        "blocked",
+    )
+    assert row["promotion_pending"] is False and row["escalated_by"] is None
+
+
+def test_park_after_a_failed_placement_only_from_launching(store: Store) -> None:
+    new_agent(store, status="live")
+    with store.lease(f"agent:{ID}") as lease:
+        with pytest.raises(CasLost):
+            store.park_after_failed_placement(
+                lease, ID, park_reason="launch_failed", needs_attention="launch_failed"
+            )
+    agent = store.get_agent(ID)
+    assert agent is not None and agent["status"] == "live"
+    new_agent(store, OTHER, status="launching", promotion_pending=True)
+    with store.lease(f"agent:{OTHER}") as lease:
+        row = store.park_after_failed_placement(
+            lease, OTHER, park_reason="vetoed", needs_attention=None
+        )
+    assert row["status"] == "parked" and row["promotion_pending"] is False
+
+
+def test_abort_teardown_returns_to_parked_except_after_a_partial_removal(
+    store: Store,
+) -> None:
+    new_agent(store)
+    with store.lease(f"agent:{ID}") as lease:
+        store.enter_teardown(lease, ID, teardown_proc=me(store))
+        row = store.abort_teardown(lease, ID)
+        assert row["status"] == "parked" and row["teardown_step"] is None
+        assert row["teardown_proc"] is None
+        store.enter_teardown(lease, ID, teardown_proc=me(store))
+        store.compare_and_set(
+            lease,
+            ID,
+            expect_status="tearing_down",
+            changes={"teardown_step": "worktree_partial", "teardown_partial_record": "wt-1"},
+        )
+        with pytest.raises(CasLost):
+            store.abort_teardown(lease, ID)
+    agent = store.get_agent(ID)
+    assert agent is not None and agent["status"] == "tearing_down"
+
+
+def test_tombstone_only_from_tearing_down(state_dir: Path) -> None:
+    gateway = ClockGateway()
+    with Store.open(state_dir, gateway=gateway, identity=ProcessIdentity(2, 7, BOOT)) as store:
+        new_agent(store, needs_attention="failed")
+        with store.lease(f"agent:{ID}") as lease:
+            with pytest.raises(CasLost):
+                store.tombstone(lease, ID)
+            store.enter_teardown(lease, ID, teardown_proc=store.holder_identity())
+            gateway.now = 5000.0
+            row = store.tombstone(lease, ID, events=[OutboxEvent("post-teardown")])
+    assert (row["status"], row["needs_attention"], row["teardown_step"]) == (
+        "torn_down",
+        None,
+        None,
+    )
+    assert row["torn_down_at"] == 5000.0
+
+
+def test_a_lifecycle_helper_on_a_missing_agent_is_agent_missing(store: Store) -> None:
+    with store.lease(f"agent:{ID}") as lease:
+        for call in (
+            lambda: store.enter_resume(lease, ID, launcher=me(store), expect_run_after=None),
+            lambda: store.restore_pre_resume(lease, ID),
+            lambda: store.enter_teardown(lease, ID, teardown_proc=me(store)),
+            lambda: store.mark_live(lease, ID),
+            lambda: store.park(lease, ID, park_reason="done", needs_attention=None),
+            lambda: store.abort_teardown(lease, ID),
+            lambda: store.tombstone(lease, ID),
+        ):
+            with pytest.raises(AgentMissing):
+                call()
