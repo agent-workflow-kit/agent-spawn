@@ -1971,6 +1971,7 @@
         "cmd": {
           "type": "string",
           "minLength": 1,
+          "pattern": "^[^\u0000]*$",
           "description": "Run via sh -c in its own process group; JSON payload on stdin."
         },
         "timeout": {
@@ -2011,6 +2012,7 @@
         "cmd": {
           "type": "string",
           "minLength": 1,
+          "pattern": "^[^\u0000]*$",
           "description": "Run via sh -c in its own process group; JSON payload on stdin."
         },
         "timeout": {
@@ -2056,6 +2058,7 @@
         "cmd": {
           "type": "string",
           "minLength": 1,
+          "pattern": "^[^\u0000]*$",
           "description": "Run via sh -c in its own process group; JSON payload on stdin."
         },
         "timeout": {

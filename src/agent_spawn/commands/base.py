@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import NoReturn
 
 from ..config import Config
@@ -36,7 +36,6 @@ class Invocation:
     result_file: ResultFileTarget | None = None
     config: Config | None = None
     config_file: str | None = None
-    warnings: list[str] = field(default_factory=lambda: [])
 
 
 Handler = Callable[[Invocation], Outcome]

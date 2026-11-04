@@ -6,14 +6,16 @@ lexical order < ``AGENT_SPAWN_*`` environment (four top-level scalar keys only).
 overrides sit on top: ``Config.resolve_promote`` applies them.
 
 Every failure is ``config_invalid`` (exit 2) naming the file and the key. The loader reads files
-only through ``safe_load`` rules: no anchors or aliases (no expansion bombs), no merge keys, no
-duplicate or non-string keys, a size cap, regular files only. Messages never echo values.
+with YAML 1.2 core-schema scalars on a safe loader: no anchors or aliases (no expansion bombs), no
+merge keys, no explicit tags, no duplicate or non-string keys, a size cap, regular files only.
+Messages never echo values.
 """
 
 from __future__ import annotations
 
 import math
 import os
+import pwd
 import re
 import stat
 from collections.abc import Mapping, Sequence
@@ -71,12 +73,14 @@ def parse_duration(value: object) -> float:
         match = _DURATION.fullmatch(value)
         if match is None:
             raise ValueError("a duration is a number of seconds or a string like 30s, 10m or 90")
-        try:
-            seconds = float(match["n"]) * _UNIT_SECONDS[match["unit"]]
-        except OverflowError:
-            raise ValueError("duration out of range") from None
+        number: str | float = match["n"]
+        unit = _UNIT_SECONDS[match["unit"]]
     else:
-        seconds = float(value)
+        number, unit = value, 1.0
+    try:
+        seconds = float(number) * unit
+    except OverflowError:
+        raise ValueError("duration out of range") from None
     if not math.isfinite(seconds) or seconds <= 0:
         raise ValueError("a duration must be positive and finite (zero is refused)")
     return seconds
@@ -87,6 +91,25 @@ Kind = Annotated[str, _pattern(_KIND, "kind name")]
 RepoId = Annotated[str, _pattern(_REPO_ID, "repo id")]
 LabelKey = Annotated[str, _pattern(_LABEL_KEY, "label key")]
 Label = Annotated[str, _pattern(_LABEL, "label (key=value)")]
+
+
+def _label_key_or_label(value: str) -> str:
+    if not (_LABEL_KEY.fullmatch(value) or _LABEL.fullmatch(value)):
+        raise ValueError("not a valid label key or label")
+    return value
+
+
+LabelKeyOrLabel = Annotated[str, AfterValidator(_label_key_or_label)]
+
+
+def _refuse_null(value: object) -> object:
+    if value is None:
+        raise ValueError("must not be null (omit the key instead)")
+    return value
+
+
+# An optional key whose schema type has no null: absent is the default, an explicit null is refused.
+NotNull = BeforeValidator(_refuse_null)
 EnvName = Annotated[str, _pattern(_ENV_NAME, "environment variable name")]
 
 # --- models ---------------------------------------------------------------------------------
@@ -117,7 +140,7 @@ def _one_of(allowed: Sequence[str]) -> Any:
 
 
 class _Model(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, populate_by_name=True)
+    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 class Me(_Model):
@@ -126,7 +149,7 @@ class Me(_Model):
 
 class Prune(_Model):
     older_than: Duration | None = None
-    protect_labels: list[LabelKey | Label] = ["owner"]
+    protect_labels: list[LabelKeyOrLabel] = ["owner"]
 
 
 class KindSettings(_Model):
@@ -134,7 +157,7 @@ class KindSettings(_Model):
 
 
 class RepoKindSettings(_Model):
-    promote: bool | None = None
+    promote: Annotated[bool | None, NotNull] = None
 
 
 class RepoSettings(_Model):
@@ -144,9 +167,9 @@ class RepoSettings(_Model):
 class PreHook(_Model):
     cmd: str = Field(min_length=1)
     timeout: Duration = 30.0
-    kinds: list[Kind] | None = None
-    exclude_kinds: list[Kind] | None = None
-    labels: list[Label] | None = None
+    kinds: Annotated[list[Kind] | None, NotNull] = None
+    exclude_kinds: Annotated[list[Kind] | None, NotNull] = None
+    labels: Annotated[list[Label] | None, NotNull] = None
 
     @field_validator("cmd")
     @classmethod
@@ -161,8 +184,8 @@ class PostHook(PreHook):
 
 
 class StateChangeHook(PostHook):
-    states: list[Annotated[str, _one_of(_STATES)]] | None = None
-    statuses: list[Annotated[str, _one_of(_STATUSES)]] | None = None
+    states: Annotated[list[Annotated[str, _one_of(_STATES)]] | None, NotNull] = None
+    statuses: Annotated[list[Annotated[str, _one_of(_STATUSES)]] | None, NotNull] = None
 
 
 class Hooks(_Model):
@@ -248,7 +271,14 @@ class _Refused(yaml.YAMLError):
 
 
 class _SafeConfigLoader(yaml.SafeLoader):
-    """SafeLoader without anchors, aliases, merge keys, duplicate keys or non-string keys."""
+    """SafeLoader with YAML 1.2 core-schema scalars; no anchors, aliases, tags or duplicate keys.
+
+    Only ``true``/``false`` (three spellings each) are booleans, only ``null``/``~``/empty is null,
+    integers are decimal and floats the 1.2 core form; every other plain scalar (``yes``, ``on``,
+    ``010`` as octal, ``0x10``, ``1:30``, ``1_0``, timestamps, ``<<``) is a string.
+    """
+
+    yaml_implicit_resolvers: dict[Any, Any] = {}
 
     def compose_node(self, parent: Any, index: Any) -> Any:
         if self.check_event(yaml.AliasEvent):
@@ -256,21 +286,65 @@ class _SafeConfigLoader(yaml.SafeLoader):
         event = self.peek_event()
         if getattr(event, "anchor", None) is not None:
             raise _Refused(f"line {event.start_mark.line + 1}: anchors are not allowed")
+        if getattr(event, "tag", None) is not None:
+            raise _Refused(f"line {event.start_mark.line + 1}: explicit tags are not allowed")
         return super().compose_node(parent, index)
 
     def construct_mapping(self, node: Any, deep: bool = False) -> dict[Any, Any]:
         seen: set[str] = set()
         for key_node, _ in node.value:
-            line = key_node.start_mark.line + 1
-            if key_node.tag == "tag:yaml.org,2002:merge":
-                raise _Refused(f"line {line}: merge keys are not allowed")
-            if key_node.tag != "tag:yaml.org,2002:str":
-                raise _Refused(f"line {line}: mapping keys must be strings")
             key = str(key_node.value)
             if key in seen:
-                raise _Refused(f"line {line}: duplicate key {_clip(key)!r}")
+                raise _Refused(f"line {key_node.start_mark.line + 1}: duplicate key {_clip(key)!r}")
             seen.add(key)
         return super().construct_mapping(node, deep)
+
+
+def _core_resolver(tag: str, pattern: str, first: str) -> None:
+    _SafeConfigLoader.add_implicit_resolver(
+        f"tag:yaml.org,2002:{tag}", re.compile(pattern), list(first)
+    )
+
+
+# Order matters within a first character: int before float.
+_core_resolver("bool", r"^(?:true|True|TRUE|false|False|FALSE)$", "tTfF")
+_core_resolver("null", r"^(?:~|null|Null|NULL|)$", "~nN")
+_SafeConfigLoader.add_implicit_resolver("tag:yaml.org,2002:null", re.compile(r"^$"), [""])
+_core_resolver("int", r"^[-+]?[0-9]+$", "-+0123456789")
+_core_resolver(
+    "float",
+    r"^(?:[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?"
+    r"|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))$",
+    "-+.0123456789",
+)
+
+
+def _construct_decimal_int(loader: _SafeConfigLoader, node: Any) -> int:
+    return int(loader.construct_scalar(node), 10)  # decimal only: 010 is ten
+
+
+_SafeConfigLoader.add_constructor("tag:yaml.org,2002:int", _construct_decimal_int)
+
+
+def _render_key(key: object) -> str:
+    if key is None:
+        return "null"
+    if isinstance(key, bool):
+        return "true" if key else "false"
+    return _clip(str(key))
+
+
+def _check_keys(node: object, path: tuple[str, ...] = ()) -> None:
+    """Refuse non-string mapping keys, naming the key path (parent path plus the key)."""
+    if isinstance(node, dict):
+        for key, value in node.items():  # pyright: ignore[reportUnknownVariableType]
+            if not isinstance(key, str):
+                where = ".".join((*path, _render_key(key)))
+                raise _Refused(f"key `{where}`: mapping keys must be strings")
+            _check_keys(value, (*path, key))
+    elif isinstance(node, list):
+        for i, item in enumerate(node):  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
+            _check_keys(item, (*path, str(i)))
 
 
 def _clip(text: str) -> str:
@@ -281,11 +355,18 @@ def _fail(message: str) -> CliError:
     return CliError.of("config_invalid", message)
 
 
+def _dangling(path: str) -> bool:
+    return os.path.islink(path) and not os.path.exists(path)
+
+
 def _read_regular(path: str) -> bytes | None:
     """The file's bytes; ``None`` when it does not exist. Symlinks are followed."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
     except FileNotFoundError:
+        for candidate in (path, os.path.dirname(path)):
+            if _dangling(candidate):
+                raise _fail(f"config path {candidate} is a dangling symlink") from None
         return None
     except OSError as exc:
         raise _fail(f"cannot read config file {path}: {exc.strerror or 'error'}") from None
@@ -319,6 +400,7 @@ def _parse(path: str, data: bytes) -> dict[str, Any]:
         raise _fail(f"config file {path} is not valid UTF-8") from None
     try:
         root = yaml.load(text, Loader=_SafeConfigLoader)  # noqa: S506  (safe subclass)
+        _check_keys(root)
     except _Refused as exc:
         raise _fail(f"config file {path}: {exc}") from None
     except yaml.MarkedYAMLError as exc:
@@ -328,6 +410,9 @@ def _parse(path: str, data: bytes) -> dict[str, Any]:
         raise _fail(f"config file {path}: invalid YAML") from None
     except RecursionError:
         raise _fail(f"config file {path}: nested too deeply") from None
+    except (ValueError, TypeError, AttributeError, KeyError, OverflowError):
+        # e.g. an integer longer than Python's digit limit; the value is never echoed
+        raise _fail(f"config file {path}: a scalar value cannot be converted") from None
     if root is None:
         return {}
     if not isinstance(root, dict):
@@ -374,14 +459,28 @@ class LoadedConfig:
     config: Config
     path: str
     files: tuple[str, ...]
-    warnings: tuple[str, ...] = ()
+
+
+def _passwd_home() -> str | None:
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_dir
+    except KeyError:
+        return None
 
 
 def default_config_path(environ: Mapping[str, str]) -> str:
+    """``$XDG_CONFIG_HOME`` if absolute, else ``$HOME`` if absolute, else the passwd home, plus
+    ``.config``; always absolute (``config_invalid`` when no absolute base exists)."""
     base = environ.get("XDG_CONFIG_HOME", "")
     if not base.startswith("/"):
         home = environ.get("HOME", "")
-        home = home if home.startswith("/") else os.path.expanduser("~")
+        if not home.startswith("/"):
+            home = _passwd_home() or ""
+        if not home.startswith("/"):
+            raise _fail(
+                "cannot find the default config path: neither XDG_CONFIG_HOME, HOME nor the "
+                "passwd entry gives an absolute directory"
+            )
         base = os.path.join(home, ".config")
     return os.path.join(base, "agent-spawn", "config.yaml")
 
@@ -393,6 +492,8 @@ def _dropins(directory: str) -> list[str]:
                 e.name for e in entries if e.name.endswith(".yaml") and not e.name.startswith(".")
             )
     except FileNotFoundError:
+        if _dangling(directory):
+            raise _fail(f"config path {directory} is a dangling symlink") from None
         return []
     except OSError as exc:
         raise _fail(f"cannot read {directory}: {exc.strerror or 'error'}") from None
@@ -405,26 +506,32 @@ def load_config(
     path: str | None = None,
     *,
     environ: Mapping[str, str] | None = None,
-    warn_missing: bool = False,
+    must_exist: bool = False,
 ) -> LoadedConfig:
     """Load and validate the config; raises ``CliError`` ``config_invalid`` (exit 2).
 
-    ``path`` is the config file (default: ``$XDG_CONFIG_HOME/agent-spawn/config.yaml``). Drop-ins
-    are ``config.d/*.yaml`` beside it. A missing file is the built-in defaults (``warn_missing``
-    adds a warning, for a path the user named).
+    ``path`` is the config file (default: ``default_config_path``). Drop-ins are
+    ``config.d/*.yaml`` beside it. A missing file is the built-in defaults, unless ``must_exist``
+    (a path the user named): then it is ``config_invalid``.
     """
     env = os.environ if environ is None else environ
-    if path is not None and "\0" in path:
-        raise _fail("the config path contains a NUL byte")
-    absolute = os.path.abspath(path) if path is not None else default_config_path(env)
-    warnings: list[str] = []
+    if path is None:
+        absolute = default_config_path(env)
+    else:
+        if "\0" in path:
+            raise _fail("the config path contains a NUL byte")
+        try:
+            absolute = os.path.abspath(path)
+        except OSError as exc:
+            reason = exc.strerror or "error"
+            raise _fail(f"cannot resolve relative config path: {reason}") from None
     files: list[str] = []
     merged: dict[str, Any] = {}
 
     main = _read_regular(absolute)
     if main is None:
-        if warn_missing:
-            warnings.append(f"config file {absolute} does not exist; using built-in defaults")
+        if must_exist:
+            raise _fail(f"config file {absolute} does not exist")
     else:
         files.append(absolute)
     sources: list[tuple[str, bytes]] = [] if main is None else [(absolute, main)]
@@ -451,4 +558,4 @@ def load_config(
         env_keys[key] = variable
 
     config = _validate(merged, "after merging", env_keys)
-    return LoadedConfig(config, absolute, tuple(files), tuple(warnings))
+    return LoadedConfig(config, absolute, tuple(files))

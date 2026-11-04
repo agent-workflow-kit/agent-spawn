@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 import yaml
 
+from agent_spawn import config as config_module
 from agent_spawn.config import Config, default_config_path, load_config
 from agent_spawn.output import CliError
 
@@ -58,6 +59,27 @@ def test_example_file_validates_against_the_schema() -> None:
     jsonschema.validate(Config().model_dump(mode="json", by_alias=True), SCHEMA)
 
 
+@pytest.mark.parametrize(
+    "doc",
+    [
+        {"claude_session_cmd": ["a\0b"]},
+        {"termctl_cmd": ["a\0b"]},
+        {"wtctl_cmd": ["a\0b"]},
+        {"hooks": {"pre-launch": [{"cmd": "a\0b"}]}},
+        {"hooks": {"post-launch": [{"cmd": "a\0b"}]}},
+        {"hooks": {"post-state-change": [{"cmd": "a\0b"}]}},
+        {"tombstone_days": 30.5},
+    ],
+)
+def test_schema_refuses_what_the_model_refuses(doc: dict[str, Any]) -> None:
+    import jsonschema
+
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(doc, SCHEMA)
+    with pytest.raises(Exception):  # noqa: B017, PT011  (pydantic ValidationError)
+        Config.model_validate(doc)
+
+
 def test_defaults_equal_the_schema_defaults() -> None:
     dumped = Config().model_dump(mode="json", by_alias=True)
     for key, spec in SCHEMA["properties"].items():
@@ -95,6 +117,42 @@ def test_default_path_uses_xdg_then_home() -> None:
     assert default_config_path({"XDG_CONFIG_HOME": "rel", "HOME": "/h"}) == (
         "/h/.config/agent-spawn/config.yaml"
     )
+
+
+@pytest.mark.parametrize("home", [None, "", "rel/home"])
+def test_default_path_falls_back_to_the_passwd_home(
+    monkeypatch: pytest.MonkeyPatch, home: str | None
+) -> None:
+    monkeypatch.setattr(config_module, "_passwd_home", lambda: "/pw")
+    env = {"XDG_CONFIG_HOME": "rel"} if home is None else {"HOME": home}
+    assert default_config_path(env) == "/pw/.config/agent-spawn/config.yaml"
+
+
+def test_default_path_ignores_the_process_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", "/process-home")
+    monkeypatch.setattr(config_module, "_passwd_home", lambda: "/pw")
+    assert default_config_path({}) == "/pw/.config/agent-spawn/config.yaml"
+
+
+@pytest.mark.parametrize("passwd", [None, "", "relative"])
+def test_default_path_without_any_absolute_home_is_invalid(
+    monkeypatch: pytest.MonkeyPatch, passwd: str | None
+) -> None:
+    monkeypatch.setattr(config_module, "_passwd_home", lambda: passwd)
+    with pytest.raises(CliError) as info:
+        default_config_path({"HOME": "rel"})
+    assert info.value.code == "config_invalid"
+
+
+def test_relative_path_with_a_deleted_cwd_is_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
+    def gone() -> str:
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(os, "getcwd", gone)
+    with pytest.raises(CliError) as info:
+        load_config("c.yaml", environ={})
+    assert info.value.code == "config_invalid"
+    assert "relative config path" in info.value.message
 
 
 def test_stored_path_is_absolute(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -187,6 +245,39 @@ def test_dropin_that_is_a_directory_or_dangling_link_is_invalid(tmp_path: Path) 
     (tmp_path / "config.d" / "b.yaml").symlink_to(tmp_path / "missing")
     with pytest.raises(CliError):
         load_config(str(base), environ={})
+
+
+def test_dangling_config_file_link_is_invalid(tmp_path: Path) -> None:
+    link = tmp_path / "config.yaml"
+    link.symlink_to(tmp_path / "missing.yaml")
+    with pytest.raises(CliError) as info:
+        load_config(str(link), environ={})
+    assert info.value.code == "config_invalid"
+    assert str(link) in info.value.message
+
+
+def test_dangling_config_dir_link_is_invalid(tmp_path: Path) -> None:
+    (tmp_path / "xdg").mkdir()
+    (tmp_path / "xdg" / "agent-spawn").symlink_to(tmp_path / "missing-dir")
+    with pytest.raises(CliError) as info:
+        load_config(None, environ={"XDG_CONFIG_HOME": str(tmp_path / "xdg")})
+    assert info.value.code == "config_invalid"
+    assert str(tmp_path / "xdg" / "agent-spawn") in info.value.message
+
+
+def test_dangling_dropin_dir_link_is_invalid(tmp_path: Path) -> None:
+    base = write(tmp_path / "config.yaml", "")
+    (tmp_path / "config.d").symlink_to(tmp_path / "missing-dir")
+    with pytest.raises(CliError) as info:
+        load_config(str(base), environ={})
+    assert str(tmp_path / "config.d") in info.value.message
+
+
+def test_missing_file_must_exist_is_invalid(tmp_path: Path) -> None:
+    with pytest.raises(CliError) as info:
+        load_config(str(tmp_path / "gone.yaml"), environ={}, must_exist=True)
+    assert info.value.code == "config_invalid"
+    assert str(tmp_path / "gone.yaml") in info.value.message
 
 
 def test_symlinked_config_file_is_followed(tmp_path: Path) -> None:
@@ -315,10 +406,97 @@ def test_other_env_vars_are_ignored(tmp_path: Path) -> None:
             "hooks.post-state-change.0.statuses.0",
         ),
         ("hooks: {post-launch: {cmd: x}}\n", "hooks.post-launch"),
+        # F1: unquoted huge numbers
+        ("handoff_timeout: " + "9" * 400 + "\n", "handoff_timeout"),
+        ("prune: {older_than: " + "9" * 400 + "}\n", "prune.older_than"),
+        (
+            "hooks: {post-launch: [{cmd: x, timeout: " + "9" * 400 + "}]}\n",
+            "hooks.post-launch.0.timeout",
+        ),
+        # F5: YAML 1.2 core scalars; 1.1 forms are strings
+        ("auto_report_resume: yes\n", "auto_report_resume"),
+        ("auto_report_resume: on\n", "auto_report_resume"),
+        ("hooks: {post-launch: [{cmd: x, async: no}]}\n", "hooks.post-launch.0.async"),
+        ("handoff_timeout: 1:30\n", "handoff_timeout"),
+        ("tombstone_days: 0x10\n", "tombstone_days"),
+        ("tombstone_days: 0o10\n", "tombstone_days"),
+        ("tombstone_days: 1_0\n", "tombstone_days"),
+        ("tombstone_days: 10.0\n", "tombstone_days"),
+        # F6: validate by alias only
+        ("hooks: {pre_launch: [{cmd: x}]}\n", "hooks.pre_launch"),
+        ("hooks: {post-launch: [{cmd: x, async_: true}]}\n", "hooks.post-launch.0.async_"),
+        # F8: explicit null where the schema has no null
+        ("repos: {example.com/g/p: {kinds: {x: {promote: null}}}}\n", "promote"),
+        ("hooks: {post-launch: [{cmd: x, kinds: null}]}\n", "hooks.post-launch.0.kinds"),
+        ("hooks: {post-launch: [{cmd: x, exclude_kinds: ~}]}\n", "exclude_kinds"),
+        ("hooks: {post-launch: [{cmd: x, labels: null}]}\n", "hooks.post-launch.0.labels"),
+        ("hooks: {post-state-change: [{cmd: x, states: null}]}\n", "states"),
+        ("hooks: {post-state-change: [{cmd: x, statuses: null}]}\n", "statuses"),
     ],
 )
 def test_invalid_config_names_the_key(tmp_path: Path, text: str, key: str) -> None:
     assert key in invalid(tmp_path, text)
+
+
+def test_protect_labels_error_has_a_plain_key_path(tmp_path: Path) -> None:
+    message = invalid(tmp_path, "prune: {protect_labels: ['Bad Key']}\n")
+    assert "key `prune.protect_labels.0`: not a valid label key or label" in message
+    assert "function-after" not in message
+
+
+def test_yaml_core_schema_scalars(tmp_path: Path) -> None:
+    cfg = load(
+        tmp_path,
+        "tombstone_days: 010\nauto_report_resume: FALSE\nkinds: {no: {promote: True}, on: {}}\n"
+        "me: {name: Null}\nhandoff_timeout: 1e2\n",
+    )
+    assert cfg.tombstone_days == 10  # decimal, not octal
+    assert cfg.auto_report_resume is False
+    assert set(cfg.kinds) == {"no", "on"}
+    assert cfg.kinds["no"].promote is True
+    assert cfg.me.name is None
+    assert cfg.handoff_timeout == 100.0
+
+
+@pytest.mark.parametrize(
+    ("text", "path"),
+    [
+        ("123: x\n", "123"),
+        ("kinds: {123: {}}\n", "kinds.123"),
+        ("repos: {example.com/g/p: {kinds: {true: {}}}}\n", "repos.example.com/g/p.kinds.true"),
+    ],
+)
+def test_non_string_key_names_the_key_path(tmp_path: Path, text: str, path: str) -> None:
+    message = invalid(tmp_path, text)
+    assert f"key `{path}`" in message
+    assert "must be strings" in message
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "tombstone_days: !!int abc\n",
+        "tombstone_days: !!int 3\n",
+        "x: !!timestamp 2001-12-14\n",
+        "auto_report_resume: !!bool maybe\n",
+        "handoff_timeout: !!float abc\n",
+        "me: !!map {name: a}\n",
+        "claude_session_cmd: !!seq [a]\n",
+        "me: {name: !!str a}\n",
+        "me: {name: ! a}\n",
+        "me: {name: !local a}\n",
+    ],
+)
+def test_explicit_tags_are_refused_without_echo(tmp_path: Path, text: str) -> None:
+    message = invalid(tmp_path, text)
+    assert "line 1" in message
+    assert "tags are not allowed" in message
+    assert "abc" not in message and "maybe" not in message
+
+
+def test_overlong_integer_is_config_invalid_without_echo(tmp_path: Path) -> None:
+    message = invalid(tmp_path, "tombstone_days: " + "7" * 5000 + "\n")
+    assert "7777" not in message
 
 
 def test_valid_full_config(tmp_path: Path) -> None:
@@ -396,7 +574,7 @@ def test_promote_flag_beats_repo_beats_kind_beats_default(tmp_path: Path) -> Non
         "- a\n- b\n",
         "just a string\n",
         "42\n",
-        "null\n" if False else "~ : 1\n",
+        "~ : 1\n",
         "1: x\n",
         "tombstone_days: 1\ntombstone_days: 2\n",
         "me: {name: a, name: b}\n",

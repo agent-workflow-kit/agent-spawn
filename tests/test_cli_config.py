@@ -115,14 +115,40 @@ def test_default_path_is_stored_when_no_file_exists(
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     cli.main(["show", "ag-abcdefgh"])
     assert reached[-1].config_file == str(tmp_path / "xdg" / "agent-spawn" / "config.yaml")
-    assert reached[-1].warnings == []
+    assert reached[-1].config is not None
 
 
-def test_missing_named_config_warns_but_internal_commands_do_not(
+def test_missing_named_config_is_invalid_for_public_commands(
+    tmp_path: Path, reached: list[Invocation], capsys: pytest.CaptureFixture[str]
+) -> None:
+    gone = str(tmp_path / "gone.yaml")
+    assert cli.main(["--json", "--config", gone, "show", "ag-abcdefgh"]) == 2
+    envelope = json.loads(capsys.readouterr().out)
+    assert reached == []
+    assert envelope["error"]["code"] == "config_invalid"
+    assert gone in envelope["error"]["message"]
+
+
+def test_internal_commands_treat_a_missing_config_as_defaults(
     tmp_path: Path, reached: list[Invocation]
 ) -> None:
-    cli.main(["--config", str(tmp_path / "gone.yaml"), "show", "ag-abcdefgh"])
-    assert any("gone.yaml" in w for w in reached[-1].warnings)
     cli.main(["--state-dir", "/s", "--config", str(tmp_path / "gone.yaml"), "_session-event"])
-    assert reached[-1].warnings == []
     assert reached[-1].config is not None
+    assert reached[-1].config_file == str(tmp_path / "gone.yaml")
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["tombstone_days: !!int abc\n", "tombstone_days: " + "7" * 5000 + "\n"],
+)
+def test_unconvertible_scalar_exits_2_with_an_envelope(
+    tmp_path: Path, reached: list[Invocation], capsys: pytest.CaptureFixture[str], text: str
+) -> None:
+    code = cli.main(["--json", "--config", _cfg(tmp_path, text), "list"])
+    envelope = json.loads(capsys.readouterr().out)
+    assert code == 2
+    assert reached == []
+    schema_registry.validate(envelope, "agent-spawn/cli/error.json")
+    assert envelope["error"]["code"] == "config_invalid"
+    assert "abc" not in envelope["error"]["message"]
+    assert "7777" not in envelope["error"]["message"]

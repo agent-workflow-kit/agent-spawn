@@ -426,8 +426,9 @@ def _check_usage(args: argparse.Namespace, key: str) -> None:
     state_dir: str | None = getattr(args, "state_dir", None)
     config: str | None = getattr(args, "config", None)
     if internal:
-        # TODO(#14): decide relay exit on malformed argv (State relay says exit 0 always;
-        # Internal commands says exit 2).
+        # TODO(#14): decide relay exit on malformed argv and on an invalid config (State relay
+        # says exit 0 always; Internal commands says exit 2; parse_invocation exits 2 on
+        # config_invalid before the relay handler runs).
         for flag, value in (("--state-dir", state_dir), ("--config", config)):
             if value is None or not value.startswith("/") or "\0" in value:
                 raise ValueError(f"{key} needs an absolute {flag}")
@@ -528,7 +529,10 @@ def parse_invocation(argv: Sequence[str]) -> Invocation:
     internal = key in INTERNAL_COMMANDS
     named: str | None = getattr(args, "config", None)
     try:
-        loaded = load_config(named, warn_missing=named is not None and not internal)
+        # TODO(#11): a window supervisor loads this config, including AGENT_SPAWN_* overrides,
+        # from its own environment before it adopts the launcher's handoff environment; decide
+        # which environment's AGENT_SPAWN_* applies to it.
+        loaded = load_config(named, must_exist=named is not None and not internal)
     except CliError as error:
         raise ConfigFailure(error, decision_ids=capped, result_file=result_file) from None
     try:
@@ -560,7 +564,6 @@ def parse_invocation(argv: Sequence[str]) -> Invocation:
         result_file=result_file,
         config=loaded.config,
         config_file=loaded.path,
-        warnings=list(loaded.warnings),
     )
 
 
