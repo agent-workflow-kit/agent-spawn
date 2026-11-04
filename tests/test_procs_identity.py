@@ -463,7 +463,36 @@ def test_a_failing_second_pipe_closes_the_first_pipe_and_the_log(tmp_path: Path)
     assert caught.value.errno == errno.EMFILE
     assert gw.open_fds() == 0  # both ends of the first pipe were closed
     assert _open_fd_count() == before  # and the log descriptor
-    assert gw.sigmask_calls == []  # nothing was blocked: the fork was never reached
+    assert gw.sigmask_calls[-1] == (signal.SIG_SETMASK, frozenset())  # the caller's mask is back
+
+
+class _ForkedWaitRaises(FakeGateway):
+    """A fork that succeeds and a waitpid interrupted by a raising signal handler."""
+
+    def __init__(self) -> None:
+        super().__init__(pipe_plan=[None, None])
+        self.waits: list[tuple[int, int | None]] = []  # (open fds, last sigmask how) per call
+
+    def fork(self) -> int:
+        return 4242
+
+    def waitpid(self, pid: int, flags: int = 0) -> tuple[int, int]:
+        last_how = self.sigmask_calls[-1][0] if self.sigmask_calls else None
+        self.waits.append((self.open_fds(), last_how))
+        raise KeyboardInterrupt
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc")
+def test_a_raising_waitpid_still_closes_every_descriptor(tmp_path: Path) -> None:
+    gw = _ForkedWaitRaises()
+    before = _open_fd_count()
+    with pytest.raises(KeyboardInterrupt):
+        procs.spawn_detached(["/bin/echo"], log_path=str(tmp_path / "log"), gateway=gw)
+    assert gw.open_fds() == 0  # both pipes
+    assert _open_fd_count() == before  # and the log descriptor
+    # The fallback reap runs with signals blocked and after every descriptor is closed.
+    assert gw.waits[-1] == (0, signal.SIG_BLOCK)
+    assert gw.sigmask_calls[-1][0] == signal.SIG_SETMASK  # the caller's mask is restored
 
 
 def test_wait_for_exit_on_a_live_fake_times_out() -> None:

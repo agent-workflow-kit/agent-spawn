@@ -464,14 +464,26 @@ def check():
             handle.write(f"{os.getpid()}\n")
         os._exit(0)
 
-inside = False
+SPAWN = procs.spawn_detached.__code__
+
+def in_spawn(frame):
+    while frame is not None:
+        if frame.f_code is SPAWN:
+            return True
+        frame = frame.f_back
+    return False
 
 def boom(sig, frame):
-    global inside
     check()
-    if inside and random.random() < 0.02:  # raise in some spawns, let others complete
-        inside = False
+    # Raise only inside spawn_detached (a raise after it returned would drop the handle),
+    # in some spawns, letting others complete.
+    if in_spawn(frame) and random.random() < 0.02:
         raise Boom
+
+FD_DIR = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+
+def open_fds():
+    return len(os.listdir(FD_DIR))
 
 def tick(sig, frame):
     check()
@@ -481,13 +493,12 @@ def tick(sig, frame):
 signal.signal(signal.SIGUSR1, boom)
 signal.signal(signal.SIGALRM, tick)
 signal.setitimer(signal.ITIMER_REAL, 0.0007, 0.0007)
+baseline = open_fds()
 deadline = time.monotonic() + 2.0
 spawns = booms = 0
 while time.monotonic() < deadline:
     try:
-        inside = True
         started = procs.spawn_detached([sys.executable, "-c", "pass"])
-        inside = False
         started.abort()
         spawns += 1
     except Boom:
@@ -497,8 +508,9 @@ signal.setitimer(signal.ITIMER_REAL, 0, 0)
 signal.signal(signal.SIGALRM, signal.SIG_IGN)
 signal.signal(signal.SIGUSR1, signal.SIG_IGN)
 check()
+leaked = open_fds() - baseline  # before opening the counts file
 with open(marker + ".counts", "w") as handle:
-    handle.write(f"{spawns} {booms}\n")
+    handle.write(f"{spawns} {booms} {leaked}\n")
 """
 
 
@@ -515,8 +527,9 @@ def test_a_raising_signal_handler_never_runs_in_a_forked_child(
     assert launcher.wait(timeout=60) == 0
     proc_tracker.settle(30)  # unacknowledged grandchildren exit once the launcher's pipes close
     assert not marker.exists(), f"children ran caller code: {marker.read_text()}"
-    spawns, booms = map(int, (tmp_path / "escaped.counts").read_text().split())
+    spawns, booms, leaked = map(int, (tmp_path / "escaped.counts").read_text().split())
     assert spawns > 0 and booms > 0
+    assert leaked == 0, f"{leaked} descriptors leaked across {booms} interrupted starts"
 
 
 STDIO_LAUNCHER = r"""

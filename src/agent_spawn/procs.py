@@ -508,6 +508,13 @@ class DetachedStart:
         if fd is not None:
             self._gw.close(fd)
 
+    def __del__(self) -> None:
+        # A handle dropped unacknowledged (a signal handler raised before the caller stored
+        # it) still closes its pipe, as abort() would.
+        fd, self._ack_fd = getattr(self, "_ack_fd", None), None
+        if fd is not None:
+            _close_quietly(self._gw, fd)
+
 
 def _fd_limit() -> int:
     """One past the highest descriptor number that can be open (for ``closerange``)."""
@@ -677,6 +684,23 @@ def _close_quietly(gw: Gateway, fd: int) -> None:
         pass
 
 
+def _release_detached(
+    gw: Gateway, fds: tuple[int, ...], log_fd: int | None, pid: int, reaped: bool
+) -> None:
+    """Launcher cleanup of a detached start. Closes first: a closed acknowledgement pipe lets
+    the grandchild exit at once; then reaps an intermediate the launcher did not wait for."""
+    for fd in fds:
+        if fd >= 0:
+            _close_quietly(gw, fd)
+    if log_fd is not None:
+        os.close(log_fd)
+    if pid > 0 and not reaped:
+        try:
+            gw.waitpid(pid)  # the intermediate exits right after its fork
+        except OSError:
+            pass
+
+
 def spawn_detached(
     argv: Sequence[str],
     *,
@@ -699,7 +723,10 @@ def spawn_detached(
     contain NUL and env names must be non-empty without ``=`` (``ValueError``).
 
     Every signal is blocked from just before the fork until the grandchild's exec, so no
-    Python signal handler of the caller ever runs in a forked child.
+    Python signal handler of the caller ever runs in a forked child. In the caller, signals
+    are blocked whenever a descriptor is created, closed or handed over, so a raising handler
+    (``KeyboardInterrupt``) leaks none; the waits for the intermediate and the report stay
+    interruptible.
     """
     # todo(#11): add a fake spawn_detached (procs-level) when the launcher's unit tests need it
     gw = _gw(gateway)
@@ -709,29 +736,31 @@ def spawn_detached(
     id_r = id_w = ack_r = ack_w = -1
     pid = -1
     reaped = False
+    old_mask = gw.pthread_sigmask(signal.SIG_BLOCK, ())  # read it before changing it
     try:
+        # Descriptors are created, closed and handed over only while every signal is blocked,
+        # so a raising handler never runs between creating a descriptor and recording it.
+        gw.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
         if log_path is not None:
             log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC, 0o600)
         id_r, id_w = gw.pipe()
         ack_r, ack_w = gw.pipe()
-        old_mask = gw.pthread_sigmask(signal.SIG_BLOCK, ())  # read it before changing it
-        try:
-            gw.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
-            pid = gw.fork()
-            if pid == 0:
-                try:
-                    _intermediate(
-                        gw, argv, env, log_fd, id_r, id_w, ack_r, ack_w, ack_timeout, fd_limit
-                    )
-                finally:
-                    gw.exit_now(70)
-        finally:
-            if pid != 0:  # the launcher (or a failed fork): restore the caller's mask
-                gw.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        pid = gw.fork()
+        if pid == 0:
+            try:
+                _intermediate(
+                    gw, argv, env, log_fd, id_r, id_w, ack_r, ack_w, ack_timeout, fd_limit
+                )
+            finally:
+                gw.exit_now(70)
         # The launcher: keep only the identity read end and the acknowledgement write end.
         gw.close(id_w)
         gw.close(ack_r)
         id_w = ack_r = -1
+        if log_fd is not None:
+            os.close(log_fd)
+            log_fd = None
+        gw.pthread_sigmask(signal.SIG_SETMASK, old_mask)  # the waits stay interruptible
         try:
             gw.waitpid(pid)
         except ChildProcessError:
@@ -739,27 +768,26 @@ def spawn_detached(
         except OSError as exc:
             raise DetachedForkError(f"waiting for the intermediate process failed: {exc}") from exc
         reaped = True
-        try:
-            payload = _read_line(gw, id_r, timeout)
-            identity = ProcessIdentity.from_dict(json.loads(payload))
-        except (DetachedForkError, ValueError):
-            gw.close(ack_w)
-            ack_w = -1
-            raise
+        payload = _read_line(gw, id_r, timeout)
+        identity = ProcessIdentity.from_dict(json.loads(payload))
+        gw.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
+        gw.close(id_r)
+        id_r = -1
         started = DetachedStart(identity, ack_w, gw)
         ack_w = -1
-        return started
     finally:
-        if pid > 0 and not reaped:
+        # Blocked (again), so a raising handler cannot skip the cleanup; nested so the cleanup
+        # and the restore run whatever raises.
+        try:
+            gw.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
+        finally:
             try:
-                gw.waitpid(pid)  # the intermediate exits right after its fork
-            except OSError:
-                pass
-        for fd in (id_r, id_w, ack_r, ack_w):
-            if fd >= 0:
-                _close_quietly(gw, fd)
-        if log_fd is not None:
-            os.close(log_fd)
+                _release_detached(gw, (id_r, id_w, ack_r, ack_w), log_fd, pid, reaped)
+            finally:
+                # This delivers any pending signal; a handler raising here drops ``started``,
+                # whose finalizer then closes the acknowledgement pipe.
+                gw.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+    return started
 
 
 def wait_for_exit(
