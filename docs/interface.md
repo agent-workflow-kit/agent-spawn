@@ -36,11 +36,11 @@ Input: the `ag-` prefix is optional; a unique prefix of at least 4 characters af
 
 ### Names
 
-An agent's **name** is the display name of its windows: 1 to 64 Unicode code points, no control characters (C0, DEL, C1), not containing `#[` (termctl's name rules). `--name` is validated against them (exit 2). The name is `--name`, else `--worktree-name`, else `<kind> <first 6 characters of the id after ag->`, where `<kind>` is the explicit `--kind` or the word `agent`. It is fixed when the record is allocated ([Launch order](#launch-order) step 3) and is never null. agent-spawn never derives a name from labels or from third-party text. The name is stored and used for every window of the agent (resume, promotion); `resume --name` replaces it.
+An agent's **name** is the display name of its windows: 1 to 64 Unicode code points, no control characters (C0, DEL, C1), not containing `#[` (termctl's name rules). `--name` is validated against them (exit 2). The name is `--name`, else `--worktree-name`, else `<kind> <first 6 characters of the id after ag->`, where `<kind>` is the explicit `--kind` cut to its first 57 code points (so the derived name fits 64) or the word `agent`. `--name` and `--worktree-name` are never cut: they are validated as given (exit 2), and a valid `--worktree-name` always fits, since wtctl's name grammar allows at most 64 ASCII characters. It is fixed when the record is allocated ([Launch order](#launch-order) step 3) and is never null. agent-spawn never derives a name from labels or from third-party text. The name is stored and used for every window of the agent (resume, promotion); `resume --name` replaces it.
 
 ### Labels
 
-A label is `key=value`, split at the first `=`; key `^[a-z0-9][a-z0-9_.-]{0,63}$`; value 0 to 256 characters from `[A-Za-z0-9._:/#@+=,-]`; at most 64 pairs per agent (exit 2 beyond, except for `job=`, [Labels on agents](#labels-on-agents)). Labels are a multiset (design guide section 9): adding a pair the agent already has, or removing a pair it does not have, is a no-op. agent-spawn assigns no meaning to any key; it writes `job=<id>` ([Labels on agents](#labels-on-agents)) and passes `agent=<agent_id>` and `kind=<run kind>` to lower tools ([Labels on lower tools](#labels-on-lower-tools)). The keys `agent` and `kind` are reserved: `--label`, `label add` and `label remove` with either key exit 2.
+A label is `key=value`, split at the first `=`; key `^[a-z0-9][a-z0-9_.-]{0,63}$`; value 0 to 256 characters from `[A-Za-z0-9._:/#@+=,-]`; at most 64 pairs per agent (exit 2 beyond, except for `job=` at launch and resume, fork included, [Labels on agents](#labels-on-agents); `label add` with `job=` over the cap exits 2 like any pair; `label remove` has no cap, since removing a pair the agent lacks is a no-op). Labels are a multiset (design guide section 9): adding a pair the agent already has, or removing a pair it does not have, is a no-op. agent-spawn assigns no meaning to any key; it writes `job=<id>` ([Labels on agents](#labels-on-agents)) and passes `agent=<agent_id>` and `kind=<run kind>` to lower tools ([Labels on lower tools](#labels-on-lower-tools)). The keys `agent` and `kind` are reserved: `--label` (of every command, `list` included), `label add` and `label remove` with either key exit 2. `resume --select` checks the grammar only; a reserved key there matches nothing, since agent-spawn never stores it on the agent.
 
 `job=<id>` identifies only retries of the same job. A workflow finds its agent by its own stable labels plus its own records (the `agent_id` it stored), not by `job=` alone; a caller that abandons a failed launch tears the agent down.
 
@@ -148,7 +148,11 @@ agent-spawn's own launch flags:
 | `--override-escalation` | off | Human-only; [Escalation overrides](#escalation-overrides). Audited. |
 | `--dry-run` | off | [`launch`](#launch). |
 
-Durations: a positive number of seconds (fractions allowed), or `<number><unit>` with unit `ms`, `s`, `m`, `h` or `d`; in flags and the environment a bare number string means seconds. Zero exits 2.
+### Durations and times
+
+Durations: a positive number of seconds (fractions allowed), or `<number><unit>` with unit `ms`, `s`, `m`, `h` or `d`; in flags and the environment a bare number string means seconds. The number is ASCII digits, optionally `.` and more digits (no sign, exponent, whitespace, leading or trailing `.`, underscore or non-ASCII digit; leading zeros are fine). Zero exits 2 (also written as `0.000ms`), as does a duration over `36500d` (as in claude-session) or text over 32 characters.
+
+Times (`--since <time|duration>` of [`list`](#list) and [`export`](#export)): a value that is a duration is tried first and means that long ago (so bare digits such as `20240101` are seconds); otherwise `YYYY-MM-DD` or `YYYY-MM-DD[T ]HH:MM[:SS[.f]][Z|±HH:MM]` with 1 to 6 fraction digits (uppercase `T` and `Z` only); a bare date takes no offset, and no offset means UTC. A date or time that does not exist, an offset outside `±23:59`, or an instant out of range once the offset is applied exits 2.
 
 ## Resume order
 
@@ -347,7 +351,7 @@ These rules cover only runs launched through agent-spawn ([Residual risks](#resi
 
 `teardown <agent_id> [--merged-head <sha>] [--force] [--override-escalation] [--hook NAME=CMD]... [--dry-run] [--actor <actor>] [--decision-id <id>]... [--json]`:
 
-1. **Resolve and check usage.** A full id of a torn-down agent exits 10 with `details.status: torn_down` (done). `--merged-head` must be a full 40-hex sha (exit 2 otherwise); `--hook` names other than `pre-teardown` and `post-teardown` exit 2.
+1. **Resolve and check usage.** A full id of a torn-down agent exits 10 with `details.status: torn_down` (done). `--merged-head` must be a full 40-character lowercase hex sha (exit 2 otherwise); `--hook` names other than `pre-teardown` and `post-teardown` exit 2.
 2. **Lifecycle entry and live checks** (exit 20, `reason: live`; nothing overrides them, not even `--force`): the [liveness](#liveness) check; the agent is live or `launching`, or a promotion is pending; the agent has a session whose current run `claude-session status` shows pending or live. Then the compare-and-set `parked` → `tearing_down` (`teardown_step: started`); a `tearing_down` agent whose teardown process is dead is a **retry** and continues where `teardown_step` shows (its teardown process is alive: exit 20 `tearing_down`).
 3. **`pre-teardown` hooks**: veto 11, escalation 13 (re-run with `--override-escalation`, human-only); either returns the agent to `parked` unchanged. A retry runs them only when `teardown_step` is `started` (they never completed), else skips them and logs `teardown_retry`. Then the live checks of step 2 run again (a refusal returns the agent to `parked`, exit 20 `live`). Marker `hooks_done`.
 4. **Worktree** (skipped when the agent holds no record, or when `teardown_step` shows it done). Records are processed in this order: every held record in stored order, then the owned record last:
@@ -421,7 +425,7 @@ agent-spawn list [--label k=v]... [--needs-attention] [--status <status>]... [--
     [--since <time|duration>] [--json]
 ```
 
-Agents ordered by `created` descending, ties by `agent_id` ([schemas/cli/list.json](../schemas/cli/list.json): `{"agents": [<agent>...]}`). Without `--status`, torn-down agents are excluded. `--label` is ANDed; `--status` and `--session-state` (claude-session states, matched against the relayed `session_state`) are ORed; `--kind` matches the launch kind or the last run's kind; `--mode` matches the last run's mode; `--since` matches `updated`. Runs the [liveness](#liveness) check for live and launching agents; it never delivers hooks and never calls claude-session for the session fields (they come from relay records).
+Agents ordered by `created` descending, ties by `agent_id` ([schemas/cli/list.json](../schemas/cli/list.json): `{"agents": [<agent>...]}`). Without `--status`, torn-down agents are excluded. `--label` is ANDed; `--status` and `--session-state` (claude-session states, matched against the relayed `session_state`) are ORed; `--kind` matches the launch kind or the last run's kind; `--mode` matches the last run's mode; `--since` ([times](#durations-and-times)) matches `updated`. Runs the [liveness](#liveness) check for live and launching agents; it never delivers hooks and never calls claude-session for the session fields (they come from relay records).
 
 ### `show`
 
@@ -528,7 +532,7 @@ Writes or removes the managed crontab block `# agent-spawn managed`, which runs 
 
 ### `export`
 
-`agent-spawn export [--since <time|duration>] [--action <action>]... [--json]`: audit records, oldest first ([schemas/cli/export.json](../schemas/cli/export.json)).
+`agent-spawn export [--since <time|duration>] [--action <action>]... [--json]`: audit records, oldest first ([schemas/cli/export.json](../schemas/cli/export.json)); `--since` takes a [time or duration](#durations-and-times).
 
 ### `browse`
 
@@ -671,7 +675,7 @@ agent-spawn is the authoritative label store for agents. Labels given with `--la
 
 - when `CSESSION_ID` is set (the caller runs inside an agent session), `job=` is taken only from an explicit `--label job=…`;
 - a fork gets `job=` only from an explicit `--label job=…`;
-- when adding `job=` would exceed the 64-pair cap, it is skipped with a warning (never a failure).
+- when adding a `job=` pair would exceed the 64-pair cap, it is skipped with a warning (never a failure), whether it comes from `job_id_env` or from an explicit `--label job=…` at launch or resume (fork included); the other labels are added first, and only they count toward the cap's exit 2. `label add job=…` over the cap exits 2 like any pair.
 
 `job=` values accumulate, one per job that launched or resumed the agent ([Labels](#labels)).
 
