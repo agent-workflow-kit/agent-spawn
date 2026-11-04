@@ -48,6 +48,10 @@ def private_env(tmp_path: Path) -> dict[str, str]:
         "HOME": str(tmp_path / "home"),
         "XDG_CONFIG_HOME": str(tmp_path / "config"),
         "XDG_STATE_HOME": str(tmp_path / "state"),
+        "XDG_DATA_HOME": str(tmp_path / "data"),
+        "XDG_CACHE_HOME": str(tmp_path / "cache"),
+        "ZDOTDIR": str(tmp_path / "zdot"),
+        "SHELL": "/bin/sh",
         "PATH": os.environ.get("PATH", ""),
     }
 
@@ -164,22 +168,25 @@ def test_forwarding_by_exact_pid_reaches_a_child_in_its_own_group(
         assert handle.wait_exit(10)
 
 
-def test_a_term_ignoring_child_needs_sigkill_and_the_tracker_delivers_it() -> None:
-    tracker = ProcTracker()
+def test_a_term_ignoring_child_needs_sigkill_and_the_tracker_delivers_it(
+    proc_tracker: ProcTracker,
+) -> None:
+    tracker = ProcTracker(sweep=False)
     child = tracker.popen(IGNORE_TERM, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
-    assert child.stdout is not None
-    assert child.stdout.readline().strip() == b"ready"
     identity = tracker.identities[0]
-    assert procs.forward_signal(identity, signal.SIGTERM).sent
-    handle = procs.open_verified(identity)
-    assert handle is not None
-    with handle:
-        assert not handle.wait_exit(0.3)  # ignored SIGTERM
+    proc_tracker.record(identity)  # the autouse tracker kills it if this test fails early
     old = procguard.GRACE
-    procguard.GRACE = 0.3
     try:
-        tracker.cleanup()
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == b"ready"
+        assert procs.forward_signal(identity, signal.SIGTERM).sent
+        handle = procs.open_verified(identity)
+        assert handle is not None
+        with handle:
+            assert not handle.wait_exit(0.3)  # ignored SIGTERM
+        procguard.GRACE = 0.3
     finally:
+        tracker.cleanup()
         procguard.GRACE = old
     assert not tracker.survivors
     assert child.poll() == -signal.SIGKILL
@@ -264,6 +271,16 @@ def test_detached_launcher_death_before_ack_never_execs(
     assert not marker.exists()
 
 
+def _fd_targets(pid: int) -> dict[int, str]:
+    targets: dict[int, str] = {}
+    for name in os.listdir(f"/proc/{pid}/fd"):
+        try:
+            targets[int(name)] = os.readlink(f"/proc/{pid}/fd/{name}")
+        except FileNotFoundError:
+            pass  # closed while listing
+    return targets
+
+
 def test_detached_closes_inherited_fds_and_redirects_stdio(
     tmp_path: Path, proc_tracker: ProcTracker
 ) -> None:
@@ -274,10 +291,20 @@ def test_detached_closes_inherited_fds_and_redirects_stdio(
         "print('fds',sorted(int(x) for x in os.listdir('/proc/self/fd')),flush=True);"
         "print('stdin',repr(os.read(0,10)),flush=True)"
     )
-    extra = [os.pipe() for _ in range(3)]  # fds the caller holds open
+    extra = [os.pipe() for _ in range(3)]  # fds the caller holds open, inheritable
+    for r, w in extra:
+        os.set_inheritable(r, True)
+        os.set_inheritable(w, True)
+    extra_targets = {os.readlink(f"/proc/self/fd/{fd}") for pair in extra for fd in pair}
     try:
         started = procs.spawn_detached([sys.executable, "-c", script], log_path=str(log))
         proc_tracker.record(started.identity)
+        # Before the acknowledgement: stdio plus the acknowledgement pipe (the identity pipe
+        # closes right after the report), and none of the caller's descriptors.
+        assert wait_until(lambda: len(_fd_targets(started.identity.pid)) <= 4)
+        before_ack = _fd_targets(started.identity.pid)
+        assert set(before_ack) - {0, 1, 2} and min(set(before_ack) - {0, 1, 2}) >= 3
+        assert not extra_targets & set(before_ack.values())
         started.acknowledge()
         assert wait_until(lambda: "stdin" in (log.read_text() if log.exists() else ""))
     finally:
@@ -383,14 +410,13 @@ def test_detached_never_holds_the_callers_pipe(tmp_path: Path, proc_tracker: Pro
         "s=procs.spawn_detached([sys.executable,'-c','import time; time.sleep(120)']);"
         "s.acknowledge(); print(json.dumps(s.identity.to_dict()),flush=True)"
     )
-    launcher = subprocess.Popen(
+    launcher = proc_tracker.popen(  # recorded first: a timeout below still kills it
         [sys.executable, "-c", script],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=private_env(tmp_path),
     )
-    proc_tracker.popens.append(launcher)
     out, _ = launcher.communicate(timeout=20)  # blocks until every writer closed its end
     identity = ProcessIdentity.from_dict(json.loads(out))
     proc_tracker.record(identity)
@@ -406,3 +432,298 @@ def test_real_prctl_and_peer_credentials_go_through_the_gateway() -> None:
     with a, b:
         creds = gw.peer_credentials(b)
     assert (creds.pid, creds.uid) == (os.getpid(), os.getuid())
+
+
+# ---- review round 1 ----------------------------------------------------------------------
+
+
+def _run_launcher(
+    tracker: ProcTracker, tmp_path: Path, script: str, *args: str, shell_prefix: str = ""
+) -> subprocess.Popen[bytes]:
+    """Run ``script`` in a fresh Python; ``shell_prefix`` redirections apply to it (via sh)."""
+    argv = [sys.executable, "-c", script, *args]
+    if shell_prefix:
+        argv = ["/bin/sh", "-c", f'exec "$@" {shell_prefix}', "sh", *argv]
+    return tracker.popen(argv, stdin=subprocess.DEVNULL, env=private_env(tmp_path))
+
+
+ESCAPE_LAUNCHER = r"""
+import os, random, signal, sys, time
+from agent_spawn import procs
+ME = os.getpid()
+marker = sys.argv[1]
+if os.getpgid(0) != ME:
+    sys.exit(3)  # the test starts this launcher as the leader of its own group
+
+class Boom(Exception):
+    pass
+
+def check():
+    if os.getpid() != ME:  # a forked child is running the caller's code
+        with open(marker, "a") as handle:
+            handle.write(f"{os.getpid()}\n")
+        os._exit(0)
+
+inside = False
+
+def boom(sig, frame):
+    global inside
+    check()
+    if inside and random.random() < 0.02:  # raise in some spawns, let others complete
+        inside = False
+        raise Boom
+
+def tick(sig, frame):
+    check()
+    os.killpg(ME, signal.SIGUSR1)  # our own group: us and any child not yet in its session
+    boom(sig, frame)
+
+signal.signal(signal.SIGUSR1, boom)
+signal.signal(signal.SIGALRM, tick)
+signal.setitimer(signal.ITIMER_REAL, 0.0007, 0.0007)
+deadline = time.monotonic() + 2.0
+spawns = booms = 0
+while time.monotonic() < deadline:
+    try:
+        inside = True
+        started = procs.spawn_detached([sys.executable, "-c", "pass"])
+        inside = False
+        started.abort()
+        spawns += 1
+    except Boom:
+        booms += 1
+    check()
+signal.setitimer(signal.ITIMER_REAL, 0, 0)
+signal.signal(signal.SIGALRM, signal.SIG_IGN)
+signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+check()
+with open(marker + ".counts", "w") as handle:
+    handle.write(f"{spawns} {booms}\n")
+"""
+
+
+def test_a_raising_signal_handler_never_runs_in_a_forked_child(
+    tmp_path: Path, proc_tracker: ProcTracker
+) -> None:
+    marker = tmp_path / "escaped"
+    launcher = proc_tracker.popen(
+        [sys.executable, "-c", ESCAPE_LAUNCHER, str(marker)],
+        stdin=subprocess.DEVNULL,
+        env=private_env(tmp_path),
+        start_new_session=True,
+    )
+    assert launcher.wait(timeout=60) == 0
+    proc_tracker.settle(30)  # unacknowledged grandchildren exit once the launcher's pipes close
+    assert not marker.exists(), f"children ran caller code: {marker.read_text()}"
+    spawns, booms = map(int, (tmp_path / "escaped.counts").read_text().split())
+    assert spawns > 0 and booms > 0
+
+
+STDIO_LAUNCHER = r"""
+import json, sys
+from agent_spawn import procs
+out, log = sys.argv[1], sys.argv[2]
+# $(...) redirects only the subshell's stdout: /proc/$$ is the probe shell's own table.
+probe = (
+    'fds=$(readlink /proc/$$/fd/0 /proc/$$/fd/1 /proc/$$/fd/2); echo "$fds" > '
+    + out + ".fds; echo out; echo err >&2"
+)
+started = procs.spawn_detached(["/bin/sh", "-c", probe], log_path=log)
+started.acknowledge()
+with open(out, "w") as handle:
+    handle.write(json.dumps(started.identity.to_dict()))
+"""
+
+
+@pytest.mark.parametrize("closed", ["0<&-", "1>&- 2>&-", "0<&- 1>&- 2>&-"])
+def test_detached_start_with_the_callers_stdio_closed(
+    closed: str, tmp_path: Path, proc_tracker: ProcTracker
+) -> None:
+    out, log = tmp_path / "identity", tmp_path / "log"
+    launcher = _run_launcher(
+        proc_tracker, tmp_path, STDIO_LAUNCHER, str(out), str(log), shell_prefix=closed
+    )
+    assert launcher.wait(timeout=30) == 0
+    identity = proc_tracker.record(ProcessIdentity.from_dict(json.loads(out.read_text())))
+    fds_file = Path(str(out) + ".fds")
+    assert wait_until(lambda: fds_file.exists() and fds_file.read_text().count("\n") == 3)
+    assert wait_until(lambda: log.exists() and "err" in log.read_text())
+    assert fds_file.read_text().splitlines() == ["/dev/null", str(log), str(log)]
+    assert log.read_text().splitlines() == ["out", "err"]
+    assert wait_until(lambda: not procs.is_alive(identity))
+
+
+def test_a_pid_that_now_names_a_thread_reads_as_gone() -> None:
+    import threading
+
+    ready, stop = threading.Event(), threading.Event()
+    tids: list[int] = []
+
+    def run() -> None:
+        tids.append(threading.get_native_id())
+        ready.set()
+        stop.wait(30)
+
+    helper = threading.Thread(target=run)
+    helper.start()
+    try:
+        assert ready.wait(10)
+        tid = tids[0]
+        assert tid != os.getpid()
+        boot = procs.read_boot_id()
+        forged = ProcessIdentity(tid, 1, boot)
+        assert procs.forward_signal(forged, signal.SIGTERM).reason == "gone"
+        assert procs.open_verified(forged) is None
+        assert procs.wait_for_exit(forged, 1.0)
+        for gw in (SystemGateway(), SystemGateway(force_syscall=True)):
+            assert procs.open_verified(forged, gateway=gw) is None
+    finally:
+        stop.set()
+        helper.join(10)
+
+
+HIGH_FD_LAUNCHER = r"""
+import json, os, resource, sys
+from agent_spawn import procs
+out = sys.argv[1]
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+r, w = os.pipe()
+os.dup2(w, 70000, inheritable=True)
+os.close(w)
+probe = "ls /proc/$$/fd > " + out + ".after"
+started = procs.spawn_detached(["/bin/sh", "-c", probe])
+pid = started.identity.pid
+before = sorted(int(x) for x in os.listdir(f"/proc/{pid}/fd"))
+os.close(70000)
+import select
+eof = bool(select.select([r], [], [], 5)[0]) and os.read(r, 1) == b""
+started.acknowledge()
+with open(out, "w") as handle:
+    handle.write(json.dumps({"identity": started.identity.to_dict(), "before": before, "eof": eof}))
+"""
+
+
+def test_detached_closes_an_inherited_fd_above_65536(
+    tmp_path: Path, proc_tracker: ProcTracker
+) -> None:
+    import resource
+
+    if resource.getrlimit(resource.RLIMIT_NOFILE)[1] <= 70001:
+        pytest.skip("the hard RLIMIT_NOFILE is too low for an fd above 65536")
+    out = tmp_path / "result"
+    launcher = _run_launcher(proc_tracker, tmp_path, HIGH_FD_LAUNCHER, str(out))
+    assert launcher.wait(timeout=30) == 0
+    result = json.loads(out.read_text())
+    proc_tracker.record(ProcessIdentity.from_dict(result["identity"]))
+    assert 70000 not in result["before"]
+    assert result["eof"]  # the grandchild did not hold the caller's pipe end
+    after = Path(str(out) + ".after")
+    assert wait_until(lambda: after.exists() and after.read_text() != "")
+    assert "70000" not in after.read_text().split()
+
+
+IGNORED_LAUNCHER = r"""
+import json, signal, sys
+from agent_spawn import procs
+out = sys.argv[1]
+for sig in (signal.SIGCHLD, signal.SIGUSR1, signal.SIGALRM):
+    signal.signal(sig, signal.SIG_IGN)
+probe = "grep -E '^SigIgn:' /proc/$$/status > " + out + ".sig"
+started = procs.spawn_detached(["/bin/sh", "-c", probe])
+started.acknowledge()
+with open(out, "w") as handle:
+    handle.write(json.dumps(started.identity.to_dict()))
+"""
+
+
+def test_detached_start_with_ignored_sigchld_and_inherited_ignores_reset(
+    tmp_path: Path, proc_tracker: ProcTracker
+) -> None:
+    out = tmp_path / "identity"
+    launcher = _run_launcher(proc_tracker, tmp_path, IGNORED_LAUNCHER, str(out))
+    assert launcher.wait(timeout=30) == 0
+    proc_tracker.record(ProcessIdentity.from_dict(json.loads(out.read_text())))
+    sig_file = Path(str(out) + ".sig")
+    assert wait_until(lambda: sig_file.exists() and sig_file.read_text() != "")
+    ignored = int(sig_file.read_text().split(":")[1], 16)
+    for sig in (signal.SIGCHLD, signal.SIGUSR1, signal.SIGALRM, signal.SIGPIPE):
+        assert ignored & (1 << (sig - 1)) == 0, signal.Signals(sig).name
+
+
+SIGCHLD_CLI = r"""
+import contextlib, io, signal, sys
+signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+from agent_spawn import cli, gateway
+before = gateway.run(["/bin/false"]).returncode
+with contextlib.redirect_stdout(io.StringIO()):
+    try:
+        cli.main(["--version"])
+    except SystemExit:
+        pass
+after = gateway.run(["/bin/false"]).returncode
+print(before, after, signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL)
+"""
+
+
+def test_the_cli_entry_resets_an_inherited_ignored_sigchld(tmp_path: Path) -> None:
+    done = subprocess.run(
+        [sys.executable, "-c", SIGCHLD_CLI],
+        capture_output=True,
+        text=True,
+        env=private_env(tmp_path),
+        stdin=subprocess.DEVNULL,
+        timeout=60,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    before, after, reset = done.stdout.split()
+    assert before == "0"  # the failure is lost while SIGCHLD is ignored ...
+    assert after == "1" and reset == "True"  # ... and reported after main() reset it
+
+
+ZOMBIE_LEADER_C = r"""
+#include <pthread.h>
+#include <unistd.h>
+static void *run(void *arg) { (void)arg; sleep(120); return 0; }
+int main(void) {
+    pthread_t t;
+    pthread_create(&t, 0, run, 0);
+    write(1, "ready\n", 6);
+    pthread_exit(0);
+}
+"""
+
+
+def test_a_zombie_leader_with_a_live_thread_is_alive(
+    tmp_path: Path, proc_tracker: ProcTracker
+) -> None:
+    import shutil
+
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if cc is None:
+        pytest.skip("no C compiler")
+    source, binary = tmp_path / "leader.c", tmp_path / "leader"
+    source.write_text(ZOMBIE_LEADER_C)
+    subprocess.run(
+        [cc, "-pthread", "-o", str(binary), str(source)],
+        check=True,
+        env=private_env(tmp_path),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=120,
+    )
+    child = start(proc_tracker, [str(binary)], stdout=subprocess.PIPE)
+    assert child.stdout is not None
+    assert child.stdout.readline() == b"ready\n"
+    identity = proc_tracker.identities[-1]
+    assert wait_until(lambda: (info := procs.inspect(child.pid)) is not None and info.state == "Z")
+    assert procs.is_alive(identity)  # the leader exited, its thread runs on
+    handle = procs.open_verified(identity)
+    assert handle is not None
+    with handle:
+        assert handle.is_alive()
+        assert not handle.wait_exit(0.2)
+    assert procs.forward_signal(identity, signal.SIGTERM).sent
+    assert procs.wait_for_exit(identity, 10)
+    assert child.wait(timeout=10) == -signal.SIGTERM

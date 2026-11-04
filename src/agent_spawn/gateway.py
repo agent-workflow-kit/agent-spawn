@@ -33,7 +33,7 @@ import struct
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import IO, Any, Protocol
 
@@ -46,6 +46,9 @@ _SOL_LOCAL = 0
 _LOCAL_PEERPID = 0x002
 
 SignalHandler = Callable[[int, Any], Any] | int | signal.Handlers | None
+
+# Raised by ``run`` when its timeout expires (re-exported so callers need not import subprocess).
+TimeoutExpired = subprocess.TimeoutExpired
 
 
 @dataclass(frozen=True)
@@ -105,8 +108,9 @@ class Gateway(Protocol):
     def poll_readable(self, fd: int, timeout: float) -> bool: ...
     def wait_pid_exit(self, pid: int, timeout: float) -> bool: ...
 
-    # signal handlers
+    # signal handlers and the calling thread's signal mask
     def install_signal_handler(self, sig: int, handler: SignalHandler) -> SignalHandler: ...
+    def pthread_sigmask(self, how: int, signals: Iterable[int]) -> set[int]: ...
 
     # process attributes and sockets
     def prctl(
@@ -267,6 +271,10 @@ class SystemGateway:
     def install_signal_handler(self, sig: int, handler: SignalHandler) -> SignalHandler:
         return signal.signal(sig, handler)
 
+    def pthread_sigmask(self, how: int, signals: Iterable[int]) -> set[int]:
+        """Change the calling thread's signal mask; return the previous one."""
+        return {int(sig) for sig in signal.pthread_sigmask(how, signals)}
+
     # process attributes and sockets
     def prctl(self, option: int, arg2: int = 0, arg3: int = 0, arg4: int = 0, arg5: int = 0) -> int:
         if not sys.platform.startswith("linux"):
@@ -332,6 +340,15 @@ def set_gateway(gateway: Gateway) -> Gateway:
     previous = _default
     _default = gateway
     return previous
+
+
+def reset_sigchld() -> None:
+    """Reset an inherited ignored SIGCHLD to the default, once at CLI entry.
+
+    With SIGCHLD ignored the kernel reaps children itself, so ``subprocess`` cannot read
+    their exit status and reports a failing child as exit 0.
+    """
+    get_gateway().install_signal_handler(signal.SIGCHLD, signal.SIG_DFL)
 
 
 def run(
