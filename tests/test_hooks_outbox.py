@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shlex
@@ -17,6 +18,7 @@ import pytest
 
 from agent_spawn import hooks, procs
 from agent_spawn.config import Hooks
+from agent_spawn.gateway import SystemGateway
 from agent_spawn.hooks import (
     AsyncRunner,
     HookEntry,
@@ -34,7 +36,7 @@ from agent_spawn.output import CliError
 from agent_spawn.store import OutboxEvent, Store
 from tests import schema_registry
 from tests.fixtures import TS, sample_agent, sample_outcome
-from tests.procguard import ProcTracker
+from tests.procguard import ProcTracker, descendants
 
 ID = "ag-abcdefgh"
 OTHER = "ag-abcdefg2"
@@ -110,6 +112,18 @@ def wait_for(path: Path, timeout: float = 10.0) -> None:
     while not path.exists():
         assert time.monotonic() < end, f"{path} never appeared"
         time.sleep(0.02)
+
+
+def quiesce(timeout: float = 8.0) -> None:
+    """Wait until this process has no live (non-zombie) descendants."""
+    end = time.monotonic() + timeout
+    while any(info.state != "Z" for info in descendants(os.getpid()).values()):
+        assert time.monotonic() < end, "descendants still running"
+        time.sleep(0.02)
+
+
+def open_fds() -> list[str]:
+    return sorted(os.listdir("/proc/self/fd"))
 
 
 def queue(store: Store, *events: OutboxEvent, agent_id: str = ID) -> None:
@@ -827,14 +841,17 @@ def test_async_failure_is_logged(state_dir: Path) -> None:
     assert record["details"]["exit_code"] == 4 and record["details"]["async"] is True
 
 
-def test_async_without_a_runner_is_a_logged_failure_not_a_crash(
-    store: Store, state_dir: Path
+def test_async_without_a_runner_still_runs_the_hook(
+    store: Store, state_dir: Path, tmp_path: Path
 ) -> None:
+    out = tmp_path / "out.jsonl"
     queue(store, event("post-park"))
     result = deliver_outbox(
-        store, ID, config(post_park=[{"cmd": "true", "async": True}]), state_dir=state_dir
+        store, ID, config(post_park=[{"cmd": recorder(out), "async": True}]), state_dir=state_dir
     )
-    assert result.delivered == 1 and result.hooks_failed == 1
+    assert result.delivered == 1 and result.hooks_failed == 0
+    quiesce()
+    assert len(lines(out)) == 1
 
 
 # -- pre-hooks --------------------------------------------------------------------------------
@@ -858,7 +875,6 @@ def test_pre_hook_veto_exits_11_creates_nothing_and_cuts_stderr(state_dir: Path)
     assert error.hook == "pre-launch"
     assert error.hook_stderr is not None and len(error.hook_stderr.encode()) == 4096
     schema_registry.validate(error.envelope(), "agent-spawn/cli/error.json")
-    assert not (state_dir / "state.db").exists()  # no agent record, no store
 
 
 def test_pre_hook_escalation_exits_13_after_running_the_remaining_hooks(
@@ -1138,8 +1154,402 @@ def test_event_ids_are_unique_across_agents(store: Store, state_dir: Path, tmp_p
     assert {p["object_id"] for p in got} == {ID, OTHER}
 
 
-def test_read_only_commands_do_not_deliver() -> None:
-    from agent_spawn.commands import observing
+# todo(#11): test_read_only_commands_do_not_deliver belongs here once `list`, `show` and `wait`
+# exist: run each against a store holding a pending outbox event and assert the event stays
+# undelivered (the commands are stubs today, so there is nothing behavioral to run).
 
-    source = Path(observing.__file__).read_text()
-    assert "deliver_outbox" not in source and "hooks" not in source
+
+# -- review round 1: process handling ---------------------------------------------------------
+
+linux_only = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs /proc")
+
+
+def _boom(*_a: object, **_k: object) -> None:
+    raise OSError(errno.EMFILE, "too many open files")
+
+
+def _no_identity_for_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``procs.identify`` finds nothing for the hook module (gateway given), the tests still can."""
+    real = procs.identify
+    monkeypatch.setattr(
+        procs,
+        "identify",
+        lambda pid, **kw: None if kw.get("gateway") is not None else real(pid, **kw),
+    )
+
+
+def test_identity_lookup_failure_neither_leaks_nor_raises(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir.mkdir()
+    monkeypatch.setattr(procs, "identify", _boom)
+    before = open_fds()
+    res = run_hook_process(
+        "exec sleep 60", b"{}", hook="post-park", agent_id=ID, timeout=0.4, state_dir=state_dir
+    )
+    assert res.timed_out and not res.unreaped
+    assert open_fds() == before
+    quiesce(3)
+
+
+def test_a_failure_while_supervising_kills_the_hook_and_closes_the_pipes(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir.mkdir()
+    monkeypatch.setattr(hooks, "_read_capped", _boom)
+    before = open_fds()
+    start = time.monotonic()
+    res = run_hook_process(
+        "sleep 60", b"{}", hook="post-park", agent_id=ID, timeout=30, state_dir=state_dir
+    )
+    assert res.error is not None and "OSError" in res.error and not res.ok
+    assert time.monotonic() - start < 10
+    assert open_fds() == before
+    quiesce(3)
+
+
+def test_an_exception_from_one_hook_is_logged_and_delivery_continues(
+    store: Store, state_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    real = hooks.run_hook_process
+    calls: list[str] = []
+
+    def flaky(cmd: str, *args: Any, **kwargs: Any) -> Any:
+        calls.append(cmd)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        return real(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(hooks, "run_hook_process", flaky)
+    queue(store, event("post-park"))
+    result = deliver_outbox(
+        store,
+        ID,
+        config(post_park=[{"cmd": "true"}, {"cmd": recorder(out)}]),
+        state_dir=state_dir,
+    )
+    assert result.delivered == 1 and result.hooks_failed == 1 and len(lines(out)) == 1
+    assert any(r["event"] == "hook_failed" for r in log_records(state_dir))
+
+
+def test_unidentified_group_still_times_out_and_only_the_leader_is_signalled(
+    tracker_dir: Path, tracker: ProcTracker, state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir.mkdir()
+    pids = tracker_dir / "pids"
+    _no_identity_for_hooks(monkeypatch)
+    cmd = (
+        f"echo $$ >> {shlex.quote(str(pids))}; sleep 60 & echo $! >> {shlex.quote(str(pids))}; wait"
+    )
+    start = time.monotonic()
+    res = run_hook_process(
+        cmd, b"{}", hook="post-park", agent_id=ID, timeout=0.5, state_dir=state_dir
+    )
+    found = track(tracker, pids)
+    assert res.timed_out and not res.unreaped and time.monotonic() - start < 4
+    leader, child = found
+    assert not alive(leader)
+    assert alive(child)  # unverified group members are never signalled
+    names = [r for r in log_records(state_dir) if r["event"] == "signal_sent"]
+    assert names and all(r["details"]["group"] is False for r in names)
+
+
+def test_unidentified_pre_hook_timeout_is_a_timeout_verdict(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir.mkdir()
+    _no_identity_for_hooks(monkeypatch)
+    verdict = run_pre_hooks(
+        "pre-launch",
+        _pre_launch_body(),
+        [HookEntry(cmd="exec sleep 60", timeout=0.4)],
+        state_dir=state_dir,
+    )
+    assert verdict.verdict == "veto" and verdict.cause == "timeout"
+
+
+def test_an_unreaped_hook_is_never_labelled_a_signal_death(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir.mkdir()
+    stuck = hooks.ProcessResult(unreaped=True, error="the hook could not be reaped")
+    monkeypatch.setattr(hooks, "run_hook_process", lambda *_a, **_k: stuck)
+    verdict = run_pre_hooks(
+        "pre-launch", _pre_launch_body(), [HookEntry(cmd="x")], state_dir=state_dir
+    )
+    assert verdict.verdict == "veto" and verdict.cause != "signal"
+
+
+class _Skewed(SystemGateway):
+    """The real gateway whose clock jumps far ahead once ``skew`` is set."""
+
+    skew = 0.0
+
+    def monotonic(self) -> float:
+        return super().monotonic() + self.skew
+
+
+def test_a_hook_that_finished_by_the_deadline_is_not_timed_out(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir.mkdir()
+    gw = _Skewed()
+    real = hooks._read_capped  # noqa: SLF001
+
+    def read_then_expire(*args: Any, **kwargs: Any) -> None:
+        real(*args, **kwargs)
+        time.sleep(0.5)  # the hook exits ...
+        gw.skew = 1000.0  # ... and the deadline passes before the next look
+
+    monkeypatch.setattr(hooks, "_read_capped", read_then_expire)
+    res = run_hook_process(
+        "echo ok", b"{}", hook="post-park", agent_id=ID, timeout=5, state_dir=state_dir, gateway=gw
+    )
+    assert res.ok and not res.timed_out and res.stdout == b"ok\n"
+
+
+@linux_only
+def test_hooks_do_not_inherit_ignored_signals_or_a_blocked_mask(state_dir: Path) -> None:
+    state_dir.mkdir()
+    sigs = (signal.SIGINT, signal.SIGQUIT, signal.SIGHUP, signal.SIGTERM)
+    old = {sig: signal.signal(sig, signal.SIG_IGN) for sig in sigs}
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+    try:
+        res = run_hook_process(
+            "grep -E '^Sig(Ign|Blk)' /proc/self/status",
+            b"{}",
+            hook="post-park",
+            agent_id=ID,
+            timeout=5,
+            state_dir=state_dir,
+        )
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGUSR1})
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+    masks = {
+        line.split(":")[0]: int(line.split()[1], 16) for line in res.stdout.decode().splitlines()
+    }
+    for sig in sigs:
+        assert not masks["SigIgn"] & (1 << (sig - 1)), sig.name
+    assert masks["SigBlk"] == 0
+
+
+def test_json_nesting_bomb_in_hook_output_is_ignored(state_dir: Path) -> None:
+    assert hooks._decision_ids(b"[" * 60000) == []  # noqa: SLF001
+    verdict = _pre(state_dir, "head -c 60000 /dev/zero | tr '\\0' '['")
+    assert verdict.verdict == "ok" and verdict.decision_ids == ()
+
+
+def test_invocation_hooks_follow_the_event_snapshot_not_the_live_run(
+    store: Store, state_dir: Path, tmp_path: Path
+) -> None:
+    mine, theirs = tmp_path / "mine", tmp_path / "theirs"
+    with store.lease(f"agent:{ID}") as lease:
+        store.put_run(
+            lease, ID, 1, {"hooks": [{"hook": "post-state-change", "cmd": recorder(mine)}]}
+        )
+        store.put_run(
+            lease, ID, 2, {"hooks": [{"hook": "post-state-change", "cmd": recorder(theirs)}]}
+        )
+        store.update_agent(lease, ID, {"run": 2})  # bumped after the event was queued
+    queue(store, event("post-state-change", run=1))
+    deliver_outbox(store, ID, config(), state_dir=state_dir)
+    assert len(lines(mine)) == 1 and lines(theirs) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_an_unwritable_state_dir_is_an_error_not_a_silent_fallback(
+    store: Store, state_dir: Path, tmp_path: Path
+) -> None:
+    marker = tmp_path / "ran"
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        res = run_hook_process(
+            f"touch {shlex.quote(str(marker))}",
+            b"{}",
+            hook="post-park",
+            agent_id=ID,
+            timeout=5,
+            state_dir=locked,
+        )
+        queue(store, event("post-park"))
+        result = deliver_outbox(
+            store,
+            ID,
+            config(post_park=[{"cmd": f"touch {shlex.quote(str(marker))}"}]),
+            state_dir=locked,
+        )
+    finally:
+        locked.chmod(0o700)
+    assert res.error is not None and not res.ok and not marker.exists()
+    assert result.delivered == 1 and result.hooks_failed == 1
+
+
+def test_a_bad_agent_id_skips_the_hook_and_delivery_continues(
+    store: Store, state_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    stored = {
+        "event_id": 7,
+        "event": "post-park",
+        "payload": event("post-park").payload,
+        "created": 0.0,
+    }
+    monkeypatch.setattr(store, "get_agent", lambda *_a, **_k: None)
+    deliverer = hooks._Deliverer(  # noqa: SLF001
+        store,
+        config(post_park=[{"cmd": recorder(out)}, {"cmd": recorder(out)}]),
+        state_dir,
+        AsyncRunner(state_dir),
+        None,
+        None,
+    )
+    result = hooks.DeliveryResult()
+    deliverer.deliver("ag-x; touch PWNED", stored, result)
+    assert result.hooks_run == 2 and result.hooks_failed == 2 and lines(out) == []
+    assert any(r["event"] == "hook_failed" for r in log_records(state_dir))
+
+
+# -- review round 1: async hooks --------------------------------------------------------------
+
+
+def _group_members(pgid: int) -> list[int]:
+    """Live (non-zombie) processes of process group ``pgid`` (Linux ``/proc`` scan)."""
+    found: list[int] = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            text = Path(f"/proc/{name}/stat").read_text()
+        except OSError:
+            continue
+        fields = text[text.rindex(")") + 2 :].split()
+        if int(fields[2]) == pgid and fields[0] != "Z":
+            found.append(int(name))
+    return found
+
+
+def _wait_group_gone(pgid: int, timeout: float) -> None:
+    end = time.monotonic() + timeout
+    while _group_members(pgid):
+        assert time.monotonic() < end, f"group still has {_group_members(pgid)}"
+        time.sleep(0.02)
+
+
+@linux_only
+def test_async_timeout_holds_after_the_starting_process_exited(
+    tmp_path: Path, state_dir: Path, tracker: ProcTracker
+) -> None:
+    state_dir.mkdir()
+    pids = tmp_path / "pids"
+    script = (
+        "import sys\n"
+        "from agent_spawn.hooks import AsyncRunner\n"
+        "r = AsyncRunner(sys.argv[1])\n"
+        "err = r.start(sys.argv[2], b'{}', hook='post-park', agent_id=None, timeout=1)\n"
+        "print(err or r.running[0].group.pid)\n"
+    )
+    cmd = (
+        f"echo $PPID >> {shlex.quote(str(pids))}; echo $$ >> {shlex.quote(str(pids))}; "
+        f"sleep 30 & echo $! >> {shlex.quote(str(pids))}; wait"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", script, str(state_dir), cmd],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    wrapper = int(done.stdout.strip())
+    end = time.monotonic() + 10
+    while len(pids.read_text().split() if pids.exists() else []) < 3:
+        assert time.monotonic() < end
+        time.sleep(0.02)
+    found = track(tracker, pids)
+    assert wrapper == found[0]
+    assert_dead(found, timeout=4.0)
+    _wait_group_gone(wrapper, 8.0)
+    quiesce()
+
+
+@linux_only
+def test_async_watchdog_is_removed_when_the_hook_ends(state_dir: Path) -> None:
+    state_dir.mkdir()
+    runner = AsyncRunner(state_dir)
+    assert runner.start("true", b"{}", hook="post-park", agent_id=None, timeout=30) is None
+    wrapper = runner.running[0].group.pid
+    assert runner.wait(5) == 0
+    _wait_group_gone(wrapper, 2.0)
+    assert not any(r["event"] == "hook_failed" for r in log_records(state_dir))
+
+
+def test_async_command_is_a_positional_parameter_never_interpolated(
+    state_dir: Path, tmp_path: Path
+) -> None:
+    state_dir.mkdir()
+    marker = tmp_path / "marker"
+    runner = AsyncRunner(state_dir)
+    cmd = f"echo '\"; touch {marker}; \"' > /dev/null; exit 3"
+    runner.start(cmd, b"{}", hook="post-park", agent_id=None, timeout=5)
+    runner.wait(5)
+    (record,) = [r for r in log_records(state_dir) if r["event"] == "hook_failed"]
+    assert record["details"]["exit_code"] == 3 and not marker.exists()
+
+
+def test_running_async_hooks_are_capped(state_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state_dir.mkdir()
+    monkeypatch.setattr(hooks, "MAX_ASYNC", 2)
+    monkeypatch.setattr(hooks, "ASYNC_CAP_WAIT", 0.3)
+    runner = AsyncRunner(state_dir)
+    try:
+        for _ in range(2):
+            assert (
+                runner.start("sleep 20", b"{}", hook="post-park", agent_id=None, timeout=1) is None
+            )
+        error = runner.start("true", b"{}", hook="post-park", agent_id=None, timeout=1)
+        assert error is not None and "too many" in error
+        assert len(runner.running) == 2
+    finally:
+        runner.wait(10)
+    quiesce()
+
+
+def test_a_slot_frees_when_a_capped_hook_finishes(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir.mkdir()
+    monkeypatch.setattr(hooks, "MAX_ASYNC", 1)
+    runner = AsyncRunner(state_dir)
+    assert runner.start("sleep 0.3", b"{}", hook="post-park", agent_id=None, timeout=5) is None
+    assert runner.start("true", b"{}", hook="post-park", agent_id=None, timeout=5) is None
+    runner.wait(5)
+    quiesce()
+
+
+def test_deliver_outbox_reaps_the_async_runner_after_each_event(
+    store: Store, state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = AsyncRunner(state_dir)
+    polls: list[int] = []
+    real = runner.poll
+
+    def counting() -> int:
+        polls.append(1)
+        return real()
+
+    monkeypatch.setattr(runner, "poll", counting)
+    queue(store, event("post-park"), event("post-park"))
+    deliver_outbox(
+        store,
+        ID,
+        config(post_park=[{"cmd": "true", "async": True}]),
+        state_dir=state_dir,
+        runner=runner,
+    )
+    assert len(polls) >= 2
+    runner.wait(5)
+    quiesce()

@@ -132,6 +132,27 @@ class Gateway(Protocol):
     def exit_now(self, code: int) -> None: ...
 
 
+_RESET_SIGNALS = tuple(
+    getattr(signal, name)
+    for name in ("SIGINT", "SIGQUIT", "SIGHUP", "SIGTERM")
+    if hasattr(signal, name)
+)
+
+
+def _reset_child_signals() -> None:
+    """Run in a spawned child before ``exec``: give it default signal dispositions and an empty
+    blocked mask, so a supervisor that ignores or blocks signals does not pass that on (an
+    ignored disposition survives ``exec``). ``subprocess`` already restores ``SIGPIPE``.
+
+    Safe despite the usual ``preexec_fn`` warning: it only calls ``signal.signal`` and
+    ``signal.pthread_sigmask`` (async-signal-safe system calls, no locks, no allocation of
+    note) and the CLI is single-threaded, so no other thread can hold a lock at fork time.
+    """
+    for sig in _RESET_SIGNALS:
+        signal.signal(sig, signal.SIG_DFL)
+    signal.pthread_sigmask(signal.SIG_SETMASK, ())
+
+
 class SystemGateway:
     """The real implementation.
 
@@ -190,6 +211,7 @@ class SystemGateway:
             env=None if env is None else dict(env),
             cwd=cwd,
             start_new_session=start_new_session,
+            preexec_fn=_reset_child_signals,
         )
 
     # files, clocks, platform

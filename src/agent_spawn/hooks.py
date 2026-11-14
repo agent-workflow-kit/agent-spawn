@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import re
 import secrets
@@ -98,6 +99,9 @@ TERM_GRACE = 2.0  # seconds between SIGTERM and SIGKILL of a timed-out hook's gr
 DRAIN_GRACE = 0.5  # seconds to keep reading pipes after the hook's leader exited
 POLL = 0.05
 REAP_TIMEOUT = 5.0
+MAX_ASYNC = 16  # async hooks one runner keeps running at once
+ASYNC_CAP_WAIT = 10.0  # seconds ``AsyncRunner.start`` waits for a free slot
+WATCHDOG_GRACE = 2  # whole seconds between the watchdog's SIGTERM and SIGKILL
 ESCALATE_EXIT = 13
 MAX_DECISION_IDS = 32
 _AGENT_ID = re.compile(r"ag-[a-z2-7]{8}")
@@ -105,6 +109,27 @@ _DECISION_ID = re.compile(r"[A-Za-z0-9._:@/-]{1,128}")
 _RUN_HOOKS = frozenset({"post-launch", "post-state-change", "post-escalate", "post-park"})
 _TEARDOWN_HOOKS = frozenset({"pre-teardown", "post-teardown"})
 _SH = "/bin/sh"
+# Runs an async hook: $1 the command (never interpolated into this text), $2 the timeout and $3
+# the SIGTERM-to-SIGKILL grace, both in whole seconds. The wrapper is the group leader; the
+# watchdog subshell signals the whole group (``kill 0``).
+_ASYNC_WRAPPER = """
+(
+  trap '' TERM
+  sleep "$2" & s=$!
+  trap 'kill -s KILL "$s" 2>/dev/null; exit 0' USR1
+  wait "$s"
+  kill -s TERM 0
+  sleep "$3" & s=$!
+  wait "$s"
+  kill -s KILL 0
+) &
+w=$!
+/bin/sh -c "$1"
+rc=$?
+kill -s USR1 "$w" 2>/dev/null
+wait "$w" 2>/dev/null
+exit "$rc"
+"""
 
 
 # --- entries and selectors -----------------------------------------------------------------------
@@ -373,16 +398,22 @@ class _Group:
         self.child = child
         self.pid: int = child.pid
         self.gw = gateway
-        handle = procs.identify(self.pid, gateway=gateway)
         self.identity: procs.ProcessIdentity | None = None
+        try:
+            handle = procs.identify(self.pid, gateway=gateway)
+        except (OSError, procs.ProcessIdentityError):
+            handle = None  # unidentified: only the leader, through ``child``, is ever signalled
         if handle is not None:
             self.identity = handle.identity
             handle.close()
 
     def leader_done(self) -> bool:
-        """The leader exited (zombie or gone). Does not reap."""
-        if self.child.returncode is not None or self.identity is None:
+        """The leader exited. Without a recorded identity this asks the (still unreaped, so
+        safe) ``Popen`` and reaps; otherwise it reads the process table and does not reap."""
+        if self.child.returncode is not None:
             return True
+        if self.identity is None:
+            return self.child.poll() is not None
         try:
             info = procs.inspect(self.pid, gateway=self.gw)
         except procs.ProcessIdentityError:
@@ -403,8 +434,24 @@ class _Group:
             return False
         return True
 
+    def _signal_leader(self, sig: int) -> bool:
+        """Signal only the leader, through its unreaped ``Popen`` (its PID cannot be reused)."""
+        if self.child.returncode is not None:
+            return False
+        try:
+            self.child.send_signal(sig)
+        except (ProcessLookupError, PermissionError):
+            return False
+        return True
+
     def terminate(self, state_dir: str | os.PathLike[str] | None, hook: str | None) -> None:
-        """SIGTERM (with SIGCONT), wait for the leader up to ``TERM_GRACE``, then SIGKILL."""
+        """SIGTERM (with SIGCONT), wait for the leader up to ``TERM_GRACE``, then SIGKILL.
+
+        A group whose identity was never recorded is not signalled as a group: only the leader
+        is (unverified members stay unsignalled)."""
+        if self.identity is None:
+            self._terminate_leader(state_dir, hook)
+            return
         sent = self.signal(signal.SIGTERM)
         if sent:
             self.signal(signal.SIGCONT)
@@ -415,7 +462,24 @@ class _Group:
         if self.signal(signal.SIGKILL):
             self._logged(state_dir, hook, signal.SIGKILL)
 
-    def _logged(self, state_dir: str | os.PathLike[str] | None, hook: str | None, sig: int) -> None:
+    def _terminate_leader(self, state_dir: str | os.PathLike[str] | None, hook: str | None) -> None:
+        sent = self._signal_leader(signal.SIGTERM)
+        if sent:
+            self._signal_leader(signal.SIGCONT)
+            self._logged(state_dir, hook, signal.SIGTERM, group=False)
+        end = self.gw.monotonic() + TERM_GRACE
+        while sent and self.gw.monotonic() < end and not self.leader_done():
+            self.gw.sleep(0.02)
+        if self._signal_leader(signal.SIGKILL):
+            self._logged(state_dir, hook, signal.SIGKILL, group=False)
+
+    def _logged(
+        self,
+        state_dir: str | os.PathLike[str] | None,
+        hook: str | None,
+        sig: int,
+        group: bool = True,
+    ) -> None:
         if state_dir is not None:
             _log(
                 state_dir,
@@ -423,7 +487,7 @@ class _Group:
                 hook=hook,
                 pid=self.pid,
                 signal_name=signal.Signals(sig).name,
-                details={"group": True},
+                details={"group": group},
             )
 
 
@@ -442,10 +506,7 @@ def hook_environment(
 
 def _stdin_file(data: bytes, state_dir: str | os.PathLike[str]) -> IO[bytes]:
     """An unlinked temporary file holding ``data``, rewound (the state dir is private)."""
-    try:
-        handle = tempfile.TemporaryFile(dir=state_dir)
-    except OSError:
-        handle = tempfile.TemporaryFile()
+    handle = tempfile.TemporaryFile(dir=state_dir)  # an OSError is the hook's error, no fallback
     try:
         handle.write(data)
         handle.flush()
@@ -464,11 +525,19 @@ def _spawn(
     env: Mapping[str, str],
     gateway: Gateway,
     capture: bool,
+    wrapper: tuple[str, str] | None = None,
 ) -> Any:
+    """Start ``/bin/sh -c cmd`` (or, with ``wrapper=(timeout, grace)``, the async wrapper that
+    gets ``cmd`` as its ``$1``)."""
     stdin = _stdin_file(payload, state_dir)
+    argv = (
+        [_SH, "-c", cmd]
+        if wrapper is None
+        else [_SH, "-c", _ASYNC_WRAPPER, "agent-spawn-hook", cmd, *wrapper]
+    )
     try:
         return gateway.spawn(
-            [_SH, "-c", cmd],
+            argv,
             stdin=stdin,
             stdout=PIPE if capture else DEVNULL,
             stderr=PIPE if capture else DEVNULL,
@@ -504,6 +573,26 @@ def _read_capped(
             truncated[name] = True
 
 
+def _kill_quietly(child: Any) -> None:
+    """SIGKILL the leader through its ``Popen`` (safe while unreaped); never raises."""
+    try:
+        if child.poll() is None:
+            child.kill()
+    except Exception:  # noqa: BLE001 - best effort
+        pass
+
+
+def _stop(child: Any, group: _Group | None, state_dir: Any, hook: str | None) -> None:
+    """Stop a hook after an error: its verified group first, then the leader itself."""
+    if group is not None:
+        try:
+            if not group.leader_done():
+                group.terminate(state_dir, hook)
+        except Exception:  # noqa: BLE001 - best effort, the leader is killed below
+            pass
+    _kill_quietly(child)
+
+
 def run_hook_process(
     cmd: str,
     payload: bytes,
@@ -529,11 +618,14 @@ def run_hook_process(
     except (OSError, ValueError) as exc:
         result.error = f"could not start the hook: {exc.__class__.__name__}"
         return result
-    group = _Group(child, gw)
-    selector = selectors.DefaultSelector()
+    group: _Group | None = None
+    selector: selectors.BaseSelector | None = None
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     truncated = {"stdout": False, "stderr": False}
+    clean = False
     try:
+        group = _Group(child, gw)
+        selector = selectors.DefaultSelector()
         for name, stream in (("stdout", child.stdout), ("stderr", child.stderr)):
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ, name)
@@ -541,30 +633,38 @@ def run_hook_process(
         done_at: float | None = None
         while True:
             now = gw.monotonic()
-            if now >= deadline:
+            if done_at is None and group.leader_done():
+                done_at = now  # checked before the deadline: a hook that finished is not late
+            if done_at is None and now >= deadline:
                 result.timed_out = True
                 break
-            if done_at is None and group.leader_done():
-                done_at = now
             if done_at is not None and (not selector.get_map() or now - done_at >= DRAIN_GRACE):
                 break
-            _read_capped(selector, buffers, truncated, min(POLL, deadline - now))
+            _read_capped(selector, buffers, truncated, min(POLL, max(deadline - now, 0.0)))
         if result.timed_out:
             group.terminate(state_dir, hook)
             end = gw.monotonic() + 0.2
             while selector.get_map() and gw.monotonic() < end:
                 _read_capped(selector, buffers, truncated, POLL)
+        clean = True
+    except Exception as exc:  # noqa: BLE001 - supervision failed: report it, clean up below
+        result.error = f"the hook could not be supervised: {exc.__class__.__name__}"
     finally:
-        if child.returncode is None and not result.timed_out and not group.leader_done():
-            group.terminate(state_dir, hook)  # an exception is leaving: leave no hook behind
+        if not clean:
+            _stop(child, group, state_dir, hook)  # an exception is leaving: leave no hook behind
+        code: int | None
         try:
             code = child.wait(timeout=REAP_TIMEOUT)
         except Exception:  # noqa: BLE001 - a hook stuck in the kernel is reported, not waited for
             code = None
             result.unreaped = True
-        selector.close()
+            result.error = result.error or "the hook did not exit and could not be reaped"
+            _kill_quietly(child)
+        if selector is not None:
+            selector.close()
         for stream in (child.stdout, child.stderr):
-            stream.close()
+            if stream is not None:
+                stream.close()
     result.duration = gw.monotonic() - started
     result.stdout = bytes(buffers["stdout"])
     result.stderr = bytes(buffers["stderr"])
@@ -593,11 +693,18 @@ class _Async:
 class AsyncRunner:
     """Tracks the ``async: true`` hooks this process started.
 
-    An async hook is started detached (own process group, stdout and stderr discarded) and its
-    event counts as delivered once it started. While this process lives, ``poll`` reaps finished
-    hooks (logging failures) and kills overdue ones the same verified way as a synchronous
-    timeout. A process that exits earlier leaves its hooks running unbounded: the timeout of an
-    async hook is enforced only by the process that started it.
+    An async hook is started detached (own process group, stdout and stderr discarded) under a
+    small ``sh`` wrapper (``_ASYNC_WRAPPER``) and its event counts as delivered once it started.
+    The wrapper leads the group and starts a watchdog in it: after the timeout (rounded up to
+    whole seconds) the watchdog sends SIGTERM to its own group and SIGKILL after a grace, and the
+    wrapper stops the watchdog when the command ends. So the timeout holds even after the
+    process that started the hook has exited. While this process lives, ``poll`` additionally
+    reaps finished hooks (logging failures) and kills overdue ones the same verified way as a
+    synchronous timeout (a backstop with the exact deadline). At most ``MAX_ASYNC`` hooks run at
+    once: ``start`` waits up to ``ASYNC_CAP_WAIT`` for a slot and then refuses.
+
+    The watchdog is a plain ``sh`` subshell: it ignores SIGTERM (so the group's SIGTERM does not
+    stop it before the SIGKILL) and stops on SIGUSR1; it needs no GNU ``timeout``.
     """
 
     state_dir: str | os.PathLike[str]
@@ -619,15 +726,31 @@ class AsyncRunner:
         if "\0" in cmd:
             return "the command contains a NUL byte"
         env = hook_environment(environ, hook, agent_id)
+        end = gw.monotonic() + ASYNC_CAP_WAIT
+        while self.poll() >= MAX_ASYNC:
+            if gw.monotonic() >= end:
+                return f"too many async hooks are running ({MAX_ASYNC})"
+            gw.sleep(0.02)
+        seconds = max(1, math.ceil(max(timeout, 0.0)))
         try:
             child = _spawn(
-                cmd, payload, state_dir=self.state_dir, env=env, gateway=gw, capture=False
+                cmd,
+                payload,
+                state_dir=self.state_dir,
+                env=env,
+                gateway=gw,
+                capture=False,
+                wrapper=(str(seconds), str(WATCHDOG_GRACE)),
             )
         except (OSError, ValueError) as exc:
             return f"could not start the hook: {exc.__class__.__name__}"
-        self.running.append(
-            _Async(_Group(child, gw), hook, agent_id, gw.monotonic() + max(timeout, 0.0))
-        )
+        try:
+            self.running.append(
+                _Async(_Group(child, gw), hook, agent_id, gw.monotonic() + max(timeout, 0.0))
+            )
+        except Exception as exc:  # noqa: BLE001 - never leave a started hook unattended
+            _kill_quietly(child)
+            return f"could not track the hook: {exc.__class__.__name__}"
         return None
 
     def poll(self) -> int:
@@ -689,7 +812,7 @@ def _decision_ids(stdout: bytes) -> list[str]:
     is not valid is ignored."""
     try:
         data = json.loads(stdout.decode("utf-8", errors="replace"))
-    except ValueError:
+    except (ValueError, RecursionError):  # hostile nesting is just invalid output
         return []
     if not isinstance(data, dict):
         return []
@@ -876,7 +999,10 @@ def _invocation_source(
         outcome = payload.get("outcome")
         run = outcome.get("run") if isinstance(outcome, dict) else None  # pyright: ignore[reportUnknownMemberType]
     if not isinstance(run, int) or isinstance(run, bool):
-        run = agent.get("run")
+        snapshot = payload.get(
+            "agent"
+        )  # the stored snapshot, not the live row (the live row may have moved on)
+        run = snapshot.get("run") if isinstance(snapshot, dict) else None  # pyright: ignore[reportUnknownMemberType]
     if not isinstance(run, int) or isinstance(run, bool):
         return None
     row = store.get_run(agent_id, run)
@@ -889,7 +1015,7 @@ class _Deliverer:
         store: Store,
         hooks: Hooks,
         state_dir: str | os.PathLike[str],
-        runner: AsyncRunner | None,
+        runner: AsyncRunner,
         environ: Mapping[str, str] | None,
         gateway: Gateway | None,
     ) -> None:
@@ -952,45 +1078,47 @@ class _Deliverer:
         result: DeliveryResult,
     ) -> None:
         result.hooks_run += 1
-        if entry.async_ and entry.source == "config":
-            runner = self.runner
-            error = (
-                "no async runner"
-                if runner is None
-                else runner.start(
-                    entry.cmd,
-                    data,
-                    hook=hook,
-                    agent_id=agent_id,
-                    timeout=entry.timeout,
-                    environ=self.environ,
-                )
-            )
-            outcome = ProcessResult(exit_code=0 if error is None else None, error=error)
-        else:
-            outcome = run_hook_process(
-                entry.cmd,
-                data,
-                hook=hook,
-                agent_id=agent_id,
-                timeout=entry.timeout,
-                state_dir=self.state_dir,
-                environ=self.environ,
-                gateway=self.gateway,
-            )
+        try:
+            outcome = self._execute(agent_id, hook, entry, data)
+        except Exception as exc:  # noqa: BLE001 - one hook never aborts the command
+            outcome = ProcessResult(error=f"{exc.__class__.__name__} while running the hook")
+        # a malformed id (never stored by this tool) must not make the log record itself fail
+        logged_id = agent_id if _AGENT_ID.fullmatch(agent_id) else None
         details = _result_details(index, entry, outcome)
         if outcome.ok:
-            _log(self.state_dir, "hook_delivered", agent_id=agent_id, hook=hook, details=details)
+            _log(self.state_dir, "hook_delivered", agent_id=logged_id, hook=hook, details=details)
             return
         result.hooks_failed += 1
         _log(
             self.state_dir,
             "hook_timeout" if outcome.timed_out else "hook_failed",
             level="warn",
-            agent_id=agent_id,
+            agent_id=logged_id,
             hook=hook,
             message="hook timed out" if outcome.timed_out else "hook failed",
             details=details,
+        )
+
+    def _execute(self, agent_id: str, hook: str, entry: HookEntry, data: bytes) -> ProcessResult:
+        if entry.async_ and entry.source == "config":
+            error = self.runner.start(
+                entry.cmd,
+                data,
+                hook=hook,
+                agent_id=agent_id,
+                timeout=entry.timeout,
+                environ=self.environ,
+            )
+            return ProcessResult(exit_code=0 if error is None else None, error=error)
+        return run_hook_process(
+            entry.cmd,
+            data,
+            hook=hook,
+            agent_id=agent_id,
+            timeout=entry.timeout,
+            state_dir=self.state_dir,
+            environ=self.environ,
+            gateway=self.gateway,
         )
 
 
@@ -1016,10 +1144,14 @@ def deliver_outbox(
     A process that cannot take the lease returns at once and leaves its events to the holder.
     After releasing, the holder looks once more: an event queued while it was finishing is
     delivered by it (up to ``rounds`` times) rather than waiting for the next deliverer.
-    Read-only commands (``list``, ``show``, ``wait``) must not call this.
+    ``async: true`` hooks start under ``runner`` (a private ``AsyncRunner`` when none is given,
+    left running when this returns, bounded by their watchdog); their event counts as delivered
+    once they started. Read-only commands (``list``, ``show``, ``wait``) must not call this.
     """
     result = DeliveryResult()
     directory = state_dir if state_dir is not None else store.path.parent
+    if runner is None:  # async hooks need a runner; a private one is bounded by the watchdog
+        runner = AsyncRunner(directory, gateway=gateway)
     deliverer = _Deliverer(store, hooks, directory, runner, environ, gateway)
     key = f"delivery:{agent_id}"
     try:
@@ -1036,6 +1168,10 @@ def deliver_outbox(
                         break
                     for event in pending:
                         deliverer.deliver(agent_id, event, result)
+                        try:
+                            runner.poll()  # reap async hooks that finished meanwhile
+                        except Exception:  # noqa: BLE001 - reaping never aborts delivery
+                            pass
                         if store.mark_delivered(lease, agent_id, event["event_id"]):
                             result.delivered += 1
             finally:
