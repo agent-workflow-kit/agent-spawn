@@ -50,6 +50,10 @@ SignalHandler = Callable[[int, Any], Any] | int | signal.Handlers | None
 # Raised by ``run`` when its timeout expires (re-exported so callers need not import subprocess).
 TimeoutExpired = subprocess.TimeoutExpired
 
+# Re-exported stdio redirections for ``Gateway.spawn`` (callers never import subprocess).
+PIPE = subprocess.PIPE
+DEVNULL = subprocess.DEVNULL
+
 
 @dataclass(frozen=True)
 class PeerCredentials:
@@ -104,6 +108,8 @@ class Gateway(Protocol):
     def pidfd_open(self, pid: int) -> int: ...
     def pidfd_send_signal(self, pidfd: int, sig: int) -> None: ...
     def kill(self, pid: int, sig: int) -> None: ...
+    def getpgid(self, pid: int) -> int: ...
+    def killpg(self, pgid: int, sig: int) -> None: ...
     def close(self, fd: int) -> None: ...
     def poll_readable(self, fd: int, timeout: float) -> bool: ...
     def wait_pid_exit(self, pid: int, timeout: float) -> bool: ...
@@ -238,6 +244,13 @@ class SystemGateway:
 
     def kill(self, pid: int, sig: int) -> None:
         os.kill(pid, sig)
+
+    def getpgid(self, pid: int) -> int:
+        return os.getpgid(pid)
+
+    def killpg(self, pgid: int, sig: int) -> None:
+        """Signal a process group this tool created (hooks); callers verify it first."""
+        os.killpg(pgid, sig)
 
     def close(self, fd: int) -> None:
         os.close(fd)
