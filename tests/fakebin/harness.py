@@ -193,5 +193,9 @@ class Fakebin:
             f"{tool} calls\n  got:      {actual}\n  expected: {[list(i) for i in expected]}"
         )
 
+    def flag_values(self, tool: str, flag: str, *, index: int = -1) -> list[str]:
+        """The values of a repeatable flag (``--label``, ``--decision-id``, ``--hook``...)."""
+        return flag_values(self.invocations(tool)[index].argv, flag)
+
     def assert_not_called(self, tool: str) -> None:
         assert not self.invocations(tool), f"{tool} was called: {self.argvs(tool)}"

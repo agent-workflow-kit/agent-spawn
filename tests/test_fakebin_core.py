@@ -53,6 +53,8 @@ def test_a_sample_test_asserts_a_fakes_logged_argv_exactly(fakebin: Fakebin) -> 
     )
     call = fakebin.invocations("wtctl")[0]
     assert flag_values(call.argv, "--label") == ["agent=ag-abcdefgh"]
+    assert fakebin.flag_values("wtctl", "--decision-id") == ["d-1"]
+    assert fakebin.flag_values("wtctl", "--actor") == ["auto:spawn"]
     assert call.exit_code == 0 and call.cwd == os.getcwd()
 
 

@@ -44,6 +44,7 @@ class PrivateTmux:
             "TERM": "xterm",
             "LANG": "C.UTF-8",
         }
+        self.kill_wait = 5.0  # seconds to wait for the server to exit before signaling its PID
         self.server_pid: int | None = None
         self._server_start: str | None = None
 
@@ -75,7 +76,7 @@ class PrivateTmux:
             self.run("kill-server")
         pid = self.server_pid
         if pid is not None:
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + self.kill_wait
             while time.monotonic() < deadline and self._alive(pid):
                 time.sleep(0.05)
             if self._alive(pid) and self._start_time_matches(pid):
