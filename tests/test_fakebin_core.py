@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
 from tests.fakebin.harness import FAKES, Fakebin, flag_values
+
+HEADLESS = ("--mode", "headless", "--skill", "implement-issue")
 
 
 def test_a_sample_test_asserts_a_fakes_logged_argv_exactly(fakebin: Fakebin) -> None:
@@ -153,3 +159,121 @@ def test_the_fakes_are_standard_library_only_and_python_is_the_running_interpret
         text = (fakebin.bin_dir / name).resolve().read_text()
         assert text.startswith("#!/usr/bin/env python3")
     assert sys.version_info >= (3, 12)
+
+
+# --- hung calls end (R16) --------------------------------------------------------------------
+
+
+def test_a_hung_call_gives_up_after_the_bounded_time(fakebin: Fakebin) -> None:
+    fakebin.seed_session()
+    fakebin.script("claude-session", "wait", hang=True)
+    done = fakebin.run(
+        "claude-session",
+        "wait",
+        "cs-abcdefgh",
+        "--json",
+        env={"FAKEBIN_HANG_SECONDS": "0.5"},
+        timeout=20,
+    )
+    assert done.returncode == 124 and "gave up after" in done.stderr
+
+
+def test_a_hung_call_ends_when_its_parent_is_gone(fakebin: Fakebin) -> None:
+    fakebin.seed_session()
+    fakebin.script("claude-session", "wait", hang=True)
+    code = (
+        "import subprocess, sys\n"
+        f"p = subprocess.Popen([{str(fakebin.bin_dir / 'claude-session')!r}, 'wait', "
+        "'cs-abcdefgh', '--json'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL, start_new_session=True)\n"
+        "print(p.pid, flush=True)\n"
+        "import time; time.sleep(1)\n"  # the fake has started and knows its parent
+    )
+    done = subprocess.run(  # the intermediate process exits, orphaning the hung fake
+        [sys.executable, "-c", code], env=fakebin.env(), capture_output=True, text=True, timeout=20
+    )
+    pid = int(done.stdout)
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        calls = [c for c in fakebin.invocations("claude-session") if c.pid == pid]
+        if calls and calls[0].exit_code is not None:
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError("the orphaned fake did not exit")
+    assert calls[0].exit_code == 124
+
+
+# --- broken setups are one-line harness errors (R26, R27) ------------------------------------
+
+
+def assert_harness_error(done: subprocess.CompletedProcess[str]) -> None:
+    assert done.returncode == 70, (done.stdout, done.stderr)
+    assert done.stderr.startswith("fakebin: ") and "Traceback" not in done.stderr
+    assert len(done.stderr.strip().splitlines()) == 1
+
+
+@pytest.mark.parametrize("content", ["{not json", "[]", '"text"'])
+def test_a_corrupt_or_misshapen_state_file_is_a_harness_error(
+    fakebin: Fakebin, content: str
+) -> None:
+    Path(str(fakebin.log) + ".sessions.json").write_text(content)
+    assert_harness_error(fakebin.run("claude-session", "list", "--json"))
+
+
+@pytest.mark.parametrize("content", ["{not json", "[]"])
+def test_a_corrupt_counts_file_is_a_harness_error(fakebin: Fakebin, content: str) -> None:
+    Path(str(fakebin.log) + ".counts.json").write_text(content)
+    assert_harness_error(fakebin.run("claude-session", "start", "--json", *HEADLESS))
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "{not json",
+        "[]",
+        '{"rules": {}}',
+        '{"rules": [1]}',
+        '{"rules": [{"respond": []}]}',
+        '{"rules": [{"respond": {"on_signal": {"SIGBOGUS": "ignore"}}}]}',
+        '{"rules": [{"respond": {"on_signal": {"SIGTERM": 5}}}]}',
+        '{"rules": [{"respond": {"sleep": "soon"}}]}',
+        '{"rules": [{"respond": {"sleep": -1}}]}',
+        '{"rules": [{"respond": {"exit": "two"}}]}',
+        '{"rules": [{"respond": {"exit": 0, "error": {"code": "usage", "message": "m"}}}]}',
+    ],
+)
+def test_a_bad_script_is_a_harness_error(fakebin: Fakebin, script: str) -> None:
+    fakebin.script_file.write_text(script)
+    assert_harness_error(fakebin.run("claude-session", "list", "--json"))
+
+
+@pytest.mark.parametrize("log", ["relative.jsonl", "/nonexistent-dir-for-fakebin/log.jsonl"])
+def test_an_unusable_log_path_is_a_harness_error(fakebin: Fakebin, log: str) -> None:
+    done = fakebin.run("claude-session", "list", "--json", env={"FAKEBIN_LOG": log})
+    assert_harness_error(done)
+
+
+def test_a_scripted_error_without_exit_uses_the_codes_mapped_exit(fakebin: Fakebin) -> None:
+    fakebin.script("wtctl", "list", times=1, error={"code": "refused", "message": "no"})
+    fakebin.script("wtctl", "list", times=1, error={"code": "mystery", "message": "no"})
+    fakebin.script("wtctl", "list", times=1, error={"code": "not_found", "message": "no"})
+    codes = [fakebin.run("wtctl", "list", "--json").returncode for _ in range(3)]
+    assert codes == [20, 1, 10]
+    assert [c.exit_code for c in fakebin.invocations("wtctl")] == codes
+
+
+def test_the_fakes_run_under_the_test_interpreter(fakebin: Fakebin) -> None:
+    fakebin.run("termctl", "list", "--json")
+    assert fakebin.python_versions() == [platform.python_version()]
+
+
+@pytest.mark.parametrize(
+    ("tool", "suffix", "args"),
+    [("termctl", ".panes.json", ["list"]), ("wtctl", ".records.json", ["list"])],
+)
+def test_corrupt_termctl_and_wtctl_state_is_a_harness_error(
+    fakebin: Fakebin, tool: str, suffix: str, args: list[str]
+) -> None:
+    Path(str(fakebin.log) + suffix).write_text("[1]")
+    assert_harness_error(fakebin.run(tool, *args, "--json"))

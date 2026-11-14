@@ -17,6 +17,7 @@ import contextlib
 import fcntl
 import json
 import os
+import platform
 import re
 import signal
 import sys
@@ -48,6 +49,29 @@ class Usage(Exception):
     """An argv the real tool refuses with exit 2."""
 
 
+class HarnessError(Exception):
+    """A broken test setup (corrupt state, bad script): one stderr line and exit 70."""
+
+
+#: Exit code of a scripted ``error`` whose rule gives no ``exit`` (the codes the siblings share).
+ERROR_EXITS = {
+    "usage": 2,
+    "not_found": 10,
+    "no_server": 10,
+    "ambiguous": 21,
+    "refused": 20,
+    "confirmation_required": 13,
+    "command_not_found": 12,
+    "busy": 12,
+    "internal": 1,
+    "fake_unsupported": 1,
+}
+SIGNAL_NAMES = {s.name for s in signal.Signals if s.name.startswith("SIG") and "_" not in s.name}
+HANG_SECONDS = 120.0
+#: The parent when the fake started; a hung call whose parent changes (or is init) is orphaned.
+START_PPID = os.getppid()
+
+
 @dataclass
 class Parsed:
     flags: dict[str, Any] = field(default_factory=dict)
@@ -66,19 +90,51 @@ class Parsed:
         return list(self.flags.get(name, []))
 
 
+NEGATIVE_NUMBER = re.compile(r"-\d+|-\d*\.\d+")
+
+
+def looks_like_option(token: str) -> bool:
+    """Whether Python's argparse takes ``token`` for an option rather than a value."""
+    return (
+        token.startswith("-")
+        and token != "-"
+        and NEGATIVE_NUMBER.fullmatch(token) is None
+        and " " not in token
+    )
+
+
+def first_positional(argv: list[str], value_flags: set[str]) -> int | None:
+    """Index of the first positional (not a flag, not a separate-token flag value) before ``--``."""
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == "--":
+            return None
+        if token.startswith("-") and token != "-":
+            if token in value_flags:
+                i += 1
+        else:
+            return i
+        i += 1
+    return None
+
+
 def parse_args(
     argv: list[str],
     flags: dict[str, str],
     *,
     dd_is_argv: bool = False,
     stop_at_dd: bool = True,
+    argparse_values: bool = False,
 ) -> Parsed:
     """Parse ``argv`` with getopt-like rules shared by the three tools.
 
     A value flag always consumes the next token (even one starting with ``-``); ``--flag=value``
     is equivalent; a boolean flag rejects ``=value``; ``--`` ends the options, and what follows
     is ``after_dd`` (``dd_is_argv``) or more positionals; a lone ``-`` is a positional; an
-    unknown option, a missing value or a combined short option is a usage error.
+    unknown option, a missing value or a combined short option is a usage error. With
+    ``argparse_values`` (claude-session is built on argparse) a separate-token value that looks
+    like an option (``-x``, ``--``) is a missing value, as argparse treats it.
     """
     parsed = Parsed(tokens=list(argv))
     i = 0
@@ -105,7 +161,7 @@ def parse_args(
             else:
                 if not eq:
                     i += 1
-                    if i >= len(argv):
+                    if i >= len(argv) or (argparse_values and looks_like_option(argv[i])):
                         raise Usage(f"{name} requires a value")
                     value = argv[i]
                 if kind == MULTI:
@@ -152,7 +208,39 @@ def _log_path() -> Path:
     if not raw:
         sys.stderr.write("fakebin: FAKEBIN_LOG is not set; refusing to run outside the fixture\n")
         raise SystemExit(70)
+    if not os.path.isabs(raw):
+        sys.stderr.write(f"fakebin: FAKEBIN_LOG must be an absolute path, got {raw!r}\n")
+        raise SystemExit(70)
+    if not os.path.isdir(os.path.dirname(raw)):
+        sys.stderr.write(f"fakebin: the directory of FAKEBIN_LOG does not exist: {raw!r}\n")
+        raise SystemExit(70)
     return Path(raw)
+
+
+def log_event(name: str, **fields: Any) -> None:
+    """Append a non-call record (``event`` other than invoke/exit) to the invocation log."""
+    _append_line(_log_path(), {"event": name, "pid": os.getpid(), **fields})
+
+
+def read_json(path: Path, what: str, kind: type, default: Any) -> Any:
+    """Read a JSON state file of the fake; a corrupt or wrongly shaped one is a harness error."""
+    if not path.exists():
+        return default
+    try:
+        data = json.loads(path.read_text())
+    except (ValueError, OSError) as problem:
+        raise HarnessError(f"{what} {path} is corrupt: {problem}") from None
+    if not isinstance(data, kind):
+        raise HarnessError(f"{what} {path} must hold a JSON {kind.__name__}")
+    return data
+
+
+def peek_counter(name: str) -> int:
+    """The value ``counter(name)`` would return next, without taking it."""
+    path = Path(str(_log_path()) + ".counts.json")
+    with locked(path):
+        data = read_json(path, "counts file", dict, {})
+        return int(data.get(name, 0)) + 1
 
 
 def _append_line(path: Path, record: dict[str, Any]) -> None:
@@ -178,9 +266,7 @@ def counter(name: str) -> int:
     """A persistent, process-safe counter next to the log; returns the new value (from 1)."""
     path = Path(str(_log_path()) + ".counts.json")
     with locked(path):
-        data: dict[str, int] = {}
-        if path.exists():
-            data = json.loads(path.read_text())
+        data: dict[str, int] = read_json(path, "counts file", dict, {})
         data[name] = data.get(name, 0) + 1
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data))
@@ -188,16 +274,70 @@ def counter(name: str) -> int:
         return data[name]
 
 
-def find_rule(tool: str, command: str, argv: list[str]) -> dict[str, Any] | None:
+def validate_response(respond: Any) -> dict[str, Any]:
+    """A scripted response must be well formed; anything else is a harness error (exit 70)."""
+    if not isinstance(respond, dict):
+        raise HarnessError("a scripted rule's respond must be an object")
+    exit_code = respond.get("exit")
+    if exit_code is not None and (isinstance(exit_code, bool) or not isinstance(exit_code, int)):
+        raise HarnessError(f"scripted exit must be an integer, got {exit_code!r}")
+    nap = respond.get("sleep")
+    if nap is not None and (
+        isinstance(nap, bool) or not isinstance(nap, (int, float)) or nap < 0 or nap != nap
+    ):
+        raise HarnessError(f"scripted sleep must be a non-negative number, got {nap!r}")
+    handlers = respond.get("on_signal", {})
+    if not isinstance(handlers, dict):
+        raise HarnessError("scripted on_signal must be an object")
+    for name, action in handlers.items():
+        if name not in SIGNAL_NAMES:
+            raise HarnessError(f"scripted on_signal names an unknown signal: {name!r}")
+        if action != "ignore" and not isinstance(action, dict):
+            raise HarnessError(f"scripted on_signal {name} must be 'ignore' or an object")
+        if isinstance(action, dict) and (
+            isinstance(action.get("exit", 0), bool) or not isinstance(action.get("exit", 0), int)
+        ):
+            raise HarnessError(f"scripted on_signal {name} exit must be an integer")
+    error = respond.get("error")
+    if error is not None and not isinstance(error, dict):
+        raise HarnessError("a scripted error must be an object")
+    if error is not None and respond.get("exit") == 0:
+        raise HarnessError("a scripted error cannot exit 0 (an error envelope means failure)")
+    return respond
+
+
+def error_exit(respond: dict[str, Any], default: int | None = None) -> int:
+    """The exit code of a scripted error: its ``exit``, else the code's mapped exit, else 1."""
+    if "exit" in respond:
+        return int(respond["exit"])
+    error = respond.get("error") or {}
+    return ERROR_EXITS.get(str(error.get("code")), default or 1)
+
+
+def find_rule(
+    tool: str,
+    command: str,
+    argv: list[str],
+    canonical: Callable[[str], str] | None = None,
+) -> dict[str, Any] | None:
     """The first scripted rule that matches and still has uses left."""
     script = os.environ.get("FAKEBIN_SCRIPT")
     if not script or not Path(script).exists():
         return None
-    rules = json.loads(Path(script).read_text()).get("rules", [])
+    document = read_json(Path(script), "script", dict, {})
+    rules = document.get("rules", [])
+    if not isinstance(rules, list):
+        raise HarnessError("the script's rules must be a list")
     for index, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            raise HarnessError("every script rule must be an object")
+        validate_response(rule.get("respond", {}))
         if rule.get("tool") not in (None, tool):
             continue
-        if rule.get("command") not in (None, command):
+        wanted = rule.get("command")
+        if canonical is not None and isinstance(wanted, str):
+            wanted = canonical(wanted)
+        if wanted not in (None, command):
             continue
         if any(token not in argv for token in rule.get("argv_contains", [])):
             continue
@@ -216,6 +356,7 @@ class Context:
     json_mode: bool = False
     stdin_text: str | None = None
     signaled: list[int] = field(default_factory=list)
+    canonical: Callable[[str], str] | None = None
     _rule: dict[str, Any] | None = None
     _rule_loaded: bool = False
     _behaved: bool = False
@@ -223,7 +364,7 @@ class Context:
     def rule(self, command: str) -> dict[str, Any] | None:
         """The scripted rule for this call (looked up, and counted, once)."""
         if not self._rule_loaded:
-            self._rule = find_rule(self.tool, command, self.argv)
+            self._rule = find_rule(self.tool, command, self.argv, self.canonical)
             self._rule_loaded = True
         return self._rule
 
@@ -244,7 +385,7 @@ class Context:
         error = dict(response["error"])
         body = json.dumps({"error": error}) + "\n" if self.json_mode else ""
         raise Exit(
-            int(response.get("exit", 1)),
+            error_exit(response),
             body,
             f"{self.tool}: {error.get('message', '')}\n{response.get('stderr', '')}",
         )
@@ -259,9 +400,7 @@ class Context:
         if response.get("sleep"):
             time.sleep(float(response["sleep"]))
         if response.get("hang"):
-            # Block until a signal ends the process (default action) or on_signal handles it.
-            while True:
-                time.sleep(0.05)
+            hang()
 
     def stdin_is_tty(self) -> bool:
         return sys.stdin is not None and sys.stdin.isatty()
@@ -281,6 +420,33 @@ class Context:
 
     def usage(self, message: str) -> NoReturn:
         self.fail(2, "usage", message)
+
+
+def drop_signal(_signum: int, _frame: Any) -> None:
+    """A handler that drops the signal. Unlike ``SIG_IGN`` it cannot raise ``OSError`` ("Signal
+    N ignored due to race condition") in code that runs after a signal was already pending."""
+
+
+def hang() -> None:
+    """Block until a signal ends the process (default action) or ``on_signal`` handles it.
+
+    A hung fake never outlives its test: it gives up after ``FAKEBIN_HANG_SECONDS`` (default
+    120 s) and when its parent is gone (orphaned: the parent changed, or is init), both with
+    exit 124 and a stderr line.
+    """
+    try:
+        limit = float(os.environ.get("FAKEBIN_HANG_SECONDS", HANG_SECONDS))
+    except ValueError:
+        raise HarnessError("FAKEBIN_HANG_SECONDS must be a number") from None
+    parent = START_PPID
+    deadline = time.monotonic() + limit
+    while True:
+        time.sleep(0.05)
+        now = os.getppid()
+        if now != parent or now == 1:
+            raise Exit(124, "", "fakebin: hung call gave up: its parent process is gone\n")
+        if time.monotonic() >= deadline:
+            raise Exit(124, "", f"fakebin: hung call gave up after {limit:g} seconds\n")
 
 
 Handler = Callable[[Context, list[str]], tuple[int, Any]]
@@ -314,6 +480,7 @@ def run_fake(
             "cwd": os.getcwd(),
             "pid": os.getpid(),
             "ppid": os.getppid(),
+            "python": platform.python_version(),
             "env": env,
             "stdin_is_tty": sys.stdin is not None and sys.stdin.isatty(),
         },
@@ -343,6 +510,9 @@ def run_fake(
             code = stop.code
             sys.stdout.write(stop.stdout)
             sys.stderr.write(stop.stderr)
+        except HarnessError as problem:
+            code = 70
+            sys.stderr.write(f"fakebin: {problem}\n")
         except Usage as problem:
             ctx.json_mode = any(t == "--json" or t.startswith("--json=") for t in _before_dd(argv))
             code = 2
@@ -377,7 +547,7 @@ def apply_rule(ctx: Context, command: str, output: Any, code: int) -> tuple[Any,
         error = dict(response["error"])
         sys.stderr.write(f"{ctx.tool}: {error.get('message', '')}\n")
         sys.stderr.write(response.get("stderr", ""))
-        return {"error": error}, int(response.get("exit", code or 1))
+        return {"error": error}, error_exit(response, code or 1)
     if "stdout" in response:
         output = response["stdout"]
     if "merge" in response:
@@ -390,6 +560,13 @@ def apply_rule(ctx: Context, command: str, output: Any, code: int) -> tuple[Any,
 
 def install_signal_behavior(spec: dict[str, Any], signaled: list[int]) -> None:
     """``{"SIGTERM": {"exit": 143}}`` exits with that code; ``"ignore"`` ignores the signal."""
+    numbers = [getattr(signal, name) for name in spec]
+
+    def disarm() -> None:
+        # Once one signal ended the call, later ones must not interrupt its finalization.
+        for number in numbers:
+            signal.signal(number, drop_signal)
+
     for name, action in spec.items():
         number = getattr(signal, name)
         if action == "ignore":
@@ -397,6 +574,7 @@ def install_signal_behavior(spec: dict[str, Any], signaled: list[int]) -> None:
             continue
 
         def handler(signum: int, _frame: Any, action: dict[str, Any] = action) -> None:
+            disarm()
             signaled.append(signum)
             raise Exit(int(action.get("exit", 128 + signum)), "", action.get("stderr", ""))
 

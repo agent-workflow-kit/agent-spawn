@@ -79,12 +79,6 @@ CASES: dict[str, list[Case]] = {
             True,
         ),
         (
-            ["start", "--json", "--skill", "x", "--mode", "headless", "--actor", "robot"],
-            2,
-            "usage",
-            False,
-        ),
-        (
             [
                 "start",
                 "--json",
@@ -165,6 +159,68 @@ CASES: dict[str, list[Case]] = {
         ),
         (["verify-secret", "cs-abcd"], 11, None, True),
         (["verify-secret", "cs-abcdefgh", "--json"], 11, None, True),
+        # observed on claude-session 0.38.4 (round 1)
+        (["status", "--json", "cs-aaaaaaaa"], 10, "not_found", True),
+        (["status", "--json", "cs-aaaaaaaaaaaaa"], 10, "not_found", True),
+        (["status", "--json", "cs-aaaaaaa1"], 10, "not_found", True),
+        (["status", "--json", "AAAAAAAA"], 10, "not_found", True),
+        (["label", "add", "--json", "cs-aaaaaaaa", "a=b"], 10, "not_found", True),
+        (["--json", "status", "cs-aaaaaaaa"], 2, "usage", True),
+        (["--json"], 2, "usage", True),
+        (["--help"], 0, None, True),
+        (["-h"], 0, None, True),
+        (["forget", "--json", "--older-than", "abc"], 2, "usage", True),
+        (["forget", "--json", "--older-than", "36501d"], 2, "usage", True),
+        (["forget", "--json", "--older-than", "1d", "--state", "bogus"], 2, "usage", True),
+        (["forget", "--json", "--older-than", "1d", "--kind", "Bad"], 2, "usage", True),
+        (["list", "--json", "--limit", "0"], 2, "usage", True),
+        (["list", "--json", "--state", "bogus"], 2, "usage", True),
+        (["list", "--json", "--kind", "Bad"], 2, "usage", True),
+        (["list", "--json", "--kind", ""], 2, "usage", True),
+        (["list", "--json", "--limit", "5"], 0, None, True),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--timeout", "36501d"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--repo", "Bad Repo"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--env-allow", "A*"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--env-allow", ""],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--setting-sources", "User"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--setting-sources", "user,"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--permission-profile", "-x"],
+            2,
+            "usage",
+            True,
+        ),
+        (["start", "--json", "--resume", "cs-abcdefgh", "--reset", "kind"], 2, "usage", True),
         (["--version"], 0, None, True),
     ],
     "termctl": [
@@ -190,6 +246,35 @@ CASES: dict[str, list[Case]] = {
         (["--json=x", "list"], 2, "usage", True),
         (["show", "--json"], 2, "usage", True),
         (["close", "--json", "tc-abcdefgh", "--force"], 2, "usage", True),
+        # observed on termctl 0.25.0 (round 1); `nosuch` is a socket name under TMUX_TMPDIR
+        (
+            ["--json", "--socket", "nosuch", "label", "add", "tc-aaaaaaaa", "a=b"],
+            10,
+            "no_server",
+            True,
+        ),
+        (
+            ["label", "add", "--socket", "nosuch", "tc-aaaaaaaa", "a=b", "--json"],
+            10,
+            "no_server",
+            True,
+        ),
+        (["open", "--json", "--cwd", "", "--", "sleep", "1"], 2, "usage", True),
+        (["open", "--json", "--override-escalation", "--", "sleep", "1"], 2, "usage", True),
+        (
+            ["open", "--json", "--override-escalation", "--actor", "auto:x", "--", "sleep", "1"],
+            2,
+            "usage",
+            True,
+        ),
+        (["--socket", "nosuch", "mark", "tc-aaaaaaaa", "nomarker", "--json"], 2, "usage", True),
+        (
+            ["open", "--json", "--socket", "nosuch", "--dry-run", "--", ""],
+            12,
+            "command_not_found",
+            True,
+        ),
+        (["show", "--json", "tc-aaaaaaa1"], 2, "usage", True),
     ],
     "wtctl": [
         (["create", "--json"], 2, "usage", False),
@@ -235,3 +320,36 @@ CASES: dict[str, list[Case]] = {
         (["remove", "wt-abcdefgh", "--force", "--json"], 2, "usage", False),
     ],
 }
+
+
+#: argv whose argument checks the real program passes (it goes on to fail later, or succeeds):
+#: neither the real program nor the fake may answer these with exit 2. Real claude-session
+#: 0.38.4 failed with ``ModuleNotFoundError`` (exit 1) right after its argv checks.
+_HEADLESS = ["start", "--json", "--skill", "x", "--mode", "headless"]
+ACCEPTED: dict[str, list[list[str]]] = {
+    "claude-session": [
+        [*_HEADLESS, "--env-allowlist-only", ""],
+        [*_HEADLESS, "--model", ""],
+        [*_HEADLESS, "--max-turns", "+5"],
+        [*_HEADLESS, "--max-turns", " 5"],
+        [*_HEADLESS, "--max-turns", "\u0665"],
+        [*_HEADLESS, "--max-turns", "1_0"],
+        [*_HEADLESS, "--auto-exit", "--no-auto-exit"],
+        [*_HEADLESS, "--timeout", "1.5h"],
+        [*_HEADLESS, "--timeout", "none"],
+        [*_HEADLESS, "--setting-sources", ""],
+        [*_HEADLESS, "--setting-sources", "user,project"],
+        [*_HEADLESS, "--permission-profile=-x"],
+        [*_HEADLESS, "--hook", "pre-launch="],
+        ["forget", "--json", "--older-than", "0"],
+        ["forget", "--json", "--older-than", "1.5h"],
+    ],
+    "termctl": [],
+}
+
+#: Known differences, kept on purpose: ``(tool, argv, real exit, fake exit)``. The live test pins
+#: the real exit, the offline table test pins the fake's.
+DIVERGENCES: list[tuple[str, list[str], int, int]] = [
+    # interface.md: argv needs `--`; the real termctl 0.25.0 opens a shell pane instead.
+    ("termctl", ["open", "--json", "--socket", "nosuch", "--dry-run"], 0, 2),
+]

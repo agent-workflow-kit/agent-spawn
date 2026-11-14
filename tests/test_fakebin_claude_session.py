@@ -200,9 +200,9 @@ def test_label_add_remove_stop_forget_list_reconcile_validate(fakebin: Fakebin) 
     )
     assert none["sessions"] == []
     _, stopped = run_json(fakebin, "claude-session", "stop", sid, schema="cli/stop.json")
-    assert stopped["ended"] and stopped["outcome"] == "killed"
+    assert stopped["canceled"] and stopped["outcome"] == "not-started"  # still pending
     _, dry = run_json(fakebin, "claude-session", "stop", sid, "--dry-run", schema="cli/stop.json")
-    assert dry["ended"] is False and dry["outcome"] is None
+    assert dry["already_final"] is True and dry["signals"] == []
     _, forgotten = run_json(fakebin, "claude-session", "forget", sid, schema="cli/forget.json")
     assert [f["csession_id"] for f in forgotten["forgotten"]] == [sid]
     code, error = error_of(fakebin, "claude-session", "status", sid[:8])  # prefix of a forgotten id
@@ -272,8 +272,11 @@ USAGE_ERRORS = [
     pytest.param(["start", "--skill", "x", "--timeout", "0"], id="timeout-zero"),
     pytest.param(["start", "--skill", "x", "--max-turns", "0"], id="max-turns-zero"),
     pytest.param(["start", "--skill", "x", "--model", "-x"], id="model-leading-dash"),
-    pytest.param(["start", "--skill", "x", "--actor", "robot"], id="bad-actor"),
-    pytest.param(["start", "--skill", "x", "--decision-id", "bad id"], id="bad-decision-id"),
+    pytest.param(["start", "--skill", "x", "--actor", "a" * 4097], id="actor-over-the-cap"),
+    pytest.param(
+        ["start", "--skill", "x", *["--decision-id", "d" * 100000] * 3],
+        id="decision-ids-over-the-cap",
+    ),
     pytest.param(["start", "--skill", "x", "--fork"], id="fork-without-resume"),
     pytest.param(["start", "--skill", "x", "--reset", "model"], id="reset-without-resume"),
     pytest.param(["start", "--skill", "x", "--allow-tainted"], id="allow-tainted-without-resume"),
@@ -381,7 +384,7 @@ def test_prompt_from_stdin_is_logged_and_flag_values_are_extractable(fakebin: Fa
 
 
 def test_a_value_flag_takes_the_next_token_even_if_it_starts_with_a_dash(fakebin: Fakebin) -> None:
-    # getopt semantics: --label consumes "--json"; so stdout is not JSON-mode output
+    # --label wants a value, and argparse takes "--json" for an option: a usage error
     done = fakebin.run(
         "claude-session", "start", "--mode", "headless", "--skill", "x", "--label", "--json"
     )
@@ -414,6 +417,7 @@ def test_signals_finalize_a_hanging_exec_as_killed_and_write_the_outcome_file(
 
 
 def test_a_scripted_signal_response_can_ignore_sigterm(fakebin: Fakebin) -> None:
+    fakebin.seed_session()
     fakebin.script("claude-session", "wait", hang=True, on_signal={"SIGTERM": "ignore"})
     proc = subprocess.Popen(
         [str(fakebin.bin_dir / "claude-session"), "wait", "cs-abcdefgh", "--json"],

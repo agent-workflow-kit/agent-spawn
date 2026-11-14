@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,6 +67,9 @@ class Fakebin:
         self.bin_dir.mkdir(parents=True)
         for name in FAKES:
             (self.bin_dir / name).symlink_to(FAKEBIN_DIR / name)
+        # The stubs start with `#!/usr/bin/env python3`: put the test interpreter first, so
+        # the 3.12/3.13 matrix runs the fakes under the version it is testing.
+        (self.bin_dir / "python3").symlink_to(os.path.realpath(sys.executable))
         self.log.touch()
         self._write_script()
 
@@ -140,6 +144,31 @@ class Fakebin:
             check=False,
         )
 
+    def seed_session(self, csession_id: str = "cs-abcdefgh", **fields: Any) -> str:
+        """Make claude-session know ``csession_id`` (an unknown id exits 10, like the real one).
+
+        By default the session is settled: its run 1 was adopted and ended ``done``. Pass
+        ``adopted=False`` for a pending run, ``final=False`` for a live one, or any other field
+        of the fake's session record (``labels``, ``kind``, ``run``...).
+        """
+        from tests.fakebin.fakelib.claude_session import new_entry
+
+        path = Path(str(self.log) + ".sessions.json")
+        data: dict[str, Any] = json.loads(path.read_text()) if path.exists() else {}
+        settled = {"adopted": True, "final": True, "outcome": "done"}
+        data[csession_id] = new_entry(**{**settled, **fields})
+        path.write_text(json.dumps(data))
+        return csession_id
+
+    def python_versions(self) -> list[str]:
+        """The Python version each logged call ran under."""
+        return [r["python"] for r in self.records("invoke")]
+
+    def records(self, event: str) -> list[dict[str, Any]]:
+        """The log records of a kind other than a call (``outcome_file_failed``...)."""
+        found = [json.loads(line) for line in self.log.read_text().splitlines()]
+        return [record for record in found if record["event"] == event]
+
     # --- the log -----------------------------------------------------------------------
 
     def invocations(self, tool: str | None = None) -> list[Invocation]:
@@ -151,7 +180,7 @@ class Fakebin:
             if record["event"] == "invoke":
                 invokes[record["id"]] = record
                 order.append(record["id"])
-            else:
+            elif record["event"] == "exit":
                 exits[record["id"]] = record
         found: list[Invocation] = []
         for invoke_id in order:

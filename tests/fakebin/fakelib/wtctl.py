@@ -30,8 +30,11 @@ from .core import (
     Parsed,
     base32_id,
     counter,
+    first_positional,
     locked,
     parse_args,
+    peek_counter,
+    read_json,
     require_pattern,
     run_fake,
 )
@@ -106,6 +109,8 @@ CHECK_NAMES = (
     "unpushed_head unpushed_branches"
 ).split()
 LIVE_STATES = ("creating", "active", "unlinked", "missing", "clone_missing", "partial")
+ALL_STATES = (*LIVE_STATES, "gone", "removed", "forgotten")
+MAX_LABELS = 32
 
 
 # --- state ---------------------------------------------------------------------------------
@@ -116,14 +121,13 @@ def _store_path() -> Path:
 
 
 def load_records() -> dict[str, dict[str, Any]]:
-    path = _store_path()
-    return json.loads(path.read_text()) if path.exists() else {}
+    return read_json(_store_path(), "records file", dict, {})
 
 
 def update_records(change: Callable[[dict[str, dict[str, Any]]], Any]) -> Any:
     path = _store_path()
     with locked(path):
-        data: dict[str, dict[str, Any]] = json.loads(path.read_text()) if path.exists() else {}
+        data: dict[str, dict[str, Any]] = read_json(path, "records file", dict, {})
         result = change(data)
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data))
@@ -154,6 +158,17 @@ def check_common(ctx: Context, p: Parsed) -> None:
 
 
 # --- records -------------------------------------------------------------------------------
+
+
+def valid_branch(name: str) -> bool:
+    """``git check-ref-format --branch`` (the rules that matter for a name given on argv)."""
+    if name in ("", "@") or name.startswith("-") or name.startswith("/") or name.endswith("/"):
+        return False
+    if name.endswith(".") or name.endswith(".lock") or ".." in name or "@{" in name:
+        return False
+    if re.search(r"[\x00-\x20\x7f~^:?*\[\\]", name) or "//" in name:
+        return False
+    return not any(part.startswith(".") or part.endswith(".lock") for part in name.split("/"))
 
 
 def derive_name(branch: str | None, fallback: str) -> str:
@@ -233,11 +248,15 @@ def dispatch(ctx: Context) -> tuple[int, Any, str]:
     if any(token in ("-h", "--help") for token in rest):
         raise Exit(0, f"usage: wtctl {command} ...\n")
     if command in ("label", "baseline"):
-        sub = next((t for t in rest if not t.startswith("-")), "")
+        # The action is the first positional once the global value flags (--config, --actor,
+        # --decision-id) are skipped: `--config X label add ...` is a normal spelling.
+        at = first_positional(rest, {"--config", "--actor", "--decision-id"})
+        sub = "" if at is None else rest[at]
         allowed = ("add", "remove") if command == "label" else ("check", "accept")
         if sub not in allowed:
             ctx.usage(f"{command} needs one of {', '.join(allowed)}")
-        rest.remove(sub)
+        assert at is not None
+        del rest[at]
         command = f"{command} {sub}"
         if command == "baseline accept":
             ctx.fail(1, "fake_unsupported", "the fake does not implement 'baseline accept'")
@@ -277,6 +296,8 @@ def do_create(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
     branch = p.get("--branch")
     if p.has("--branch") and p.has("--detach"):
         ctx.usage("--branch and --detach are mutually exclusive")
+    if branch is not None and not valid_branch(branch):
+        ctx.usage(f"invalid --branch: {branch!r} (git check-ref-format --branch)")
     if (ref := p.get("--ref")) is not None:
         require_pattern(ref, g.SHA, "--ref")
     if (name := p.get("--name")) is not None:
@@ -285,7 +306,7 @@ def do_create(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
     if holder is not None:
         require_pattern(holder, g.HOLDER, "--holder")
     labels = p.multi("--label")
-    if len(labels) > 32:
+    if len(set(labels)) > MAX_LABELS:
         ctx.usage("at most 32 --label values")
     for label in labels:
         require_pattern(label, g.LABEL, "label")
@@ -338,7 +359,8 @@ def do_create(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
                         holder_id=existing["id"],
                         holder_path=existing["path"],
                     )
-        record_id = base32_id("wt-", counter("wt"))
+        # a dry run reports the id a real create would take, and takes none
+        record_id = base32_id("wt-", peek_counter("wt") if dry else counter("wt"))
         taken = {
             r["name"] for r in data.values() if r["state"] in LIVE_STATES and r["repo"] == repo
         }
@@ -349,7 +371,9 @@ def do_create(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
             final = f"{wanted[: 64 - len(str(n)) - 1]}-{n}"
         path = os.path.join(fake_root(), "throwaways" if throwaway else "worktrees", record_id[3:])
         if not throwaway:
-            path = os.path.join(fake_root(), "worktrees", final)
+            # {root}/{host}/{path}/{name}: the host's ':' becomes '_' (wtctl interface, Locations)
+            host, _, project = repo.partition("/")
+            path = os.path.join(fake_root(), "worktrees", host.replace(":", "_"), project, final)
         number = (
             int(
                 record_id[3:].translate(
@@ -440,6 +464,9 @@ def do_list(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         require_pattern(label, g.LABEL, "label")
     wanted = set(p.multi("--label"))
     states = p.multi("--state")
+    for state in states:
+        if state not in ALL_STATES:
+            ctx.usage(f"invalid --state: {state!r}")
     records = [
         r
         for r in load_records().values()
@@ -592,6 +619,8 @@ def label_handler(sub: str) -> Callable[[Context, Parsed], tuple[int, Any, str]]
             current = set(data[record["id"]]["labels"])
             wanted = set(p.positionals[1:])
             result = sorted(current | wanted if sub == "add" else current - wanted)
+            if len(result) > MAX_LABELS:
+                ctx.usage("a record holds at most 32 labels")
             if not dry:
                 data[record["id"]]["labels"] = result
             return result

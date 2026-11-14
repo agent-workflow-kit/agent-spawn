@@ -21,7 +21,7 @@ import pytest
 
 from tests.conftest import Isolation
 from tests.fakebin.fakelib.tmux import split_commands
-from tests.fakebin.fidelity_cases import CASES
+from tests.fakebin.fidelity_cases import ACCEPTED, CASES, DIVERGENCES
 from tests.fakebin.harness import Fakebin
 from tests.private_tmux import PrivateTmux
 
@@ -79,6 +79,29 @@ def test_the_real_program_gives_the_exit_and_error_code_the_fake_gives(
     done = run_real(real_program(tool), argv, isolation_env.env)
     assert done.returncode == exit_code, (done.stdout, done.stderr)
     assert error_code(done.stdout) == code
+
+
+@pytest.mark.parametrize(
+    ("tool", "argv"),
+    [pytest.param(t, a, id=f"{t}:{' '.join(a)}") for t, rows in ACCEPTED.items() for a in rows],
+)
+def test_the_real_program_accepts_the_argv_the_fake_accepts(
+    isolation_env: Isolation, tool: str, argv: list[str]
+) -> None:
+    done = run_real(real_program(tool), argv, isolation_env.env)
+    assert done.returncode != 2, (done.stdout, done.stderr)
+
+
+@pytest.mark.parametrize(
+    ("tool", "argv", "real_exit", "fake_exit"),
+    [pytest.param(t, a, r, f, id=f"{t}:{' '.join(a)}") for t, a, r, f in DIVERGENCES],
+)
+def test_the_real_program_still_differs_from_the_fake_where_the_table_says(
+    isolation_env: Isolation, tool: str, argv: list[str], real_exit: int, fake_exit: int
+) -> None:
+    done = run_real(real_program(tool), argv, isolation_env.env)
+    assert done.returncode == real_exit, (done.stdout, done.stderr)
+    assert real_exit != fake_exit
 
 
 def test_real_wtctl_when_implemented_matches_the_fake(isolation_env: Isolation) -> None:
@@ -139,3 +162,69 @@ def test_tmux_new_window_prints_pane_and_window_ids_like_the_scripted_fake_repli
         "new-window", "-d", "-P", "-F", "#{pane_id} #{window_id}", "-t", "=one:", "sleep", "30"
     )
     assert re.fullmatch(r"%\d+ @\d+\n", done.stdout), done
+
+
+def test_tmux_no_server_text_distinguishes_a_missing_socket_from_a_dead_one(
+    fakebin: Fakebin, isolation_env: Isolation
+) -> None:
+    import socket as socket_module
+
+    program = real_program("tmux")
+    base = Path(isolation_env.tmux_tmpdir)
+    stale = base / "stale.sock"
+    listener = socket_module.socket(socket_module.AF_UNIX)
+    listener.bind(str(stale))
+    listener.close()
+    regular = base / "regular"
+    regular.touch()
+    for path in (stale, regular, base / "missing"):
+        argv = ["-f", "/dev/null", "-S", str(path), "list-sessions"]
+        real = run_real(program, argv, isolation_env.env)
+        fake = fakebin.run("tmux", *argv)
+        assert (real.returncode, real.stdout, real.stderr) == (
+            fake.returncode,
+            fake.stdout,
+            fake.stderr,
+        ), path
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["-d", "list-sessions"],
+        ["-U", "list-sessions"],
+        ["-D", "list-sessions"],
+        ["-q", "list-sessions"],
+        ["ls"],
+        ["kill-server"],
+        ["bogus"],
+    ],
+    ids=lambda a: " ".join(a),
+)
+def test_tmux_client_options_and_server_commands_without_a_server_match_the_fake(
+    fakebin: Fakebin, isolation_env: Isolation, args: list[str]
+) -> None:
+    program = real_program("tmux")
+    socket = Path(isolation_env.tmux_tmpdir) / "absent"
+    argv = ["-f", "/dev/null", "-S", str(socket), *args]
+    real = run_real(program, argv, isolation_env.env)
+    fake = fakebin.run("tmux", *argv)
+    assert (real.returncode, real.stdout, real.stderr) == (
+        fake.returncode,
+        fake.stdout,
+        fake.stderr,
+    )
+
+
+def test_tmux_start_server_without_a_session_succeeds_silently(
+    fakebin: Fakebin, isolation_env: Isolation
+) -> None:
+    program = real_program("tmux")
+    argv = ["-f", "/dev/null", "-S", str(Path(isolation_env.tmux_tmpdir) / "start"), "start-server"]
+    real = run_real(program, argv, isolation_env.env)
+    fake = fakebin.run("tmux", *argv)
+    assert (real.returncode, real.stdout, real.stderr) == (
+        fake.returncode,
+        fake.stdout,
+        fake.stderr,
+    )

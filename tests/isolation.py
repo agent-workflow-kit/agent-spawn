@@ -48,12 +48,17 @@ def _real_xdg_dirs(original: Mapping[str, str]) -> dict[str, set[Path]]:
     return dirs
 
 
-def _real_tmux_dirs(original: Mapping[str, str]) -> set[Path]:
-    tmpdirs = {Path("/tmp")}
+def _real_tmux_parents(original: Mapping[str, str]) -> set[Path]:
+    """Directories whose ``tmux-UID`` child is a real tmux socket directory."""
+    tmpdirs = {_real("/tmp")}
     for entry in original.get("TMUX_TMPDIR", "").split(":"):
         if entry:
             tmpdirs.add(_real(entry))
-    return {_real(d / f"tmux-{REAL_UID}") for d in tmpdirs}
+    return tmpdirs
+
+
+def _real_tmux_dirs(original: Mapping[str, str]) -> set[Path]:
+    return {_real(d / f"tmux-{REAL_UID}") for d in _real_tmux_parents(original)}
 
 
 def _inside(path: Path, parents: set[Path]) -> bool:
@@ -84,8 +89,16 @@ def environment_problems(
     tmpdir = env.get("TMUX_TMPDIR")
     if not tmpdir or not os.path.isabs(tmpdir):
         problems.append(f"TMUX_TMPDIR is not an absolute path: {tmpdir!r}")
-    elif _inside(_real(tmpdir), _real_tmux_dirs(original)):
-        problems.append(f"TMUX_TMPDIR is the real tmux directory: {tmpdir}")
+    else:
+        real_tmpdir = _real(tmpdir)
+        if (
+            _inside(real_tmpdir, _real_tmux_dirs(original))
+            or f"tmux-{REAL_UID}" in real_tmpdir.parts
+        ):
+            problems.append(f"TMUX_TMPDIR is the real tmux directory: {tmpdir}")
+        elif real_tmpdir in _real_tmux_parents(original):
+            # tmux looks for $TMUX_TMPDIR/tmux-UID/default: this is the parent of the real one
+            problems.append(f"TMUX_TMPDIR holds the real tmux directory: {tmpdir}")
     for name in env:
         if name in LEAKY_NAMES or name.startswith(LEAKY_PREFIXES):
             problems.append(f"{name} is set in the test environment")

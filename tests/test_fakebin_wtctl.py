@@ -25,11 +25,11 @@ def create(fakebin: Fakebin, *extra: str) -> dict[str, object]:
 
 def test_create_worktree_validates_and_makes_the_directory(fakebin: Fakebin) -> None:
     body = create(
-        fakebin, "--branch", "feat/x y", "--holder", "ag-abcdefgh", "--label", "agent=ag-abcdefgh"
+        fakebin, "--branch", "feat/x-y", "--holder", "ag-abcdefgh", "--label", "agent=ag-abcdefgh"
     )
     record = body["record"]
     assert isinstance(record, dict)
-    assert record["name"] == "feat-x-y" and record["branch"] == "feat/x y"
+    assert record["name"] == "feat-x-y" and record["branch"] == "feat/x-y"
     assert record["holders"] == ["ag-abcdefgh"] and record["labels"] == ["agent=ag-abcdefgh"]
     assert body["branch_action"] == "new" and body["reused"] is False
     assert os.path.isdir(record["path"])
@@ -230,3 +230,110 @@ def test_version_and_unsupported(fakebin: Fakebin) -> None:
     assert fakebin.run("wtctl", "--version").stdout == "wtctl 0.1.0\n"
     done = fakebin.run("wtctl", "adopt", "/x", "--json")
     assert done.returncode == 1 and json.loads(done.stdout)["error"]["code"] == "fake_unsupported"
+
+
+# --- global value flags before a nested command (R3) ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "flag", [["--config", "/x/c.yaml"], ["--actor", "auto:spawn"], ["--decision-id", "d-1"]]
+)
+def test_label_and_baseline_accept_a_global_value_flag_before_the_action(
+    fakebin: Fakebin, flag: list[str]
+) -> None:
+    record = create(fakebin, "--branch", "b")["record"]
+    assert isinstance(record, dict)
+    code, body = run_json(
+        fakebin,
+        "wtctl",
+        *flag,
+        "label",
+        "add",
+        str(record["id"]),
+        "k=v",
+        schema="cli/label-add.json",
+    )
+    assert code == 0 and body["labels"] == ["k=v"]
+    code, check = run_json(
+        fakebin,
+        "wtctl",
+        *flag,
+        "baseline",
+        "check",
+        str(record["id"]),
+        schema="cli/baseline-check.json",
+    )
+    assert code == 0 and check["changed"] is False
+
+
+# --- paths per repo (R4) ----------------------------------------------------------------------
+
+
+def test_two_repos_with_the_same_worktree_name_get_distinct_paths_and_removal_is_separate(
+    fakebin: Fakebin,
+) -> None:
+    def make(repo: str) -> dict[str, str]:
+        code, body = run_json(
+            fakebin, "wtctl", "create", "--repo", repo, "--name", "same", schema="cli/create.json"
+        )
+        assert code == 0
+        return body["record"]
+
+    first, second = make("example.org:8080/o/a"), make("example.org/o/b")
+    assert first["path"] != second["path"]
+    assert first["path"].endswith("/example.org_8080/o/a/same")
+    assert second["path"].endswith("/example.org/o/b/same")
+    done = fakebin.run("wtctl", "remove", first["id"], "--yes", "--json")
+    assert done.returncode == 0
+    assert not os.path.exists(first["path"]) and os.path.isdir(second["path"])
+
+
+# --- limits and checks (R12) ------------------------------------------------------------------
+
+
+def test_label_add_beyond_32_labels_exits_2(fakebin: Fakebin) -> None:
+    record = create(fakebin, "--branch", "b")["record"]
+    assert isinstance(record, dict)
+    pairs = [f"k{i}=v" for i in range(33)]
+    assert (
+        fakebin.run("wtctl", "label", "add", str(record["id"]), *pairs[:32], "--json").returncode
+        == 0
+    )
+    assert (
+        fakebin.run("wtctl", "label", "add", str(record["id"]), pairs[32], "--json").returncode == 2
+    )
+
+
+def test_list_state_must_be_a_record_state(fakebin: Fakebin) -> None:
+    assert fakebin.run("wtctl", "list", "--state", "bogus", "--json").returncode == 2
+    assert fakebin.run("wtctl", "list", "--state", "removed", "--json").returncode == 0
+
+
+@pytest.mark.parametrize(
+    "branch", ["", "-x", "a b", "a..b", "a/", "/a", "a.lock", "a~1", "a:b", "@", "a@{b", "a//b"]
+)
+def test_create_refuses_a_branch_git_would_refuse(fakebin: Fakebin, branch: str) -> None:
+    done = fakebin.run("wtctl", "create", "--repo", REPO, f"--branch={branch}", "--json")
+    assert done.returncode == 2, branch
+
+
+@pytest.mark.parametrize("branch", ["feat/x", "KEY-12.a", "a@b", "release/1.2"])
+def test_create_accepts_a_valid_branch(fakebin: Fakebin, branch: str) -> None:
+    assert create(fakebin, "--branch", branch)["record"]["branch"] == branch  # type: ignore[index]
+
+
+def test_a_dry_run_create_takes_no_record_id(fakebin: Fakebin) -> None:
+    _, dry = run_json(
+        fakebin,
+        "wtctl",
+        "create",
+        "--repo",
+        REPO,
+        "--branch",
+        "b",
+        "--dry-run",
+        schema="cli/create.json",
+    )
+    assert not os.path.exists(dry["record"]["path"])  # type: ignore[index]
+    real = create(fakebin, "--branch", "b")["record"]
+    assert dry["record"]["id"] == real["id"]  # type: ignore[index]

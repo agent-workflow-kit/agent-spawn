@@ -55,6 +55,8 @@ def isolation_env(
     }
     for path in paths.values():
         path.mkdir(parents=True)
+    # termctl refuses a socket directory that others can write (and tmux wants 0700 anyway)
+    paths["tmux_tmpdir"].chmod(0o700)
     for name in list(os.environ):
         if name in isolation.LEAKY_NAMES or name.startswith(isolation.LEAKY_PREFIXES):
             monkeypatch.delenv(name)

@@ -17,14 +17,35 @@ from collections.abc import Mapping
 from pathlib import Path
 
 
-def process_start_time(pid: int) -> str | None:
-    """Field 22 of ``/proc/<pid>/stat`` (parsed after the last ``)``), or None if unreadable."""
+def _ps(field: str, pid: int) -> str | None:
+    """One ``ps`` field of ``pid`` (Linux and macOS), or None if there is no such process."""
     try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
+        done = subprocess.run(
+            ["ps", "-o", f"{field}=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            env={"LC_ALL": "C", "PATH": "/usr/local/bin:/usr/bin:/bin"},
+            stdin=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
         return None
-    fields = stat[stat.rindex(")") + 2 :].split()
-    return fields[19] if len(fields) > 19 else None
+    text = done.stdout.strip()
+    return text if done.returncode == 0 and text else None
+
+
+def process_start_time(pid: int) -> str | None:
+    """The process's start time as ``ps -o lstart=`` prints it, or None if it does not exist.
+
+    Together with the PID this identifies a process: a reused PID has another start time.
+    """
+    return _ps("lstart", pid)
+
+
+def process_state(pid: int) -> str | None:
+    """The ``ps`` state letters of the process (``Z`` for a zombie), or None if it is gone."""
+    return _ps("stat", pid)
 
 
 class PrivateTmux:
@@ -71,17 +92,32 @@ class PrivateTmux:
         self._server_start = process_start_time(self.server_pid)
 
     def stop(self) -> None:
-        """Stop the server: ``kill-server``, then SIGKILL the recorded PID only if it lingers."""
-        if self.socket.exists():
-            self.run("kill-server")
+        """Stop the server: ``kill-server``, then SIGKILL the recorded PID only if it lingers.
+
+        Every step runs even if an earlier one fails (a hung ``kill-server`` included), and the
+        private directory is always removed.
+        """
+        try:
+            if self.socket.exists():
+                try:
+                    self.run("kill-server")
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+        finally:
+            try:
+                self._reap()
+            finally:
+                shutil.rmtree(self.directory, ignore_errors=True)
+
+    def _reap(self) -> None:
         pid = self.server_pid
-        if pid is not None:
-            deadline = time.monotonic() + self.kill_wait
-            while time.monotonic() < deadline and self._alive(pid):
-                time.sleep(0.05)
-            if self._alive(pid) and self._start_time_matches(pid):
-                os.kill(pid, signal.SIGKILL)
-        shutil.rmtree(self.directory, ignore_errors=True)
+        if pid is None:
+            return
+        deadline = time.monotonic() + self.kill_wait
+        while time.monotonic() < deadline and self._alive(pid):
+            time.sleep(0.05)
+        if self._alive(pid) and self._start_time_matches(pid):
+            os.kill(pid, signal.SIGKILL)
 
     def _start_time_matches(self, pid: int) -> bool:
         return self._server_start is not None and process_start_time(pid) == self._server_start
@@ -89,8 +125,5 @@ class PrivateTmux:
     def _alive(self, pid: int) -> bool:
         if not self._start_time_matches(pid):
             return False  # gone, or the PID was reused by another process
-        try:
-            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-        except OSError:
-            return False
-        return state != "Z"
+        state = process_state(pid)
+        return state is not None and not state.startswith("Z")

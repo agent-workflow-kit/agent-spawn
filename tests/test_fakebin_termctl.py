@@ -279,3 +279,104 @@ def test_hanging_close_can_be_scripted_for_signal_tests(fakebin: Fakebin) -> Non
 def test_placements_is_not_implemented(fakebin: Fakebin) -> None:
     done = fakebin.run("termctl", "placements", "--json")
     assert done.returncode == 1 and json.loads(done.stdout)["error"]["code"] == "fake_unsupported"
+
+
+# --- global flags with a separate value before a nested command (R2) --------------------------
+
+
+@pytest.mark.parametrize("before", [True, False], ids=["flag-before-label", "flag-after-label"])
+def test_label_add_accepts_a_global_value_flag_in_either_position(
+    fakebin: Fakebin, tmp_path: Path, before: bool
+) -> None:
+    sock = str(tmp_path / "s")
+    pane = open_pane(fakebin, "--socket", sock)
+    flag = ["--socket", sock]
+    argv = (
+        [*flag, "label", "add", str(pane["id"]), "k=v"]
+        if before
+        else ["label", "add", *flag, str(pane["id"]), "k=v"]
+    )
+    code, body = run_json(fakebin, "termctl", *argv, schema="cli/label-add.json")
+    assert code == 0 and "k=v" in body["labels"]
+
+
+def test_label_remove_with_a_config_flag_value_named_like_an_action(fakebin: Fakebin) -> None:
+    pane = open_pane(fakebin, "--label", "k=v")
+    code, body = run_json(
+        fakebin, "termctl", "--config", "add", "label", "remove", str(pane["id"]), "k=v"
+    )
+    assert code == 0 and body["labels"] == []
+
+
+# --- limits and checks the real termctl makes (R11) -------------------------------------------
+
+
+def test_label_add_beyond_32_labels_exits_2_after_resolving_the_id(fakebin: Fakebin) -> None:
+    pane = open_pane(fakebin)
+    pairs = [f"k{i}=v" for i in range(33)]
+    fits = fakebin.run("termctl", "label", "add", str(pane["id"]), *pairs[:32], "--json")
+    assert fits.returncode == 0  # 32 fit
+    done = fakebin.run("termctl", "label", "add", str(pane["id"]), *pairs, "--json")
+    assert done.returncode == 2
+    unknown = fakebin.run("termctl", "label", "add", "tc-zzzzzzzz", *pairs, "--json")
+    assert unknown.returncode == 10
+
+
+def test_open_with_an_empty_cwd_or_an_empty_command_is_refused(fakebin: Fakebin) -> None:
+    assert fakebin.run("termctl", "open", "--cwd", "", "--json", "--", "sleep", "1").returncode == 2
+    done = fakebin.run("termctl", "open", "--json", "--", "")
+    assert done.returncode == 12 and json.loads(done.stdout)["error"]["code"] == "command_not_found"
+    assert fakebin.run("termctl", "open", "--json", "--", "A=1", "sleep").returncode == 2
+
+
+@pytest.mark.parametrize("command", ["open", "close"])
+def test_override_escalation_needs_a_human_actor_or_a_terminal(
+    fakebin: Fakebin, command: str
+) -> None:
+    pane = str(open_pane(fakebin)["id"])
+    base = ["open", "--dry-run", "--", "sleep", "1"] if command == "open" else ["close", pane]
+
+    def call(*extra: str) -> int:
+        head, tail = (base[:1], base[1:]) if command == "close" else (base[:2], base[2:])
+        return fakebin.run(
+            "termctl", *head, "--json", "--override-escalation", *extra, *tail
+        ).returncode
+
+    assert call() == 2
+    assert call("--actor", "auto:cron") == 2
+    assert call("--actor", "human:me") in (0, 20)  # close of a running pane is refused (20)
+
+
+def test_mark_with_an_undefined_marker_exits_2_unless_it_is_built_in_or_scripted(
+    fakebin: Fakebin,
+) -> None:
+    pane = str(open_pane(fakebin)["id"])
+    assert fakebin.run("termctl", "mark", pane, "nosuch", "--json").returncode == 2
+    code, body = run_json(fakebin, "termctl", "mark", pane, "attention", schema="cli/mark.json")
+    assert code == 0 and body["marker"] == "attention" and body["marker_text"] == "\U0001f514 "
+    fakebin.script("termctl", "mark", markers={"review": "R "})
+    code, body = run_json(fakebin, "termctl", "mark", pane, "review", schema="cli/mark.json")
+    assert (code, body["marker_text"]) == (0, "R ")
+
+
+def test_the_default_session_is_termctl(fakebin: Fakebin) -> None:
+    assert open_pane(fakebin)["session"] == "termctl"
+    _, plan = run_json(
+        fakebin, "termctl", "open", "--dry-run", "--", "sleep", "1", schema="cli/open-dry-run.json"
+    )
+    assert plan["session"] == "termctl"
+
+
+def test_spellings_of_one_socket_path_share_state(fakebin: Fakebin, tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real)
+    pane = open_pane(fakebin, "--socket", str(real / "sock"))
+    for spelling in (
+        str(tmp_path / "link" / "sock"),
+        str(tmp_path) + "//real//sock",
+        str(tmp_path / "real" / "x" / ".." / "sock"),
+    ):
+        # `x` does not exist: a lexical `..` still names the same socket
+        code, body = run_json(fakebin, "termctl", "--socket", spelling, "show", str(pane["id"]))
+        assert code == 0 and body["id"] == pane["id"], spelling

@@ -26,8 +26,10 @@ from .core import (
     Parsed,
     base32_id,
     counter,
+    first_positional,
     locked,
     parse_args,
+    read_json,
     require_pattern,
     run_fake,
 )
@@ -90,16 +92,13 @@ def _store_path() -> Path:
 
 
 def load_panes() -> dict[str, dict[str, dict[str, Any]]]:
-    path = _store_path()
-    return json.loads(path.read_text()) if path.exists() else {}
+    return read_json(_store_path(), "panes file", dict, {})
 
 
 def update_panes(change: Callable[[dict[str, dict[str, dict[str, Any]]]], Any]) -> Any:
     path = _store_path()
     with locked(path):
-        data: dict[str, dict[str, dict[str, Any]]] = (
-            json.loads(path.read_text()) if path.exists() else {}
-        )
+        data: dict[str, dict[str, dict[str, Any]]] = read_json(path, "panes file", dict, {})
         result = change(data)
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data))
@@ -117,13 +116,19 @@ def socket_path(ctx: Context, p: Parsed) -> str:
     if "/" in value:
         if not os.path.isabs(value):
             value = os.path.join(os.getcwd(), value)
-        return os.path.normpath(value)
+        return canonical_socket(value)
     if not re.fullmatch(r"(?!\.\.?$)[A-Za-z0-9._-]{1,64}", value):
         ctx.usage(f"invalid socket name: {value!r}")
     tmpdir = next(
         (d for d in os.environ.get("TMUX_TMPDIR", "").split(":") if d and os.path.isdir(d)), "/tmp"
     )
-    return f"{tmpdir}/tmux-{os.getuid()}/{value}"
+    return canonical_socket(f"{tmpdir}/tmux-{os.getuid()}/{value}")
+
+
+def canonical_socket(path: str) -> str:
+    """Symlinked, ``//`` and ``..`` spellings of one socket share state: resolve the directory."""
+    head, tail = os.path.split(os.path.normpath(path))
+    return os.path.join(os.path.realpath(head), tail)
 
 
 def pane_view(pane: dict[str, Any]) -> dict[str, Any]:
@@ -201,10 +206,14 @@ def dispatch(ctx: Context) -> tuple[int, Any, str]:
     if command == "placements":
         ctx.fail(1, "fake_unsupported", "the fake does not implement 'placements'")
     if command == "label":
-        sub = next((t for t in rest if not t.startswith("-")), "")
+        # The action is the first positional once the global value flags are skipped, so
+        # `--socket PATH label add ...` and `label add --socket PATH ...` are the same call.
+        at = first_positional(rest, {"--socket", "--config"})
+        sub = "" if at is None else rest[at]
         if sub not in ("add", "remove"):
             ctx.usage("label needs add or remove")
-        rest.remove(sub)
+        assert at is not None
+        del rest[at]
         command = f"label {sub}"
     p = parse_args(rest, SPECS[command.split()[0]], dd_is_argv=command == "open")
     ctx.json_mode = p.has("--json")
@@ -243,6 +252,19 @@ def check_actor_and_decisions(ctx: Context, p: Parsed) -> None:
         require_pattern(decision, g.DECISION_ID, "--decision-id")
 
 
+def check_human(ctx: Context, p: Parsed, flag: str) -> None:
+    """A human-only flag: ``--actor human:<user>``, or a terminal on stdin without an actor.
+
+    An ``auto:`` actor is refused whatever the terminal (termctl 0.25.0, observed).
+    """
+    actor = p.get("--actor")
+    if actor is not None:
+        if not actor.startswith("human:"):
+            ctx.usage(f"{flag} is refused for an auto: actor, whatever the terminal")
+    elif not ctx.stdin_is_tty():
+        ctx.usage(f"{flag} needs a terminal on stdin or --actor human:<user>")
+
+
 def check_hooks(ctx: Context, p: Parsed, names: tuple[str, str]) -> None:
     for hook in p.multi("--hook"):
         name, eq, cmd = hook.partition("=")
@@ -260,6 +282,8 @@ def valid_name(name: str) -> bool:
 
 
 def find_in_path(program: str, path: str) -> bool:
+    if program == "":
+        return False
     return any(os.access(os.path.join(d or ".", program), os.X_OK) for d in path.split(":"))
 
 
@@ -301,6 +325,12 @@ def do_open(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         ctx.usage(f"invalid --keep-on-exit: {keep!r}")
     check_actor_and_decisions(ctx, p)
     check_hooks(ctx, p, ("pre-open", "post-open"))
+    if p.has("--override-escalation"):
+        check_human(ctx, p, "--override-escalation")
+    if "=" in argv[0]:
+        ctx.usage("argv[0] must not contain '=' (env would take it as an assignment)")
+    if p.get("--cwd") == "":
+        ctx.usage("--cwd must not be empty")
     cwd = os.path.join(os.getcwd(), p.get("--cwd") or ".")
     if not os.path.isdir(cwd):
         ctx.usage(f"--cwd {cwd!r} is not a directory")
@@ -327,7 +357,7 @@ def do_open(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
             "tmux_version": "3.4",
             "placement": placement or "default",
             "matched_rule": None,
-            "session": session or "agents",
+            "session": session or "termctl",
             "session_exists": None if sock not in load_panes() else True,
             "target": target or "window",
             "cwd": cwd,
@@ -353,7 +383,7 @@ def do_open(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         "marker_text": None,
         "labels": sorted(set(labels)),
         "placement": placement or "default",
-        "session": session or "agents",
+        "session": session or "termctl",
         "pane_id": f"%{number}",
         "window_id": f"@{number}",
         "socket_path": sock,
@@ -421,8 +451,11 @@ def change_handler(command: str) -> Callable[[Context, Parsed], tuple[int, Any, 
             ctx.usage("the key=value pairs must be contiguous")
         if command == "rename" and not valid_name(p.positionals[1]):
             ctx.usage(f"invalid name: {p.positionals[1]!r}")
+        markers = {"attention": "\U0001f514 ", **ctx.response(command).get("markers", {})}
         if command == "mark":
             require_pattern(p.positionals[1], r"[a-z0-9][a-z0-9_-]{0,31}", "marker name")
+            if p.positionals[1] not in markers:
+                ctx.usage(f"unknown marker {p.positionals[1]!r}: not defined in config (markers)")
         if command.startswith("label"):
             for pair in p.positionals[1:]:
                 require_pattern(pair, g.LABEL, "label")
@@ -436,12 +469,14 @@ def change_handler(command: str) -> Callable[[Context, Parsed], tuple[int, Any, 
                 pane["name"] = p.positionals[1]
             elif command == "mark":
                 pane["marker"] = p.positionals[1]
-                pane["marker_text"] = p.positionals[1]
+                pane["marker_text"] = markers[p.positionals[1]]
             elif command == "unmark":
                 pane["marker"] = None
                 pane["marker_text"] = None
             elif command == "label add":
                 pane["labels"] = sorted(set(pane["labels"]) | set(p.positionals[1:]))
+                if len(pane["labels"]) > 32:
+                    ctx.usage("a pane carries at most 32 labels")
             else:
                 pane["labels"] = sorted(set(pane["labels"]) - set(p.positionals[1:]))
             if pane["marker_text"]:
@@ -497,6 +532,8 @@ def do_close(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         require_pattern(grace, g.TC_DURATION, "--grace")
         if not p.has("--force"):
             ctx.usage("--grace needs --force")
+    if p.has("--override-escalation"):
+        check_human(ctx, p, "--override-escalation")
     if p.has("--force"):
         actor = p.get("--actor")
         human = actor.startswith("human:") if actor else ctx.stdin_is_tty()

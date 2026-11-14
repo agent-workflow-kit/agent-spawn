@@ -78,6 +78,21 @@ def test_the_guard_flags_anything_that_reaches_the_real_user(
     assert any(fragment in problem for problem in problems), problems
 
 
+def test_tmux_tmpdir_that_reaches_the_real_server_is_flagged(tmp_path: Path) -> None:
+    """tmux uses $TMUX_TMPDIR/tmux-UID/default: /tmp and the original value reach the real one."""
+    original = {**REAL, "TMUX_TMPDIR": str(tmp_path / "their-tmux")}
+    (tmp_path / "their-tmux").mkdir()
+    link = tmp_path / "to-tmp"
+    link.symlink_to("/tmp")
+    inside = tmp_path / "x" / f"tmux-{isolation.REAL_UID}" / "sub"
+    inside.mkdir(parents=True)
+    for bad in ("/tmp", str(tmp_path / "their-tmux"), str(link), str(inside)):
+        env = {**good_env(tmp_path), "TMUX_TMPDIR": bad}
+        problems = isolation.environment_problems(env, original)
+        assert any("TMUX_TMPDIR" in problem for problem in problems), bad
+    assert isolation.environment_problems(good_env(tmp_path), original) == []
+
+
 def test_unset_variables_are_problems_too(tmp_path: Path) -> None:
     env = good_env(tmp_path)
     del env["XDG_STATE_HOME"]
@@ -123,7 +138,8 @@ def test_pytest_started_inside_tmux_with_real_variables_is_isolated(tmp_path: Pa
         "AGENT_SPAWN_X": "1",
         "TERMCTL_SOCKET": "work",
         "XDG_RUNTIME_DIR": "/run/user/1000",
-        "ORIGINAL_HOME": isolation.ORIGINAL_ENV["HOME"],
+        # the passwd home, not $HOME: pytest itself may run with a private HOME
+        "ORIGINAL_HOME": isolation.REAL_PASSWD_HOME,
     }
     done = subprocess.run(
         [
@@ -166,7 +182,8 @@ def test_a_test_that_restores_a_real_directory_fails_at_teardown(tmp_path: Path)
     env = {
         **os.environ,
         "PYTHONPATH": str(REPO_ROOT),
-        "ORIGINAL_HOME": isolation.ORIGINAL_ENV["HOME"],
+        # the passwd home, not $HOME: pytest itself may run with a private HOME
+        "ORIGINAL_HOME": isolation.REAL_PASSWD_HOME,
     }
     done = subprocess.run(
         [
