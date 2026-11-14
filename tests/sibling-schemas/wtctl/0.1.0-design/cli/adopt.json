@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/adopt.json",
+  "title": "wtctl adopt --json",
+  "type": "object",
+  "properties": {
+    "record": {
+      "$ref": "../defs.json#/$defs/record"
+    },
+    "existing": {
+      "type": "boolean",
+      "description": "The path was already recorded by an active record (under its per-record lease); that record is returned with only the --holder added (record.owned tells whether wtctl created it). Other states refuse (interface: Commands by record state)."
+    },
+    "dry_run": {
+      "type": "boolean",
+      "description": "true: what the command would do; nothing was changed and no hooks ran."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "record",
+    "existing",
+    "dry_run"
+  ]
+}

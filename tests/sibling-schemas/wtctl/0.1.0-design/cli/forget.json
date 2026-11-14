@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/forget.json",
+  "title": "wtctl forget --json",
+  "type": "object",
+  "properties": {
+    "record": {
+      "$ref": "../defs.json#/$defs/record",
+      "description": "With --holder, the record may stay live (other holders remain, it is owned, or the holder was not present)."
+    },
+    "warnings": {
+      "$ref": "../defs.json#/$defs/warnings",
+      "description": "Human-readable warnings; one starting with not_a_holder when --holder named no holder of the record (nothing changed)."
+    },
+    "dry_run": {
+      "type": "boolean",
+      "description": "true: what the command would do; nothing was changed and no hooks ran."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "record",
+    "warnings",
+    "dry_run"
+  ],
+  "allOf": [
+    {
+      "properties": {
+        "record": {
+          "properties": {
+            "object_type": {
+              "const": "worktree"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

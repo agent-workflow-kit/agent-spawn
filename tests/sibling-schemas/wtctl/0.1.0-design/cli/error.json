@@ -1,0 +1,1018 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/error.json",
+  "title": "wtctl error output (--json, non-zero exit)",
+  "type": "object",
+  "properties": {
+    "error": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "../defs.json#/$defs/error_code"
+        },
+        "message": {
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "../defs.json#/$defs/refusal_reason",
+          "description": "exit 20 only."
+        },
+        "checks": {
+          "$ref": "../defs.json#/$defs/checks",
+          "description": "exit 20 from remove: the check results that ran."
+        },
+        "holder_path": {
+          "$ref": "../defs.json#/$defs/abs_path",
+          "description": "branch_in_use: the worktree that has the branch checked out."
+        },
+        "holder_id": {
+          "oneOf": [
+            {
+              "$ref": "../defs.json#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "branch_in_use: the holder's record id if wtctl manages it, else null. path_exists: the live record that holds the path (e.g. a creating record of a crashed create), when there is one."
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "$ref": "../defs.json#/$defs/process"
+          },
+          "minItems": 1,
+          "description": "in_use: the processes found."
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "../defs.json#/$defs/baseline_item"
+          },
+          "minItems": 1,
+          "description": "repo_config_changed: the changed baseline items."
+        },
+        "hook": {
+          "type": "string",
+          "description": "cmd of the hook that vetoed (exit 11) or of the first hook that escalated (exit 13)."
+        },
+        "hook_stderr": {
+          "type": "string",
+          "x-untrusted": true,
+          "description": "Untrusted: that hook's stderr, cut to 4096 bytes."
+        },
+        "escalated_hooks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "description": "exit 13 escalated: the cmd of every hook that escalated, in order."
+        },
+        "decision_ids": {
+          "$ref": "../defs.json#/$defs/decision_ids",
+          "description": "Present when hooks returned any."
+        },
+        "candidates": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "oneOf": [
+                  {
+                    "$ref": "../defs.json#/$defs/id"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "null for clone candidates."
+              },
+              "path": {
+                "$ref": "../defs.json#/$defs/abs_path"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "path"
+            ]
+          },
+          "description": "exit 21: the records or clones the selector matched."
+        },
+        "details": {
+          "type": "object",
+          "description": "Command-specific context: extract_invalid {paths}; io_error {path, written, deleted}; bootstrap_failed {record, step}; partial {remaining_path, remaining (after an fd-based deletion)}; held {holders}; remote_mismatch without the remote {cause: no_remote}; repo_config_changed {digest, recorded_digest, changed_classes}; branch_exists {tip}; locked {lock_reason}; unsafe_repo_config {keys}; not_found on a tombstone {state, removed_at}; a network timeout {cause: timeout}; fetch_failed after an incomplete prune {cause: prune_incomplete}; create_failed for a SHA-256 repository {cause: object_format} or a changed anchor identity {cause: anchor_changed, anchors}; refused unlinked from baseline accept or clone for an anchor on a FUSE file system {cause: fuse_anchor, anchors}."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "refused"
+                ]
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "reason"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "reason"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "ambiguous"
+                ]
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "candidates"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "candidates"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "escalated"
+                ]
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "escalated_hooks"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "escalated_hooks"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "vetoed",
+                  "escalated"
+                ]
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "hook",
+              "hook_stderr"
+            ]
+          }
+        },
+        {
+          "if": {
+            "not": {
+              "properties": {
+                "code": {
+                  "enum": [
+                    "vetoed",
+                    "escalated"
+                  ]
+                }
+              },
+              "required": [
+                "code"
+              ]
+            }
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "hook"
+                  ]
+                },
+                {
+                  "required": [
+                    "hook_stderr"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "not": {
+              "properties": {
+                "code": {
+                  "const": "refused"
+                }
+              },
+              "required": [
+                "code"
+              ]
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "checks"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "branch_in_use"
+                ]
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "required": [
+              "holder_path"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "holder_path"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "const": "branch_in_use"
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "required": [
+              "holder_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "not": {
+              "properties": {
+                "reason": {
+                  "enum": [
+                    "branch_in_use",
+                    "path_exists"
+                  ]
+                }
+              },
+              "required": [
+                "reason"
+              ]
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "holder_id"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "const": "held"
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "required": [
+              "details"
+            ],
+            "properties": {
+              "details": {
+                "required": [
+                  "holders"
+                ],
+                "properties": {
+                  "holders": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "$ref": "../defs.json#/$defs/holder"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "in_use"
+                ]
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "required": [
+              "processes"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "processes"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "repo_config_changed"
+                ]
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "required": [
+              "items"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "items"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "const": "repo_config_changed"
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "required": [
+              "details"
+            ],
+            "properties": {
+              "details": {
+                "required": [
+                  "digest",
+                  "recorded_digest",
+                  "changed_classes"
+                ],
+                "properties": {
+                  "digest": {
+                    "$ref": "../defs.json#/$defs/digest"
+                  },
+                  "recorded_digest": {
+                    "$ref": "../defs.json#/$defs/digest"
+                  },
+                  "changed_classes": {
+                    "$ref": "../defs.json#/$defs/changed_classes"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "const": "branch_exists"
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "required": [
+              "details"
+            ],
+            "properties": {
+              "details": {
+                "required": [
+                  "tip"
+                ],
+                "properties": {
+                  "tip": {
+                    "$ref": "../defs.json#/$defs/sha"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "const": "locked"
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "required": [
+              "details"
+            ],
+            "properties": {
+              "details": {
+                "required": [
+                  "lock_reason"
+                ],
+                "properties": {
+                  "lock_reason": {
+                    "type": "string",
+                    "x-untrusted": true,
+                    "description": "Untrusted: the content of the admin entry's locked file, which agents can write."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "partial"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "details"
+            ],
+            "properties": {
+              "details": {
+                "required": [
+                  "remaining_path"
+                ],
+                "properties": {
+                  "remaining_path": {
+                    "$ref": "../defs.json#/$defs/abs_path"
+                  },
+                  "remaining": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "../defs.json#/$defs/abs_path"
+                    },
+                    "maxItems": 100,
+                    "description": "After an fd-based deletion: the entries that could not be deleted, including any mount point that was skipped (at most 100)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "io_error"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "details"
+            ],
+            "properties": {
+              "details": {
+                "required": [
+                  "path",
+                  "written",
+                  "deleted"
+                ],
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "x-untrusted": true,
+                    "description": "Untrusted: the agent-chosen relative path whose write or delete failed."
+                  },
+                  "written": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "x-untrusted": true,
+                      "description": "Untrusted: agent-chosen relative path."
+                    },
+                    "description": "Paths already written; the destination is partly changed."
+                  },
+                  "deleted": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "x-untrusted": true,
+                      "description": "Untrusted: agent-chosen relative path."
+                    },
+                    "description": "Paths already deleted."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "remote_mismatch"
+              },
+              "details": {
+                "type": "object",
+                "required": [
+                  "cause"
+                ]
+              }
+            },
+            "required": [
+              "code",
+              "details"
+            ]
+          },
+          "then": {
+            "properties": {
+              "details": {
+                "properties": {
+                  "cause": {
+                    "const": "no_remote"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "unsafe_repo_config"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "details"
+            ],
+            "properties": {
+              "details": {
+                "required": [
+                  "keys"
+                ],
+                "properties": {
+                  "keys": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "string",
+                      "x-untrusted": true,
+                      "description": "Untrusted: a config key name read from the clone or .lfsconfig."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "not_found"
+              },
+              "details": {
+                "type": "object",
+                "required": [
+                  "state"
+                ]
+              }
+            },
+            "required": [
+              "code",
+              "details"
+            ]
+          },
+          "then": {
+            "properties": {
+              "details": {
+                "required": [
+                  "state",
+                  "removed_at"
+                ],
+                "properties": {
+                  "state": {
+                    "enum": [
+                      "gone",
+                      "removed",
+                      "forgotten"
+                    ]
+                  },
+                  "removed_at": {
+                    "$ref": "../defs.json#/$defs/ts"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "clone_failed"
+              },
+              "details": {
+                "type": "object",
+                "required": [
+                  "cause"
+                ]
+              }
+            },
+            "required": [
+              "code",
+              "details"
+            ]
+          },
+          "then": {
+            "properties": {
+              "details": {
+                "properties": {
+                  "cause": {
+                    "const": "timeout"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "create_failed"
+              },
+              "details": {
+                "type": "object",
+                "required": [
+                  "cause"
+                ]
+              }
+            },
+            "required": [
+              "code",
+              "details"
+            ]
+          },
+          "then": {
+            "properties": {
+              "details": {
+                "properties": {
+                  "cause": {
+                    "enum": [
+                      "object_format",
+                      "anchor_changed"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "create_failed"
+              },
+              "details": {
+                "type": "object",
+                "properties": {
+                  "cause": {
+                    "const": "anchor_changed"
+                  }
+                },
+                "required": [
+                  "cause"
+                ]
+              }
+            },
+            "required": [
+              "code",
+              "details"
+            ]
+          },
+          "then": {
+            "properties": {
+              "details": {
+                "required": [
+                  "anchors"
+                ],
+                "properties": {
+                  "anchors": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "$ref": "../defs.json#/$defs/anchor_change"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "details": {
+                "type": "object",
+                "properties": {
+                  "cause": {
+                    "const": "fuse_anchor"
+                  }
+                },
+                "required": [
+                  "cause"
+                ]
+              }
+            },
+            "required": [
+              "details"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "const": "unlinked"
+              },
+              "details": {
+                "required": [
+                  "anchors"
+                ],
+                "properties": {
+                  "anchors": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "$ref": "../defs.json#/$defs/anchor_change"
+                    }
+                  }
+                }
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "fetch_failed"
+              },
+              "details": {
+                "type": "object",
+                "required": [
+                  "cause"
+                ]
+              }
+            },
+            "required": [
+              "code",
+              "details"
+            ]
+          },
+          "then": {
+            "properties": {
+              "details": {
+                "properties": {
+                  "cause": {
+                    "enum": [
+                      "timeout",
+                      "prune_incomplete"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "extract_invalid"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "details"
+            ],
+            "properties": {
+              "details": {
+                "required": [
+                  "paths"
+                ],
+                "properties": {
+                  "paths": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "type": "string",
+                          "x-untrusted": true,
+                          "description": "Untrusted: agent-chosen path, as given in the list."
+                        },
+                        "error": {
+                          "enum": [
+                            "invalid_path",
+                            "git_component",
+                            "duplicate",
+                            "not_found",
+                            "not_regular",
+                            "symlink",
+                            "hard_link",
+                            "too_large",
+                            "limit_exceeded",
+                            "dest_conflict"
+                          ]
+                        }
+                      },
+                      "additionalProperties": false,
+                      "required": [
+                        "path",
+                        "error"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "bootstrap_failed"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "details"
+            ],
+            "properties": {
+              "details": {
+                "required": [
+                  "record",
+                  "step"
+                ],
+                "properties": {
+                  "record": {
+                    "$ref": "../defs.json#/$defs/record"
+                  },
+                  "step": {
+                    "$ref": "../defs.json#/$defs/bootstrap_step"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "error"
+  ]
+}

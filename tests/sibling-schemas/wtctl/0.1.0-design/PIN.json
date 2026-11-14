@@ -1,0 +1,6 @@
+{
+  "tool": "wtctl",
+  "interface_version": "0.1.0-design",
+  "source_repo_commit": "5f2e03278b0a",
+  "source_path": "schemas/"
+}

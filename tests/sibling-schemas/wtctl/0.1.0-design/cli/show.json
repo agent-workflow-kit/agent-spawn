@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/show.json",
+  "title": "wtctl show --json",
+  "$ref": "../defs.json#/$defs/record"
+}

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/bootstrap.json",
+  "title": "wtctl bootstrap --json",
+  "type": "object",
+  "properties": {
+    "record": {
+      "$ref": "../defs.json#/$defs/record"
+    },
+    "bootstrap": {
+      "$ref": "../defs.json#/$defs/bootstrap_result"
+    },
+    "warnings": {
+      "$ref": "../defs.json#/$defs/warnings"
+    },
+    "dry_run": {
+      "type": "boolean",
+      "description": "true: what the command would do; nothing was changed and no hooks ran."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "record",
+    "bootstrap",
+    "warnings",
+    "dry_run"
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/export.json",
+  "title": "wtctl export --json",
+  "description": "Records of audit.jsonl (default) or log.jsonl (--log), oldest first, filtered by --since. Without --json, one record per line (JSONL).",
+  "type": "array",
+  "items": {
+    "anyOf": [
+      {
+        "$ref": "../audit.json"
+      },
+      {
+        "$ref": "../log.json"
+      }
+    ]
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/cron-install.json",
+  "title": "wtctl cron install --json",
+  "type": "object",
+  "properties": {
+    "installed": {
+      "const": true,
+      "description": "The block is (or, in a dry run, would be) installed."
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "description": "A crontab line of the managed block."
+      },
+      "minItems": 1,
+      "description": "The lines written: reconcile at minute 17 and prune --if-configured at minute 47, each with --actor auto:cron."
+    },
+    "dry_run": {
+      "type": "boolean",
+      "description": "true: what the command would do; nothing was changed and no hooks ran."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "installed",
+    "entries",
+    "dry_run"
+  ]
+}

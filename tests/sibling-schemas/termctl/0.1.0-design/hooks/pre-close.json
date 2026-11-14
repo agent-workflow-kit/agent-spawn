@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/hooks/pre-close.json",
+  "title": "termctl pre-close hook payload",
+  "type": "object",
+  "properties": {
+    "tool": {
+      "const": "termctl"
+    },
+    "object_type": {
+      "const": "pane"
+    },
+    "object_id": {
+      "$ref": "../defs.json#/$defs/id"
+    },
+    "labels": {
+      "$ref": "../defs.json#/$defs/labels"
+    },
+    "hook": {
+      "const": "pre-close"
+    },
+    "pane": {
+      "$ref": "../cli/pane.json"
+    },
+    "force": {
+      "type": "boolean"
+    },
+    "grace_ms": {
+      "$ref": "../defs.json#/$defs/grace_ms"
+    },
+    "actor": {
+      "$ref": "../defs.json#/$defs/actor"
+    },
+    "decision_ids": {
+      "$ref": "../defs.json#/$defs/decision_ids",
+      "description": "From --decision-id."
+    },
+    "override_escalation": {
+      "type": "boolean",
+      "description": "true on a run with --override-escalation; a policy may veto such runs."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "tool",
+    "object_type",
+    "object_id",
+    "labels",
+    "hook",
+    "pane",
+    "force",
+    "grace_ms",
+    "actor",
+    "decision_ids",
+    "override_escalation"
+  ]
+}
