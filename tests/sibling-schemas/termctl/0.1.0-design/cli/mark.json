@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/cli/mark.json",
+  "title": "termctl mark --json",
+  "$ref": "pane-change.json"
+}

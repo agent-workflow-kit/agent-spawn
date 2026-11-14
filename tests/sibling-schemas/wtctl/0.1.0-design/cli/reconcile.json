@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/reconcile.json",
+  "title": "wtctl reconcile --json",
+  "type": "object",
+  "properties": {
+    "changes": {
+      "type": "array",
+      "items": {
+        "$ref": "../defs.json#/$defs/change"
+      }
+    },
+    "reports": {
+      "type": "array",
+      "items": {
+        "$ref": "../defs.json#/$defs/report"
+      }
+    },
+    "already_running": {
+      "type": "boolean"
+    },
+    "dry_run": {
+      "type": "boolean",
+      "description": "true: what the command would do; nothing was changed and no hooks ran."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "changes",
+    "reports",
+    "already_running",
+    "dry_run"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "already_running": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "changes": {
+            "maxItems": 0
+          },
+          "reports": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ]
+}

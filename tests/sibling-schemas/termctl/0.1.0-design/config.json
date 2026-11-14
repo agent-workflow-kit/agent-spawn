@@ -1,0 +1,298 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/config.json",
+  "title": "termctl config",
+  "type": "object",
+  "properties": {
+    "backend": {
+      "enum": [
+        "tmux"
+      ],
+      "default": "tmux"
+    },
+    "tmux_bin": {
+      "type": "string",
+      "minLength": 1,
+      "default": "tmux",
+      "description": "Resolved once to an absolute path from the caller's PATH."
+    },
+    "socket": {
+      "$ref": "#/$defs/socket",
+      "default": null
+    },
+    "server_env_allow": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*\\*?$"
+      },
+      "default": [
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "LC_*",
+        "TERM",
+        "COLORTERM",
+        "TZ",
+        "XDG_*",
+        "DISPLAY",
+        "WAYLAND_DISPLAY"
+      ]
+    },
+    "keep_on_exit": {
+      "$ref": "#/$defs/keep_on_exit",
+      "default": "never"
+    },
+    "close_grace": {
+      "$ref": "#/$defs/duration",
+      "default": "10s"
+    },
+    "marker_display": {
+      "enum": [
+        "name",
+        "option"
+      ],
+      "default": "name"
+    },
+    "markers": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/marker_name"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/$defs/marker_text"
+          },
+          "bell": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "text"
+        ]
+      },
+      "default": {
+        "attention": {
+          "text": "🔔 ",
+          "bell": false
+        }
+      }
+    },
+    "placements": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/placement_name"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/placement"
+      },
+      "default": {
+        "default": {
+          "session": "termctl",
+          "target": "window"
+        }
+      }
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/rule"
+      },
+      "default": []
+    },
+    "hooks": {
+      "type": "object",
+      "properties": {
+        "pre-open": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/pre_hook_entry"
+          }
+        },
+        "pre-close": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/pre_hook_entry"
+          }
+        },
+        "post-open": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/post_hook_entry"
+          }
+        },
+        "post-close": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/post_hook_entry"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "default": {}
+    }
+  },
+  "additionalProperties": false,
+  "required": [],
+  "description": "Schema-level shape. Placement fields missing from an entry inherit from default. termctl additionally rejects at load time a rule naming an undefined placement (config_invalid). target: pane, max_panes, layout and group_by are rejected (not_supported) only when open or placements resolves a placement that uses them.",
+  "$defs": {
+    "duration": {
+      "type": "string",
+      "pattern": "^((0|[1-9][0-9]{0,4}|[1-5][0-9]{5}|600000)ms|(0|[1-9][0-9]?|[1-5][0-9]{2}|600)s?|([0-9]|10)m)$",
+      "description": "A non-negative integer without leading zeros followed by ms, s or m (bare: seconds); at most 10m."
+    },
+    "keep_on_exit": {
+      "enum": [
+        "never",
+        "failed",
+        "always"
+      ]
+    },
+    "marker_name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$"
+    },
+    "marker_text": {
+      "$comment": "Lookaheads use [\\s\\S], not '.', so that U+2028 and U+2029 cannot hide text from ECMA-262 engines. The surrogate-pair alternative lets engines without the u flag accept characters outside the BMP while lone surrogates are rejected.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16,
+      "pattern": "^(?![\\s\\S]*#\\[)(?![\\s\\S]*#$)(?:[^\\u0000-\\u001f\\u007f-\\u009f\\ud800-\\udfff]|[\\ud800-\\udbff][\\udc00-\\udfff])+$",
+      "description": "1-16 code points, the name rules, and not ending in '#'."
+    },
+    "placement": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/session_name"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "max_panes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "layout": {
+          "type": "string"
+        },
+        "group_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [],
+      "description": "A configured placement; missing fields inherit from default."
+    },
+    "placement_name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "post_hook_entry": {
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000]*$",
+          "description": "No NUL character: a command line cannot hold one."
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600,
+          "default": 30,
+          "description": "Seconds (at most 600). On timeout termctl kills the hook's process group; a pre-hook timeout counts as a veto."
+        },
+        "async": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cmd"
+      ]
+    },
+    "pre_hook_entry": {
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000]*$",
+          "description": "No NUL character: a command line cannot hold one."
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600,
+          "default": 30,
+          "description": "Seconds (at most 600). On timeout termctl kills the hook's process group; a pre-hook timeout counts as a veto."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cmd"
+      ]
+    },
+    "rule": {
+      "type": "object",
+      "properties": {
+        "match": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._:/#@+=,-]{0,256}$"
+          },
+          "propertyNames": {
+            "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"
+          }
+        },
+        "placement": {
+          "$ref": "#/$defs/placement_name"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "match",
+        "placement"
+      ]
+    },
+    "session_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}$",
+      "description": "A session name termctl creates or targets (config, open --session, pre-open payload)."
+    },
+    "socket": {
+      "$comment": "Lookaheads use [\\s\\S], not '.', so that U+2028 and U+2029 cannot hide text from ECMA-262 engines. The surrogate-pair alternative lets engines without the u flag accept characters outside the BMP while lone surrogates are rejected.",
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^(?:(?!\\.\\.?$)[A-Za-z0-9._-]{1,64}|(?![\\s\\S]*[;/]$)(?![\\s\\S]*/\\.\\.?$)/(?:[^\\u0000-\\u001f\\u007f-\\u009f,\\ud800-\\udfff]|[\\ud800-\\udbff][\\udc00-\\udfff])*)$",
+          "maxLength": 100
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "A socket name (not '.' or '..') or an absolute socket path (the socket_path rules; '/' itself is rejected). The path limit is 100 bytes; maxLength counts code points and is an approximation."
+    },
+    "target": {
+      "enum": [
+        "window",
+        "pane"
+      ]
+    }
+  }
+}

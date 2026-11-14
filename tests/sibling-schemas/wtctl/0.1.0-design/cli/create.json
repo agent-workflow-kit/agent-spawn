@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/create.json",
+  "title": "wtctl create --json",
+  "type": "object",
+  "properties": {
+    "record": {
+      "$ref": "../defs.json#/$defs/record",
+      "description": "In a dry run, the record as it would be created (id illustrative)."
+    },
+    "branch_action": {
+      "enum": [
+        "existing",
+        "track",
+        "new",
+        "detached",
+        null
+      ],
+      "description": "How the branch was obtained (interface: Create order step 9); null for throwaways."
+    },
+    "bootstrap": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/bootstrap_result"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "This run's bootstrap; null for throwaways and when reused."
+    },
+    "reused": {
+      "type": "boolean",
+      "description": "true: a retry after a crash (create --holder H hit branch_in_use or path_exists on an active record that has H among its holders); that record is returned unchanged, with branch_action and bootstrap null and no hooks run (interface: Create order, Retry after a crash)."
+    },
+    "warnings": {
+      "$ref": "../defs.json#/$defs/warnings"
+    },
+    "dry_run": {
+      "type": "boolean",
+      "description": "true: what the command would do; nothing was changed and no hooks ran."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "record",
+    "branch_action",
+    "bootstrap",
+    "reused",
+    "warnings",
+    "dry_run"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "record": {
+            "properties": {
+              "object_type": {
+                "const": "throwaway"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "bootstrap": {
+            "type": "null"
+          },
+          "branch_action": {
+            "type": "null"
+          },
+          "reused": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "reused": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "bootstrap": {
+            "type": "null"
+          },
+          "branch_action": {
+            "type": "null"
+          },
+          "dry_run": {
+            "const": false
+          },
+          "record": {
+            "properties": {
+              "state": {
+                "const": "active"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

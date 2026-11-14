@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/list.json",
+  "title": "wtctl list --json",
+  "type": "object",
+  "properties": {
+    "records": {
+      "type": "array",
+      "items": {
+        "$ref": "../defs.json#/$defs/record"
+      },
+      "description": "Newest first."
+    },
+    "foreign": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "foreign": {
+            "const": true
+          },
+          "path": {
+            "$ref": "../defs.json#/$defs/abs_path",
+            "x-untrusted": true,
+            "description": "Untrusted: read from the clone's worktree metadata, which agents can write."
+          },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-untrusted": true,
+            "description": "Untrusted: read from the clone; null when detached."
+          },
+          "head": {
+            "oneOf": [
+              {
+                "$ref": "../defs.json#/$defs/sha"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "clone_path": {
+            "$ref": "../defs.json#/$defs/abs_path"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "foreign",
+          "path",
+          "branch",
+          "head",
+          "clone_path"
+        ]
+      },
+      "description": "Only with --all; else empty."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "records",
+    "foreign"
+  ]
+}

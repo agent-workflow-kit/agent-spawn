@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/cli/list.json",
+  "title": "termctl list --json",
+  "description": "Ordered by created, then id; one element per pane id. No server running: empty panes.",
+  "type": "object",
+  "properties": {
+    "socket_path": {
+      "$ref": "../defs.json#/$defs/socket_path"
+    },
+    "panes": {
+      "type": "array",
+      "items": {
+        "$ref": "pane.json"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "socket_path",
+    "panes"
+  ]
+}

@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/cli/pane.json",
+  "title": "termctl pane object",
+  "description": "Output of show; element of list; base of the other pane outputs.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "$ref": "../defs.json#/$defs/id"
+    },
+    "name": {
+      "$ref": "../defs.json#/$defs/name",
+      "x-untrusted": true,
+      "description": "Read from a pane option: untrusted, since anything with access to the socket can write it; a hook gate that must hold must not rely on it."
+    },
+    "display_name": {
+      "$ref": "../defs.json#/$defs/display_name"
+    },
+    "marker": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/marker_name"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "x-untrusted": true,
+      "description": "Read from a pane option: untrusted, since anything with access to the socket can write it; a hook gate that must hold must not rely on it."
+    },
+    "marker_text": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/marker_text"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "x-untrusted": true,
+      "description": "The stored text (@termctl_marker_text). Read from a pane option: untrusted, since anything with access to the socket can write it; a hook gate that must hold must not rely on it."
+    },
+    "labels": {
+      "$ref": "../defs.json#/$defs/labels",
+      "x-untrusted": true,
+      "description": "Read from a pane option: untrusted, since anything with access to the socket can write it; a hook gate that must hold must not rely on it."
+    },
+    "placement": {
+      "$ref": "../defs.json#/$defs/placement_name",
+      "x-untrusted": true,
+      "description": "Read from a pane option: untrusted, since anything with access to the socket can write it; a hook gate that must hold must not rely on it."
+    },
+    "session": {
+      "$ref": "../defs.json#/$defs/session",
+      "description": "For a linked window, the first session tmux lists for it."
+    },
+    "pane_id": {
+      "$ref": "../defs.json#/$defs/pane_id"
+    },
+    "window_id": {
+      "$ref": "../defs.json#/$defs/window_id"
+    },
+    "socket_path": {
+      "$ref": "../defs.json#/$defs/socket_path"
+    },
+    "created": {
+      "$ref": "../defs.json#/$defs/created"
+    },
+    "pid": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "x-untrusted": true,
+      "description": "The recorded PID, used only for signaling; null if none was recorded. Read from a pane option: untrusted, since anything with access to the socket can write it; a hook gate that must hold must not rely on it."
+    },
+    "state": {
+      "enum": [
+        "running",
+        "dead"
+      ],
+      "description": "running: the pane exists and tmux does not report it dead."
+    },
+    "exit_status": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Set when dead and the command exited normally. Both exit fields may be null for a dead pane."
+    },
+    "exit_signal": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Set when dead by a signal; null on tmux older than 3.3."
+    },
+    "keep_on_exit": {
+      "$ref": "../defs.json#/$defs/keep_on_exit",
+      "description": "From @termctl_keep."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "name",
+    "display_name",
+    "marker",
+    "marker_text",
+    "labels",
+    "placement",
+    "session",
+    "pane_id",
+    "window_id",
+    "socket_path",
+    "created",
+    "pid",
+    "state",
+    "exit_status",
+    "exit_signal",
+    "keep_on_exit"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "running"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "exit_status": {
+            "const": null
+          },
+          "exit_signal": {
+            "const": null
+          }
+        }
+      }
+    },
+    {
+      "not": {
+        "properties": {
+          "exit_status": {
+            "type": "integer"
+          },
+          "exit_signal": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "exit_status",
+          "exit_signal"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "marker": {
+            "type": "null"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "marker_text": {
+            "type": "null"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "marker_text": {
+            "$ref": "../defs.json#/$defs/marker_text"
+          }
+        }
+      }
+    }
+  ]
+}

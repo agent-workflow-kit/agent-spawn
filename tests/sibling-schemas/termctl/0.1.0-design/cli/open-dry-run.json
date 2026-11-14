@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/cli/open-dry-run.json",
+  "title": "termctl open --dry-run --json",
+  "type": "object",
+  "properties": {
+    "dry_run": {
+      "const": true
+    },
+    "id": {
+      "$ref": "../defs.json#/$defs/id",
+      "description": "Illustrative; a real run generates its own."
+    },
+    "name": {
+      "$ref": "../defs.json#/$defs/name"
+    },
+    "socket_path": {
+      "$ref": "../defs.json#/$defs/socket_path"
+    },
+    "tmux_version": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The version tmux -V reported; null if unparsable."
+    },
+    "placement": {
+      "$ref": "../defs.json#/$defs/placement_name"
+    },
+    "matched_rule": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Index into rules; null if none matched or --placement was given."
+    },
+    "session": {
+      "$ref": "../defs.json#/$defs/session_name"
+    },
+    "session_exists": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "null when no server is running."
+    },
+    "target": {
+      "$ref": "../defs.json#/$defs/target"
+    },
+    "cwd": {
+      "type": "string"
+    },
+    "argv": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "env_names": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "../defs.json#/$defs/env_name"
+      }
+    },
+    "labels": {
+      "$ref": "../defs.json#/$defs/labels"
+    },
+    "keep_on_exit": {
+      "$ref": "../defs.json#/$defs/keep_on_exit"
+    },
+    "focus": {
+      "type": "boolean"
+    },
+    "actor": {
+      "$ref": "../defs.json#/$defs/actor"
+    },
+    "decision_ids": {
+      "$ref": "../defs.json#/$defs/decision_ids",
+      "description": "From --decision-id (no hooks run in a dry run)."
+    },
+    "override_escalation": {
+      "type": "boolean"
+    },
+    "tmux_commands": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "description": "The tmux invocations that would create and tag the pane (Open order steps 5 and 6), in order, each as argv, after the tmux argument rules; read-only probes, confirmations, the step-7 PID recording and the step-8 focus (its client is chosen only once the pane exists) are not listed; --env values are replaced by the name only; ids not yet known appear as the literal tokens %NEW and @NEW."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "dry_run",
+    "id",
+    "name",
+    "socket_path",
+    "tmux_version",
+    "placement",
+    "matched_rule",
+    "session",
+    "session_exists",
+    "target",
+    "cwd",
+    "argv",
+    "env_names",
+    "labels",
+    "keep_on_exit",
+    "focus",
+    "actor",
+    "decision_ids",
+    "override_escalation",
+    "tmux_commands"
+  ]
+}

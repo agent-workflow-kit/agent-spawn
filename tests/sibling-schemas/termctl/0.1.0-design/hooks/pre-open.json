@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/hooks/pre-open.json",
+  "title": "termctl pre-open hook payload",
+  "description": "object_id is the id this open attempt will assign; a re-run generates another, so gates correlate override runs by decision_ids and actor.",
+  "type": "object",
+  "properties": {
+    "tool": {
+      "const": "termctl"
+    },
+    "object_type": {
+      "const": "pane"
+    },
+    "object_id": {
+      "$ref": "../defs.json#/$defs/id"
+    },
+    "labels": {
+      "$ref": "../defs.json#/$defs/labels"
+    },
+    "hook": {
+      "const": "pre-open"
+    },
+    "name": {
+      "$ref": "../defs.json#/$defs/name"
+    },
+    "cwd": {
+      "type": "string"
+    },
+    "argv": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "env_names": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "../defs.json#/$defs/env_name"
+      },
+      "description": "Names only; values are never in payloads."
+    },
+    "placement": {
+      "$ref": "../defs.json#/$defs/placement_name"
+    },
+    "session": {
+      "$ref": "../defs.json#/$defs/session_name"
+    },
+    "target": {
+      "$ref": "../defs.json#/$defs/target"
+    },
+    "socket_path": {
+      "$ref": "../defs.json#/$defs/socket_path"
+    },
+    "keep_on_exit": {
+      "$ref": "../defs.json#/$defs/keep_on_exit"
+    },
+    "focus": {
+      "type": "boolean"
+    },
+    "actor": {
+      "$ref": "../defs.json#/$defs/actor"
+    },
+    "decision_ids": {
+      "$ref": "../defs.json#/$defs/decision_ids",
+      "description": "From --decision-id."
+    },
+    "override_escalation": {
+      "type": "boolean",
+      "description": "true on a run with --override-escalation; a policy may veto such runs."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "tool",
+    "object_type",
+    "object_id",
+    "labels",
+    "hook",
+    "name",
+    "cwd",
+    "argv",
+    "env_names",
+    "placement",
+    "session",
+    "target",
+    "socket_path",
+    "keep_on_exit",
+    "focus",
+    "actor",
+    "decision_ids",
+    "override_escalation"
+  ]
+}

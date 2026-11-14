@@ -1,0 +1,2719 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/defs.json",
+  "title": "wtctl shared definitions",
+  "description": "Definitions referenced by every other wtctl schema (config.json embeds copies).",
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^wt-[a-z2-7]{8}$",
+      "description": "Record id; never reused."
+    },
+    "repo_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?(?:/(?!\\.\\.?(?:/|$))[A-Za-z0-9._-]+)+$",
+      "description": "Lowercase host, optional :port for a non-default port, then '/' and one or more path segments of [A-Za-z0-9._-], none equal to '.' or '..' (architecture section 16)."
+    },
+    "host": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?$",
+      "description": "A repo id's host part: lowercase host, optional :port."
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      "description": "A worktree's display name and last path component."
+    },
+    "label_key": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"
+    },
+    "label_value": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:/#@+=,-]{0,256}$"
+    },
+    "label": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}$",
+      "description": "key=value"
+    },
+    "labels": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/label"
+      },
+      "uniqueItems": true,
+      "maxItems": 32,
+      "description": "Sorted, unique key=value pairs; at most 32 (as termctl and claude-session)."
+    },
+    "holder": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:/#@+=,-]{1,64}$",
+      "description": "A holder (create, adopt, remove and forget --holder): the label value grammar, at most 64 characters."
+    },
+    "duration": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*[smhdw]$",
+      "description": "DURATION: a positive integer and a unit (s, m, h, d, w)."
+    },
+    "actor": {
+      "type": "string",
+      "pattern": "^(human|auto):[A-Za-z0-9._@-]{1,64}$",
+      "description": "human:<user> or auto:<policy>."
+    },
+    "decision_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:@/-]{1,128}$"
+    },
+    "decision_ids": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/decision_id"
+      },
+      "maxItems": 32,
+      "description": "The --decision-id values, followed by the decision ids returned by pre-hooks (at most 32; invalid or excess hook-returned ids are dropped with a warning)."
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Full 40-hex commit sha."
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256, lowercase hex."
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 timestamp."
+    },
+    "abs_path": {
+      "type": "string",
+      "pattern": "^/[^\\n]*$",
+      "description": "Absolute path without a newline."
+    },
+    "dev_ino": {
+      "type": "string",
+      "pattern": "^[0-9]+:[0-9]+$",
+      "description": "A recorded anchor identity: the directory's (st_dev, st_ino) as <dev>:<ino> (interface: Mount points)."
+    },
+    "branch": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\n]+$",
+      "description": "A branch name (short form, without refs/heads/)."
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Human-readable warnings."
+    },
+    "object_type": {
+      "enum": [
+        "worktree",
+        "throwaway"
+      ]
+    },
+    "state": {
+      "enum": [
+        "creating",
+        "active",
+        "unlinked",
+        "missing",
+        "clone_missing",
+        "partial",
+        "gone",
+        "removed",
+        "forgotten"
+      ],
+      "description": "Live: creating, active, unlinked, missing, clone_missing, partial. Tombstones: gone, removed, forgotten."
+    },
+    "refusal_reason": {
+      "enum": [
+        "dirty",
+        "unpushed",
+        "repo_config_changed",
+        "branch_in_use",
+        "branch_exists",
+        "path_exists",
+        "in_use",
+        "held",
+        "unlinked",
+        "not_owned",
+        "main_worktree",
+        "locked"
+      ]
+    },
+    "error_code": {
+      "enum": [
+        "usage",
+        "config_invalid",
+        "not_found",
+        "vetoed",
+        "git_too_old",
+        "remote_mismatch",
+        "clone_failed",
+        "auth_required",
+        "fetch_failed",
+        "ref_not_found",
+        "create_failed",
+        "unsafe_repo_config",
+        "bootstrap_failed",
+        "extract_invalid",
+        "busy",
+        "confirmation_required",
+        "escalated",
+        "refused",
+        "ambiguous",
+        "internal",
+        "partial",
+        "io_error"
+      ]
+    },
+    "branch_kept_reason": {
+      "enum": [
+        "not_created",
+        "disabled",
+        "keep_branch",
+        "unpushed",
+        "checked_out_elsewhere"
+      ]
+    },
+    "check_name": {
+      "enum": [
+        "tracked",
+        "untracked",
+        "ignored",
+        "nested_repos",
+        "stash",
+        "unpushed_head",
+        "unpushed_branches",
+        "in_use",
+        "held",
+        "integrity",
+        "locked",
+        "baseline",
+        "fetch"
+      ]
+    },
+    "forceable_check": {
+      "enum": [
+        "held",
+        "tracked",
+        "untracked",
+        "ignored",
+        "nested_repos",
+        "stash",
+        "unpushed_head",
+        "unpushed_branches",
+        "fetch"
+      ],
+      "description": "A check a human --force can override: held, the dirty and unpushed checks, and the pre-removal fetch (fetch_failed or auth_required)."
+    },
+    "process": {
+      "type": "object",
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "command": {
+          "type": "string",
+          "x-untrusted": true,
+          "description": "Untrusted: the process's command name, chosen by whoever started it."
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\n]*$",
+          "x-untrusted": true,
+          "description": "Untrusted: the matching cwd or open file inside the directory, as the process's /proc link or lsof reports it; non-printable bytes are escaped as \\xNN; agents choose such names."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "pid",
+        "command",
+        "path"
+      ]
+    },
+    "baseline_class": {
+      "enum": [
+        "git",
+        "claude"
+      ],
+      "description": "git: repository config, hooks, alternates, modules, excludes, the record's own admin entry. claude: .claude/ (except .claude/.cc-writes/), .mcp.json and CLAUDE*.md at any depth in the worktree."
+    },
+    "baseline_entry": {
+      "oneOf": [
+        {
+          "const": "absent"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "enum": [
+                "file",
+                "directory",
+                "symlink",
+                "config"
+              ]
+            },
+            "sha256": {
+              "$ref": "#/$defs/digest",
+              "description": "file: content hash; directory: hash of the recursive listing of names, types and content hashes; symlink: hash of the target string; config: hash of the key's values in order."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "sha256"
+          ]
+        }
+      ],
+      "description": "One side of a baseline item: absent, or its type and hash. Contents are never reported."
+    },
+    "anchor_change": {
+      "type": "object",
+      "properties": {
+        "anchor": {
+          "enum": [
+            "common_dir",
+            "worktree_dir",
+            "worktree_root",
+            "hooks_path"
+          ],
+          "description": "common_dir: the clone's common dir (common_id, also in the clone's row); worktree_dir: the worktree directory (dir_id); worktree_root: an owned worktree's root (base_dir, its identity in the anchors table); hooks_path: a core.hooksPath directory outside the common dir (the identity stored in its baseline item)."
+        },
+        "path": {
+          "$ref": "#/$defs/abs_path"
+        },
+        "recorded": {
+          "$ref": "#/$defs/dev_ino"
+        },
+        "current": {
+          "$ref": "#/$defs/dev_ino"
+        },
+        "changed": {
+          "type": "boolean",
+          "description": "true when current differs from recorded."
+        },
+        "fs_type": {
+          "type": "string",
+          "minLength": 1,
+          "x-untrusted": true,
+          "description": "Untrusted: the current file-system type (Linux: the mountinfo type of the opened fd's mount, e.g. ext4 or fuse.sshfs; macOS: statfs f_fstypename); a FUSE type is refused."
+        },
+        "mount_source": {
+          "type": "string",
+          "x-untrusted": true,
+          "description": "Untrusted: the mount source (Linux: mountinfo; macOS: f_mntfromname); a FUSE file system's owner chooses it."
+        },
+        "mount_point": {
+          "$ref": "#/$defs/abs_path",
+          "description": "Where the file system holding the anchor is mounted (Linux: mountinfo; macOS: f_mntonname)."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "anchor",
+        "path",
+        "recorded",
+        "current",
+        "changed",
+        "fs_type",
+        "mount_source",
+        "mount_point"
+      ],
+      "description": "An anchor with its recorded and current identity and where it is currently mounted, shown by baseline accept, by a human clone re-accepting a changed clone identity, and in create_failed anchor_changed details, so a human can tell a reboot from a mount an agent made (interface: Mount points, baseline accept)."
+    },
+    "baseline_item": {
+      "type": "object",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/baseline_class"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "x-untrusted": true,
+          "description": "Untrusted: a path inside the clone's git dir or the worktree; agents can create such paths."
+        },
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "x-untrusted": true,
+          "description": "Untrusted: a config key (section[.subsection].key) read from a file agents can write; null for items that are not config values."
+        },
+        "before": {
+          "$ref": "#/$defs/baseline_entry"
+        },
+        "after": {
+          "$ref": "#/$defs/baseline_entry"
+        },
+        "detail": {
+          "enum": [
+            "incomplete",
+            "mount_point"
+          ],
+          "description": "Present when the item could not be read in full, which fails safe: it always counts as changed. incomplete: a git-class directory listing exceeded remove.nested_scan_limit entries, or a file or the computation exceeded the baseline bounds (64 MiB per file; 256 MiB and remove.nested_scan_limit entries per baseline computation), or a walk reached its deadline (60 s; 300 s for one remove); mount_point: the anchor (the common dir, or a core.hooksPath directory outside it) lacks its recorded identity, or the directory, a directory on its no-follow chain from the anchor, a directory inside it or a file read for it is on another device or (Linux) mount than the anchor (in the claude-class walk: a directory or file on another mount than the worktree). after then holds the hash of the listing as far as it was read (empty for a mount point)."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "class",
+        "path",
+        "key",
+        "before",
+        "after"
+      ]
+    },
+    "changed_classes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/baseline_class"
+      },
+      "uniqueItems": true,
+      "minItems": 1,
+      "description": "The classes with at least one changed item."
+    },
+    "bootstrap_step": {
+      "type": "object",
+      "properties": {
+        "argv": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "description": "The configured argv (for sh: true, the single shell string)."
+        },
+        "exit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Exit status; null when the step was killed (timeout) or did not exit normally."
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_tail": {
+          "type": "string",
+          "x-untrusted": true,
+          "description": "Untrusted: the last 4096 bytes of the step's combined output, mask_env values masked; project code wrote it."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "argv",
+        "exit",
+        "duration_ms",
+        "output_tail"
+      ]
+    },
+    "bootstrap": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "enum": [
+            "none",
+            "ok",
+            "failed",
+            "interrupted"
+          ],
+          "description": "none: bootstrap never ran (no steps, --no-bootstrap, adopted). interrupted: a create reclaimed by reconcile after its creator died (adopted_after_crash); bootstrap may have run partly and nothing was recorded as bootstrap-created."
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/bootstrap_step"
+          },
+          "description": "The steps of the last run, in order, up to and including the first failing step."
+        },
+        "created_paths_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Size of the bootstrap-created set."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "steps",
+        "created_paths_count"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "none"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "steps": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "bootstrap_result": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "enum": [
+            "none",
+            "ok",
+            "failed",
+            "interrupted"
+          ],
+          "description": "none: bootstrap never ran (no steps, --no-bootstrap, adopted). interrupted: a create reclaimed by reconcile after its creator died (adopted_after_crash); bootstrap may have run partly and nothing was recorded as bootstrap-created."
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/bootstrap_step"
+          },
+          "description": "The steps of the last run, in order, up to and including the first failing step."
+        },
+        "created_paths_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Size of the bootstrap-created set."
+        },
+        "tracked_changes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "x-untrusted": true,
+            "description": "Untrusted: a tracked path bootstrap changed; project code chose it."
+          },
+          "description": "Tracked files changed by bootstrap: reported, not recorded; they count as dirty at removal."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "steps",
+        "created_paths_count",
+        "tracked_changes"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "none"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "steps": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ],
+      "description": "The bootstrap object of the record, plus the tracked files this run changed."
+    },
+    "checks": {
+      "type": "object",
+      "properties": {
+        "integrity": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "skipped"
+              ]
+            },
+            "details": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "step": {
+                    "enum": [
+                      "path",
+                      "root",
+                      "dotgit",
+                      "admin_gitdir",
+                      "commondir",
+                      "git_common_dir"
+                    ],
+                    "description": "path: record path vs recorded path; root: under the recorded root with no symlink below it, or the adopted path; dotgit: <path>/.git names exactly the recorded admin_dir; admin_gitdir: the admin entry's gitdir file; commondir: the admin entry's commondir; git_common_dir: git rev-parse --git-common-dir."
+                  },
+                  "expected": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "actual": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "x-untrusted": true,
+                    "description": "Untrusted: read from files an agent in the worktree can write; null when absent or unreadable."
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "step",
+                  "expected",
+                  "actual"
+                ]
+              },
+              "description": "What failed; empty unless status is fail."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "details"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "fail",
+                      "warn"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "details": {
+                    "minItems": 1
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "details": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
+          ],
+          "description": "Integrity (refusal unlinked)."
+        },
+        "locked": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "skipped"
+              ]
+            },
+            "details": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "lock_reason": {
+                    "type": "string",
+                    "x-untrusted": true,
+                    "description": "Untrusted: the content of the admin entry's locked file, which agents can write."
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "lock_reason"
+                ]
+              },
+              "description": "What failed; empty unless status is fail."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "details"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "fail",
+                      "warn"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "details": {
+                    "minItems": 1
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "details": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
+          ],
+          "description": "The worktree's admin entry has a locked file (refusal locked; checked right after integrity, never overridden)."
+        },
+        "baseline": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "warn",
+                "skipped"
+              ]
+            },
+            "details": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/baseline_item"
+              },
+              "description": "What failed (or, for warn, what was found); empty unless status is fail or warn."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "details"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "fail",
+                      "warn"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "details": {
+                    "minItems": 1
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "details": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
+          ],
+          "description": "Repo-config baseline; details are the changed items. fail: a git-class item changed (refusal repo_config_changed). warn: only claude-class items changed (remove proceeds)."
+        },
+        "in_use": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "unavailable"
+              ]
+            },
+            "details": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/process"
+              },
+              "description": "What failed; empty unless status is fail."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "details"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "fail",
+                      "warn"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "details": {
+                    "minItems": 1
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "details": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
+          ],
+          "description": "In-use detection (refusal in_use). unavailable: no scanner (no /proc and no lsof); the check was skipped with a warning."
+        },
+        "held": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "skipped"
+              ]
+            },
+            "details": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "holder": {
+                    "$ref": "#/$defs/holder"
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "holder"
+                ]
+              },
+              "description": "What failed; empty unless status is fail."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "details"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "fail",
+                      "warn"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "details": {
+                    "minItems": 1
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "details": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
+          ],
+          "description": "Holders other than the one passed with --holder (refusal held; a human --force overrides it). Worktrees only."
+        },
+        "fetch": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "skipped"
+              ]
+            },
+            "details": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "code": {
+                    "enum": [
+                      "fetch_failed",
+                      "auth_required"
+                    ],
+                    "description": "auth_required: the remote asked for credentials; fetch_failed: anything else."
+                  },
+                  "cause": {
+                    "enum": [
+                      "timeout",
+                      "prune_incomplete",
+                      null
+                    ],
+                    "description": "timeout: network_timeout expired; prune_incomplete: git exited 0 but printed an error: line (a --prune that left a stale ref); null otherwise."
+                  },
+                  "message": {
+                    "type": "string",
+                    "x-untrusted": true,
+                    "description": "Untrusted: git's stderr, from the remote."
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "code",
+                  "cause",
+                  "message"
+                ]
+              },
+              "description": "What failed; empty unless status is fail."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "details"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "fail",
+                      "warn"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "details": {
+                    "minItems": 1
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "details": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
+          ],
+          "description": "The refresh of the clone's mirror (interface: Mirror), whose refs/heads are the tips for reachability. fail without --force exits 12 (fetch_failed or auth_required); with a human --force it is a warning and nothing counts as pushed. status reports it and skips the unpushed checks; status reports it skipped (with a warning) when the per-clone lease stayed held for 5 seconds."
+        },
+        "tracked": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "skipped"
+              ]
+            },
+            "details": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "x-untrusted": true,
+                    "description": "Untrusted: a path inside the worktree, relative to its root; agents choose such names."
+                  },
+                  "detail": {
+                    "enum": [
+                      "changed",
+                      "hidden_changes"
+                    ],
+                    "description": "changed: a staged, unstaged or conflicted change reported by git status; hidden_changes: the index entry has the assume-unchanged or skip-worktree bit (ls-files -v tag lowercase, S or s), which hides edits from git status (also every path outside a sparse-checkout cone; only a human --force removes such a worktree in v1)."
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "path",
+                  "detail"
+                ]
+              },
+              "description": "What failed; empty unless status is fail."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "details"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "fail",
+                      "warn"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "details": {
+                    "minItems": 1
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "details": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
+          ],
+          "description": "Tracked files with changes, or with index flags that hide changes (dirty)."
+        },
+        "untracked": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "skipped"
+              ]
+            },
+            "details": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "x-untrusted": true,
+                    "description": "Untrusted: a path inside the worktree, relative to its root; agents choose such names."
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "path"
+                ]
+              },
+              "description": "What failed; empty unless status is fail."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "details"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "fail",
+                      "warn"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "details": {
+                    "minItems": 1
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "details": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
+          ],
+          "description": "Untracked, non-ignored files that are not bootstrap-created with unchanged content (dirty)."
+        },
+        "ignored": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "skipped"
+              ]
+            },
+            "details": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "x-untrusted": true,
+                    "description": "Untrusted: a path inside the worktree, relative to its root; agents choose such names."
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "path"
+                ]
+              },
+              "description": "What failed; empty unless status is fail."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "details"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "fail",
+                      "warn"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "details": {
+                    "minItems": 1
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "details": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
+          ],
+          "description": "Ignored paths neither bootstrap-created nor disposable (dirty)."
+        },
+        "nested_repos": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "skipped"
+              ]
+            },
+            "details": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "detail": {
+                    "enum": [
+                      "nested_repo",
+                      "submodule",
+                      "mount_point",
+                      "incomplete"
+                    ],
+                    "description": "nested_repo: a .git found at path (not a recorded bootstrap_nested entry); submodule: the .git file of an initialized submodule (listed in .gitmodules at HEAD, pointing under <admin_dir>/modules/ or <common>/modules/; v1 has no recursive check, so only a human --force removes it); mount_point: a mount point below the worktree root (a directory on another device or, on Linux, another mount), which no walk crosses; incomplete: the walk exceeded remove.nested_scan_limit (path null)."
+                  },
+                  "path": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "minLength": 1,
+                    "x-untrusted": true,
+                    "description": "Untrusted: a path inside the worktree, relative to its root; agents choose such names."
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "detail",
+                  "path"
+                ]
+              },
+              "description": "What failed; empty unless status is fail."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "details"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "fail",
+                      "warn"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "details": {
+                    "minItems": 1
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "details": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
+          ],
+          "description": "Nested .git files or directories anywhere below the worktree root (dirty)."
+        },
+        "stash": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "skipped"
+              ]
+            },
+            "details": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "ref": {
+                    "type": "string",
+                    "pattern": "^stash@\\{[0-9]+\\}$"
+                  },
+                  "sha": {
+                    "$ref": "#/$defs/sha"
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "ref",
+                  "sha"
+                ]
+              },
+              "description": "What failed; empty unless status is fail."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "details"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "fail",
+                      "warn"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "details": {
+                    "minItems": 1
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "details": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
+          ],
+          "description": "Stash entries made in this worktree (dirty)."
+        },
+        "unpushed_head": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "skipped"
+              ]
+            },
+            "details": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "sha": {
+                    "$ref": "#/$defs/sha"
+                  },
+                  "detail": {
+                    "enum": [
+                      "not_reachable",
+                      "ancestry_unverified",
+                      "head_moved"
+                    ],
+                    "description": "not_reachable: the commit is missing from the mirror or is not an ancestor of any mirror refs/heads tip; ancestry_unverified: the content-verified ancestry check failed (interface: Reachability); head_moved: HEAD changed after the confirmation (remove step 9; sha is the new HEAD)."
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "sha",
+                  "detail"
+                ]
+              },
+              "description": "What failed; empty unless status is fail."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "details"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "fail",
+                      "warn"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "details": {
+                    "minItems": 1
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "details": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
+          ],
+          "description": "HEAD not pushed (interface: Reachability) and not --merged-head (unpushed)."
+        },
+        "unpushed_branches": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "skipped"
+              ]
+            },
+            "details": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "branch": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "minLength": 1,
+                    "pattern": "^[^\\n]+$",
+                    "x-untrusted": true,
+                    "description": "Untrusted: a branch name created in the worktree; null for reflog_unavailable."
+                  },
+                  "sha": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/$defs/sha"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "The branch tip; null for reflog_unavailable."
+                  },
+                  "detail": {
+                    "enum": [
+                      "not_reachable",
+                      "ancestry_unverified",
+                      "reflog_unavailable"
+                    ],
+                    "description": "reflog_unavailable: the worktree's HEAD reflog is missing or unreadable, or neither anchor is usable (no entry at or before the recorded start time and no start entry; branch and sha null)."
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "branch",
+                  "sha",
+                  "detail"
+                ]
+              },
+              "description": "What failed; empty unless status is fail."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "details"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "fail",
+                      "warn"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "details": {
+                    "minItems": 1
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "details": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
+          ],
+          "description": "Side branches committed in this worktree and not pushed (unpushed)."
+        }
+      },
+      "additionalProperties": false,
+      "required": [],
+      "description": "Check results by name. Only checks that ran are present: remove stops at the first of integrity, locked, baseline, in_use and held that fails (held only without a human --force, which overrides it); status runs every check it can and reports skipped ones; a content-check refusal reports every content check. A throwaway has only in_use."
+    },
+    "record": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "object_type": {
+          "$ref": "#/$defs/object_type"
+        },
+        "owned": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "worktree: true if created by wtctl, false if adopted. throwaway: null."
+        },
+        "state": {
+          "$ref": "#/$defs/state"
+        },
+        "repo": {
+          "$ref": "#/$defs/repo_id"
+        },
+        "clone_path": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/abs_path"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The local clone. Throwaway: the clone used as source, or null."
+        },
+        "common_dir": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/abs_path"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The clone's git common dir. Throwaway: null."
+        },
+        "admin_dir": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/abs_path"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The worktree's admin entry <common>/worktrees/<n> (from git rev-parse --git-dir at create or adopt). null for a main worktree, a throwaway, and a worktree still creating."
+        },
+        "common_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/dev_ino"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The clone's common dir identity (st_dev, st_ino), the recorded common-dir anchor (interface: Anchor identity, Mount points); copied from the clone's row at create or adopt, changed only by a human baseline accept (wtctl never re-records it by itself). Throwaway: null."
+        },
+        "dir_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/dev_ino"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The worktree or throwaway directory's (st_dev, st_ino), recorded at create (a throwaway's after its mkdir), adopt or a reclaim after a crash; checked before wtctl deletes the directory or rewrites its pointers. null only while creating, and in a gone or forgotten tombstone of a record that never left creating."
+        },
+        "base_dir": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/abs_path"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The resolved realpath root the record's path lives under (not the root config key). Owned worktree: its worktree root at create. Throwaway: the throwaway root. Adopted: null."
+        },
+        "root_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/dev_ino"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Throwaway: the throwaway root's identity (st_dev, st_ino), recorded at create (equal to that of every live throwaway under the same root). Worktree: null."
+        },
+        "path": {
+          "$ref": "#/$defs/abs_path"
+        },
+        "name": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/name"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Throwaway: null."
+        },
+        "branch": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/branch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The branch at create (or adopt), not the current one; null when detached and for throwaways. For an adopted worktree the name comes from the clone and is untrusted.",
+          "x-untrusted": true
+        },
+        "created_branch": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "wtctl created the local branch (also for a remote-only branch). Throwaway: null."
+        },
+        "base": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The resolved base ref the new branch was created from: refs/heads/<b>, the remote's branch (read from the mirror) when the remote has it, else the clone's local branch; null if none was used."
+        },
+        "base_sha": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The base's tip when the branch was created; null if no base was used."
+        },
+        "head_at_create": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "HEAD when the worktree was created or adopted. Throwaway, or a worktree still creating: null."
+        },
+        "ref": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Throwaway: the checked-out commit. Worktree: --ref, else null."
+        },
+        "source": {
+          "enum": [
+            "auto",
+            "local",
+            "remote",
+            null
+          ],
+          "description": "Throwaway: the source used; while creating, the requested --source (auto possible). Worktree: null."
+        },
+        "depth": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Throwaway: history depth, 0 = full history. While creating, the requested depth; once active, the depth used (a local source copies the full history, 0, unless --depth 1). Worktree: null."
+        },
+        "fetch_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Worktree: the clone fetch URL recorded at create or adopt (interface: Clone resolution), without userinfo. Throwaway: the URL fetched from, or the clone's path for a local source; null while creating, until the source is chosen."
+        },
+        "remote": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "description": "The clone's remote whose URL was recorded. Throwaway: null."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels"
+        },
+        "holders": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/holder"
+          },
+          "uniqueItems": true,
+          "description": "Sorted holders added by create --holder and adopt --holder (owned and adopted worktrees); remove refuses held while another holder remains. Empty for throwaways."
+        },
+        "baseline_digest": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Throwaway, or a worktree whose baseline is not recorded yet (creating): null."
+        },
+        "bootstrap": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/bootstrap"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Throwaway: null."
+        },
+        "created": {
+          "$ref": "#/$defs/ts"
+        },
+        "updated": {
+          "$ref": "#/$defs/ts"
+        },
+        "missing_since": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ts"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When reconcile first saw the directory missing; null otherwise."
+        },
+        "removed_at": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ts"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the record became a tombstone; null while live."
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-untrusted": true,
+          "description": "Untrusted: the last failure's message, which may quote git or the file system."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "object_type",
+        "owned",
+        "state",
+        "repo",
+        "clone_path",
+        "common_dir",
+        "admin_dir",
+        "common_id",
+        "dir_id",
+        "base_dir",
+        "root_id",
+        "path",
+        "name",
+        "branch",
+        "created_branch",
+        "base",
+        "base_sha",
+        "head_at_create",
+        "ref",
+        "source",
+        "depth",
+        "fetch_url",
+        "remote",
+        "labels",
+        "holders",
+        "baseline_digest",
+        "bootstrap",
+        "created",
+        "updated",
+        "missing_since",
+        "removed_at",
+        "last_error"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "object_type": {
+                "const": "throwaway"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "owned": {
+                "type": "null"
+              },
+              "common_dir": {
+                "type": "null"
+              },
+              "common_id": {
+                "type": "null"
+              },
+              "admin_dir": {
+                "type": "null"
+              },
+              "name": {
+                "type": "null"
+              },
+              "branch": {
+                "type": "null"
+              },
+              "created_branch": {
+                "type": "null"
+              },
+              "base": {
+                "type": "null"
+              },
+              "base_sha": {
+                "type": "null"
+              },
+              "head_at_create": {
+                "type": "null"
+              },
+              "remote": {
+                "type": "null"
+              },
+              "baseline_digest": {
+                "type": "null"
+              },
+              "bootstrap": {
+                "type": "null"
+              },
+              "base_dir": {
+                "$ref": "#/$defs/abs_path"
+              },
+              "root_id": {
+                "$ref": "#/$defs/dev_ino"
+              },
+              "holders": {
+                "maxItems": 0
+              },
+              "ref": {
+                "$ref": "#/$defs/sha"
+              },
+              "source": {
+                "enum": [
+                  "auto",
+                  "local",
+                  "remote"
+                ]
+              },
+              "depth": {
+                "type": "integer"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "source": {
+                "type": "null"
+              },
+              "depth": {
+                "type": "null"
+              },
+              "root_id": {
+                "type": "null"
+              },
+              "common_id": {
+                "$ref": "#/$defs/dev_ino"
+              },
+              "owned": {
+                "type": "boolean"
+              },
+              "clone_path": {
+                "$ref": "#/$defs/abs_path"
+              },
+              "common_dir": {
+                "$ref": "#/$defs/abs_path"
+              },
+              "name": {
+                "$ref": "#/$defs/name"
+              },
+              "created_branch": {
+                "type": "boolean"
+              },
+              "fetch_url": {
+                "type": "string"
+              },
+              "remote": {
+                "type": "string"
+              },
+              "bootstrap": {
+                "$ref": "#/$defs/bootstrap"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "object_type": {
+                "const": "throwaway"
+              },
+              "state": {
+                "not": {
+                  "enum": [
+                    "creating",
+                    "gone",
+                    "forgotten"
+                  ]
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "source": {
+                "enum": [
+                  "local",
+                  "remote"
+                ]
+              },
+              "fetch_url": {
+                "type": "string"
+              },
+              "dir_id": {
+                "$ref": "#/$defs/dev_ino"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "object_type": {
+                "const": "worktree"
+              },
+              "state": {
+                "not": {
+                  "enum": [
+                    "creating",
+                    "gone",
+                    "forgotten"
+                  ]
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "head_at_create": {
+                "$ref": "#/$defs/sha"
+              },
+              "baseline_digest": {
+                "$ref": "#/$defs/digest"
+              },
+              "dir_id": {
+                "$ref": "#/$defs/dev_ino"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "enum": [
+                  "creating",
+                  "active",
+                  "unlinked",
+                  "missing",
+                  "clone_missing",
+                  "partial"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "removed_at": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "not": {
+                  "enum": [
+                    "missing",
+                    "clone_missing",
+                    "gone"
+                  ]
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "missing_since": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "owned": {
+                "const": false
+              }
+            },
+            "required": [
+              "owned"
+            ]
+          },
+          "then": {
+            "properties": {
+              "created_branch": {
+                "const": false
+              },
+              "base_dir": {
+                "type": "null"
+              },
+              "bootstrap": {
+                "properties": {
+                  "state": {
+                    "const": "none"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "owned": {
+                "const": true
+              }
+            },
+            "required": [
+              "owned"
+            ]
+          },
+          "then": {
+            "properties": {
+              "base_dir": {
+                "$ref": "#/$defs/abs_path"
+              }
+            }
+          }
+        }
+      ],
+      "description": "A wtctl record (interface: Record object). Fields that do not apply are null."
+    },
+    "change": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "from": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/state"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "to": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/state"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "null when the tombstone was deleted."
+        },
+        "action": {
+          "type": "string",
+          "pattern": "^[a-z][a-z_]*$",
+          "description": "What reconcile did (e.g. repair, admin_entry_delete, tombstone_delete)."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "from",
+        "to",
+        "action"
+      ]
+    },
+    "report": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "enum": [
+            "gone",
+            "gone_with_unpushed",
+            "kept_unpushed",
+            "adopted_gone",
+            "adopted_after_crash",
+            "abandoned",
+            "stray",
+            "unlinked",
+            "clone_missing",
+            "moved_clone",
+            "fetch_failed"
+          ]
+        },
+        "id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "path": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/abs_path"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "clone_path": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/abs_path"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-untrusted": true,
+          "description": "Untrusted: a branch name from the clone."
+        },
+        "tip": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-untrusted": true,
+          "description": "Untrusted: git's stderr, a pointer-rewrite failure message, or, for kept_unpushed, the condition that kept the admin entry."
+        },
+        "kind_of": {
+          "enum": [
+            "throwaway",
+            "clone_tmp",
+            "mirror",
+            null
+          ],
+          "description": "stray: throwaway (a directory under the throwaway root with no live record), clone_tmp (a leftover *.wtctl-tmp-* clone directory) or mirror (a mirror no clone in state.db names). Other kinds: null or omitted."
+        },
+        "admin_entry": {
+          "enum": [
+            "absent",
+            null
+          ],
+          "description": "gone: absent (the clone's admin entry was already gone; nothing was deleted). Other kinds: null or omitted."
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "gone"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "id",
+              "path",
+              "admin_entry"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/id"
+              },
+              "path": {
+                "$ref": "#/$defs/abs_path"
+              },
+              "admin_entry": {
+                "const": "absent"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "admin_entry": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "gone_with_unpushed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "id",
+              "branch",
+              "tip"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/id"
+              },
+              "branch": {
+                "type": "string"
+              },
+              "tip": {
+                "$ref": "#/$defs/sha"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "kept_unpushed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "id",
+              "tip",
+              "message"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/id"
+              },
+              "tip": {
+                "$ref": "#/$defs/sha"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "adopted_gone",
+                  "adopted_after_crash",
+                  "abandoned"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "id",
+              "path"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/id"
+              },
+              "path": {
+                "$ref": "#/$defs/abs_path"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "stray"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "path",
+              "kind_of"
+            ],
+            "properties": {
+              "path": {
+                "$ref": "#/$defs/abs_path"
+              },
+              "kind_of": {
+                "enum": [
+                  "throwaway",
+                  "clone_tmp",
+                  "mirror"
+                ]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "kind_of": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "unlinked"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "id",
+              "path"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/id"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "clone_missing"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "id",
+              "clone_path"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/id"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "moved_clone"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "id",
+              "clone_path"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/id"
+              },
+              "clone_path": {
+                "$ref": "#/$defs/abs_path"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "fetch_failed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "clone_path",
+              "message"
+            ]
+          }
+        }
+      ],
+      "description": "A reconcile report. gone: id, path, admin_entry: absent, and branch when a created branch was kept (an owned missing record whose admin entry was already gone, marked gone after the grace period with nothing to delete); gone_with_unpushed: id, branch, tip (the record is gone, its unpushed branch kept); kept_unpushed: id, tip, message (an admin entry kept because its HEAD is neither reachable from a local branch nor pushed, it holds submodule git dirs or per-worktree refs, or its HEAD reflog names an unpushed commit since the recorded start; tip is the entry's HEAD or that commit); adopted_gone: id, path (an adopted record marked gone after the grace period); adopted_after_crash: id, path (a creating worktree whose creator died, found intact and made active); abandoned: id, path, and branch when a created branch was kept (a creating record whose creator died and that could not be reclaimed: gone if its path was absent, else left creating for a human forget, or skipped because a process is in its planned path; the changes list shows which); stray: path, kind_of (a throwaway directory with no live record, a leftover *.wtctl-tmp-* clone directory, or an orphaned mirror; never deleted); unlinked: id, path; clone_missing: id, clone_path; moved_clone: id, clone_path (the record is clone_missing; a re-resolved clone at clone_path names the record's path; reconcile changes nothing else, and a human re-attaches the record with baseline accept); fetch_failed: clone_path, message."
+    },
+    "pre_hook_entry": {
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "minLength": 1
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cmd"
+      ]
+    },
+    "post_hook_entry": {
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "minLength": 1
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30
+        },
+        "async": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cmd"
+      ],
+      "description": "async: true runs the hook detached (post-hooks only)."
+    },
+    "env_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "filter_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "disposable": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "gitignore-syntax patterns."
+    },
+    "dir": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(/|~/)[^\\n]*$",
+      "description": "An absolute directory, or one starting with ~/ (expanded once)."
+    },
+    "bootstrap_step_config": {
+      "type": "object",
+      "properties": {
+        "argv": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "sh": {
+          "type": "boolean",
+          "default": false,
+          "description": "true: argv[0] runs through sh -c, and argv must have one element."
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 600,
+          "description": "Seconds."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "argv"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "sh": {
+                "const": true
+              }
+            },
+            "required": [
+              "sh"
+            ]
+          },
+          "then": {
+            "properties": {
+              "argv": {
+                "maxItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "repo_config": {
+      "type": "object",
+      "properties": {
+        "clone": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/dir"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "clone_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "default": null,
+          "description": "Overrides the host's template; may be a file:// URL or a path."
+        },
+        "remote": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "default": "origin"
+        },
+        "worktree_root": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/dir"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "auto_clone": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null,
+          "description": "null: inherit."
+        },
+        "base": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "default": null,
+          "description": "null: the remote's default branch."
+        },
+        "branch_template": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "default": null
+        },
+        "copy_env": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": [],
+          "description": "Env-file globs relative to the main worktree."
+        },
+        "bootstrap": {
+          "type": "object",
+          "properties": {
+            "auto": {
+              "type": "boolean",
+              "default": true
+            },
+            "env": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "propertyNames": {
+                "$ref": "#/$defs/env_name"
+              },
+              "default": {},
+              "description": "Non-secret values only."
+            },
+            "pass_env": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/env_name"
+              },
+              "uniqueItems": true,
+              "default": [],
+              "description": "hosts.*.token_env variables passed to steps after all (they are stripped by default)."
+            },
+            "steps": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/bootstrap_step_config"
+              },
+              "default": []
+            }
+          },
+          "additionalProperties": false,
+          "required": []
+        },
+        "remove": {
+          "type": "object",
+          "properties": {
+            "disposable": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/disposable"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Replaces the global list; null: the global list."
+            }
+          },
+          "additionalProperties": false,
+          "required": []
+        },
+        "create": {
+          "type": "object",
+          "properties": {
+            "allow_filters": {
+              "oneOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/filter_name"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Replaces the global list; null: the global list."
+            }
+          },
+          "additionalProperties": false,
+          "required": []
+        }
+      },
+      "additionalProperties": false,
+      "required": []
+    },
+    "host_config": {
+      "type": "object",
+      "properties": {
+        "clone_url": {
+          "type": "string",
+          "minLength": 1,
+          "default": "https://{host}/{path}.git",
+          "description": "URL template ({host}, {path})."
+        },
+        "token_env": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/env_name"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Env var holding an HTTPS token; used when set and non-empty."
+        },
+        "token_command": {
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "argv (no shell; an argument equal to {host} is replaced) whose stdout is the token; used when token_env gives none. 10-second timeout."
+        },
+        "token_user": {
+          "type": "string",
+          "minLength": 1,
+          "default": "x-access-token"
+        }
+      },
+      "additionalProperties": false,
+      "required": []
+    }
+  }
+}

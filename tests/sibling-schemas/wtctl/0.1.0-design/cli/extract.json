@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/extract.json",
+  "title": "wtctl extract --json",
+  "type": "object",
+  "properties": {
+    "record_id": {
+      "$ref": "../defs.json#/$defs/id"
+    },
+    "dest": {
+      "$ref": "../defs.json#/$defs/abs_path"
+    },
+    "written": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "x-untrusted": true,
+            "description": "Untrusted: agent-chosen relative path."
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "mode": {
+            "type": "string",
+            "pattern": "^0[0-7]{3}$",
+            "description": "Octal file mode, e.g. 0644."
+          },
+          "created": {
+            "type": "boolean",
+            "description": "true: a new file; false: an existing file was replaced."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "bytes",
+          "mode",
+          "created"
+        ]
+      }
+    },
+    "deleted": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "x-untrusted": true,
+            "description": "Untrusted: agent-chosen relative path."
+          },
+          "result": {
+            "enum": [
+              "deleted",
+              "absent"
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "result"
+        ]
+      }
+    },
+    "dry_run": {
+      "type": "boolean",
+      "description": "true: what the command would do; nothing was changed and no hooks ran."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "record_id",
+    "dest",
+    "written",
+    "deleted",
+    "dry_run"
+  ]
+}

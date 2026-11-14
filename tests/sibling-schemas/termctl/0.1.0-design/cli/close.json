@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/cli/close.json",
+  "title": "termctl close --json",
+  "type": "object",
+  "properties": {
+    "id": {
+      "$ref": "../defs.json#/$defs/id"
+    },
+    "pane_closed": {
+      "const": true
+    },
+    "was_running": {
+      "type": "boolean",
+      "description": "The pane was running at the first check."
+    },
+    "forced": {
+      "type": "boolean",
+      "description": "--force was given."
+    },
+    "signals_sent": {
+      "$ref": "../defs.json#/$defs/signals"
+    },
+    "exited": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "The recorded process is gone at the end (true when there was none; false if it survived SIGKILL). null when pid_mismatch is true."
+    },
+    "pid_mismatch": {
+      "type": "boolean",
+      "description": "The recorded PID failed a check or a check could not be made, so nothing was signaled: it did not equal the pane's #{pane_pid} (at the first check, the re-check or kill time), @termctl_pid or @termctl_pid_start changed between the checks, the server on the socket was not #{pid} in termctl's PID namespace, /proc showed another PID namespace, the process's parent was not the server, its start time was not the recorded one before the first signal (pane respawned or PID reused), the pane was gone at the first check while the process had not exited, or no process handle could be opened."
+    },
+    "decision_ids": {
+      "$ref": "../defs.json#/$defs/decision_ids"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "socket_path": {
+      "$ref": "../defs.json#/$defs/socket_path"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "pane_closed",
+    "was_running",
+    "forced",
+    "signals_sent",
+    "exited",
+    "pid_mismatch",
+    "decision_ids",
+    "duration_ms",
+    "socket_path"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "forced": {
+            "const": false
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "was_running": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "was_running": {
+            "const": false
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "signals_sent": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "pid_mismatch": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "signals_sent": {
+            "maxItems": 0
+          },
+          "exited": {
+            "const": null
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "exited": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  ]
+}
