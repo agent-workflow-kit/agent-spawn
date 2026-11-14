@@ -182,15 +182,23 @@ def test_a_hung_call_ends_when_its_parent_is_gone(fakebin: Fakebin) -> None:
     fakebin.seed_session()
     fakebin.script("claude-session", "wait", hang=True)
     code = (
-        "import subprocess, sys\n"
+        "import os, subprocess, sys, time\n"
+        "env = dict(os.environ, FAKEBIN_PARENT_PID=str(os.getpid()))\n"
         f"p = subprocess.Popen([{str(fakebin.bin_dir / 'claude-session')!r}, 'wait', "
         "'cs-abcdefgh', '--json'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
-        "stderr=subprocess.DEVNULL, start_new_session=True)\n"
+        "stderr=subprocess.DEVNULL, start_new_session=True, env=env)\n"
         "print(p.pid, flush=True)\n"
-        "import time; time.sleep(1)\n"  # the fake has started and knows its parent
+        "import json\n"
+        f"log = {str(fakebin.log)!r}\n"
+        "deadline = time.monotonic() + 15\n"  # exit only once the fake is hanging
+        "while time.monotonic() < deadline:\n"
+        "    recs = [json.loads(l) for l in open(log)]\n"
+        "    if any(r['event'] == 'hang_ready' and r['pid'] == p.pid for r in recs):\n"
+        "        break\n"
+        "    time.sleep(0.02)\n"
     )
     done = subprocess.run(  # the intermediate process exits, orphaning the hung fake
-        [sys.executable, "-c", code], env=fakebin.env(), capture_output=True, text=True, timeout=20
+        [sys.executable, "-c", code], env=fakebin.env(), capture_output=True, text=True, timeout=30
     )
     pid = int(done.stdout)
     deadline = time.monotonic() + 15

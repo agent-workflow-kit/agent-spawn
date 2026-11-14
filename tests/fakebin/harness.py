@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -119,6 +120,7 @@ class Fakebin:
             "PATH": f"{self.bin_dir}:{SYSTEM_PATH}",
             "FAKEBIN_LOG": str(self.log),
             "FAKEBIN_SCRIPT": str(self.script_file),
+            "FAKEBIN_PARENT_PID": str(os.getpid()),  # a hung fake exits when this process is gone
         }
         env.update(extra or {})
         return env
@@ -202,6 +204,18 @@ class Fakebin:
                 )
             )
         return found
+
+    def wait_for_hang(self, pid: int, timeout: float = 10) -> None:
+        """Block until the fake with this PID logged ``hang_ready`` (its handlers are installed)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.log.exists():
+                for line in self.log.read_text().splitlines():
+                    record = json.loads(line)
+                    if record["event"] == "hang_ready" and record["pid"] == pid:
+                        return
+            time.sleep(0.02)
+        raise AssertionError(f"the fake (pid {pid}) never reached its hang")
 
     def argvs(self, tool: str) -> list[list[str]]:
         return [call.argv for call in self.invocations(tool)]

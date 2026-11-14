@@ -35,13 +35,8 @@ def spawn(fakebin: Fakebin, *args: str, **kwargs: object) -> subprocess.Popen[st
 
 
 def wait_for_call(fakebin: Fakebin, pid: int) -> None:
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        if any(call.pid == pid for call in fakebin.invocations()):
-            time.sleep(0.3)  # let the signal handlers install
-            return
-        time.sleep(0.05)
-    raise AssertionError("the fake never logged its invocation")
+    """Wait until the hung fake is ready for signals (its handlers are installed)."""
+    fakebin.wait_for_hang(pid)
 
 
 def hanging_exec(

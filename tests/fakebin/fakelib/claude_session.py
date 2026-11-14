@@ -751,8 +751,9 @@ def run_session(
     begin_run(session_id, run, mode, forked_from, fields)
     response = ctx.response(command)
     name = response.get("outcome", "done")
-    if response.get("hang") and "on_signal" not in response:
-        numbers = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    numbers = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    killing = bool(response.get("hang")) and "on_signal" not in response
+    if killing:
 
         def killed(signum: int, _frame: Any) -> None:
             for number in numbers:
@@ -771,7 +772,12 @@ def run_session(
                 signal.signal(number, signal.SIG_IGN)
             else:
                 signal.signal(number, killed)
-    ctx.behave(command)
+    try:
+        ctx.behave(command)
+    finally:
+        if killing:  # the run is over: a late signal must not overwrite the outcome below
+            for number in numbers:
+                signal.signal(number, drop_signal)
     obj = outcome_object(name, session_id, run)
     obj["forked_from"] = forked_from
     write_outcome_file(outcome_file, obj)

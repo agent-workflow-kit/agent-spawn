@@ -400,7 +400,7 @@ class Context:
         if response.get("sleep"):
             time.sleep(float(response["sleep"]))
         if response.get("hang"):
-            hang()
+            hang(self)
 
     def stdin_is_tty(self) -> bool:
         return sys.stdin is not None and sys.stdin.isatty()
@@ -427,23 +427,49 @@ def drop_signal(_signum: int, _frame: Any) -> None:
     N ignored due to race condition") in code that runs after a signal was already pending."""
 
 
-def hang() -> None:
+def _parent_gone() -> bool:
+    """Whether the process that started this fake is gone.
+
+    The harness passes its own PID in ``FAKEBIN_PARENT_PID``; the parent is gone when that PID no
+    longer exists. Without it, fall back to watching the parent PID, which only works when the
+    runner is not PID 1 (a container's init): then the parent changed or is init.
+    """
+    raw = os.environ.get("FAKEBIN_PARENT_PID")
+    if raw is not None:
+        try:
+            pid = int(raw)
+        except ValueError:
+            raise HarnessError("FAKEBIN_PARENT_PID must be an integer") from None
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        return False
+    if START_PPID == 1:
+        return False
+    now = os.getppid()
+    return now != START_PPID or now == 1
+
+
+def hang(ctx: Context | None = None) -> None:
     """Block until a signal ends the process (default action) or ``on_signal`` handles it.
 
     A hung fake never outlives its test: it gives up after ``FAKEBIN_HANG_SECONDS`` (default
-    120 s) and when its parent is gone (orphaned: the parent changed, or is init), both with
-    exit 124 and a stderr line.
+    120 s) and when its parent is gone (see ``_parent_gone``), both with exit 124 and a stderr
+    line. Once it is waiting (its signal handlers are installed) it logs a ``hang_ready``
+    record, which tests poll for instead of sleeping.
     """
     try:
         limit = float(os.environ.get("FAKEBIN_HANG_SECONDS", HANG_SECONDS))
     except ValueError:
         raise HarnessError("FAKEBIN_HANG_SECONDS must be a number") from None
-    parent = START_PPID
     deadline = time.monotonic() + limit
+    log_event("hang_ready", id=ctx.invoke_id if ctx else None)
     while True:
         time.sleep(0.05)
-        now = os.getppid()
-        if now != parent or now == 1:
+        if _parent_gone():
             raise Exit(124, "", "fakebin: hung call gave up: its parent process is gone\n")
         if time.monotonic() >= deadline:
             raise Exit(124, "", f"fakebin: hung call gave up after {limit:g} seconds\n")

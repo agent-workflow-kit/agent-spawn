@@ -437,13 +437,7 @@ def test_a_scripted_signal_response_can_ignore_sigterm(fakebin: Fakebin) -> None
 
 
 def _wait_for_invocation(fakebin: Fakebin, pid: int) -> None:
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        if any(call.pid == pid for call in fakebin.invocations()):
-            time.sleep(0.2)  # let the script's signal handlers install
-            return
-        time.sleep(0.05)
-    raise AssertionError("the fake never logged its invocation")
+    fakebin.wait_for_hang(pid)  # the script's signal handlers are installed
 
 
 def test_unimplemented_commands_say_so_distinctly(fakebin: Fakebin) -> None:
