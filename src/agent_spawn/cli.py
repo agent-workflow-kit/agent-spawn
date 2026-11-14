@@ -23,9 +23,9 @@ from typing import Any, NoReturn
 from . import __version__, gateway
 from .commands.base import Invocation
 from .commands.table import HANDLERS
+from .config import load_config
 from .ids import agent_id_arg, check_agent_id_text
 from .labels import label_arg, parse_run_labels, parse_user_label, parse_user_labels, selector_arg
-from .config import load_config
 from .output import (
     CliError,
     Outcome,
