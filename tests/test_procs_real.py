@@ -288,7 +288,13 @@ def test_detached_closes_inherited_fds_and_redirects_stdio(
     script = (
         "import os,sys;"
         "print('out',flush=True); print('err',file=sys.stderr,flush=True);"
-        "print('fds',sorted(int(x) for x in os.listdir('/proc/self/fd')),flush=True);"
+        "import json;"
+        "names=os.listdir('/proc/self/fd');"  # the listing handle is closed once this returns
+        "m={}\n"
+        "for n in names:\n"
+        "  try: m[int(n)]=os.readlink('/proc/self/fd/'+n)\n"
+        "  except OSError: pass\n"
+        "print('fds',json.dumps(m),flush=True);"
         "print('stdin',repr(os.read(0,10)),flush=True)"
     )
     extra = [os.pipe() for _ in range(3)]  # fds the caller holds open, inheritable
@@ -314,10 +320,15 @@ def test_detached_closes_inherited_fds_and_redirects_stdio(
     lines = log.read_text().splitlines()
     assert "out" in lines and "err" in lines
     fds = next(line for line in lines if line.startswith("fds"))
-    # Stdio, the acknowledgement pipe and the listdir handle itself; which of 3 and 4 each is
-    # depends on the Python version (3.12 lists with a second descriptor). The caller's pipes were
-    # already shown absent above, so a larger set means a leak.
-    assert set(json.loads(fds[4:])) <= {0, 1, 2, 3, 4}
+    child_fds = {int(k): v for k, v in json.loads(fds[4:]).items()}
+    assert {0, 1, 2} <= set(child_fds)
+    # Some interpreters hold their own descriptors >= 3 (CPython 3.12.8 keeps a file open for
+    # /sys/kernel/mm/transparent_hugepage/enabled), so a fixed fd set is not portable. Instead:
+    # none of the pipes the caller held may appear, and anything >= 3 must be a plain
+    # filesystem path; an inherited pipe would show up as "pipe:[..]".
+    extra_fds = {fd: t for fd, t in child_fds.items() if fd >= 3}
+    assert not extra_targets & set(extra_fds.values())
+    assert all(t.startswith("/") for t in extra_fds.values()), extra_fds
     assert "stdin b''" in lines  # /dev/null
     assert oct(log.stat().st_mode & 0o777) == "0o600"
 

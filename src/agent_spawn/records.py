@@ -75,11 +75,21 @@ _HOOKS = frozenset(
 _AGENT_ID = re.compile(r"ag-[a-z2-7]{8}")
 _CSESSION_ID = re.compile(r"cs-[a-z2-7]{8}")
 _WT_ID = re.compile(r"wt-[a-z2-7]{8}")
-_ACTOR = re.compile(r"(?:human|auto):[A-Za-z0-9._@-]{1,64}")
+_ACTOR = re.compile(r"(human|auto):[A-Za-z0-9._@-]{1,64}")
 _DECISION_ID = re.compile(r"[A-Za-z0-9._:@/-]{1,128}")
 _LABEL = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}")
 _SHA = re.compile(r"[0-9a-f]{40}")
 _ABS_PATH = re.compile(r"/[^\n]*")
+# schemas/defs.json repo_id, verbatim without its anchors.
+_REPO = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?"
+    r"(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+)+"
+)
+# RFC 3339 date-time: full date and time, uppercase T, an offset or Z (ASCII digits only).
+_TS = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?"
+    r"(?:Z|[+-][0-9]{2}:[0-9]{2})"
+)
 
 
 class RecordsError(Exception):
@@ -88,12 +98,20 @@ class RecordsError(Exception):
 
 def format_ts(moment: datetime) -> str:
     """UTC with millisecond precision and a ``Z``, as the schemas' ``date-time`` expects."""
-    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    try:
+        return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    except OverflowError:
+        raise ValueError("time out of range") from None
 
 
 def _parse_ts(text: str) -> datetime:
-    moment = datetime.fromisoformat(text)
-    return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
+    """The UTC instant of an RFC 3339 ``date-time``; ``ValueError`` for anything else."""
+    if _TS.fullmatch(text) is None:
+        raise ValueError("not an RFC 3339 date-time")
+    try:
+        return datetime.fromisoformat(text).astimezone(UTC)
+    except OverflowError:
+        raise ValueError("time out of range") from None
 
 
 # --- validation ----------------------------------------------------------------------------------
@@ -127,7 +145,7 @@ def _check_decision_ids(value: object) -> None:
 def _encode(record: Mapping[str, Any]) -> bytes:
     try:
         text = json.dumps(record, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise _fail(f"record is not JSON: {exc}") from None
     line = text.encode("ascii") + b"\n"
     if len(line) > MAX_RECORD_BYTES:
@@ -136,9 +154,9 @@ def _encode(record: Mapping[str, Any]) -> bytes:
 
 
 def _check_log(record: Mapping[str, Any]) -> None:
-    if record["event"] not in LOG_EVENTS:
+    if not isinstance(record["event"], str) or record["event"] not in LOG_EVENTS:
         raise _fail(f"unknown log event {record['event']!r}")
-    if record["level"] not in LOG_LEVELS:
+    if not isinstance(record["level"], str) or record["level"] not in LOG_LEVELS:
         raise _fail(f"unknown log level {record['level']!r}")
     _optional(_AGENT_ID, record["agent_id"], "agent id")
     _optional(_CSESSION_ID, record.get("csession_id"), "session id")
@@ -149,7 +167,7 @@ def _check_log(record: Mapping[str, Any]) -> None:
     if "decision_ids" in record:
         _check_decision_ids(record["decision_ids"])
     hook = record.get("hook")
-    if hook is not None and hook not in _HOOKS:
+    if hook is not None and (not isinstance(hook, str) or hook not in _HOOKS):
         raise _fail(f"unknown hook {hook!r}")
     pid = record.get("pid")
     if pid is not None and not _is_int(pid):
@@ -172,8 +190,7 @@ def _check_inputs(inputs: object) -> None:
     for label in labels:  # pyright: ignore[reportUnknownVariableType]
         _match(_LABEL, label, "label")
     repo = inputs["repo"]
-    if repo is not None and (not isinstance(repo, str) or not repo or "\n" in repo):
-        raise _fail("invalid repo")
+    _optional(_REPO, repo, "repo")
     worktree = inputs["worktree"]
     if worktree is not None:
         if not isinstance(worktree, dict) or set(worktree) != {"record_id", "path", "owned"}:  # pyright: ignore[reportUnknownArgumentType]
@@ -202,9 +219,9 @@ def check_audit(record: Mapping[str, Any]) -> None:
     _match(_ACTOR, record["actor"], "actor")
     _check_decision_ids(record["decision_id"])
     _match(_AGENT_ID, record["target"], "target")
-    if record["action"] not in AUDIT_ACTIONS:
+    if not isinstance(record["action"], str) or record["action"] not in AUDIT_ACTIONS:
         raise _fail(f"unknown audit action {record['action']!r}")
-    if record["result"] not in AUDIT_RESULTS:
+    if not isinstance(record["result"], str) or record["result"] not in AUDIT_RESULTS:
         raise _fail(f"unknown audit result {record['result']!r}")
     _check_inputs(record["inputs"])
 
@@ -230,6 +247,8 @@ def append_log(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Append one ``log.jsonl`` record and return it. Fields left ``None`` are omitted."""
+    if isinstance(decision_ids, str):
+        raise _fail("decision ids must be a list")
     record: dict[str, Any] = {
         "ts": format_ts(now or datetime.now(UTC)),
         "level": level,
@@ -309,9 +328,23 @@ def _open_checked(path: Path, flags: int) -> int:
     return fd
 
 
+def _prepare_dir(directory: Path) -> None:
+    """Make or check the state dir: a real directory of this user, tightened to 0700."""
+    os.makedirs(directory, mode=DIR_MODE, exist_ok=True)
+    info = os.lstat(directory)
+    if stat.S_ISLNK(info.st_mode):
+        raise RecordsError(f"{directory} is a symbolic link: refusing to follow it")
+    if not stat.S_ISDIR(info.st_mode):
+        raise RecordsError(f"{directory} is not a directory")
+    if info.st_uid != os.geteuid():
+        raise RecordsError(f"{directory} is not owned by this user")
+    if stat.S_IMODE(info.st_mode) != DIR_MODE:
+        os.chmod(directory, DIR_MODE)
+
+
 def _append(directory: Path, name: str, line: bytes) -> None:
     try:
-        os.makedirs(directory, mode=DIR_MODE, exist_ok=True)
+        _prepare_dir(directory)
         fd = _open_checked(directory / name, _APPEND_FLAGS)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -339,7 +372,11 @@ class AuditRead:
     skipped: int
 
 
-def _read_lines(path: Path) -> Iterator[bytes]:
+_DRAIN_CHUNK = 64 * 1024
+
+
+def _read_lines(path: Path) -> Iterator[bytes | None]:
+    """Lines of ``path``; ``None`` stands for one longer than ``MAX_RECORD_BYTES`` (drained)."""
     try:
         fd = _open_checked(path, _READ_FLAGS)
     except FileNotFoundError:
@@ -351,7 +388,13 @@ def _read_lines(path: Path) -> Iterator[bytes]:
     try:
         fcntl.flock(fd, fcntl.LOCK_SH)
         with os.fdopen(fd, "rb", closefd=False) as handle:
-            yield from handle
+            while raw := handle.readline(MAX_RECORD_BYTES + 1):
+                if len(raw) <= MAX_RECORD_BYTES or raw.endswith(b"\n"):
+                    yield raw if len(raw) <= MAX_RECORD_BYTES else None
+                    continue
+                while not raw.endswith(b"\n") and (raw := handle.readline(_DRAIN_CHUNK)):
+                    pass
+                yield None
     except OSError as exc:
         raise RecordsError(f"cannot read {path}: {exc}") from exc
     finally:
@@ -367,6 +410,9 @@ def read_audit(state_dir: str | os.PathLike[str]) -> AuditRead:
     found: list[tuple[datetime, dict[str, Any]]] = []
     skipped = 0
     for raw in _read_lines(Path(state_dir) / AUDIT_NAME):
+        if raw is None:
+            skipped += 1
+            continue
         if not raw.strip():
             continue
         try:
@@ -375,7 +421,7 @@ def read_audit(state_dir: str | os.PathLike[str]) -> AuditRead:
                 raise ValueError("not an object")
             check_audit(record)  # pyright: ignore[reportUnknownArgumentType]
             found.append((_parse_ts(record["ts"]), record))  # pyright: ignore[reportUnknownArgumentType]
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, RecursionError):
             skipped += 1
     found.sort(key=lambda item: item[0])
     return AuditRead([record for _, record in found], skipped)

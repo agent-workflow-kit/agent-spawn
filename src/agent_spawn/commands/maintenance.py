@@ -56,7 +56,8 @@ def export(inv: Invocation) -> Outcome:
     ]
     if result.skipped:
         message = (
-            f"agent-spawn: warning: skipped {result.skipped} unreadable line(s) in audit.jsonl\n"
+            f"agent-spawn: warning: skipped {result.skipped} unreadable or unknown line(s) "
+            "in audit.jsonl\n"
         )
         sys.stderr.write(message)
     rows = [

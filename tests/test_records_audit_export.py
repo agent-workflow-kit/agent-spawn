@@ -6,7 +6,7 @@ import json
 import multiprocessing
 import os
 import stat
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +94,13 @@ def test_events_in_code_match_the_schema() -> None:
     assert set(audit_schema["inputs"]["required"]) == records.AUDIT_INPUT_KEYS
 
 
+def _deep(depth: int = 100_000) -> Any:
+    node: Any = []
+    for _ in range(depth):
+        node = [node]
+    return node
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -111,6 +118,11 @@ def test_events_in_code_match_the_schema() -> None:
         {"event": "launch", "details": {"x": float("nan")}},
         {"event": "launch", "details": {"x": object()}},
         {"event": "launch", "message": 5},
+        {"event": ["x"]},
+        {"event": "launch", "level": ["info"]},
+        {"event": "launch", "hook": ["pre-launch"]},
+        {"event": "launch", "decision_ids": "abc"},
+        {"event": "launch", "details": {"a": _deep()}},
     ],
 )
 def test_invalid_log_records_are_refused_and_nothing_is_written(
@@ -236,6 +248,13 @@ def test_audit_record_is_schema_valid(tmp_path: Path) -> None:
         {"inputs": {**INPUTS, "worktree": "wt-abcdefgh"}},
         {"inputs": {**INPUTS, "worktree": {"record_id": "wt-x", "path": "/w", "owned": True}}},
         {"inputs": {**INPUTS, "repo": ""}},
+        {"inputs": {**INPUTS, "repo": "no-slash"}},
+        {"inputs": {**INPUTS, "repo": "example.org/o/.."}},
+        {"inputs": {**INPUTS, "repo": "Example.org/o/r"}},
+        {"inputs": {**INPUTS, "repo": "example.org/o/r\n"}},
+        {"action": ["stop"]},
+        {"result": ["ok"]},
+        {"now": datetime.min.replace(tzinfo=UTC)},
     ],
 )
 def test_invalid_audit_records_are_refused(tmp_path: Path, override: dict[str, Any]) -> None:
@@ -271,6 +290,129 @@ def test_read_audit_skips_records_that_do_not_fit_the_schema(tmp_path: Path) -> 
         handle.write(json.dumps(bad) + "\n" + json.dumps(extra) + "\n")
     result = records.read_audit(tmp_path)
     assert result.records == [good] and result.skipped == 2
+
+
+def _write_raw(state: Path, *chunks: bytes) -> None:
+    with open(state / "audit.jsonl", "ab") as handle:
+        for chunk in chunks:
+            handle.write(chunk)
+
+
+def test_read_audit_skips_a_deeply_nested_line(tmp_path: Path) -> None:
+    good = audit(tmp_path)
+    _write_raw(tmp_path, b"[" * 100_000 + b"\n")
+    result = records.read_audit(tmp_path)
+    assert result.records == [good] and result.skipped == 1
+
+
+@pytest.mark.parametrize("ts", ["0001-01-01T00:00:00+05:00", "9999-12-31T23:59:59-05:00"])
+def test_read_audit_skips_a_ts_that_overflows_utc(tmp_path: Path, ts: str) -> None:
+    good = audit(tmp_path)
+    _write_raw(tmp_path, json.dumps({**good, "ts": ts}).encode() + b"\n")
+    result = records.read_audit(tmp_path)
+    assert result.records == [good] and result.skipped == 1
+
+
+def test_format_ts_out_of_range_is_a_value_error() -> None:
+    with pytest.raises(ValueError):
+        records.format_ts(datetime.max.replace(tzinfo=timezone(-timedelta(hours=5))))
+
+
+@pytest.mark.parametrize(
+    "ts",
+    [
+        "2026-11-03",
+        "2026-11-03T10:00:00",
+        "2026-11-03 10:00:00Z",
+        "2026-11-03t10:00:00z",
+        "20261103T100000Z",
+        "2026-11-03T10:00:00+0000",
+        "2026-11-03T10:00:00\u0661Z",
+        "2026-11-03T10:00:00Z\n",
+    ],
+)
+def test_ts_must_be_a_full_rfc3339_date_time(tmp_path: Path, ts: str) -> None:
+    good = audit(tmp_path)
+    _write_raw(tmp_path, json.dumps({**good, "ts": ts}).encode() + b"\n")
+    result = records.read_audit(tmp_path)
+    assert result.records == [good] and result.skipped == 1
+    with pytest.raises(ValueError):
+        records.check_audit({**good, "ts": ts})
+
+
+def test_read_audit_skips_an_over_cap_line_and_reads_on(tmp_path: Path) -> None:
+    first = audit(tmp_path, at=NOW)
+    _write_raw(tmp_path, b"x" * (records.MAX_RECORD_BYTES * 3 + 5) + b"\n")
+    second = audit(tmp_path, "teardown", at=NOW + timedelta(seconds=1))
+    result = records.read_audit(tmp_path)
+    assert result.records == [first, second] and result.skipped == 1
+
+
+def test_read_audit_cap_boundary_does_not_disturb_neighbours(tmp_path: Path) -> None:
+    first = audit(tmp_path, at=NOW)
+    _write_raw(
+        tmp_path,
+        b"x" * (records.MAX_RECORD_BYTES - 1) + b"\n",  # exactly the cap with its newline
+        b"x" * records.MAX_RECORD_BYTES + b"\n",  # one over
+    )
+    second = audit(tmp_path, "teardown", at=NOW + timedelta(seconds=1))
+    result = records.read_audit(tmp_path)
+    assert result.records == [first, second] and result.skipped == 2
+
+
+def test_read_audit_ties_keep_file_order(tmp_path: Path) -> None:
+    for action in ("teardown", "stop", "resume_tainted", "stop"):
+        audit(tmp_path, action, at=NOW)
+    result = records.read_audit(tmp_path)
+    assert [r["action"] for r in result.records] == ["teardown", "stop", "resume_tainted", "stop"]
+
+
+def test_hand_written_patterns_match_the_schemas() -> None:
+    defs = schema_registry.schema("agent-spawn/defs.json")["$defs"]
+
+    def body(name: str) -> str:
+        pattern = defs[name]["pattern"]
+        assert pattern.startswith("^") and pattern.endswith("$")
+        return pattern[1:-1]
+
+    assert records._AGENT_ID.pattern == body("agent_id")
+    assert records._CSESSION_ID.pattern == body("csession_id")
+    assert records._WT_ID.pattern == body("wt_record_id")
+    assert records._ACTOR.pattern == body("actor")
+    assert records._DECISION_ID.pattern == body("decision_id")
+    assert records._LABEL.pattern == body("label")
+    assert records._SHA.pattern == body("sha")
+    assert records._ABS_PATH.pattern == body("abs_path")
+    assert records._REPO.pattern == body("repo_id")
+
+
+# --- state directory -----------------------------------------------------------------------------
+
+
+def test_append_tightens_a_loose_state_dir(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir(mode=0o777)
+    state.chmod(0o777)
+    audit(state)
+    assert stat.S_IMODE(state.stat().st_mode) == 0o700
+
+
+def test_append_refuses_a_symlinked_state_dir(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    with pytest.raises(records.RecordsError):
+        audit(link)
+    assert not (real / "audit.jsonl").exists()
+
+
+def test_append_refuses_a_state_dir_of_another_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(os, "geteuid", lambda: os.stat(tmp_path).st_uid + 1)
+    with pytest.raises(records.RecordsError):
+        audit(tmp_path)
 
 
 # --- export command ------------------------------------------------------------------------------
