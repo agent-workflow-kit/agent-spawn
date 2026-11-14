@@ -314,7 +314,10 @@ def test_detached_closes_inherited_fds_and_redirects_stdio(
     lines = log.read_text().splitlines()
     assert "out" in lines and "err" in lines
     fds = next(line for line in lines if line.startswith("fds"))
-    assert set(json.loads(fds[4:])) <= {0, 1, 2, 3}  # 3 is the listdir handle itself
+    # Stdio, the acknowledgement pipe and the listdir handle itself; which of 3 and 4 each is
+    # depends on the Python version (3.12 lists with a second descriptor). The caller's pipes were
+    # already shown absent above, so a larger set means a leak.
+    assert set(json.loads(fds[4:])) <= {0, 1, 2, 3, 4}
     assert "stdin b''" in lines  # /dev/null
     assert oct(log.stat().st_mode & 0o777) == "0o600"
 

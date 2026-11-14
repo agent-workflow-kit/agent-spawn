@@ -305,7 +305,7 @@ def test_error_outcome_wraps_the_envelope_with_default_decision_ids() -> None:
     outcome = output.error_outcome(CliError.of("not_found", "no such agent"), ["d9"])
     assert outcome.exit_code == 10
     assert outcome.kind is output.PayloadKind.ENVELOPE
-    assert outcome.payload is not None
+    assert isinstance(outcome.payload, dict)
     assert outcome.payload["error"]["decision_ids"] == ["d9"]
 
 

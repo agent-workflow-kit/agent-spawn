@@ -42,7 +42,10 @@ OWNERS = {
 }
 
 
-@pytest.mark.parametrize("command", sorted(MIN_ARGV))
+IMPLEMENTED = {"export"}  # commands whose issue has landed; they are no longer stubs
+
+
+@pytest.mark.parametrize("command", sorted(set(MIN_ARGV) - IMPLEMENTED))
 def test_every_command_is_a_stub_that_fails_through_the_envelope(
     command: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
