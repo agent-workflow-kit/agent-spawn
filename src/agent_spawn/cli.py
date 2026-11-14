@@ -25,6 +25,7 @@ from .commands.base import Invocation
 from .commands.table import HANDLERS
 from .ids import agent_id_arg, check_agent_id_text
 from .labels import label_arg, parse_run_labels, parse_user_label, parse_user_labels, selector_arg
+from .config import load_config
 from .output import (
     CliError,
     Outcome,
@@ -85,6 +86,23 @@ class UsageError(Exception):
         self.message = message
         self.usage = usage
         self.parsed = parsed  # argparse succeeded; decision_ids and result_file are known
+        self.decision_ids = list(decision_ids)
+        self.result_file = result_file
+
+
+class ConfigFailure(Exception):
+    """An invalid config (``config_invalid``), found after parsing: like a usage error found then,
+    it carries the decision ids and the result file the envelope goes to."""
+
+    def __init__(
+        self,
+        error: CliError,
+        *,
+        decision_ids: Sequence[str] = (),
+        result_file: ResultFileTarget | None = None,
+    ) -> None:
+        super().__init__(error.message)
+        self.error = error
         self.decision_ids = list(decision_ids)
         self.result_file = result_file
 
@@ -389,7 +407,7 @@ def stdin_is_tty() -> bool:
 
 def me_name() -> str:
     """The user name for the default actor ``human:<me.name>``, fitted to the actor grammar."""
-    # TODO(#3): config key me.name (default: the OS user name).
+    # The config key me.name, when set, takes precedence over this (see parse_invocation).
     # The account of the effective uid, never $LOGNAME or $USER (which anyone can set).
     try:
         name = pwd.getpwuid(os.geteuid()).pw_name
@@ -413,8 +431,9 @@ def _check_usage(args: argparse.Namespace, key: str) -> None:
     state_dir: str | None = getattr(args, "state_dir", None)
     config: str | None = getattr(args, "config", None)
     if internal:
-        # TODO(#14): decide relay exit on malformed argv (State relay says exit 0 always;
-        # Internal commands says exit 2).
+        # TODO(#14): decide relay exit on malformed argv and on an invalid config (State relay
+        # says exit 0 always; Internal commands says exit 2; parse_invocation exits 2 on
+        # config_invalid before the relay handler runs).
         for flag, value in (("--state-dir", state_dir), ("--config", config)):
             if value is None or not value.startswith("/") or "\0" in value:
                 raise ValueError(f"{key} needs an absolute {flag}")
@@ -510,9 +529,30 @@ def parse_invocation(argv: Sequence[str]) -> Invocation:
     try:
         validate_decision_ids(decision_ids)
         _check_usage(args, key)
+    except ValueError as exc:
+        raise UsageError(
+            str(exc),
+            child.format_usage(),
+            parsed=True,
+            decision_ids=capped,
+            result_file=result_file,
+        ) from None
+    # Fail fast on an invalid config (CliError config_invalid, exit 2) before anything else runs.
+    internal = key in INTERNAL_COMMANDS
+    named: str | None = getattr(args, "config", None)
+    try:
+        # TODO(#11): a window supervisor loads this config, including AGENT_SPAWN_* overrides,
+        # from its own environment before it adopts the launcher's handoff environment; decide
+        # which environment's AGENT_SPAWN_* applies to it.
+        loaded = load_config(named, must_exist=named is not None and not internal)
+    except CliError as error:
+        raise ConfigFailure(error, decision_ids=capped, result_file=result_file) from None
+    try:
         tty = stdin_is_tty()
         explicit = args.actor is not None
-        actor: str = args.actor or (f"human:{me_name()}" if tty else "auto:unknown")
+        actor: str = args.actor or (
+            f"human:{loaded.config.me.name or me_name()}" if tty else "auto:unknown"
+        )
         _check_human_only(args, actor, explicit, tty)
     except ValueError as exc:
         raise UsageError(
@@ -534,6 +574,8 @@ def parse_invocation(argv: Sequence[str]) -> Invocation:
         verbose=bool(args.verbose),
         quiet=bool(args.quiet),
         result_file=result_file,
+        config=loaded.config,
+        config_file=loaded.path,
     )
 
 
@@ -643,6 +685,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except _ParserExit as done:  # --help or --version, printed by argparse
         _write(sys.stdout, "")
         return done.status
+    except ConfigFailure as exc:
+        return _config_failure(exc, argv_list)
     except UsageError as exc:
         return _usage_failure(exc, argv_list)
 
@@ -669,6 +713,14 @@ def _usage_failure(exc: UsageError, argv: list[str]) -> int:
                 _warn(f"--result-file {raw} not written: {error.message}")
     _write_result_file(target, outcome)
     return 2
+
+
+def _config_failure(exc: ConfigFailure, argv: list[str]) -> int:
+    """Print ``config_invalid`` (exit 2) and write it to the result file when one is known."""
+    outcome = error_outcome(exc.error, exc.decision_ids)
+    _emit(outcome, _json_requested(argv))
+    _write_result_file(exc.result_file, outcome)
+    return exc.error.exit_code
 
 
 def _run(inv: Invocation) -> Outcome:
