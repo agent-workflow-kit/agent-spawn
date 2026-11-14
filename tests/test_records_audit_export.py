@@ -397,14 +397,38 @@ def test_append_tightens_a_loose_state_dir(tmp_path: Path) -> None:
     assert stat.S_IMODE(state.stat().st_mode) == 0o700
 
 
-def test_append_refuses_a_symlinked_state_dir(tmp_path: Path) -> None:
+def test_append_follows_a_symlinked_state_dir_and_tightens_the_target(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    real.chmod(0o755)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    audit(link)
+    assert link.is_symlink()
+    assert stat.S_IMODE(real.stat().st_mode) == 0o700
+    assert (real / "audit.jsonl").exists()
+
+
+def test_append_refuses_a_symlink_to_a_dir_of_another_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     real = tmp_path / "real"
     real.mkdir()
     link = tmp_path / "link"
     link.symlink_to(real)
+    monkeypatch.setattr(os, "geteuid", lambda: os.stat(real).st_uid + 1)
     with pytest.raises(records.RecordsError):
         audit(link)
     assert not (real / "audit.jsonl").exists()
+
+
+def test_append_refuses_a_symlink_to_a_non_directory(tmp_path: Path) -> None:
+    target = tmp_path / "file"
+    target.write_text("x")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    with pytest.raises(records.RecordsError):
+        audit(link)
 
 
 def test_append_refuses_a_state_dir_of_another_user(

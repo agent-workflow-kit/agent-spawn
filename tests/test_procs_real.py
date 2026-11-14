@@ -329,6 +329,8 @@ def test_detached_closes_inherited_fds_and_redirects_stdio(
     extra_fds = {fd: t for fd, t in child_fds.items() if fd >= 3}
     assert not extra_targets & set(extra_fds.values())
     assert all(t.startswith("/") for t in extra_fds.values()), extra_fds
+    # At most one: the interpreter-owned one (CPython 3.12.8); none elsewhere.
+    assert len(extra_fds) <= 1, extra_fds
     assert "stdin b''" in lines  # /dev/null
     assert oct(log.stat().st_mode & 0o777) == "0o600"
 

@@ -329,17 +329,20 @@ def _open_checked(path: Path, flags: int) -> int:
 
 
 def _prepare_dir(directory: Path) -> None:
-    """Make or check the state dir: a real directory of this user, tightened to 0700."""
-    os.makedirs(directory, mode=DIR_MODE, exist_ok=True)
-    info = os.lstat(directory)
-    if stat.S_ISLNK(info.st_mode):
-        raise RecordsError(f"{directory} is a symbolic link: refusing to follow it")
+    """Make or check the state dir: a directory of this user, tightened to 0700.
+
+    Like the store, the dir itself may be a symlink (the user chose that): it is resolved, and
+    the checks and the tightening apply to the target.
+    """
+    target = Path(os.path.realpath(directory))
+    os.makedirs(target, mode=DIR_MODE, exist_ok=True)
+    info = os.stat(target)
     if not stat.S_ISDIR(info.st_mode):
-        raise RecordsError(f"{directory} is not a directory")
+        raise RecordsError(f"{target} is not a directory")
     if info.st_uid != os.geteuid():
-        raise RecordsError(f"{directory} is not owned by this user")
+        raise RecordsError(f"{target} is not owned by this user")
     if stat.S_IMODE(info.st_mode) != DIR_MODE:
-        os.chmod(directory, DIR_MODE)
+        os.chmod(target, DIR_MODE)
 
 
 def _append(directory: Path, name: str, line: bytes) -> None:
