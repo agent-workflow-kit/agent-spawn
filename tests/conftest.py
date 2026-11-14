@@ -1,3 +1,4 @@
+import os
 from collections.abc import Iterator
 
 import pytest
@@ -25,4 +26,6 @@ def private_environment(
         path.mkdir()
         monkeypatch.setenv(name, str(path))
     monkeypatch.setenv("SHELL", "/bin/sh")
+    for name in [n for n in os.environ if n.startswith("AGENT_SPAWN_")]:
+        monkeypatch.delenv(name)
     yield
