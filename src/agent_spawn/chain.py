@@ -202,11 +202,14 @@ def record_unstarted(
     *,
     hooks: object,
     token: str | None,
+    actual: RunOutcome | None = None,
 ) -> None:
     """Record a chain run that was canceled before it started, with its ``not-started`` outcome.
 
     ``end_reason`` None records a run that could not be confirmed ended (``stop`` failed or left
     it live): the row exists with ``ended_at`` but with a null outcome, never a fabricated one.
+    ``actual`` is the real final outcome of a run that ended itself (read from ``status``): it is
+    recorded as it is, whatever it was.
     """
     assert sup.store is not None
     fields: dict[str, object] = {
@@ -218,7 +221,13 @@ def record_unstarted(
         "exit_code": None,
         "ended_at": sup.gateway.wall_time(),
     }
-    if end_reason is not None:
+    if actual is not None and actual.final:
+        fields.update(
+            outcome=outcome_object(sup.agent_id, actual, auto_resumed=True),
+            end_reason=actual.end_reason,
+            exit_code=actual.exit_code,
+        )
+    elif end_reason is not None:
         result = RunOutcome(
             session, run, "launch", "not-started", end_reason, 12, "not-started", None, "status"
         )
@@ -420,8 +429,11 @@ def _recover_run(
     """
     run = error.run if error.csession_id == session else None
     ended_reason: str | None = None
+    actual: RunOutcome | None = None
     if run is not None:
-        ended_reason = _real_end_reason(backend, session, run, error)
+        # The run ended itself in the launch phase: never stop it, never invent its outcome.
+        actual = _real_outcome(backend, session, run)
+        ended_reason = actual.end_reason if actual is not None else None
     elif error.maybe_allocated:
         found = _pending_run_after(sup, backend, session, trigger)
         if found is None:
@@ -429,29 +441,23 @@ def _recover_run(
         run = found
     if run is None:
         return None, None
-    if ended_reason is None:
+    if error.run is None or error.csession_id != session:
         ended_reason = "canceled" if stop_pending(sup, backend, session) else None
     try:
-        record_unstarted(sup, session, run, ended_reason, hooks=hooks, token=token)
+        record_unstarted(sup, session, run, ended_reason, hooks=hooks, token=token, actual=actual)
     except StoreError as problem:
         sup.log("warning", level="warn", message=f"could not record the run: {problem}")
     return run, ended_reason
 
 
-def _real_end_reason(
-    backend: SessionBackend, session: str, run: int, error: StartError
-) -> str | None:
-    lower = error.lower_error
-    reason = lower.get("end_reason") if isinstance(lower, dict) else None  # pyright: ignore[reportUnknownMemberType]
-    if isinstance(reason, str):
-        return reason
+def _real_outcome(backend: SessionBackend, session: str, run: int) -> RunOutcome | None:
+    """The final outcome of ``run`` from ``status --run N``, else None (unreadable or live)."""
     try:
         status = backend.status(session, run)
     except CliError:
         return None
-    if status.run.run == run and status.run.outcome is not None:
-        return status.run.end_reason
-    return None
+    outcome = status.outcome()
+    return outcome if status.run.run == run and outcome.final else None
 
 
 def _pending_run_after(

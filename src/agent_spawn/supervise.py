@@ -73,8 +73,8 @@ class Signals:
             return
         try:
             outcome = forwarder.forward(signum)
-        except OSError:
-            return  # the loop retries through its own forward
+        except Exception:  # noqa: BLE001 - a handler must not raise; the loop retries
+            return  # the signal stays queued and the loop retries through its own forward
         if outcome is not None:
             self.sent.append(outcome)
 
@@ -201,14 +201,19 @@ class Supervisor:
                 if previous is None:
                     return self.park_canceled(backend, session, ctx)
                 run_row = store.get_run(self.agent_id, ctx.run) or {}
-                chain.cancel_pending(
-                    self,
-                    backend,
-                    session,
-                    ctx.run,
-                    hooks=run_row.get("hooks"),
-                    token=run_row.get("outcome_token"),
-                )
+                try:
+                    chain.cancel_pending(
+                        self,
+                        backend,
+                        session,
+                        ctx.run,
+                        hooks=run_row.get("hooks"),
+                        token=run_row.get("outcome_token"),
+                    )
+                except Exception as problem:  # noqa: BLE001 - best effort, as chain._start
+                    self.log(
+                        "warning", level="warn", message=f"could not cancel the run: {problem}"
+                    )
                 failure = chain.ChainFailure("agent-spawn", "failed", run=ctx.run)
                 return self.park_chain_failure(previous, failure)
             self.watch(child, poller, session, ctx)

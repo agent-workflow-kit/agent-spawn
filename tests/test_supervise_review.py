@@ -421,6 +421,8 @@ def test_start_failure_with_an_ended_run_records_the_real_end_reason(
     rig_for: Callable[..., Rig], fakebin: Fakebin
 ) -> None:
     rig = rig_for()
+    bump_run(fakebin, rig.session, 2)  # the failed start allocated run 2, which then ended
+    fakebin.script("claude-session", "status", argv_contains=["--run=2"], outcome="vetoed")
     script_unreported_first(fakebin)
     fakebin.script("claude-session", "start", argv_contains=["--dry-run"])
     fakebin.script(
@@ -615,13 +617,9 @@ def test_recover_run_after_a_start_that_allocated_a_run(
     rig_for: Callable[..., Rig], fakebin: Fakebin
 ) -> None:
     rig = rig_for()
-    error = StartError(
-        "launch_failed",
-        "x",
-        csession_id=rig.session,
-        run=2,
-        lower_error={"code": "launch_failed", "end_reason": "hook_veto"},
-    )
+    bump_run(fakebin, rig.session, 2)
+    fakebin.script("claude-session", "status", outcome="vetoed")
+    error = StartError("launch_failed", "x", csession_id=rig.session, run=2)
     assert recover(rig, error) == (2, "hook_veto")  # the run ended itself: no stop
     assert not [a for a in fakebin.argvs("claude-session") if a[0] == "stop"]
     second = rig_runs(rig)[-1]
@@ -647,3 +645,145 @@ def test_sigterm_after_exec_exited_skips_the_resume(
     assert row["status"] == "parked" and row["park_reason"] == "unreported"
     assert not [a for a in fakebin.argvs("claude-session") if a[0] == "start"]
     assert [r["run"] for r in rig_runs(rig)] == [1]
+
+
+# --- 16: hardening of signal forwarding and run recovery ----
+
+
+def test_a_cancel_pending_failure_still_parks_the_chain_failure(
+    rig_for: Callable[..., Rig], fakebin: Fakebin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = rig_for()
+    sup = rig.supervisor
+    script_unreported_first(fakebin)
+    original = sup.spawn_exec
+    spawned: list[int] = []
+
+    def spawn(row: dict[str, Any], session: str) -> subprocess.Popen[bytes]:
+        spawned.append(1)
+        if len(spawned) == 2:
+            raise OSError("no exec")
+        return original(row, session)
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise StoreError("store down")
+
+    sup.spawn_exec = spawn  # type: ignore[method-assign]
+    monkeypatch.setattr(chain, "cancel_pending", boom)
+    sup.run()
+    assert rig.agent()["status"] == "parked"
+    (park,) = [p for n, p in rig_events(rig) if n == "post-park"]
+    assert park["chain_failure"]["tool"] == "agent-spawn"
+
+
+def test_the_forwarder_blocks_the_signals_around_its_check_and_mark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    forwarder = procs.SignalForwarder(procs.ProcessIdentity(pid=1, start_time=1, boot_id="b"))
+    calls: list[tuple[int, set[int]]] = []
+    real = signal.pthread_sigmask
+
+    def spy(how: int, mask: Any) -> Any:
+        calls.append((how, set(mask)))
+        return real(how, mask)
+
+    monkeypatch.setattr(signal, "pthread_sigmask", spy)
+    monkeypatch.setattr(procs, "forward_signal", lambda *a, **k: None)
+    forwarder.forward(signal.SIGTERM)
+    assert calls[0][0] == signal.SIG_BLOCK
+    assert {signal.SIGTERM, signal.SIGHUP, signal.SIGINT} <= calls[0][1]
+    assert calls[-1][0] in (signal.SIG_SETMASK, signal.SIG_UNBLOCK)
+
+
+def test_an_error_after_the_main_signal_was_delivered_counts_as_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = procs.ProcessIdentity(pid=1, start_time=1, boot_id="b")
+    forwarder = procs.SignalForwarder(identity)
+    sent: list[int] = []
+
+    class Handle:
+        def __enter__(self) -> Handle:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def send(self, sig: int) -> bool:
+            sent.append(sig)
+            if sig == signal.SIGCONT:
+                raise OSError("cont failed")
+            return True
+
+    monkeypatch.setattr(procs, "open_verified", lambda *a, **k: Handle())
+    outcome = forwarder.forward(signal.SIGTERM)
+    assert outcome is not None and outcome.sent
+    assert forwarder.forward(signal.SIGTERM) is None  # marked: not sent twice
+    assert sent == [signal.SIGTERM, signal.SIGCONT]
+
+
+def test_a_failed_main_send_is_unmarked(monkeypatch: pytest.MonkeyPatch) -> None:
+    forwarder = procs.SignalForwarder(procs.ProcessIdentity(pid=1, start_time=1, boot_id="b"))
+
+    def open_fails(*args: Any, **kwargs: Any) -> None:
+        raise OSError("open failed")
+
+    monkeypatch.setattr(procs, "open_verified", open_fails)
+    with pytest.raises(OSError):
+        forwarder.forward(signal.SIGTERM)
+    monkeypatch.setattr(procs, "open_verified", lambda *a, **k: None)
+    outcome = forwarder.forward(signal.SIGTERM)
+    assert outcome is not None and outcome.reason == "gone"
+
+
+def test_the_handler_swallows_any_forward_error_and_keeps_the_signal_queued() -> None:
+    signals = Signals()
+
+    class Broken:
+        def forward(self, sig: int) -> None:
+            raise ValueError("bad")
+
+    signals.forwarder = Broken()  # type: ignore[assignment]
+    signals.handle(signal.SIGTERM, None)
+    assert signals.received == [signal.SIGTERM] and signals.sent == []
+
+
+def bump_run(fakebin: Fakebin, session: str, run: int) -> None:
+    """Make the fake claude-session know ``run`` (as if a start had allocated it)."""
+    path = Path(str(fakebin.log) + ".sessions.json")
+    sessions = json.loads(path.read_text())
+    sessions[session]["run"] = run
+    path.write_text(json.dumps(sessions))
+
+
+def _ended_run_error(rig: Rig) -> StartError:
+    return StartError("launch_failed", "x", csession_id=rig.session, run=2)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "reason", "code"), [("vetoed", "hook_veto", 11), ("escalated", "hook_escalate", 13)]
+)
+def test_recover_run_records_the_real_outcome_of_an_ended_run(
+    rig_for: Callable[..., Rig], fakebin: Fakebin, outcome: str, reason: str, code: int
+) -> None:
+    rig = rig_for()
+    bump_run(fakebin, rig.session, 2)
+    fakebin.script("claude-session", "status", outcome=outcome)
+    assert recover(rig, _ended_run_error(rig)) == (2, reason)
+    assert not [a for a in fakebin.argvs("claude-session") if a[0] == "stop"]
+    row = rig_runs(rig)[-1]
+    assert row["end_reason"] == reason and row["exit_code"] == code
+    assert row["outcome"]["outcome"] == outcome
+
+
+def test_recover_run_with_unreadable_status_records_no_outcome_and_does_not_stop(
+    rig_for: Callable[..., Rig], fakebin: Fakebin
+) -> None:
+    rig = rig_for()
+    bump_run(fakebin, rig.session, 2)
+    fakebin.script("claude-session", "status", exit=1, error={"code": "failed", "message": "x"})
+    assert recover(rig, _ended_run_error(rig)) == (2, None)
+    assert not [a for a in fakebin.argvs("claude-session") if a[0] == "stop"]
+    row = rig_runs(rig)[-1]
+    assert row["run"] == 2 and row["outcome"] is None and row["end_reason"] is None
+    assert any("without an outcome" in str(r.get("message")) for r in log_records(rig.state))
