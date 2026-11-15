@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/hooks/pre-create.json",
+  "title": "wtctl pre-create hook payload",
+  "type": "object",
+  "properties": {
+    "tool": {
+      "const": "wtctl"
+    },
+    "object_type": {
+      "$ref": "../defs.json#/$defs/object_type"
+    },
+    "object_id": {
+      "$ref": "../defs.json#/$defs/id",
+      "description": "The record id, allocated before this hook (a veto burns it); also in WTCTL_ID."
+    },
+    "repo": {
+      "$ref": "../defs.json#/$defs/repo_id"
+    },
+    "labels": {
+      "$ref": "../defs.json#/$defs/labels"
+    },
+    "hook": {
+      "const": "pre-create"
+    },
+    "clone_path": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/abs_path"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "null for a throwaway from a remote source."
+    },
+    "path": {
+      "$ref": "../defs.json#/$defs/abs_path",
+      "description": "The planned path."
+    },
+    "branch": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/branch"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "branch_action": {
+      "enum": [
+        "existing",
+        "track",
+        "new",
+        "detached",
+        null
+      ],
+      "description": "null for throwaways."
+    },
+    "base": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The resolved base ref; null when none is used."
+    },
+    "ref": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/sha"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "source": {
+      "enum": [
+        "auto",
+        "local",
+        "remote",
+        null
+      ],
+      "description": "Throwaway: the requested --source (may be auto, decided after this hook; the record's source is the one used). Worktree: null."
+    },
+    "actor": {
+      "$ref": "../defs.json#/$defs/actor"
+    },
+    "decision_ids": {
+      "$ref": "../defs.json#/$defs/decision_ids",
+      "description": "From --decision-id."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "tool",
+    "object_type",
+    "object_id",
+    "repo",
+    "labels",
+    "hook",
+    "clone_path",
+    "path",
+    "branch",
+    "branch_action",
+    "base",
+    "ref",
+    "source",
+    "actor",
+    "decision_ids"
+  ]
+}

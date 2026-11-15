@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/cli/exists.json",
+  "title": "termctl exists --json",
+  "description": "Printed on exit 0 and exit 10.",
+  "type": "object",
+  "properties": {
+    "input": {
+      "type": "string",
+      "description": "The id argument as given."
+    },
+    "id": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/id"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The full id; null when no managed pane matched."
+    },
+    "exists": {
+      "type": "boolean"
+    },
+    "socket_path": {
+      "$ref": "../defs.json#/$defs/socket_path"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "input",
+    "id",
+    "exists",
+    "socket_path"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "exists": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "id": {
+            "$ref": "../defs.json#/$defs/id"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "id": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ]
+}

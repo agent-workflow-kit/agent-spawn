@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/log.json",
+  "title": "wtctl log.jsonl record",
+  "description": "One record per state-changing command and per hook run.",
+  "type": "object",
+  "properties": {
+    "ts": {
+      "$ref": "defs.json#/$defs/ts"
+    },
+    "level": {
+      "enum": [
+        "info",
+        "warn",
+        "error"
+      ],
+      "description": "error: exit 1; warn: refusals, vetoes, escalations, expected failures, post-hook failures; info: everything else."
+    },
+    "event": {
+      "enum": [
+        "create",
+        "throwaway_create",
+        "bootstrap",
+        "remove",
+        "throwaway_remove",
+        "refused",
+        "extract",
+        "baseline_accept",
+        "prune",
+        "reconcile",
+        "clone",
+        "discovered",
+        "adopt",
+        "forget",
+        "label",
+        "cron",
+        "fetch",
+        "hook"
+      ]
+    },
+    "id": {
+      "oneOf": [
+        {
+          "$ref": "defs.json#/$defs/id"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "repo": {
+      "oneOf": [
+        {
+          "$ref": "defs.json#/$defs/repo_id"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "actor": {
+      "oneOf": [
+        {
+          "$ref": "defs.json#/$defs/actor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "decision_ids": {
+      "$ref": "defs.json#/$defs/decision_ids"
+    },
+    "details": {
+      "type": "object",
+      "description": "Event-specific context. Never holds secrets; may hold untrusted text (paths, hook stderr, output tails).",
+      "x-untrusted": true
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "ts",
+    "level",
+    "event",
+    "id",
+    "repo",
+    "actor",
+    "decision_ids",
+    "details"
+  ]
+}

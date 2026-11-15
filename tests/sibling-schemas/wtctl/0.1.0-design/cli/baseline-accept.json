@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/baseline-accept.json",
+  "title": "wtctl baseline accept --json",
+  "type": "object",
+  "properties": {
+    "record": {
+      "$ref": "../defs.json#/$defs/record",
+      "description": "The record with the new baseline_digest."
+    },
+    "old_digest": {
+      "$ref": "../defs.json#/$defs/digest"
+    },
+    "new_digest": {
+      "$ref": "../defs.json#/$defs/digest"
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "$ref": "../defs.json#/$defs/baseline_item"
+      },
+      "description": "The changed items that were accepted."
+    },
+    "anchors": {
+      "type": "array",
+      "items": {
+        "$ref": "../defs.json#/$defs/anchor_change"
+      },
+      "description": "Every anchor of the record with its recorded and current identity and current mount information; those with changed true were re-recorded (after a reboot, some file systems present a new st_dev). An anchor on a FUSE file system is refused (exit 20 unlinked, details.cause fuse_anchor)."
+    },
+    "dry_run": {
+      "type": "boolean",
+      "description": "true: what the command would do; nothing was changed and no hooks ran."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "record",
+    "old_digest",
+    "new_digest",
+    "items",
+    "anchors",
+    "dry_run"
+  ]
+}

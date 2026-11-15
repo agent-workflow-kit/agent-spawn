@@ -1,0 +1,354 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/audit.json",
+  "title": "wtctl audit.jsonl record",
+  "description": "Written for worktree removal, branch deletion, baseline accept, adopt, a human clone re-accepting a changed clone identity and reconcile's admin-entry deletion. Throwaway create/remove, prune, create, bootstrap, clone and discovery are only logged.",
+  "type": "object",
+  "properties": {
+    "ts": {
+      "$ref": "defs.json#/$defs/ts"
+    },
+    "actor": {
+      "$ref": "defs.json#/$defs/actor"
+    },
+    "decision_id": {
+      "oneOf": [
+        {
+          "$ref": "defs.json#/$defs/decision_id"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "defs.json#/$defs/decision_id"
+          }
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "From --decision-id and hooks; a string, a list, or null when none."
+    },
+    "target": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "oneOf": [
+            {
+              "$ref": "defs.json#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The record id; null for clone_accept, whose path is the clone."
+        },
+        "path": {
+          "$ref": "defs.json#/$defs/abs_path"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "path"
+      ]
+    },
+    "action": {
+      "enum": [
+        "remove",
+        "branch_delete",
+        "baseline_accept",
+        "adopt",
+        "clone_accept",
+        "admin_entry_delete"
+      ]
+    },
+    "inputs": {
+      "type": "object"
+    },
+    "result": {
+      "enum": [
+        "ok",
+        "error"
+      ],
+      "description": "ok: the action completed; error: it failed after starting (e.g. a partial deletion)."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "ts",
+    "actor",
+    "decision_id",
+    "target",
+    "action",
+    "inputs",
+    "result"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "remove"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "inputs": {
+            "type": "object",
+            "properties": {
+              "head": {
+                "oneOf": [
+                  {
+                    "$ref": "defs.json#/$defs/sha"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "HEAD at removal; null when unknown (finishing a partial record)."
+              },
+              "merged_head": {
+                "oneOf": [
+                  {
+                    "$ref": "defs.json#/$defs/sha"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "baseline_digest": {
+                "$ref": "defs.json#/$defs/digest"
+              },
+              "overridden": {
+                "type": "array",
+                "items": {
+                  "$ref": "defs.json#/$defs/forceable_check"
+                },
+                "uniqueItems": true,
+                "description": "The checks a human --force overrode; empty when nothing was forced."
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "head",
+              "merged_head",
+              "baseline_digest",
+              "overridden"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "branch_delete"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "inputs": {
+            "type": "object",
+            "properties": {
+              "branch": {
+                "$ref": "defs.json#/$defs/branch"
+              },
+              "sha": {
+                "$ref": "defs.json#/$defs/sha"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "branch",
+              "sha"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "baseline_accept"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "inputs": {
+            "type": "object",
+            "properties": {
+              "old_digest": {
+                "$ref": "defs.json#/$defs/digest"
+              },
+              "new_digest": {
+                "$ref": "defs.json#/$defs/digest"
+              },
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "defs.json#/$defs/baseline_item"
+                }
+              },
+              "anchors": {
+                "type": "array",
+                "items": {
+                  "$ref": "defs.json#/$defs/anchor_change"
+                }
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "old_digest",
+              "new_digest",
+              "items",
+              "anchors"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "adopt"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "inputs": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "$ref": "defs.json#/$defs/abs_path"
+              },
+              "baseline_digest": {
+                "$ref": "defs.json#/$defs/digest"
+              },
+              "holder": {
+                "oneOf": [
+                  {
+                    "$ref": "defs.json#/$defs/holder"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "path",
+              "baseline_digest",
+              "holder"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "clone_accept"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "inputs": {
+            "type": "object",
+            "properties": {
+              "repo": {
+                "$ref": "defs.json#/$defs/repo_id"
+              },
+              "clone_path": {
+                "$ref": "defs.json#/$defs/abs_path"
+              },
+              "anchors": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "$ref": "defs.json#/$defs/anchor_change"
+                }
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "repo",
+              "clone_path",
+              "anchors"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "admin_entry_delete"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "inputs": {
+            "type": "object",
+            "properties": {
+              "admin_entry": {
+                "$ref": "defs.json#/$defs/abs_path",
+                "description": "The deleted <common>/worktrees/<n>/ directory."
+              },
+              "head": {
+                "oneOf": [
+                  {
+                    "$ref": "defs.json#/$defs/sha"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The admin entry's HEAD; null when detached HEAD could not be read."
+              },
+              "branch": {
+                "oneOf": [
+                  {
+                    "$ref": "defs.json#/$defs/branch"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "tip": {
+                "oneOf": [
+                  {
+                    "$ref": "defs.json#/$defs/sha"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "admin_entry",
+              "head",
+              "branch",
+              "tip"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

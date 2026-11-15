@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/hooks/post-close.json",
+  "title": "termctl post-close hook payload",
+  "type": "object",
+  "properties": {
+    "tool": {
+      "const": "termctl"
+    },
+    "object_type": {
+      "const": "pane"
+    },
+    "object_id": {
+      "$ref": "../defs.json#/$defs/id"
+    },
+    "labels": {
+      "$ref": "../defs.json#/$defs/labels"
+    },
+    "hook": {
+      "const": "post-close"
+    },
+    "result": {
+      "$ref": "../cli/close.json"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "tool",
+    "object_type",
+    "object_id",
+    "labels",
+    "hook",
+    "result"
+  ]
+}
