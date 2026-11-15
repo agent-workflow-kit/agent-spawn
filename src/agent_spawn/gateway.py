@@ -160,6 +160,8 @@ def _reset_child_signals() -> None:
     for sig in _RESET_SIGNALS:
         signal.signal(sig, signal.SIG_DFL)
     signal.pthread_sigmask(signal.SIG_SETMASK, ())
+
+
 def _communicate(
     proc: subprocess.Popen[bytes],
     data: bytes | None,
