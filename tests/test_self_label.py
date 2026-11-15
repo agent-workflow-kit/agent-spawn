@@ -312,12 +312,17 @@ def test_mirror_failure_is_a_warning_not_a_failure(rig: Rig) -> None:
 # --- read_secret directly ----------------------------------------------------------------------
 
 
+def _ident(path: str) -> tuple[int, int]:
+    info = os.lstat(path)
+    return (info.st_dev, info.st_ino)
+
+
 def test_read_secret_checks_the_owner(tmp_path: Path) -> None:
     (tmp_path / "secret").write_text("abc")
     (tmp_path / "secret").chmod(0o600)
-    assert self_label.read_secret(str(tmp_path), os.getuid()) == "abc"
+    assert self_label.read_secret(str(tmp_path), os.getuid(), _ident(str(tmp_path))) == "abc"
     with pytest.raises(CliError) as caught:
-        self_label.read_secret(str(tmp_path), os.getuid() + 1)
+        self_label.read_secret(str(tmp_path), os.getuid() + 1, _ident(str(tmp_path)))
     assert caught.value.exit_code == 11
 
 
@@ -329,14 +334,14 @@ def test_read_secret_refuses_a_symlinked_directory_component_leaf(tmp_path: Path
     link = tmp_path / "link"
     link.symlink_to(real)
     with pytest.raises(CliError):  # the directory itself is opened with O_NOFOLLOW
-        self_label.read_secret(str(link), os.getuid())
+        self_label.read_secret(str(link), os.getuid(), _ident(str(link)))
 
 
 def test_read_secret_refuses_non_utf8(tmp_path: Path) -> None:
     (tmp_path / "secret").write_bytes(b"\xff\xfe")
     (tmp_path / "secret").chmod(0o600)
     with pytest.raises(CliError):
-        self_label.read_secret(str(tmp_path), os.getuid())
+        self_label.read_secret(str(tmp_path), os.getuid(), _ident(str(tmp_path)))
 
 
 # --- review round 1 ----------------------------------------------------------------------------
@@ -357,25 +362,14 @@ def test_lower_tool_failure_text_is_never_echoed(bare_rig: Rig, command: str) ->
     assert body["error"].get("lower_code") is None
 
 
-def test_read_secret_refuses_a_directory_swapped_after_the_open(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # R4: the opened descriptor must be the directory the path names now
+def test_read_secret_refuses_a_directory_that_is_not_the_expected_one(tmp_path: Path) -> None:
+    # R4: the opened descriptor must be the directory that was checked before the open
     (tmp_path / "secret").write_text("abc")
     (tmp_path / "secret").chmod(0o600)
-    real_stat = os.stat
-
-    def swapped(path: Any, *args: Any, **kwargs: Any) -> Any:
-        info = real_stat(path, *args, **kwargs)
-        if path == str(tmp_path):
-            fields = list(info)
-            fields[1] += 1  # st_ino
-            return os.stat_result(fields)
-        return info
-
-    monkeypatch.setattr(self_label.os, "stat", swapped)
+    info = os.lstat(tmp_path)
+    assert self_label.read_secret(str(tmp_path), os.getuid(), (info.st_dev, info.st_ino)) == "abc"
     with pytest.raises(CliError) as caught:
-        self_label.read_secret(str(tmp_path), os.getuid())
+        self_label.read_secret(str(tmp_path), os.getuid(), (info.st_dev, info.st_ino + 1))
     assert caught.value.exit_code == 11 and str(tmp_path) not in str(caught.value)
 
 

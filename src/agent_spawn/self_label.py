@@ -43,12 +43,13 @@ def refused(why: str) -> CliError:
     return CliError("vetoed", f"self-labeling refused: {why}", exit_code=11)
 
 
-def read_secret(directory: str, uid: int) -> str:
+def read_secret(directory: str, uid: int, expected: tuple[int, int]) -> str:
     """The session secret at ``<directory>/secret``, or a refusal (exit 11).
 
     ``directory`` is a realpath. The file is opened with ``O_NOFOLLOW`` (and ``O_NONBLOCK``, so a
     FIFO cannot hang the open) relative to an open directory descriptor; the checks run on the
-    descriptor with ``fstat`` after the open, and the read is bounded.
+    descriptor with ``fstat`` after the open, and the read is bounded. ``expected`` is the
+    ``(st_dev, st_ino)`` of the directory taken when the path was checked, before this open.
     """
     dir_fd = -1
     fd = -1
@@ -62,14 +63,13 @@ def read_secret(directory: str, uid: int) -> str:
             )
         except OSError:
             raise refused("the session secret cannot be opened") from None
-        # The descriptor must be the directory the path names now (a swap after the realpath
-        # check would otherwise open another session's secret).
+        # The descriptor must be the directory that was checked before the open (a swap after
+        # that check would otherwise open another session's secret).
         try:
-            named = os.stat(directory)
             opened = os.fstat(dir_fd)
         except OSError:
             raise refused("the session directory cannot be checked") from None
-        if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+        if (opened.st_dev, opened.st_ino) != expected:
             raise refused("the session directory changed while it was opened")
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
@@ -169,8 +169,14 @@ def self_label(inv: Invocation) -> Outcome:
             real_dir = _realpath(session_dir)
             if real_dir != _realpath(status.csession_dir):
                 raise refused("CSESSION_DIR is not this session's directory")
+            try:
+                dir_info = os.lstat(real_dir)
+            except OSError:
+                raise refused("the session directory cannot be resolved") from None
             # 5. the secret file
-            secret = read_secret(real_dir, gw.get_gateway().getuid())
+            secret = read_secret(
+                real_dir, gw.get_gateway().getuid(), (dir_info.st_dev, dir_info.st_ino)
+            )
             # 6. verified by claude-session; the secret travels on stdin only
             try:
                 verified = backend.verify_secret(session_id, secret)
