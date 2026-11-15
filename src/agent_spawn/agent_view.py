@@ -163,6 +163,8 @@ def lifecycle_events(
     started_run: int | None = None,
     resumed: bool = False,
     fork: bool = False,
+    auto_resumed: bool = False,
+    teardown_refused: bool = False,
 ) -> list[OutboxEvent]:
     """The outbox events of a status or attention change from ``before`` to ``after`` (agent
     objects): ``post-launch`` when ``started_run`` is given, ``post-park`` when the agent became
@@ -180,7 +182,7 @@ def lifecycle_events(
                     "resumed": resumed,
                     "fork": fork,
                     "promoted": False,
-                    "auto_resumed": False,
+                    "auto_resumed": auto_resumed,
                 },
             )
         )
@@ -193,7 +195,7 @@ def lifecycle_events(
                 extra={
                     "reason": after["park_reason"],
                     "outcome": None if outcome is None else dict(outcome),
-                    "teardown_refused": False,
+                    "teardown_refused": teardown_refused,
                     "chain_failure": None if chain_failure is None else dict(chain_failure),
                 },
             )
