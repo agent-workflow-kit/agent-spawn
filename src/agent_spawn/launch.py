@@ -980,15 +980,15 @@ class Launch:
             deadline = time.monotonic() + _seconds(args.wait_timeout)
         dead_looks = 0
         while True:
-            for received in self.sig.take():
-                forward = self.forward_signal(received)
-                if forward is not None:
-                    return forward
             row = store.get_agent(agent_id)
             if row is None:
                 raise CliError("failed", "the agent record disappeared", agent_id=agent_id)
             status = row["status"]
             self.started = self.started or status != "launching"
+            for received in self.sig.take():
+                forward = self.forward_signal(received)
+                if forward is not None:
+                    return forward
             supervisor = row.get("supervisor")
             alive = supervisor is not None and procs.is_alive(supervisor, gateway=self.gateway)
             ended = status not in ("launching", "live")
@@ -1005,7 +1005,7 @@ class Launch:
                     # TODO(#32): the liveness check parks an agent whose supervisor died.
                     raise CliError(
                         "failed",
-                        "the supervisor exited before the agent parked; try `agent-spawn reconcile`",
+                        "the supervisor exited before the agent parked (see reconcile)",
                         agent_id=agent_id,
                     )
             else:
