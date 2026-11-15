@@ -166,6 +166,8 @@ class Teardown:
         self.session_forgotten = False
         self.session_missing = False
         self.past_refusals = False  # step 6 started: a failure there is not a refusal
+        self.hooks_before: object = None  # agents.hooks before this call's entry wrote it
+        self.hooks_written = False
         self._log = log
 
     # -- records ----------------------------------------------------------------------------
@@ -259,7 +261,10 @@ class Teardown:
         return CliError("refused", message, reason=reason, agent_id=agent_id, details=details)
 
     def live_reason(self, row: Mapping[str, Any]) -> str | None:
-        """``live`` when nothing may tear the agent down (the checks no flag overrides)."""
+        """``live`` when nothing may tear the agent down (the checks no flag overrides).
+
+        TODO(#31): the liveness check of step 2 (``lost``, ``session_missing``) runs here once
+        issue #31 lands; until then only the status, the promotion and the session's run count."""
         if row["status"] in ("launching", "live") or row.get("promotion_pending"):
             return "live"
         if self.run_is_live(self.session_status(row)):
@@ -298,12 +303,15 @@ class Teardown:
 
     # -- the lifecycle ----------------------------------------------------------------------
 
-    def entry_changes(self, **extra: object) -> dict[str, object]:
-        return {
-            "updated": self.store.gateway.wall_time(),
-            "hooks": self.hooks or None,
-            **extra,
-        }
+    def entry_changes(self, row: Mapping[str, Any], **extra: object) -> dict[str, object]:
+        """The entry's changes. ``--hook`` values replace the stored hooks; without any, the
+        stored value (the first invocation's) is left alone."""
+        changes: dict[str, object] = {"updated": self.store.gateway.wall_time(), **extra}
+        if self.hooks:
+            self.hooks_before = row.get("hooks")
+            self.hooks_written = True
+            changes["hooks"] = self.hooks
+        return changes
 
     def dead_teardown_process(self, row: Mapping[str, Any]) -> procs.ProcessIdentity:
         """The recorded teardown process of a ``tearing_down`` agent, which must be dead for a
@@ -384,10 +392,11 @@ class Teardown:
                     agent_id,
                     expect_status="tearing_down",
                     expect={"teardown_proc": retry_from},
-                    changes=self.entry_changes(teardown_proc=me),
+                    changes=self.entry_changes(row, teardown_proc=me),
                 )
                 return done, True
             changes = self.entry_changes(
+                row,
                 status="tearing_down",
                 teardown_step="started",
                 teardown_proc=me,
@@ -456,6 +465,8 @@ class Teardown:
                 "promotion_pending": False,
                 "updated": now,
             }
+            if self.hooks_written:
+                changes["hooks"] = self.hooks_before  # this call's --hook values go with it
             before = agent_object(store, row)
             after = agent_object(store, {**row, **changes})
             events = lifecycle_events(
@@ -481,7 +492,7 @@ class Teardown:
         if not reached(row, "hooks_done"):
             self.step_hooks(row, abort_on_refusal=abort_on_refusal)
             row = self.store.get_agent(agent_id) or row
-        elif retry:
+        elif retry:  # a retry past the hooks step skips it
             self.log(
                 "teardown_retry", agent_id=agent_id, message=f"retry after {row['teardown_step']}"
             )
@@ -530,19 +541,20 @@ class Teardown:
         """Step 7: delete the agent's prompt copies and outcome files, then ``torn_down`` with
         ``post-teardown`` in the same transaction, then the log (and audit) records."""
         store = self.store
-        for problem in remove_agent_files(self.state_dir, agent_id):
-            self.warnings.append(problem)
-            self.log("warning", level="warn", agent_id=agent_id, message=problem)
         with store.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
             row = store.get_agent(agent_id)
             if not self.mine(row) or row is None:
                 raise CliError(
                     "failed", "this teardown no longer owns the agent", agent_id=agent_id
                 )
+            # Ownership first, then the files, then the compare-and-set: a crash in between
+            # leaves ``tearing_down`` and a retry deletes what is left (idempotent).
+            problems = remove_agent_files(self.state_dir, agent_id)
             changes: dict[str, object] = {
                 "status": "torn_down",
                 "needs_attention": None,
                 "teardown_step": None,
+                "teardown_proc": None,
                 "promotion_pending": False,
                 "torn_down_at": store.gateway.wall_time(),
                 "updated": store.gateway.wall_time(),
@@ -571,6 +583,9 @@ class Teardown:
                 changes=changes,
                 events=events,
             )
+        for problem in problems:
+            self.warnings.append(problem)
+            self.log("warning", level="warn", agent_id=agent_id, message=problem)
         self.log("teardown", agent_id=agent_id, message="torn down")
         if self.force:
             self.audit(done)
@@ -595,13 +610,12 @@ class Teardown:
 
 
 def _dry_run(td: Teardown, agent_id: str) -> Outcome:
-    """Steps 1 and 2 without the compare-and-set; the liveness check only reports."""
+    """Steps 1 and 2 without the compare-and-set; the liveness check only reports.
+
+    TODO(#31): the liveness check of step 2 is reported here once issue #31 lands."""
     row = td.store.get_agent(agent_id)
     if row is None or row["status"] == "torn_down":
         raise td.torn_down(agent_id, row is None)
-    unsupported = td.unsupported(row)
-    if unsupported is not None:
-        raise unsupported
     would_refuse: str | None = None
     if row["status"] == "tearing_down":
         try:
@@ -611,7 +625,11 @@ def _dry_run(td: Teardown, agent_id: str) -> Outcome:
                 raise
             would_refuse = error.reason
     if would_refuse is None:
-        would_refuse = td.live_reason(row)
+        would_refuse = td.live_reason(row)  # TODO(#31): includes the liveness check
+    if would_refuse is None:  # a refusal the live checks report wins over "not implemented"
+        unsupported = td.unsupported(row)
+        if unsupported is not None:
+            raise unsupported
     payload: dict[str, Any] = {
         "dry_run": True,
         "agent_id": agent_id,
@@ -659,19 +677,22 @@ def teardown_command(inv: Any) -> Outcome:
         if args.dry_run:
             return _dry_run(td, agent_id)
         return _run(td, agent_id)
+    except CasLost:
+        raise CliError(
+            "failed", "this teardown no longer owns the agent", agent_id=agent_id
+        ) from None
     except StoreError as error:
         raise _store_failure(error, agent_id) from None
     finally:
-        if td is not None and agent_id is not None:
+        # A dry run runs no hooks.
+        if td is not None and agent_id is not None and not args.dry_run:
             td.deliver(agent_id)
         store.close()
 
 
 def _run(td: Teardown, agent_id: str) -> Outcome:
     row, retry = td.enter(agent_id)
-    if retry:
-        td.log("teardown_retry", agent_id=agent_id, message=f"retry after {row['teardown_step']}")
-    done = td.run_from_step_3(row, retry=False, abort_on_refusal=True)
+    done = td.run_from_step_3(row, retry=retry, abort_on_refusal=True)
     payload: dict[str, Any] = {
         "agent": agent_object(td.store, done, warnings=td.warnings),
         "worktrees": [],

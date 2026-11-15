@@ -11,11 +11,14 @@ from typing import Any
 
 import pytest
 
-from agent_spawn import procs, teardown
+from agent_spawn import lifecycle, procs, teardown
+from agent_spawn.agent_view import agent_object
 from agent_spawn.config import Config
+from agent_spawn.hooks import agent_event
 from agent_spawn.ids import new_agent_id
+from agent_spawn.lifecycle import LEASE_WAIT, lease_key
 from agent_spawn.session_backend import SessionBackend
-from agent_spawn.store import Store
+from agent_spawn.store import CasLost, Store
 from tests import schema_registry
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
@@ -81,7 +84,8 @@ def td(env: Env, agent_id: str, *flags: str) -> Any:
 def test_teardown_tombstones_forgets_the_session_and_deletes_the_files(
     env: Env, fakebin: Fakebin
 ) -> None:
-    agent_id = seed(env, fakebin)
+    agent_id = seed(env, fakebin, needs_attention="failed")
+    assert env.agent(agent_id)["needs_attention"] == "failed"
     outside = env.state_dir / "keep"
     outside.mkdir()
     (outside / "secret").write_text("keep me")
@@ -100,6 +104,7 @@ def test_teardown_tombstones_forgets_the_session_and_deletes_the_files(
     row = env.agent(agent_id)
     assert row["status"] == "torn_down" and row["teardown_step"] is None
     assert row["needs_attention"] is None
+    assert row["teardown_proc"] is None  # null when not tearing down
     names = [n for n, _ in events(env, agent_id)]
     assert names == ["post-state-change", "post-state-change", "post-teardown"]
     post = dict(events(env, agent_id))["post-teardown"]
@@ -154,6 +159,15 @@ def test_force_is_audited(env: Env, fakebin: Fakebin) -> None:
         ("teardown", True, "ok")
     ]
     assert dict(events(env, agent_id))["post-teardown"]["force"] is True
+    for record in audit:
+        schema_registry.validate(record, "agent-spawn/audit.json")
+
+
+def test_a_teardown_without_force_writes_no_audit_record(env: Env, fakebin: Fakebin) -> None:
+    agent_id = seed(env, fakebin)
+    assert td(env, agent_id).returncode == 0
+    audit = env.state_dir / "audit.jsonl"
+    assert not audit.exists() or audit.read_text() == ""
 
 
 def test_a_post_teardown_hook_is_delivered(env: Env, fakebin: Fakebin, tmp_path: Path) -> None:
@@ -220,7 +234,9 @@ def test_agents_with_worktrees_are_refused_before_any_change(env: Env, fakebin: 
     # TODO(#23): worktree teardown replaces this refusal.
     agent_id = seed(env, fakebin, wt_record_id="wt-abcdefgh", wt_path="/x", wt_owned=True)
     done = td(env, agent_id)
+    body = result_json(done)
     assert done.returncode == 1
+    assert body["error"]["code"] == "internal" and "not implemented" in body["error"]["message"]
     assert env.agent(agent_id)["status"] == "parked"
     assert (env.state_dir / "prompts" / agent_id).exists()
 
@@ -229,8 +245,24 @@ def test_a_configured_pre_teardown_hook_is_refused_not_skipped(env: Env, fakebin
     # TODO(#32): the hook runs instead of refusing.
     agent_id = seed(env, fakebin)
     done = td(env, agent_id, "--hook", "pre-teardown=true")
+    body = result_json(done)
     assert done.returncode == 1
+    assert body["error"]["code"] == "internal" and "not implemented" in body["error"]["message"]
     assert env.agent(agent_id)["status"] == "parked"
+
+
+def test_a_config_defined_pre_teardown_hook_is_refused_not_skipped(
+    fakebin: Fakebin, isolation_env: Isolation
+) -> None:
+    config = 'hooks:\n  pre-teardown:\n    - cmd: "true"\n'
+    cfg_env = Env(fakebin, isolation_env, config)
+    agent_id = seed(cfg_env, fakebin)
+    done = td(cfg_env, agent_id)
+    body = result_json(done)
+    assert done.returncode == 1
+    assert body["error"]["code"] == "internal" and "not implemented" in body["error"]["message"]
+    assert cfg_env.agent(agent_id)["status"] == "parked"
+    assert (cfg_env.state_dir / "prompts" / agent_id).exists()
 
 
 # --- dry run ----------------------------------------------------------------------------------
@@ -289,6 +321,8 @@ def test_a_forget_failure_keeps_tearing_down_and_a_retry_continues(
     schema_registry.validate(body, "agent-spawn/cli/error.json")
     assert done.returncode == 20 and body["error"]["reason"] == "live"
     assert body["error"]["details"]["hint"] == f"agent-spawn stop {agent_id}"
+    assert body["error"]["tool"] == "claude-session"
+    assert body["error"]["lower_error"]["code"] == "refused"
     row = env.agent(agent_id)
     assert row["status"] == "tearing_down" and row["teardown_step"] == "hooks_done"
     assert (env.state_dir / "prompts" / agent_id).exists()  # the tombstone step did not run
@@ -337,7 +371,9 @@ def test_a_retry_of_a_tearing_down_agent_with_a_live_run_is_refused_unchanged(
     assert row["status"] == "tearing_down" and row["teardown_proc"] == dead()
 
 
-def test_two_concurrent_entries_one_wins(env: Env, fakebin: Fakebin) -> None:
+def test_an_entry_over_a_live_teardown_process_is_refused_unchanged(
+    env: Env, fakebin: Fakebin
+) -> None:
     agent_id = seed(env, fakebin)
     gateway = FakebinGateway(fakebin)
     backend = SessionBackend([str(fakebin.bin_dir / "claude-session")], gateway=gateway)
@@ -491,4 +527,279 @@ def test_ephemeral_live_run_is_refused_with_a_reason_and_nothing_changes(
     row = env.agent(agent_id)
     assert row["status"] == "tearing_down" and row["teardown_step"] == "started"
     assert (env.state_dir / "prompts" / agent_id).exists()
+    assert forget_calls(fakebin) == []
+
+
+# --- review findings ----------------------------------------------------------------------------
+
+
+def pass_status_once(fakebin: Fakebin) -> None:
+    """The next ``status`` call answers as usual; the ones after it report a live run."""
+    fakebin.script("claude-session", "status", times=1)
+    script_live_run(fakebin)
+
+
+def fail_forget_once(fakebin: Fakebin) -> None:
+    fakebin.script(
+        "claude-session",
+        "forget",
+        times=1,
+        exit=20,
+        error={"code": "refused", "reason": "live", "message": "x"},
+    )
+
+
+def log_text(env: Env) -> str:
+    path = env.state_dir / "log.jsonl"
+    return path.read_text() if path.exists() else ""
+
+
+def test_a_retry_without_hook_flags_keeps_the_stored_post_teardown_hook(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    agent_id = seed(env, fakebin)
+    marker = tmp_path / "hook-out"
+    fail_forget_once(fakebin)
+    first = td(env, agent_id, "--hook", f"post-teardown=cat > {marker}")
+    assert first.returncode == 20
+    assert env.agent(agent_id)["hooks"] == [{"hook": "post-teardown", "cmd": f"cat > {marker}"}]
+    again = td(env, agent_id)  # no --hook: the stored one must survive the retry's entry
+    assert again.returncode == 0, (again.stdout, again.stderr)
+    assert json.loads(marker.read_text())["hook"] == "post-teardown"
+
+
+def test_an_aborted_call_carrying_a_hook_leaves_the_stored_hooks_as_before(
+    env: Env, fakebin: Fakebin
+) -> None:
+    old = [{"hook": "post-teardown", "cmd": "echo old"}]
+    agent_id = seed(env, fakebin, hooks=old)
+    pass_status_once(fakebin)  # live between step 2 and step 3: the call aborts to parked
+    done = td(env, agent_id, "--hook", "post-teardown=echo new")
+    assert done.returncode == 20 and result_json(done)["error"]["reason"] == "live"
+    assert env.agent(agent_id)["hooks"] == old
+
+
+def test_an_aborted_call_without_stored_hooks_leaves_them_null(env: Env, fakebin: Fakebin) -> None:
+    agent_id = seed(env, fakebin)
+    pass_status_once(fakebin)
+    done = td(env, agent_id, "--hook", "post-teardown=echo new")
+    assert done.returncode == 20
+    assert env.agent(agent_id)["hooks"] is None
+
+
+def test_a_refused_call_carrying_a_hook_leaves_the_stored_hooks_as_before(
+    env: Env, fakebin: Fakebin
+) -> None:
+    old = [{"hook": "post-teardown", "cmd": "echo old"}]
+    agent_id = seed(env, fakebin, status="live", park_reason=None, hooks=old)
+    done = td(env, agent_id, "--hook", "post-teardown=echo new")
+    assert done.returncode == 20
+    assert env.agent(agent_id)["hooks"] == old
+
+
+def test_the_abort_path_returns_to_parked_with_the_markers_cleared(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = seed(env, fakebin)
+    pass_status_once(fakebin)
+    done = td(env, agent_id)
+    body = result_json(done)
+    schema_registry.validate(body, "agent-spawn/cli/error.json")
+    assert done.returncode == 20 and body["error"]["reason"] == "live"
+    row = env.agent(agent_id)
+    assert row["status"] == "parked" and row["park_reason"] == "done"
+    assert row["teardown_step"] is None and row["teardown_proc"] is None
+    assert (env.state_dir / "prompts" / agent_id).exists()
+    assert forget_calls(fakebin) == []
+    emitted = events(env, agent_id)
+    assert [n for n, _ in emitted] == [
+        "post-state-change",
+        "post-park",
+        "post-state-change",
+    ]
+    park = dict(emitted)["post-park"]
+    assert park["reason"] == "done" and park["teardown_refused"] is False
+    assert emitted[-1][1]["previous_status"] == "tearing_down"
+
+
+def test_a_dry_run_runs_no_hooks(
+    fakebin: Fakebin, isolation_env: Isolation, tmp_path: Path
+) -> None:
+    sink = tmp_path / "sink"
+    config = f'hooks:\n  post-state-change:\n    - cmd: "cat >> {sink}"\n'
+    cfg_env = Env(fakebin, isolation_env, config)
+    agent_id = seed(cfg_env, fakebin)
+    with Store.open(cfg_env.state_dir) as store:
+        row = store.get_agent(agent_id)
+        assert row is not None
+        event = agent_event(
+            "post-state-change",
+            agent_object(store, row),
+            reads_third_party=None,
+            extra={"change": "agent", "previous_status": "live", "previous_needs_attention": None},
+        )
+        with store.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
+            store.update_agent(lease, agent_id, {}, events=[event])
+    dry = td(cfg_env, agent_id, "--dry-run")
+    assert dry.returncode == 0, dry.stderr
+    assert not sink.exists()  # the pending event was not delivered
+    assert td(cfg_env, agent_id).returncode == 0
+    assert sink.exists()  # a real run delivers it
+
+
+@pytest.mark.parametrize(
+    ("step", "logged"), [("hooks_done", True), ("started", False)], ids=["skipped", "reruns"]
+)
+def test_teardown_retry_is_logged_only_when_the_hooks_step_is_skipped(
+    env: Env, fakebin: Fakebin, step: str, logged: bool
+) -> None:
+    agent_id = seed(env, fakebin, status="tearing_down", teardown_step=step, teardown_proc=dead())
+    assert td(env, agent_id).returncode == 0
+    assert ('"teardown_retry"' in log_text(env)) is logged
+
+
+def test_dry_run_of_a_live_agent_holding_a_worktree_reports_live(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = seed(
+        env,
+        fakebin,
+        status="live",
+        park_reason=None,
+        wt_record_id="wt-abcdefgh",
+        wt_path="/x",
+        wt_owned=True,
+    )
+    done = td(env, agent_id, "--dry-run")
+    body = result_json(done)
+    assert done.returncode == 20 and body["would_refuse"] == "live"
+
+
+def test_the_tombstone_checks_ownership_before_deleting_any_file(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = seed(
+        env, fakebin, status="tearing_down", teardown_step="session_done", teardown_proc=dead()
+    )
+    with Store.open(env.state_dir) as store:
+        engine = teardown.Teardown(store, Config(), state_dir=str(env.state_dir), actor="human:t")
+        with pytest.raises(teardown.CliError) as raised:
+            engine.step_tombstone(agent_id)
+    assert "no longer owns" in raised.value.message
+    assert (env.state_dir / "prompts" / agent_id).exists()
+    assert (env.state_dir / "outcomes" / agent_id).exists()
+    assert env.agent(agent_id)["status"] == "tearing_down"
+
+
+def test_a_lost_entry_compare_and_set_is_judged_again(env: Env, fakebin: Fakebin) -> None:
+    agent_id = seed(env, fakebin)
+    backend = SessionBackend(
+        [str(fakebin.bin_dir / "claude-session")], gateway=FakebinGateway(fakebin)
+    )
+    with Store.open(env.state_dir) as store:
+
+        class Racing(teardown.Teardown):
+            raced = 0
+
+            def live_reason(self, row: Any) -> str | None:
+                result = super().live_reason(row)
+                if not self.raced:  # a promotion starts between the check and the CAS
+                    self.raced += 1
+                    with store.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
+                        store.update_agent(lease, agent_id, {"promotion_pending": True})
+                return result
+
+        engine = Racing(
+            store, Config(), state_dir=str(env.state_dir), actor="human:t", backend=backend
+        )
+        with pytest.raises(teardown.CliError) as raised:
+            engine.enter(agent_id)
+        assert raised.value.reason == "live" and engine.raced == 1
+        row = store.get_agent(agent_id)
+        assert row is not None and row["status"] == "parked" and row["teardown_step"] is None
+
+
+class _Inv:
+    """The pieces of an invocation ``teardown_command`` reads."""
+
+    def __init__(self, env: Env, agent_id: str) -> None:
+        import argparse
+
+        self.args = argparse.Namespace(
+            agent_id=agent_id, hook=[], dry_run=False, force=False, merged_head=None
+        )
+        self.state_dir = str(env.state_dir)
+        self.config = Config()
+        self.actor = "human:t"
+        self.decision_ids: list[str] = []
+        self.warnings: list[str] = []
+
+
+def test_a_lost_compare_and_set_reports_that_the_teardown_no_longer_owns_the_agent(
+    env: Env, fakebin: Fakebin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent_id = seed(env, fakebin, session=False)
+
+    def lose(self: teardown.Teardown, agent: str, marker: str) -> None:
+        raise CasLost(agent, ("tearing_down",), {"status": "parked"})
+
+    monkeypatch.setattr(teardown.Teardown, "set_step", lose)
+    with pytest.raises(teardown.CliError) as raised:
+        teardown.teardown_command(_Inv(env, agent_id))
+    assert raised.value.code == "failed"
+    assert "no longer owns the agent" in raised.value.message
+
+
+# --- the ephemeral refusal's compare-and-set -----------------------------------------------------
+
+
+def test_the_ephemeral_refusal_needs_this_supervisor_as_the_teardown_process(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = seed(
+        env, fakebin, status="tearing_down", teardown_step="started", teardown_proc=dead()
+    )
+    with Store.open(env.state_dir) as store:
+        assert lifecycle.refuse_ephemeral_teardown(store, agent_id, outcome=None) is None
+    row = env.agent(agent_id)
+    assert row["status"] == "tearing_down" and row["teardown_proc"] == dead()
+
+
+def test_the_ephemeral_refusal_needs_the_started_marker(env: Env, fakebin: Fakebin) -> None:
+    agent_id = seed(
+        env, fakebin, status="tearing_down", teardown_step="hooks_done", teardown_proc=me()
+    )
+    with Store.open(env.state_dir) as store:
+        assert lifecycle.refuse_ephemeral_teardown(store, agent_id, outcome=None) is None
+    assert env.agent(agent_id)["status"] == "tearing_down"
+
+
+def test_the_ephemeral_refusal_parks_the_agent_it_owns(env: Env, fakebin: Fakebin) -> None:
+    agent_id = seed(
+        env, fakebin, status="tearing_down", teardown_step="started", teardown_proc=me()
+    )
+    with Store.open(env.state_dir) as store:
+        moved = lifecycle.refuse_ephemeral_teardown(store, agent_id, outcome=None)
+    assert moved is not None and moved["status"] == "parked"
+    row = env.agent(agent_id)
+    assert row["teardown_step"] is None and row["teardown_proc"] is None
+
+
+def test_an_ephemeral_agent_with_a_pre_teardown_hook_parks_done_with_teardown_refused(
+    fakebin: Fakebin, isolation_env: Isolation
+) -> None:
+    # TODO(#32): the hook runs instead of refusing.
+    config = 'hooks:\n  pre-teardown:\n    - cmd: "true"\n'
+    cfg_env = Env(fakebin, isolation_env, config)
+    done = cfg_env.run(
+        "launch", "--mode", "headless", "--skill", "do-it", "--json", "--ephemeral", "--wait"
+    )
+    agent_id = result_json(done)["agent"]["agent_id"]
+    row = cfg_env.agent(agent_id)
+    assert row["status"] == "parked" and row["park_reason"] == "done"
+    assert row["teardown_step"] is None and row["teardown_proc"] is None
+    emitted = events(cfg_env, agent_id)
+    park = next(p for n, p in emitted if n == "post-park")
+    assert park["teardown_refused"] is True
+    assert "post-teardown" not in [n for n, _ in emitted]
     assert forget_calls(fakebin) == []

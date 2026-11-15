@@ -210,7 +210,10 @@ def refuse_ephemeral_teardown(
         row = store.get_agent(agent_id)
         if row is None or row["status"] != "tearing_down":
             return None
-        if row.get("teardown_step") == "worktree_partial":
+        # Only the supervisor that entered the teardown (marker ``started``) may refuse it.
+        if row.get("teardown_proc") != store.holder_identity() or row.get("teardown_step") != (
+            "started"
+        ):
             return None
         all_changes: dict[str, object] = {
             "updated": store.gateway.wall_time(),
@@ -234,7 +237,12 @@ def refuse_ephemeral_teardown(
         )
         try:
             return store.compare_and_set(
-                lease, agent_id, expect_status="tearing_down", changes=all_changes, events=events
+                lease,
+                agent_id,
+                expect_status="tearing_down",
+                expect={"teardown_proc": store.holder_identity(), "teardown_step": "started"},
+                changes=all_changes,
+                events=events,
             )
         except CasLost:
             return None

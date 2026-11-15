@@ -341,6 +341,9 @@ def test_ephemeral_done_hands_over_and_is_torn_down(env: Env, fakebin: Fakebin) 
     assert row["status"] == "torn_down" and row["teardown_step"] is None
     names = [n for n, _ in events(env, agent_id)]
     assert names.count("post-teardown") == 1 and "post-park" not in names
+    for name, payload in events(env, agent_id):
+        if name == "post-teardown":
+            validate_event(name, payload, agent_id)
     log = (env.state_dir / "supervise" / f"{agent_id}.log").read_text()
     assert "Traceback" not in log
 
