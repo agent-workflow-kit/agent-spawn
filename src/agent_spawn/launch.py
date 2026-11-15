@@ -639,14 +639,20 @@ class Launch:
         if mode != "none" and cwd is not None and wtlib.inside_throwaway(records, cwd):
             raise CliError.usage("--worktree lies inside a wtctl throwaway")
         self.enforce_rules(reads, cwd, records)
+        self.check_result_file(reads, cwd)
+        return cwd
+
+    def check_result_file(self, reads_third_party: bool, cwd: str | None) -> None:
+        """The third-party path rule of ``--result-file``: not inside the run's cwd (a throwaway's
+        root). The session directory does not exist before ``start``; the classification check
+        covers it."""
         if (
-            reads
+            reads_third_party
             and cwd is not None
             and cwd != third_party.SESSION_DIR
             and self.result_file_inside([cwd])
         ):
             raise CliError.usage("--result-file lies inside a third-party-reading run's cwd")
-        return cwd
 
     # -- hooks --------------------------------------------------------------------------------
 
@@ -865,9 +871,10 @@ class Launch:
         records = self.records_for(cwd)
         if mode != "none" and cwd is not None and wtlib.inside_throwaway(records, cwd):
             raise CliError.usage("--worktree lies inside a wtctl throwaway")
-        if third_party.cwd_rule_allows(reads, cwd, records=records):
-            return None, None
-        return ("third_party_cwd" if reads else "third_party_run"), None
+        if not third_party.cwd_rule_allows(reads, cwd, records=records):
+            return ("third_party_cwd" if reads else "third_party_run"), None
+        self.check_result_file(reads, cwd)
+        return None, None
 
     def hook_listing(self) -> list[dict[str, str]]:
         listing: list[dict[str, str]] = []

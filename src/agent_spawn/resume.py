@@ -636,13 +636,28 @@ class Resume(Launch):
         of a third-party-reading run, the throwaway check of a trusted one."""
         reads = classification.reads_third_party
         self.enforce_rules(reads, cwd, self.records_for(cwd))
-        if (
-            reads
-            and cwd is not None
-            and cwd != third_party.SESSION_DIR
-            and self.result_file_inside([cwd])
-        ):
-            raise CliError.usage("--result-file lies inside a third-party-reading run's cwd")
+        if reads:
+            self.check_session_result_file(cwd)
+
+    def check_session_result_file(self, cwd: str | None) -> None:
+        """The third-party path rule of ``--result-file`` (interface.md, Result file): not inside
+        the run's cwd (a throwaway's root) nor inside the session's directory, ``outbox/``
+        included. The session directory is known from ``claude-session status``; a session that
+        cannot be read fails the command (the rule cannot be checked) rather than skipping it.
+        A fork's own directory does not exist yet: the source's is checked, and the classification
+        check covers the fork's."""
+        if self.inv.result_file is None:
+            return
+        directories: list[str] = []
+        if cwd is not None and cwd != third_party.SESSION_DIR:
+            directories.append(cwd)
+        if self.source_session is not None:
+            assert self.backend is not None
+            directories.append(self.backend.status(self.source_session).csession_dir)
+        if self.result_file_inside(directories):
+            raise CliError.usage(
+                "--result-file lies inside a third-party-reading run's cwd or session directory"
+            )
 
     def check_plan_cwd(self, classification: third_party.Classification, cwd: str | None) -> None:
         """A plain resume passes no ``--cwd``: the run starts where claude-session's plan says.
@@ -1592,9 +1607,11 @@ class Resume(Launch):
         reads = classification.reads_third_party
         if self.worktree_mode() != "none":
             return "third_party_cwd" if reads else None
-        if third_party.cwd_rule_allows(reads, cwd, records=self.records_for(cwd)):
-            return None
-        return "third_party_cwd" if reads else "third_party_run"
+        if not third_party.cwd_rule_allows(reads, cwd, records=self.records_for(cwd)):
+            return "third_party_cwd" if reads else "third_party_run"
+        if reads:
+            self.check_session_result_file(cwd)
+        return None
 
     def dry_plan(
         self,
