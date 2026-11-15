@@ -283,6 +283,117 @@ def test_wtctl_is_not_needed_for_a_session_dir_run(
     assert wtctl_calls(fakebin) == []
 
 
+def work_of(fakebin: Fakebin, rig: Rig) -> str:
+    done = fakebin.run("claude-session", "status", rig.session, "--json")
+    return os.path.join(json.loads(done.stdout)["csession_dir"], "work")
+
+
+def test_a_third_party_agent_at_its_real_work_dir_needs_no_records_lookup(
+    rig_for: Callable[..., Rig],
+    fakebin: Fakebin,
+    tmp_path: Path,  # noqa: F811
+) -> None:
+    rig = rig_for()
+    work = work_of(fakebin, rig)
+    rig.put_run(1, cwd=work)
+    script_unreported_first(fakebin)
+    fakebin.script(
+        "claude-session",
+        "start",
+        argv_contains=["--dry-run"],
+        merge={"profile": {"reads_third_party": True}},
+    )
+    sup = rig.supervisor
+    sup.config = sup.config.model_copy(update={"wtctl_cmd": [str(tmp_path / "gone" / "wtctl")]})
+    fakebin.script("wtctl", "list", error={"code": "internal", "message": "x"}, exit=1)
+    sup.run()
+    assert rig.agent()["park_reason"] == "done"
+    assert len(starts(fakebin)) == 1
+    assert wtctl_calls(fakebin, "list") == [] and wtctl_calls(fakebin, "adopt") == []
+
+
+def test_an_unreadable_session_leaves_the_work_dir_unknown_and_fails_closed(
+    rig_for: Callable[..., Rig],
+    fakebin: Fakebin,
+) -> None:
+    rig = rig_for()
+    work = work_of(fakebin, rig)
+    rig.put_run(1, cwd=work)
+    script_unreported_first(fakebin)
+    fakebin.script(
+        "claude-session",
+        "start",
+        argv_contains=["--dry-run"],
+        merge={"profile": {"reads_third_party": True}},
+    )
+    fakebin.script("claude-session", "status", error={"code": "internal", "message": "x"}, exit=1)
+    rig.supervisor.run()
+    failure = park_failure(rig)
+    assert failure is not None and failure["reason"] == "third_party_cwd"
+    assert starts(fakebin) == []
+
+
+# --- in process: the plan's cwd -----------------------------------------------------------------
+
+
+def plan_cwd(fakebin: Fakebin, cwd: str, *, third_party: bool = False) -> None:
+    merge: dict[str, Any] = {"cwd": cwd}
+    if third_party:
+        merge["profile"] = {"reads_third_party": True}
+    fakebin.script("claude-session", "start", argv_contains=["--dry-run"], merge=merge)
+
+
+def test_a_trusted_run_whose_plan_cwd_is_a_throwaway_root_is_refused(
+    rig_for: Callable[..., Rig],
+    fakebin: Fakebin,
+    tmp_path: Path,  # noqa: F811
+) -> None:
+    throwaway = fake_throwaway(fakebin)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    rig = seeded(rig_for, fakebin, str(plain))
+    plan_cwd(fakebin, throwaway["path"])
+    rig.supervisor.run()
+    failure = park_failure(rig)
+    assert failure is not None and failure["reason"] == "third_party_run"
+    assert starts(fakebin) == []
+
+
+def test_a_third_party_run_whose_plan_cwd_is_below_a_throwaway_root_is_refused(
+    rig_for: Callable[..., Rig],
+    fakebin: Fakebin,
+    tmp_path: Path,  # noqa: F811
+) -> None:
+    throwaway = fake_throwaway(fakebin)
+    sub = Path(throwaway["path"]) / "sub"
+    sub.mkdir()
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    rig = seeded(rig_for, fakebin, str(plain))
+    plan_cwd(fakebin, str(sub), third_party=True)
+    rig.supervisor.run()
+    failure = park_failure(rig)
+    assert failure is not None and failure["reason"] == "third_party_cwd"
+    assert starts(fakebin) == []
+
+
+def test_the_records_of_the_plans_cwd_are_held(
+    rig_for: Callable[..., Rig],
+    fakebin: Fakebin,
+    tmp_path: Path,  # noqa: F811
+) -> None:
+    root = tree(tmp_path)
+    record = fake_adopted(fakebin, root)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    rig = seeded(rig_for, fakebin, str(elsewhere))
+    plan_cwd(fakebin, str(root))
+    rig.supervisor.run()
+    assert rig.agent()["park_reason"] == "done"
+    assert holds_of(rig) == [record["id"]]
+    assert len(starts(fakebin)) == 1
+
+
 # --- in process: the holds ----------------------------------------------------------------------
 
 
@@ -414,6 +525,8 @@ def test_the_post_start_rule_is_judged_by_the_records(
     try:
         rule = rule_of_the_chain_check(rig, str(tmp_path / "cs" / "work"))
         assert rule(True, throwaway["path"]) is True  # third-party at a throwaway root
+        work = str(tmp_path / "cs" / "work")
+        assert rule(True, work) is True  # the session's own work/ lies in no record
         assert rule(False, throwaway["path"]) is False  # trusted inside a throwaway
         assert rule(True, str(Path(throwaway["path"]) / "sub")) is False
         assert rule(True, str(tmp_path)) is False  # outside every record
@@ -439,3 +552,66 @@ def test_a_failed_lookup_in_the_post_start_rule_raises_so_the_run_is_canceled(
             rule(True, str(tmp_path))
     finally:
         rig.supervisor.store.close()
+
+
+# --- end to end: the post-start check through the real session backend --------------------------
+
+
+def aftermath(env: Env, fakebin: Fakebin, *args: str) -> tuple[str, dict[str, Any]]:
+    done = env.run(*LAUNCH, *args, "--wait")
+    agent_id = result_json(done)["agent"]["agent_id"]
+    failure = chain_failure_of(env, agent_id)
+    assert failure is not None, (done.stdout, done.stderr)
+    assert len(starts(fakebin)) == 2  # the launch and the (canceled) report resume
+    assert [a for a in fakebin.argvs("claude-session") if a[0] == "stop"]
+    assert len([a for a in fakebin.argvs("claude-session") if a[0] == "exec"]) == 1
+    return agent_id, failure
+
+
+def test_a_third_party_run_started_outside_every_record_is_canceled_as_a_mismatch(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    throwaway = fake_throwaway(fakebin)
+    script_unreported_first(fakebin)
+    carry_third_party(fakebin)
+    fakebin.script("claude-session", "status", times=2)  # the launcher's check, the pre-start read
+    fakebin.script(
+        "claude-session",
+        "status",
+        merge={"run": {"reads_third_party": True, "cwd": str(tmp_path)}, "tainted_by_run": 2},
+    )
+    _, failure = aftermath(env, fakebin, "--cwd", throwaway["path"], "--reads-third-party")
+    assert (failure["tool"], failure["reason"]) == ("agent-spawn", "classification_mismatch")
+
+
+def test_a_failed_records_lookup_in_the_post_start_check_cancels_the_run_as_unknown(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    throwaway = fake_throwaway(fakebin)
+    script_unreported_first(fakebin)
+    carry_third_party(fakebin)
+    fakebin.script("claude-session", "status", times=2)
+    fakebin.script(
+        "claude-session",
+        "status",
+        merge={"run": {"reads_third_party": True, "cwd": str(tmp_path)}, "tainted_by_run": 2},
+    )
+    # the launcher's two lookups, the chain's pre-start and holds lookups; the fifth is the check's
+    fakebin.script("wtctl", "list", times=4)
+    fakebin.script("wtctl", "list", error={"code": "internal", "message": "x"}, exit=1)
+    _, failure = aftermath(env, fakebin, "--cwd", throwaway["path"], "--reads-third-party")
+    assert (failure["tool"], failure["reason"]) == ("agent-spawn", "classification_unknown")
+
+
+def test_a_run_that_turned_third_party_without_a_cwd_is_canceled_as_unknown(
+    env: Env, fakebin: Fakebin
+) -> None:
+    script_unreported_first(fakebin)
+    fakebin.script("claude-session", "status", times=1)
+    fakebin.script(
+        "claude-session",
+        "status",
+        merge={"run": {"reads_third_party": True, "cwd": None}, "tainted_by_run": 2},
+    )
+    _, failure = aftermath(env, fakebin)
+    assert (failure["tool"], failure["reason"]) == ("agent-spawn", "classification_unknown")

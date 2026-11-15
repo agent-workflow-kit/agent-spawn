@@ -372,25 +372,17 @@ def _real_cwd(cwd: object) -> str | None:
         return None
 
 
-def _pre_start_checks(
+def _judge_cwd(
     sup: Supervisor,
     backend: SessionBackend,
-    spec: RunSpec,
-    row: dict[str, Any],
+    wt: _Wtctl,
+    reads: bool,
     session: str,
-    cwd: object,
-) -> tuple[third_party.Classification, str | None, _Wtctl]:
-    """Pre-start checks 1 to 4 (the holds, check 5, follow in ``_take_holds``): the
-    classification dry run, the records of the cwd, the cwd rule of a third-party-reading run or
-    the throwaway check of a trusted one. Returns the classification, the realpath cwd the run
-    uses and wtctl (``None`` without one)."""
-    try:
-        classification = backend.classify(spec)
-    except CliError as error:
-        raise failure_of(error) from None
-    reads = classification.reads_third_party
-    real = _real_cwd(cwd)
-    wt = _Wtctl(sup, backend, row)
+    real: str | None,
+) -> bool:
+    """Pre-start checks 2 to 4 for one cwd: its records (one ``wtctl list``), the cwd rule of a
+    third-party-reading run or the throwaway check of a trusted one. Returns whether the cwd is
+    the session's own ``work/`` (it lies in no record: nothing to look up or hold)."""
     session_work: str | None = None
     if reads and real is not None and real != third_party.SESSION_DIR:
         try:  # the one real path besides a throwaway root a third-party run may use
@@ -406,37 +398,71 @@ def _pre_start_checks(
         if error.reason in ("third_party_cwd", "third_party_run"):
             sup.log("third_party_refused", level="warn", details={"reason": error.reason})
         raise failure_of(error) from None
-    return classification, real, wt
+    return in_work
 
 
-def _take_holds(sup: Supervisor, wt: _Wtctl, row: dict[str, Any], cwd: str | None) -> None:
-    """Pre-start check 5: hold every worktree record of the cwd the agent does not hold yet
+def _pre_start_checks(
+    sup: Supervisor,
+    backend: SessionBackend,
+    spec: RunSpec,
+    row: dict[str, Any],
+    session: str,
+    cwd: object,
+) -> tuple[third_party.Classification, list[str], _Wtctl]:
+    """Pre-start checks 1 to 4 (the holds, check 5, follow in ``_take_holds``): the
+    classification dry run, then the records of the cwd, the cwd rule of a third-party-reading
+    run or the throwaway check of a trusted one. The chain passes no ``--cwd``: the run goes
+    where the plan says, so the plan's cwd is judged too when it is a real path other than the
+    recorded one. Returns the classification, the realpath cwds to hold (the session's own
+    ``work/`` and ``session-dir`` are left out: they lie in no record) and wtctl."""
+    try:
+        classification = backend.classify(spec)
+    except CliError as error:
+        raise failure_of(error) from None
+    reads = classification.reads_third_party
+    wt = _Wtctl(sup, backend, row)
+    real = _real_cwd(cwd)
+    holdable: list[str] = []
+    if not _judge_cwd(sup, backend, wt, reads, session, real) and real is not None:
+        holdable.append(real)
+    plan = _real_cwd(classification.cwd)
+    if plan is not None and plan != third_party.SESSION_DIR and plan != real:
+        if not _judge_cwd(sup, backend, wt, reads, session, plan):
+            holdable.append(plan)
+    return classification, [c for c in holdable if c != third_party.SESSION_DIR], wt
+
+
+def _take_holds(sup: Supervisor, wt: _Wtctl, cwds: list[str]) -> None:
+    """Pre-start check 5: hold every worktree record of the cwds the agent does not hold yet
     (``wtctl adopt --holder``). Throwaways are never held. The records are looked up again, so a
     record created since the checks is not missed."""
     assert sup.store is not None
-    if cwd is None or cwd == third_party.SESSION_DIR:
+    if not cwds:
         return
     store, agent_id = sup.store, sup.agent_id
     try:
         backend = wt.get()
         if backend is None:
             return
-        around = worktrees_containing(backend.list_records(), cwd)
-        held = {h["record_id"] for h in store.get_holds(agent_id)}
-        for record in around:
-            if record.id in held and agent_id in record.holders:
-                continue  # both sides agree that the agent holds it
-            adopted, _ = backend.adopt(record.path, agent_id)  # idempotent: re-adds a lost holder
-            with store.lease(lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT) as lease:
-                store.reacquire_hold(
-                    lease, agent_id, adopted.id, adopted.path, owned=adopted.owned is True
-                )
-        _store_nearest(sup, around, row)
+        records = backend.list_records()
+        for cwd in cwds:
+            around = worktrees_containing(records, cwd)
+            held = {h["record_id"] for h in store.get_holds(agent_id)}
+            for record in around:
+                if record.id in held and agent_id in record.holders:
+                    continue  # both sides agree that the agent holds it
+                # idempotent: re-adds a lost holder
+                adopted, _ = backend.adopt(record.path, agent_id)
+                with store.lease(lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT) as lease:
+                    store.reacquire_hold(
+                        lease, agent_id, adopted.id, adopted.path, owned=adopted.owned is True
+                    )
+            _store_nearest(sup, around)
     except CliError as error:
         raise failure_of(error) from None
 
 
-def _store_nearest(sup: Supervisor, around: list[WtRecord], row: dict[str, Any]) -> None:
+def _store_nearest(sup: Supervisor, around: list[WtRecord]) -> None:
     """No worktree was created or adopted at launch: the agent's ``worktree`` is the nearest
     record it holds for its cwd (as the launcher does)."""
     assert sup.store is not None
@@ -466,10 +492,10 @@ def _start(
     assert sup.store is not None
     agent_id = sup.agent_id
     spec = RunSpec(agent_id=agent_id, mode="headless", resume=session, prompt_file=prompt)
-    classification, real_cwd, wt = _pre_start_checks(sup, backend, spec, row, session, cwd)
+    classification, hold_cwds, wt = _pre_start_checks(sup, backend, spec, row, session, cwd)
     if sup.collect_signals():
         raise ChainCanceled  # no run exists yet
-    _take_holds(sup, wt, row, real_cwd)
+    _take_holds(sup, wt, hold_cwds)
     if sup.collect_signals():
         raise ChainCanceled  # no run exists yet (a hold taken stays: teardown releases it)
     outcome_file = new_outcome_file(sup.state_dir, agent_id)

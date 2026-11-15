@@ -562,6 +562,12 @@ class Launch:
             return False
         return any(_inside(target.parent, os.path.realpath(d)) for d in directories)
 
+    def refuse_result_file(self, message: str) -> CliError:
+        """The usage error of a refused ``--result-file``; the target is dropped on the way, so
+        nothing is written to it, not even the exit-2 envelope."""
+        self.inv.result_file = None
+        return CliError.usage(message)
+
     # -- wtctl: resolution, the records of a cwd, the rules, the holds -----------------------------
 
     def wtctl_backend(self, stored: str | None = None) -> WtctlBackend | None:
@@ -652,7 +658,9 @@ class Launch:
             and cwd != third_party.SESSION_DIR
             and self.result_file_inside([cwd])
         ):
-            raise CliError.usage("--result-file lies inside a third-party-reading run's cwd")
+            raise self.refuse_result_file(
+                "--result-file lies inside a third-party-reading run's cwd"
+            )
 
     # -- hooks --------------------------------------------------------------------------------
 
@@ -1322,7 +1330,10 @@ class Launch:
             )
 
         def result_file_allows() -> bool:
-            return not self.result_file_inside([result.csession_dir, *([cwd] if cwd else [])])
+            if not self.result_file_inside([result.csession_dir, *([cwd] if cwd else [])]):
+                return True
+            self.inv.result_file = None  # refused: never written, not even the error envelope
+            return False
 
         check = self.backend.check_classification(
             result,

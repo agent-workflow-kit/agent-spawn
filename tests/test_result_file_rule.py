@@ -45,6 +45,7 @@ def test_a_launch_at_a_throwaway_root_refuses_a_result_file_inside_it(
     )
     assert done.returncode == 2, (done.stdout, done.stderr)
     assert env.agents() == [] and real_starts(fakebin) == []
+    assert not inside.exists()  # a refused path is never written, not even the envelope
 
 
 def test_a_launch_at_a_throwaway_root_accepts_a_result_file_outside_it(
@@ -74,6 +75,7 @@ def test_a_symlink_into_the_throwaway_does_not_hide_a_result_file_inside_it(
         str(link / "r.json"),
     )
     assert done.returncode == 2, (done.stdout, done.stderr)
+    assert not (Path(throwaway["path"]) / "r.json").exists()
 
 
 def test_a_resume_at_a_throwaway_root_refuses_a_result_file_inside_it(
@@ -83,15 +85,10 @@ def test_a_resume_at_a_throwaway_root_refuses_a_result_file_inside_it(
     agent_id = launched(env, "--cwd", throwaway["path"], "--reads-third-party")
     before = env.agent(agent_id)
     third_party_dry_run(fakebin)
-    done = env.run(
-        "resume",
-        agent_id,
-        "--json",
-        "--wait",
-        "--result-file",
-        str(Path(throwaway["path"]) / "r.json"),
-    )
+    target = Path(throwaway["path"]) / "r.json"
+    done = env.run("resume", agent_id, "--json", "--wait", "--result-file", str(target))
     assert done.returncode == 2, (done.stdout, done.stderr)
+    assert not target.exists()
     after = env.agent(agent_id)
     assert (after["status"], after["updated"]) == ("parked", before["updated"])
     assert len(real_starts(fakebin)) == 1
@@ -111,6 +108,7 @@ def test_a_resume_refuses_a_result_file_in_the_session_dir(
         "resume", agent_id, "--json", "--wait", "--result-file", str(directory / "r.json")
     )
     assert done.returncode == 2, (done.stdout, done.stderr)
+    assert not (directory / "r.json").exists()
     assert env.agent(agent_id)["updated"] == before["updated"]
     assert len(real_starts(fakebin)) == 1
 
@@ -149,3 +147,63 @@ def test_a_dry_run_applies_the_result_file_rule_too(env: Env, fakebin: Fakebin) 
     )
     assert done.returncode == 2, (done.stdout, done.stderr)
     assert env.agents() == []
+    assert not inside.exists()
+
+
+def test_the_equals_form_of_a_refused_result_file_is_dropped_too(
+    env: Env, fakebin: Fakebin
+) -> None:
+    throwaway = fake_throwaway(fakebin)
+    inside = Path(throwaway["path"]) / "eq.json"
+    done = env.run(
+        *LAUNCH, "--cwd", throwaway["path"], "--reads-third-party", f"--result-file={inside}"
+    )
+    assert done.returncode == 2, (done.stdout, done.stderr)
+    assert not inside.exists()
+
+
+def test_a_resume_dry_run_drops_a_refused_result_file(env: Env, fakebin: Fakebin) -> None:
+    throwaway = fake_throwaway(fakebin)
+    agent_id = launched(env, "--cwd", throwaway["path"], "--reads-third-party")
+    third_party_dry_run(fakebin)
+    inside = Path(throwaway["path"]) / "dry.json"
+    done = env.run("resume", agent_id, "--dry-run", "--json", "--result-file", str(inside))
+    assert done.returncode == 2, (done.stdout, done.stderr)
+    assert not inside.exists()
+
+
+def test_an_ordinary_usage_error_still_writes_the_exit_2_envelope(env: Env, tmp_path: Path) -> None:
+    out = tmp_path / "usage.json"
+    done = env.run(
+        *LAUNCH, "--cwd", "/nonexistent", "--worktree", "bogus", "--result-file", str(out)
+    )
+    assert done.returncode == 2, (done.stdout, done.stderr)
+    assert json.loads(out.read_text())["error"]["code"] == "usage"
+
+
+def test_a_resume_dry_run_refuses_a_result_file_in_the_session_dir(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = launched(env, "--cwd", "session-dir", "--reads-third-party")
+    directory = Path(session_dir(fakebin, env.agent(agent_id)["csession_id"]))
+    third_party_dry_run(fakebin, cwd=str(directory / "work"))
+    done = env.run(
+        "resume", agent_id, "--dry-run", "--json", "--result-file", str(directory / "r.json")
+    )
+    assert done.returncode == 2, (done.stdout, done.stderr)
+    assert not (directory / "r.json").exists()
+
+
+@pytest.mark.parametrize("where", ["", "outbox"])
+def test_a_fork_refuses_a_result_file_in_the_sources_session_dir(
+    env: Env, fakebin: Fakebin, where: str
+) -> None:
+    agent_id = launched(env, "--cwd", "session-dir", "--reads-third-party")
+    directory = Path(session_dir(fakebin, env.agent(agent_id)["csession_id"]))
+    third_party_dry_run(fakebin, cwd=str(directory / "work"))
+    target = directory / where / "fork.json"
+    done = env.run("resume", agent_id, "--fork", "--json", "--wait", "--result-file", str(target))
+    assert done.returncode == 2, (done.stdout, done.stderr)
+    assert not target.exists()
+    assert [a["agent_id"] for a in env.agents()] == [agent_id]
+    assert len(real_starts(fakebin)) == 1

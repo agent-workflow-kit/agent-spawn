@@ -563,7 +563,10 @@ def dry_run_plan(p: Parsed, existing: str | None, fork: bool) -> dict[str, Any]:
         "labels": sorted(set(p.multi("--label"))),
         "taints": False,
         "mode": p.get("--mode", "interactive"),
-        "cwd": p.get("--cwd") or os.getcwd(),
+        # A resume runs in the previous run's cwd (interface.md, --cwd); the fake records none,
+        # so it plans the session dir. A launch or fork without --cwd uses the caller's.
+        "cwd": p.get("--cwd")
+        or ("session-dir" if existing is not None and not fork else os.getcwd()),
         "repo": p.get("--repo"),
         "skill": p.get("--skill"),
         "has_prompt": p.has("--prompt-file"),

@@ -655,7 +655,7 @@ class Resume(Launch):
             assert self.backend is not None
             directories.append(self.backend.status(self.source_session).csession_dir)
         if self.result_file_inside(directories):
-            raise CliError.usage(
+            raise self.refuse_result_file(
                 "--result-file lies inside a third-party-reading run's cwd or session directory"
             )
 
