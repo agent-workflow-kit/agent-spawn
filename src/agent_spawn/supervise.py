@@ -28,13 +28,16 @@ from .outcome_table import park_row
 from .output import CliError, Outcome, PayloadKind
 from .records import RecordsError, append_log, parse_record_ts
 from .session_backend import RunOutcome, SessionBackend, read_outcome_file
-from .store import Store, StoreError
+from .store import Store, StoreError, StoreMissing
 
 STATUS_EVERY = 1.0  # seconds between looks at `claude-session status` and the outbox
 TICK = 0.05  # seconds between looks at `exec`
 SUPERVISOR_ACTOR = "auto:agent-spawn"
-# Exit 0 cannot carry "nothing", so the supervisor prints `{}` (its stdout is its log).
-DONE = Outcome(0, {}, PayloadKind.COMMAND)
+# The supervisor writes nothing to its terminal (interface.md, Supervision): no payload.
+DONE = Outcome(0, {}, PayloadKind.COMMAND, quiet=True)
+OUTCOME_TRIES = 3  # reads of the final outcome before giving up
+OUTCOME_RETRY = 0.2  # seconds between them
+EXEC_GRACE = 30.0  # seconds `exec` gets after SIGTERM when this supervisor fails
 FORWARDED = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 
 
@@ -43,12 +46,9 @@ class Signals:
 
     def __init__(self) -> None:
         self.received: list[int] = []
-        self.deliberate = False  # SIGTERM or SIGHUP seen: the chain ends
 
     def handle(self, signum: int, frame: FrameType | None) -> None:
         self.received.append(signum)
-        if signum in (signal.SIGTERM, signal.SIGHUP):
-            self.deliberate = True
 
     def take(self) -> list[int]:
         taken, self.received = self.received, []
@@ -102,7 +102,11 @@ class Supervisor:
             raise CliError.of(
                 "internal", "supervise --host and --handoff are not implemented yet (issue #27)"
             )  # TODO(#27): windows, the handoff and host mode.
-        self.store = Store.open(self.state_dir, create=False, gateway=self.gateway)
+        try:
+            self.store = Store.open(self.state_dir, create=False, gateway=self.gateway)
+        except StoreMissing:
+            self.log("warning", level="warn", message="supervise refused: no state database")
+            raise CliError.usage("supervise: there is no state database") from None
         try:
             row = self.startup_check()
             return self.supervise(row)
@@ -135,33 +139,59 @@ class Supervisor:
             return self.finish(backend, row, session, run, outcome_file, cancel=True)
 
         child = self.spawn_exec(row, session)
-        started = False
-        next_status = 0.0
-        while child.poll() is None:
-            for received in self.signals.take():
-                self.forward(received)
-            now = time.monotonic()
-            if now >= next_status:
-                next_status = now + STATUS_EVERY
-                if not started:
-                    started = self.look_started(backend, row, session, run)
-                self.deliver()
-            self.gateway.sleep(TICK)
+        try:
+            started = False
+            next_status = 0.0
+            while child.poll() is None:
+                for received in self.signals.take():
+                    self.forward(received)
+                now = time.monotonic()
+                if now >= next_status:
+                    next_status = now + STATUS_EVERY
+                    if not started:
+                        started = self.look_started(backend, row, session, run)
+                    self.deliver()
+                self.gateway.sleep(TICK)
+        except BaseException:
+            self.stop_child(child)
+            raise
         return self.finish(backend, row, session, run, outcome_file, cancel=False)
 
     def spawn_exec(self, row: dict[str, Any], session: str) -> subprocess.Popen[bytes]:
         assert self.store is not None
         argv = [*shlex.split(row["claude_session_path"]), "exec", "--session-id", session]
         child = self.gateway.spawn(argv, stdin=gw.DEVNULL)
-        identity = procs.read_identity(child.pid, gateway=self.gateway)
-        if identity is not None:
-            self.forwarder = procs.SignalForwarder(identity, gateway=self.gateway)
-            with self.store.lease(lifecycle.lease_key(self.agent_id), wait=30.0) as lease:
-                self.store.update_agent(lease, self.agent_id, {"exec_proc": identity})
+        try:
+            identity = procs.read_identity(child.pid, gateway=self.gateway)
+            if identity is not None:
+                self.forwarder = procs.SignalForwarder(identity, gateway=self.gateway)
+                with self.store.lease(lifecycle.lease_key(self.agent_id), wait=30.0) as lease:
+                    self.store.update_agent(lease, self.agent_id, {"exec_proc": identity})
+        except BaseException:
+            # `exec` is running but unrecorded: nothing could adopt it, so end it here.
+            self.stop_child(child)
+            raise
         return child
+
+    def stop_child(self, child: subprocess.Popen[bytes]) -> None:
+        """Send SIGTERM to exactly this `exec` (by identity when known), wait, then SIGKILL it."""
+        try:
+            if self.forwarder is not None:
+                self.forwarder.forward(signal.SIGTERM)
+            else:
+                child.terminate()
+            try:
+                child.wait(timeout=EXEC_GRACE)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+        except OSError as error:
+            self.log("warning", level="warn", message=f"could not stop exec: {error.strerror}")
 
     def forward(self, received: int) -> None:
         """Forward SIGTERM, SIGHUP (and SIGINT, headless) once to the exact `exec` process."""
+        # TODO(#12): `exec`'s own child (the claude process) must get the signal too, plus
+        # SIGCONT for a stopped one; today only `exec` itself is signaled.
         if received not in FORWARDED or self.forwarder is None:
             return
         outcome = self.forwarder.forward(received)
@@ -180,7 +210,10 @@ class Supervisor:
         if status.run.run != run:
             return False
         if status.run.phase == "session" or status.run.outcome is not None:
-            return self.mark_started(run, status.run.phase)
+            try:
+                return self.mark_started(run, status.run.phase)
+            except StoreError as error:
+                self.log("warning", level="warn", message=f"could not go live: {error}")
         return False
 
     def mark_started(self, run: int, phase: str) -> bool:
@@ -227,16 +260,15 @@ class Supervisor:
             except CliError as error:
                 self.log("warning", level="warn", message=f"cancel failed: {error.code}")
         try:
-            result = backend.run_outcome(outcome_file, session, run)
+            result = self.read_outcome(backend, outcome_file, session, run)
         except CliError as error:
-            self.log("error", level="error", message=f"no outcome: {error.code}")
+            self.log("warning", level="error", message=f"error: no outcome: {error.code}")
             if cancel:
                 lifecycle.park(store, self.agent_id, park_reason="killed", needs_attention=None)
                 self.deliver()
                 return DONE
+            # TODO(#32): the liveness check parks an agent whose outcome cannot be read.
             raise
-        if not result.final:
-            raise CliError.of("internal", "exec exited but the run is not final")
         raw = read_outcome_file(outcome_file, session, run)
         first = result.first_working_at
         outcome = outcome_object(self.agent_id, result, raw, first_working_at=first)
@@ -264,6 +296,26 @@ class Supervisor:
         self.deliver()
         self.drain()
         return DONE
+
+    def read_outcome(
+        self, backend: SessionBackend, outcome_file: str, session: str, run: int
+    ) -> RunOutcome:
+        """The final outcome of the run, read again a few times when it is not there yet."""
+        failure: CliError | None = None
+        for attempt in range(OUTCOME_TRIES):
+            if attempt:
+                self.gateway.sleep(OUTCOME_RETRY)
+            try:
+                result = backend.run_outcome(outcome_file, session, run)
+            except CliError as error:
+                failure = error
+                continue
+            if result.final:
+                return result
+            failure = CliError.of("internal", "exec exited but the run is not final")
+        assert failure is not None
+        # TODO(#32): the liveness check parks an agent whose run never became final.
+        raise failure
 
     def record_run(self, run: int, result: RunOutcome, outcome: dict[str, Any]) -> None:
         assert self.store is not None
@@ -306,6 +358,8 @@ def supervise(inv: Any) -> Outcome:
             signal.SIGQUIT: signal.SIG_IGN,
         }
     )
+    # The launcher exec'd us with these blocked: deliver what arrived meanwhile to the handlers.
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, FORWARDED)
     try:
         return Supervisor(inv, signals).run()
     finally:

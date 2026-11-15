@@ -59,8 +59,10 @@ def park(
         wanted = (from_status,) if isinstance(from_status, str) else tuple(from_status)
         if row["status"] not in wanted:
             return None
+        now = store.gateway.wall_time()
         all_changes: dict[str, object] = {
             **(changes or {}),
+            "updated": now,  # the stored value is this one: the events' `after` matches it
             "status": "parked",
             "park_reason": park_reason,
             "needs_attention": needs_attention,
@@ -83,7 +85,7 @@ def park(
                 needs_attention=needs_attention,
                 escalated_by=escalated_by,
                 from_status=wanted,
-                changes=changes,
+                changes={**(changes or {}), "updated": now},
                 events=events,
             )
         except CasLost:
@@ -101,6 +103,7 @@ def go_live(
             return None
         all_changes: dict[str, object] = {
             **(changes or {}),
+            "updated": store.gateway.wall_time(),
             "status": "live",
             "needs_attention": None,
             "park_reason": None,

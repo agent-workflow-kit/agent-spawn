@@ -162,6 +162,23 @@ def _reset_child_signals() -> None:
     signal.pthread_sigmask(signal.SIG_SETMASK, ())
 
 
+INTERRUPT_GRACE = 5.0  # seconds a child gets to act on SIGTERM when its caller is interrupted
+
+
+def _stop_politely(proc: subprocess.Popen[bytes]) -> None:
+    """SIGTERM ``proc`` (only it), wait a bounded time, then SIGKILL it."""
+    try:
+        proc.terminate()
+        proc.wait(timeout=INTERRUPT_GRACE)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    except BaseException:  # a second interrupt while waiting: do not leave the child running
+        proc.kill()
+        proc.wait()
+        raise
+
+
 def _communicate(
     proc: subprocess.Popen[bytes],
     data: bytes | None,
@@ -226,9 +243,13 @@ def _communicate(
                 chunks[fd].append(block)
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         proc.wait(timeout=remaining)
-    except BaseException:
+    except (subprocess.TimeoutExpired, OutputTooLarge):
         proc.kill()
         proc.wait()
+        raise
+    except BaseException:
+        # An interrupt (a signal handler raised): ask the exact child to stop, then force it.
+        _stop_politely(proc)
         raise
     finally:
         selector.close()

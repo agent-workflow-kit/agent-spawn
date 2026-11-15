@@ -236,7 +236,7 @@ def _check_spec(spec: RunSpec) -> None:
             raise CliError.usage(f"label key {label.key!r} is reserved for agent-spawn")
 
 
-def _launch_flags(spec: RunSpec) -> list[str]:
+def launch_flags(spec: RunSpec) -> list[str]:
     """The flags shared by the dry run and the real ``start`` (all but hook and outcome file)."""
     _check_spec(spec)
     argv: list[str] = []
@@ -765,7 +765,7 @@ class SessionBackend:
     def gateway(self) -> gw.Gateway:
         return self._gateway if self._gateway is not None else gw.get_gateway()
 
-    def _audit_flags(self) -> list[str]:
+    def audit_flags(self) -> list[str]:
         flags: list[str] = []
         if self.actor is not None:
             flags.append(_flag("--actor", self.actor))
@@ -773,7 +773,7 @@ class SessionBackend:
             flags.append(_flag("--decision-id", value))
         return flags
 
-    def _call(
+    def call(
         self, args: Sequence[str], *, stdin: str | None = None, timeout: float | None = None
     ) -> _Reply:
         """Run one command. Lower-tool exit codes are returned, not raised; a missing tool, a
@@ -829,18 +829,24 @@ class SessionBackend:
 
     def dry_run_argv(self, spec: RunSpec) -> list[str]:
         """``start ... --dry-run --json``: the real command without hook and outcome file."""
-        flags = _launch_flags(spec)
+        flags = launch_flags(spec)
         self._check_actor(spec)
-        return ["start", *flags, *self._audit_flags(), "--dry-run", "--json"]
+        return ["start", *flags, *self.audit_flags(), "--dry-run", "--json"]
 
     def classify(self, spec: RunSpec, *, refuse: bool = True) -> Classification:
-        """Run the dry run and read the classification.
+        """The classification of ``classify_with_plan`` (see there)."""
+        return self.classify_with_plan(spec, refuse=refuse)[0]
+
+    def classify_with_plan(
+        self, spec: RunSpec, *, refuse: bool = True
+    ) -> tuple[Classification, dict[str, Any]]:
+        """Run the dry run and read the classification; also returns the plan, verbatim.
 
         Exits 0, 12 and 20 carry a plan and are all used. ``would_refuse`` raises the exit-20
         refusal (``tool: claude-session``) unless ``refuse`` is false; ``would_fail`` is not
         acted on. Any other result fails the command and starts nothing.
         """
-        reply = self._call(self.dry_run_argv(spec))
+        reply = self.call(self.dry_run_argv(spec))
         plan = reply.data
         if reply.code in (0, 12, 20) and plan is not None and "error" not in plan:
             try:
@@ -855,10 +861,20 @@ class SessionBackend:
                     problem = refusal(replace(classification, would_refuse="unknown"))
                 if problem is not None:
                     raise problem
-            return classification
+            return classification, plan
         if reply.code == 0:
             raise self._unusable("output for a dry run")
-        raise self._fail(reply)
+        failure = self._fail(reply)
+        if reply.code == 2:
+            # claude-session rejected a flag value: the caller's input, not our bug.
+            raise CliError(
+                "usage",
+                "claude-session rejected the launch arguments (see lower_error)",
+                tool=TOOL,
+                lower_code=failure.lower_code,
+                lower_error=failure.lower_error,
+            )
+        raise failure
 
     # -- start
 
@@ -877,18 +893,18 @@ class SessionBackend:
         """
         if not os.path.isabs(outcome_file):
             raise ValueError("the outcome file must be an absolute path")
-        flags = _launch_flags(spec)
+        flags = launch_flags(spec)
         self._check_actor(spec)
         args = [
             "start",
             *flags,
             *(_flag("--hook", value) for value in (hook, *extra_hooks)),
             _flag("--outcome-file", outcome_file),
-            *self._audit_flags(),
+            *self.audit_flags(),
             "--json",
         ]
         try:
-            reply = self._call(args)
+            reply = self.call(args)
         except CliError as error:
             raise StartError(
                 error.code,
@@ -936,7 +952,7 @@ class SessionBackend:
         args = ["status", _session_id(csession_id)]
         if run is not None:
             args.append(_flag("--run", str(run)))
-        reply = self._call([*args, "--json"])
+        reply = self.call([*args, "--json"])
         if reply.code != 0:
             raise self._fail(reply)
         parsed = parse_status(reply.data) if reply.data is not None else None
@@ -1043,7 +1059,7 @@ class SessionBackend:
     def stop(self, csession_id: str, *, grace: str | None = None) -> dict[str, Any]:
         """``stop <id> [--grace D]``. Returns the stop object verbatim for exit 0, and for exit
         12 with ``ended: false`` (still live: the caller checks ``["ended"]``); else raises."""
-        args = ["stop", _session_id(csession_id), *self._audit_flags()]
+        args = ["stop", _session_id(csession_id), *self.audit_flags()]
         wanted: float | None = None
         if grace is not None:
             try:
@@ -1051,7 +1067,7 @@ class SessionBackend:
             except GrammarError as error:
                 raise CliError.usage(str(error)) from None
             args.append(_flag("--grace", grace))
-        reply = self._call([*args, "--json"], timeout=wanted)
+        reply = self.call([*args, "--json"], timeout=wanted)
         data = reply.data
         if reply.code == 0 or (
             reply.code == 12
@@ -1066,7 +1082,7 @@ class SessionBackend:
 
     def forget(self, csession_id: str) -> dict[str, Any]:
         """``forget <id>``; exit 10 (unknown) raises ``not_found`` (callers count it as done)."""
-        reply = self._call(["forget", _session_id(csession_id), *self._audit_flags(), "--json"])
+        reply = self.call(["forget", _session_id(csession_id), *self.audit_flags(), "--json"])
         if reply.code != 0:
             raise self._fail(reply)
         if reply.data is None:
@@ -1081,7 +1097,7 @@ class SessionBackend:
                 parse_label(pair)
             except GrammarError as error:
                 raise CliError.usage(str(error)) from None
-        reply = self._call(["label", action, _session_id(csession_id), *pairs, "--json"])
+        reply = self.call(["label", action, _session_id(csession_id), *pairs, "--json"])
         if reply.code != 0:
             raise self._fail(reply)
         if reply.data is None:
@@ -1097,7 +1113,7 @@ class SessionBackend:
     def verify_secret(self, csession_id: str, secret: str) -> bool:
         """``verify-secret <id>`` with the secret on stdin (never argv). True only for exit 0
         with ``{"match": true}``; exit 11 is False; anything else raises."""
-        reply = self._call(["verify-secret", _session_id(csession_id), "--json"], stdin=secret)
+        reply = self.call(["verify-secret", _session_id(csession_id), "--json"], stdin=secret)
         if reply.code == 11:
             return False
         if reply.code != 0:
@@ -1110,7 +1126,7 @@ class SessionBackend:
             parse_label(pair)
         except GrammarError as error:
             raise CliError.usage(str(error)) from None
-        reply = self._call(["list", _flag("--label", pair), "--json"])
+        reply = self.call(["list", _flag("--label", pair), "--json"])
         if reply.code != 0:
             raise self._fail(reply)
         sessions = reply.data.get("sessions") if reply.data is not None else None
@@ -1126,7 +1142,7 @@ class SessionBackend:
 
     def reconcile(self, *, dry_run: bool = False) -> dict[str, Any]:
         args = ["reconcile", *(["--dry-run"] if dry_run else []), "--json"]
-        reply = self._call(args, timeout=RECONCILE_TIMEOUT)
+        reply = self.call(args, timeout=RECONCILE_TIMEOUT)
         if reply.code != 0:
             raise self._fail(reply)
         if reply.data is None:

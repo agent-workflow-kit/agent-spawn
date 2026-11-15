@@ -105,21 +105,43 @@ def test_started_without_wait_leaves_agent_running(
 
 
 def test_detached_supervisor_holds_no_inherited_descriptor(
-    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
 ) -> None:
-    body = launch_hung(env, fakebin, proc_tracker)  # subprocess.run returned: no pipe was held
-    pid = env.agent(body["agent"]["agent_id"])["supervisor"].pid
+    # The launcher holds a marker descriptor (and a pipe for its output) that the detached
+    # supervisor must not inherit: the check fails if the grandchild keeps any of them.
+    script_live_run(fakebin)
+    script_hung_exec(fakebin)
+    marker = tmp_path / "marker-held-by-the-launcher"
+    marker.write_text("x")
+    marker_fd = os.open(marker, os.O_RDONLY)
+    try:
+        launcher = proc_tracker.popen(
+            env.argv(*LAUNCH),
+            env=env.env(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            pass_fds=(marker_fd,),
+        )
+        out, _err = launcher.communicate(timeout=60)  # returns only if no pipe end is held
+    finally:
+        os.close(marker_fd)
+    body = json.loads(out)
+    agent_id = body["agent"]["agent_id"]
+    track_agent(env, proc_tracker, agent_id)
+    pid = env.agent(agent_id)["supervisor"].pid
     targets = {fd: os.readlink(f"/proc/{pid}/fd/{fd}") for fd in os.listdir(f"/proc/{pid}/fd")}
     assert targets["0"] == os.devnull
-    assert (
-        targets["1"]
-        == targets["2"]
-        == str(env.state_dir / "supervise" / f"{body['agent']['agent_id']}.log")
-    )
+    log = str(env.state_dir / "supervise" / f"{agent_id}.log")
+    assert targets["1"] == targets["2"] == log
+    assert str(marker) not in targets.values()
+    database = str(env.state_dir / "state.db")
+    own = [t for fd, t in targets.items() if int(fd) > 2 and t.startswith(database)]
+    assert len(own) <= 3, own  # the database and its -wal and -shm, opened by the supervisor
     for fd, target in targets.items():
         assert not target.startswith(("pipe:", "socket:")), (fd, target)
         if int(fd) > 2:  # its own state database, or interpreter internals
-            allowed = (str(env.state_dir / "state.db"), "/sys/", "/dev/urandom", "anon_inode:")
+            allowed = (database, "/sys/", "/dev/urandom", "anon_inode:")
             assert target.startswith(allowed), (fd, target)
 
 
@@ -168,6 +190,9 @@ def _agents(env: Env) -> list[dict[str, Any]]:
         return []
 
 
+# TODO(#12): the fake `exec` has no child of its own, so this proves the supervisor forwards
+# SIGTERM to the exact `exec` but not that `exec`'s own child gets SIGTERM (and SIGCONT); that
+# needs a fake `exec` that spawns a real child, with the forwarding owned by issue #12.
 def test_sigterm_chain_launcher_supervisor_exec(
     env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
 ) -> None:

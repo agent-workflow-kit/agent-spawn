@@ -14,13 +14,16 @@ handlers only set a flag and the wait loop forwards SIGTERM to the exact verifie
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 import signal
 import stat
 import sys
+import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import FrameType
@@ -29,9 +32,9 @@ from typing import Any
 from . import gateway as gw
 from . import hooks as hooklib
 from . import lifecycle, procs, third_party
-from .agent_view import agent_object, ts
+from .agent_view import agent_object, outcome_object, ts
 from .config import Config
-from .ids import new_agent_id
+from .ids import IdEntry, new_agent_id
 from .labels import LabelSet, job_label, parse_run_labels
 from .output import (
     EXIT_SIGINT,
@@ -45,10 +48,12 @@ from .output import (
 )
 from .records import RecordsError, append_audit, append_log
 from .session_backend import (
+    RunOutcome,
     RunSpec,
     SessionBackend,
     StartError,
     StartResult,
+    launch_flags,
     new_outcome_file,
     relay_hook,
 )
@@ -73,6 +78,8 @@ PASS_THROUGH_FLAGS = (
     "env_allowlist_only",
     "auto_exit",
 )
+HANDLED_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+INPUT_NAME = re.compile(r"[A-Za-z0-9._-]{1,128}")
 SIGNAL_NAMES: dict[int, str] = {
     int(signal.SIGTERM): "SIGTERM",
     int(signal.SIGHUP): "SIGHUP",
@@ -98,6 +105,9 @@ class SignalState:
 
     def handle(self, signum: int, frame: FrameType | None) -> None:
         if self.raising:
+            # Only the first signal interrupts: a second one (even while the interrupt is being
+            # handled) is recorded, never raised again.
+            self.raising = False
             raise LaunchInterrupted(signum)
         self.received.append(signum)
 
@@ -112,7 +122,14 @@ class SignalState:
 def resolve_tool(argv: Sequence[str], name: str) -> list[str]:
     """``argv`` with its program resolved to an absolute path, or exit 12 ``tool_missing``."""
     first = argv[0]
-    path = os.path.abspath(first) if "/" in first else shutil.which(first)
+    found = shutil.which(first)
+    path = (
+        os.path.abspath(first)
+        if "/" in first
+        else None
+        if found is None
+        else os.path.abspath(found)
+    )
     if path is None or not os.path.isfile(path) or not os.access(path, os.X_OK):
         raise CliError(
             "tool_missing",
@@ -174,6 +191,22 @@ def _copy_private(source: str | None, destination: str) -> None:
         os.close(out)
 
 
+def input_names(args: Any) -> list[str]:
+    """The basenames of the ``--input-file`` values: each fits ``[A-Za-z0-9._-]{1,128}`` and
+    none repeats (exit 2)."""
+    names: list[str] = []
+    for source in args.input_file or []:
+        name = os.path.basename(source)
+        if name in ("", ".", "..") or INPUT_NAME.fullmatch(name) is None:
+            raise CliError.usage(
+                "--input-file names must be 1 to 128 characters of letters, digits, '.', '_' or '-'"
+            )
+        if name in names:
+            raise CliError.usage(f"two --input-file values have the base name {name!r}")
+        names.append(name)
+    return names
+
+
 @dataclass
 class _Copies:
     directory: str
@@ -188,6 +221,7 @@ def make_copies(state_dir: str, agent_id: str, args: Any) -> _Copies:
     The directory is made exclusively (mode 0700): two launchers that drew the same id never
     share it. Later steps pass these copies, never the caller's paths.
     """
+    names = input_names(args)  # exit 2 before anything is created
     base = os.path.join(state_dir, "prompts")
     os.makedirs(base, mode=0o700, exist_ok=True)
     directory = os.path.join(base, agent_id)
@@ -209,10 +243,7 @@ def make_copies(state_dir: str, agent_id: str, args: Any) -> _Copies:
             path = os.path.join(directory, "prompt")
             _copy_private(None if args.prompt_file == "-" else args.prompt_file, path)
             copies.prompt = path
-        for index, source in enumerate(args.input_file or []):
-            name = os.path.basename(source)
-            if not name or name in (".", ".."):
-                raise CliError.usage("--input-file must name a file")
+        for index, (source, name) in enumerate(zip(args.input_file or [], names, strict=True)):
             folder = os.path.join(directory, "inputs", str(index))
             os.makedirs(folder, mode=0o700)
             path = os.path.join(folder, name)
@@ -256,6 +287,8 @@ class Launch:
         self.run_hooks: list[dict[str, str]] = []
         self.pre_hooks: list[dict[str, str]] = []
         self.started = False
+        self.supervised = False  # a supervisor is recorded and acknowledged
+        self.label_set: LabelSet | None = None
 
     # -- logging ------------------------------------------------------------------------------
 
@@ -330,6 +363,8 @@ class Launch:
         self.run_hooks = [h for h in hook_values if h["hook"] == "post-launch"]
         if args.max_turns is not None:
             self.max_turns()
+        input_names(args)
+        self.label_set = self.labels()  # a reserved label key is exit 2, before any tool lookup
         # Seams owned by later issues; the usage checks above already ran.
         if worktree != "none":
             raise CliError.of(
@@ -553,27 +588,31 @@ class Launch:
         config = self.config
         cs_argv = self.tool_argv("claude-session", config.claude_session_cmd)
         self_path = resolve_self()
+        if self.args.dry_run:
+            return self.dry_run_launch(cs_argv)
         state = Path(self.state_dir)
         state.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.store = Store.open(self.state_dir, gateway=self.gateway)
         store = self.store
+        # TODO(#13): no `kill_grace` config key exists yet, so every `stop` of this backend uses
+        # claude-session's default grace (30 s); a key needs a spec change first.
         self.backend = SessionBackend(
             cs_argv,
             actor=self.inv.actor,
             decision_ids=self.inv.decision_ids,
             gateway=self.gateway,
         )
-        labels = self.labels()
+        labels = self.label_set if self.label_set is not None else self.labels()
         proposed = new_agent_id(store)
         self.agent_id = None  # no record yet: log lines and errors carry no agent id
         self.copies = make_copies(self.state_dir, proposed, self.args)
         try:
             spec = self.build_spec(proposed, labels, self._classification_cwd(), self.copies)
-            classification = self.backend.classify(spec, refuse=not self.args.dry_run)
-            cwd = self.pre_start_checks(classification) if not self.args.dry_run else None
-            if self.args.dry_run:
-                return self.dry_run(spec, labels, classification, cs_argv, proposed)
+            classification = self.backend.classify(spec)
+            cwd = self.pre_start_checks(classification)
             self.run_pre_launch(labels, classification, cwd, self.copies)
+            # The hooks' decision ids join every later call of the launcher.
+            self.backend.decision_ids = list(self.decision_ids)
         except BaseException:
             remove_copies(self.copies.directory)
             raise
@@ -590,68 +629,77 @@ class Launch:
 
     # -- dry run ------------------------------------------------------------------------------
 
+    def dry_run_launch(self, cs_argv: Sequence[str]) -> Outcome:
+        """``--dry-run`` creates nothing: no state directory, no database, no kept prompt copy.
+
+        The copies the classification needs live in a private temporary directory that is
+        removed before returning; the plan is the classification's own dry run, reused.
+        """
+        labels = self.label_set if self.label_set is not None else self.labels()
+        agent_id = new_agent_id(_NoIndex())
+        scratch = tempfile.mkdtemp(prefix="agent-spawn-dry-run-")
+        try:
+            copies = make_copies(scratch, agent_id, self.args)
+            self.backend = SessionBackend(
+                cs_argv,
+                actor=self.inv.actor,
+                decision_ids=self.inv.decision_ids,
+                gateway=self.gateway,
+            )
+            spec = self.build_spec(agent_id, labels, self._classification_cwd(), copies)
+            classification, session_plan = self.backend.classify_with_plan(spec, refuse=False)
+            return self.dry_run(
+                spec, labels, classification, session_plan, cs_argv, agent_id, copies
+            )
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
     def dry_run(
         self,
         spec: RunSpec,
         labels: LabelSet,
         classification: third_party.Classification,
+        session_plan: dict[str, Any],
         cs_argv: Sequence[str],
         agent_id: str,
+        copies: _Copies,
     ) -> Outcome:
-        assert self.backend is not None and self.copies is not None
-        try:
-            cwd = self.effective_cwd(classification)
-            would_refuse = classification.would_refuse
-            if would_refuse is not None and would_refuse not in third_party.WOULD_REFUSE_REASONS:
-                would_refuse = "unknown"
-            if would_refuse is None and classification.reads_third_party:
-                if not third_party.cwd_rule_allows(True, cwd):
-                    would_refuse = "third_party_cwd"
-            outcome_path = os.path.join(self.state_dir, "outcomes", agent_id, "TOKEN.json")
-            relay = relay_hook(resolve_self(), self.state_dir, self.inv.config_file or "")
-            argv = [
-                *cs_argv,
-                "start",
-                *self.start_flags(spec),
-                f"--hook={relay}",
-                f"--outcome-file={outcome_path}",
-                *self.audit_flags(),
-                "--json",
-            ]
-            plan = {
-                "dry_run": True,
-                "resume": False,
-                "agent_settings": self.settings(
-                    labels, self.copies.input_names, classification.repo or self.args.repo
-                ),
-                "reads_third_party": classification.reads_third_party,
-                "session_plan": self.plan_of(spec),
-                "would_refuse": would_refuse,
-                "tools": {"claude-session": list(cs_argv), "termctl": None, "wtctl": None},
-                "worktree_plan": None,
-                "term_plan": None,
-                "session_start_argv": argv,
-                "hooks": self.hook_listing(),
-                "warnings": self.warnings,
-            }
-        finally:
-            remove_copies(self.copies.directory)
+        assert self.backend is not None
+        cwd = self.effective_cwd(classification)
+        would_refuse = classification.would_refuse
+        if would_refuse is not None and would_refuse not in third_party.WOULD_REFUSE_REASONS:
+            would_refuse = "unknown"
+        if would_refuse is None and classification.reads_third_party:
+            if not third_party.cwd_rule_allows(True, cwd):
+                would_refuse = "third_party_cwd"
+        outcome_path = os.path.join(self.state_dir, "outcomes", agent_id, "TOKEN.json")
+        relay = relay_hook(resolve_self(), self.state_dir, self.inv.config_file or "")
+        argv = [
+            *cs_argv,
+            "start",
+            *launch_flags(spec),
+            f"--hook={relay}",
+            f"--outcome-file={outcome_path}",
+            *self.backend.audit_flags(),
+            "--json",
+        ]
+        plan = {
+            "dry_run": True,
+            "resume": False,
+            "agent_settings": self.settings(
+                labels, copies.input_names, classification.repo or self.args.repo
+            ),
+            "reads_third_party": classification.reads_third_party,
+            "session_plan": session_plan,
+            "would_refuse": would_refuse,
+            "tools": {"claude-session": list(cs_argv), "termctl": None, "wtctl": None},
+            "worktree_plan": None,
+            "term_plan": None,
+            "session_start_argv": argv,
+            "hooks": self.hook_listing(),
+            "warnings": self.warnings,
+        }
         return Outcome(20 if would_refuse else 0, plan, PayloadKind.DRY_RUN)
-
-    def start_flags(self, spec: RunSpec) -> list[str]:
-        from .session_backend import _launch_flags  # pyright: ignore[reportPrivateUsage]
-
-        return _launch_flags(spec)
-
-    def audit_flags(self) -> list[str]:
-        assert self.backend is not None
-        return self.backend._audit_flags()  # pyright: ignore[reportPrivateUsage]
-
-    def plan_of(self, spec: RunSpec) -> dict[str, Any]:
-        """The classification dry run's plan, verbatim."""
-        assert self.backend is not None
-        reply = self.backend._call(self.backend.dry_run_argv(spec))  # pyright: ignore[reportPrivateUsage]
-        return reply.data or {}
 
     def hook_listing(self) -> list[dict[str, str]]:
         listing: list[dict[str, str]] = []
@@ -687,33 +735,33 @@ class Launch:
             "pass_throughs": self.pass_throughs(),
         }
         name = _name_of(proposed, args)
-        row = store.insert_new_agent(
-            {
-                "status": "launching",
-                "launch_kind": args.kind,
-                "mode": "headless",
-                "placement": None,
-                "term_placement": args.term_placement,
-                "name": name,
-                "repo": args.repo or classification.repo,
-                "cwd": cwd,
-                "agent_spawn_path": self_path,
-                "state_dir": self.state_dir,
-                "config_path": self.inv.config_file,
-                "claude_session_path": shlex.join(cs_argv),
-                "actor": self.inv.actor,
-                "decision_ids": list(self.decision_ids),
-                "settings": settings_row,
-                "launcher": identity,
-                "starter": identity,
-                "promote": args.promote,
-                "ephemeral": bool(args.ephemeral),
-            },
-            proposed=proposed,
-            labels=labels,
-        )
-        self.agent_id = row["agent_id"]
-        self.agent_inserted = True
+        fields: dict[str, Any] = {
+            "status": "launching",
+            "launch_kind": args.kind,
+            "mode": "headless",
+            "placement": None,
+            "term_placement": args.term_placement,
+            "name": name,
+            "repo": args.repo or classification.repo,
+            "cwd": cwd,
+            "agent_spawn_path": self_path,
+            "state_dir": self.state_dir,
+            "config_path": self.inv.config_file,
+            "claude_session_path": shlex.join(cs_argv),
+            "actor": self.inv.actor,
+            "decision_ids": list(self.decision_ids),
+            "settings": settings_row,
+            "launcher": identity,
+            "starter": identity,
+            "promote": args.promote,
+            "ephemeral": bool(args.ephemeral),
+        }
+        # A signal is held back until the record and the flag agree: an interrupt must never
+        # find a record the launcher does not know about.
+        with _signals_held():
+            row = store.insert_new_agent(fields, proposed=proposed, labels=labels)
+            self.agent_id = row["agent_id"]
+            self.agent_inserted = True
         assert self.agent_id is not None
         if self.agent_id != proposed:
             self.copies = _rename_copies(self.state_dir, self.copies, self.agent_id, args)
@@ -815,19 +863,45 @@ class Launch:
                     self.backend.stop(session)
                 except CliError:
                     pass
+        recorded: dict[str, Any] | None = None
         if session is not None:
             self.csession_id = session
+            agent_changes: dict[str, object] = {"csession_id": session}
+            run_fields: dict[str, object] = {"mode": "headless", "hooks": self.run_hooks}
+            if run:
+                # The run was allocated and never started: it is recorded with its not-started
+                # outcome, updating `run`, `last_outcome` and `last_end_reason` together.
+                lower = error.lower_error or {}
+                reason = lower.get("end_reason")
+                end_reason = reason if isinstance(reason, str) else None
+                recorded = outcome_object(
+                    agent_id,
+                    RunOutcome(
+                        session,
+                        run,
+                        "launch",
+                        "not-started",
+                        end_reason,
+                        12,
+                        "not-started",
+                        None,
+                        "status",
+                    ),  # fmt: skip
+                )
+                agent_changes.update(run=run, last_outcome=recorded, last_end_reason=end_reason)
+                run_fields.update(
+                    outcome=recorded,
+                    end_reason=end_reason,
+                    exit_code=12,
+                    ended_at=self.gateway.wall_time(),
+                )
             with self.store.lease(
                 lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT
             ) as lease:
                 with self.store.transaction():
-                    self.store.update_agent(
-                        lease, agent_id, {"csession_id": session, **({"run": run} if run else {})}
-                    )
+                    self.store.update_agent(lease, agent_id, agent_changes)
                     if run:
-                        self.store.put_run(
-                            lease, agent_id, run, {"mode": "headless", "hooks": self.run_hooks}
-                        )
+                        self.store.put_run(lease, agent_id, run, run_fields)
             remove_copies(None if self.copies is None else self.copies.directory)
         code = error.exit_code
         if code == 11:
@@ -842,7 +916,7 @@ class Launch:
             fields = {"park_reason": "launch_failed", "needs_attention": None}
         else:
             fields = {"park_reason": "launch_failed", "needs_attention": "launch_failed"}
-        lifecycle.park(self.store, agent_id, from_status="launching", **fields)
+        lifecycle.park(self.store, agent_id, from_status="launching", outcome=recorded, **fields)
         self.log("status_change", level="warn", details={"to": "parked", **fields})
         error.agent_id = agent_id
         error.decision_ids = list(self.decision_ids)
@@ -901,6 +975,16 @@ class Launch:
         )
         error = check.error(agent_id)
         error.decision_ids = list(self.decision_ids)
+        if check.cancel_error is not None or not check.cancelled:
+            # The run could not be canceled and may still be live: say so, keep the session.
+            code = check.cancel_error.code if check.cancel_error is not None else "still_live"
+            self.log(
+                "warning",
+                level="warn",
+                csession_id=result.csession_id,
+                message=f"the pending run could not be canceled ({code})",
+            )
+            error.details = {**(error.details or {}), "cancel_failed": True, "cancel_code": code}
         raise error
 
     def record_status(
@@ -950,6 +1034,9 @@ class Launch:
                 argv,
                 log_path=os.path.join(supervise_dir, f"{agent_id}.log"),
                 ack_timeout=ACK_TIMEOUT,
+                # The supervisor starts with these blocked and unblocks them once its handlers
+                # are installed, so an early signal is delivered instead of killing it.
+                keep_blocked=HANDLED_SIGNALS,
                 gateway=self.gateway,
             )
             identity = self.detached.identity
@@ -958,7 +1045,8 @@ class Launch:
             self.forwarder = procs.SignalForwarder(identity, gateway=self.gateway)
             self.sig.raising = False  # from here a signal is forwarded, not a reason to cancel
             self.detached.acknowledge()
-        except (procs.DetachedForkError, OSError) as error:
+            self.supervised = True
+        except (procs.DetachedForkError, OSError, StoreError) as error:
             self.sig.raising = True
             self.placement_failed(result, error)
             raise  # placement_failed raises; unreachable
@@ -971,19 +1059,28 @@ class Launch:
         agent_id = self.agent_id
         if self.detached is not None:
             self.detached.abort()
-        with self.store.lease(lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT) as lease:
-            self.store.update_agent(lease, agent_id, {"supervisor": None})
+        try:
+            with self.store.lease(
+                lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT
+            ) as lease:
+                self.store.update_agent(lease, agent_id, {"supervisor": None})
+        except StoreError:
+            self.log("warning", level="warn", message="could not clear the supervisor record")
         try:
             self.backend.stop(result.csession_id)
         except CliError:
             pass
-        lifecycle.park(
-            self.store,
-            agent_id,
-            park_reason="launch_failed",
-            needs_attention="launch_failed",
-            from_status="launching",
-        )
+        try:
+            lifecycle.park(
+                self.store,
+                agent_id,
+                park_reason="launch_failed",
+                needs_attention="launch_failed",
+                from_status="launching",
+            )
+        except StoreError:
+            # TODO(#32): the liveness check parks an agent that stayed launching.
+            self.log("warning", level="warn", message="could not park the agent")
         raise CliError(
             "launch_failed",
             f"could not start the detached supervisor ({type(error).__name__})",
@@ -1017,14 +1114,17 @@ class Launch:
             if not wait:
                 if status == "live":
                     return self.result(row, final=False)
-                if ended:  # the run ended before this launcher saw it started
+                if ended and not alive:  # the run ended before this launcher saw it started
                     return self.result(row, final=True)
             elif ended and not row["promotion_pending"] and not alive:
                 return self.result(row, final=True)
             if not alive and status in ("launching", "live"):
                 dead_looks += 1
+                if dead_looks >= DEAD_SUPERVISOR_POLLS and status == "launching":
+                    self.park_unsupervised(row)  # raises once it parked the agent
+                    continue
                 if dead_looks >= DEAD_SUPERVISOR_POLLS:
-                    # TODO(#32): the liveness check parks an agent whose supervisor died.
+                    # TODO(#32): the liveness check parks a live agent whose supervisor died.
                     raise CliError(
                         "failed",
                         "the supervisor exited before the agent parked (see reconcile)",
@@ -1036,10 +1136,45 @@ class Launch:
                 payload = result_object(
                     agent=agent_object(store, row, warnings=self.warnings),
                     timed_out=True,
+                    first_working_at=self.first_working_at(row),
                     warnings=self.warnings,
                 )
                 return Outcome(EXIT_TIMED_OUT, payload, PayloadKind.RESULT)
             self.gateway.sleep(POLL)
+
+    def park_unsupervised(self, row: dict[str, Any]) -> None:
+        """The supervisor died while the agent was still ``launching``: the run was never
+        adopted, so cancel it and park ``launch_failed`` with attention. False when the agent
+        parked meanwhile (the next look reports it); else raises ``launch_failed``."""
+        assert self.store is not None and self.backend is not None
+        agent_id = row["agent_id"]
+        session = row.get("csession_id")
+        if isinstance(session, str):
+            try:
+                self.backend.stop(session)
+            except CliError:
+                pass
+        parked = lifecycle.park(
+            self.store,
+            agent_id,
+            park_reason="launch_failed",
+            needs_attention="launch_failed",
+            from_status="launching",
+        )
+        if parked is None:
+            return
+        self.log("status_change", level="warn", details={"to": "parked", "cause": "supervisor"})
+        raise CliError(
+            "launch_failed",
+            "the supervisor exited before the agent started",
+            agent_id=agent_id,
+            decision_ids=list(self.decision_ids),
+        )
+
+    def first_working_at(self, row: dict[str, Any]) -> str | None:
+        assert self.store is not None
+        run_row = self.store.get_run(row["agent_id"], row["run"]) if row.get("run") else None
+        return ts(run_row.get("first_working_at")) if run_row else None
 
     def forward_signal(self, received: int) -> Outcome | None:
         """Handle a flagged signal: forward SIGTERM to the supervisor and keep waiting, or (a
@@ -1059,8 +1194,7 @@ class Launch:
         store = self.store
         agent_id = row["agent_id"]
         agent = agent_object(store, row, warnings=self.warnings)
-        run_row = store.get_run(agent_id, row["run"]) if row.get("run") else None
-        first = ts(run_row.get("first_working_at")) if run_row else None
+        first = self.first_working_at(row)
         if not final:
             payload = result_object(agent=agent, first_working_at=first, warnings=self.warnings)
             return Outcome(0, payload, PayloadKind.RESULT)
@@ -1106,6 +1240,8 @@ class Launch:
                 pass
         elif self.copies is not None:
             remove_copies(self.copies.directory)
+        if self.agent_inserted and self.csession_id is not None and self.copies is not None:
+            remove_copies(self.copies.directory)  # a session was allocated: the copies are spent
         self.log(
             "interrupted",
             level="warn",
@@ -1121,6 +1257,28 @@ class Launch:
             decision_ids=list(self.decision_ids),
         )
         return error_outcome(error, self.inv.decision_ids)
+
+    def store_failed(self, error: StoreError) -> CliError:
+        """The state database failed mid-launch: end what is pending and report, never escape.
+
+        Before a supervisor is recorded and acknowledged the pending run is canceled and the
+        agent parked; afterwards the supervisor owns the run and is left alone.
+        """
+        agent_id = self.agent_id if self.agent_inserted else None
+        if agent_id is not None and not self.supervised and self.store is not None:
+            try:
+                self.cancel_pending(agent_id)
+            except (CliError, StoreError):
+                pass  # TODO(#32): the liveness check parks an agent that stayed launching.
+            if self.csession_id is not None and self.copies is not None:
+                remove_copies(self.copies.directory)
+        self.log("warning", level="warn", message=f"state error ({type(error).__name__})")
+        return CliError(
+            "launch_failed" if agent_id is not None else "failed",
+            f"the state database could not be used ({type(error).__name__})",
+            agent_id=agent_id,
+            decision_ids=list(self.decision_ids),
+        )
 
     def cancel_pending(self, agent_id: str) -> None:
         assert self.store is not None and self.backend is not None
@@ -1151,6 +1309,26 @@ class Launch:
             needs_attention=None,
             from_status="launching",
         )
+
+
+class _NoIndex:
+    """An empty agent index: a dry run allocates an id without opening the database."""
+
+    def entries_with_prefix(self, prefix: str) -> list[IdEntry]:
+        return []
+
+    def is_reserved(self, agent_id: str) -> bool:
+        return False
+
+
+@contextmanager
+def _signals_held() -> Iterator[None]:
+    """Block SIGTERM, SIGHUP and SIGINT; a signal that arrived meanwhile is delivered on exit."""
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
 
 
 def _name_of(agent_id: str, args: Any) -> str:
@@ -1186,29 +1364,37 @@ def _tty_pair() -> bool:
 
 
 def launch(inv: Any) -> Outcome:
-    """Run ``launch``; the handler of ``commands.launching``."""
+    """Run ``launch``; the handler of ``commands.launching``.
+
+    The handlers stay installed after this returns: they only record the signals, so one that
+    arrives while the result is being printed cannot lose it. The process exits right after.
+    """
     sig = SignalState()
     launch_run = Launch(inv, sig)
-    restore = procs.install_signal_handlers(
+    procs.install_signal_handlers(
         {signal.SIGTERM: sig.handle, signal.SIGHUP: sig.handle, signal.SIGINT: sig.handle}
     )
     try:
+        failure: CliError
         try:
             return launch_run.run()
         except LaunchInterrupted as exc:
             outcome = launch_run.interrupted(exc.signum)
             launch_run.deliver()
             return outcome
-        except CliError as error:
+        except StoreError as error:
             sig.raising = False  # a second signal must not interrupt the cleanup below
-            if launch_run.copies is not None and not launch_run.agent_inserted:
-                remove_copies(launch_run.copies.directory)
-            if error.agent_id is None and launch_run.agent_inserted:
-                error.agent_id = launch_run.agent_id
-            launch_run.deliver()
-            raise
+            failure = launch_run.store_failed(error)
+        except CliError as error:
+            sig.raising = False
+            failure = error
+        if launch_run.copies is not None and not launch_run.agent_inserted:
+            remove_copies(launch_run.copies.directory)
+        if failure.agent_id is None and launch_run.agent_inserted:
+            failure.agent_id = launch_run.agent_id
+        launch_run.deliver()
+        raise failure
     finally:
         sig.raising = False
-        restore()
         if launch_run.store is not None:
             launch_run.store.close()

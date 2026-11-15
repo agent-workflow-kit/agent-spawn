@@ -99,6 +99,16 @@ def _text_or_none(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
+_OWN_STATE = ("killed", "timeout", "lost", "exited-unreported", "not-started")
+
+
+def _state_of(outcome: str) -> str:
+    """The final state of an outcome (claude-session interface, Outcome mapping)."""
+    if outcome in ("vetoed", "escalated"):
+        return "not-started"
+    return outcome if outcome in _OWN_STATE else "exited"
+
+
 def outcome_object(
     agent_id: str,
     outcome: RunOutcome,
@@ -129,7 +139,7 @@ def outcome_object(
         "outcome": outcome.outcome,
         "end_reason": outcome.end_reason,
         "exit_code": outcome.exit_code,
-        "state": outcome.state or "exited",
+        "state": _state_of(outcome.outcome),
         "report": outcome.report,
         "session_started_at": _text_or_none(raw.get("session_started_at")),
         "cost_usd": cost if isinstance(cost, int | float) and not isinstance(cost, bool) else None,

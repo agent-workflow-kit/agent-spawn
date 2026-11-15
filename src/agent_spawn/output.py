@@ -83,7 +83,7 @@ ENVELOPE_EXITS = frozenset({1, 2, 10, 11, 12, 13, 20, 21, 130, 143})
 TOOLS = ("agent-spawn", "claude-session", "termctl", "wtctl")
 LOWER_TOOLS = TOOLS[1:]
 HOOKS = ("pre-launch", "pre-teardown")
-DETAIL_KEYS = frozenset({"status", "cause", "retryable", "hint"})
+DETAIL_KEYS = frozenset({"status", "cause", "retryable", "hint", "cancel_failed", "cancel_code"})
 # Allowed values of ``details.status`` and ``details.cause`` (schemas/cli/error.json).
 DETAIL_STATUSES = frozenset(
     {"torn_down", "session_missing", "parked", "launching", "tearing_down", None}
@@ -325,6 +325,10 @@ def _check_details(details: Mapping[str, Any]) -> None:
         raise ValueError(f"invalid details cause {details['cause']!r}")
     if "retryable" in details and not isinstance(details["retryable"], bool):
         raise ValueError("details retryable must be a boolean")
+    if "cancel_failed" in details and not isinstance(details["cancel_failed"], bool):
+        raise ValueError("details cancel_failed must be a boolean")
+    if "cancel_code" in details and not isinstance(details["cancel_code"], str):
+        raise ValueError("details cancel_code must be a string")
     if "hint" in details and not isinstance(details["hint"], str):
         raise ValueError("details hint must be a string")
 
@@ -439,6 +443,9 @@ class Outcome:
     payload: dict[str, Any] | list[Any] | None
     kind: PayloadKind
     human: str | None = None
+    #: Print nothing at all (an internal command such as ``supervise``, which writes nothing to
+    #: its terminal); the exit code still follows the table for a payload of ``kind``.
+    quiet: bool = False
 
     def __post_init__(self) -> None:
         if self.kind not in allowed_payload_kinds(self.exit_code):
@@ -479,7 +486,7 @@ def result_object(
 def emit(outcome: Outcome, *, as_json: bool, stdout: TextIO, stderr: TextIO) -> None:
     """Print ``outcome``: errors always on stderr, JSON (or human text) on stdout."""
     payload = outcome.payload
-    if outcome.kind is PayloadKind.NONE or payload is None:
+    if outcome.quiet or outcome.kind is PayloadKind.NONE or payload is None:
         return
     if outcome.kind is PayloadKind.ENVELOPE:
         assert isinstance(payload, dict)  # an envelope is always an object

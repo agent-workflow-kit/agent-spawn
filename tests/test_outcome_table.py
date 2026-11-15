@@ -113,3 +113,20 @@ def test_lifecycle_events_for_a_park() -> None:
     assert events[2].payload["previous_status"] == "live"
     unchanged = lifecycle_events(after, after, reads_third_party=None)
     assert unchanged == []
+
+
+@pytest.mark.parametrize(
+    ("outcome", "state"),
+    [
+        ("done", "exited"),
+        ("failed", "exited"),
+        ("killed", "killed"),
+        ("timeout", "timeout"),
+        ("lost", "lost"),
+        ("not-started", "not-started"),
+        ("exited-unreported", "exited-unreported"),
+    ],
+)
+def test_outcome_object_state_is_derived_from_the_outcome(outcome: str, state: str) -> None:
+    run = RunOutcome("cs-aaaaaaaa", 1, "session", outcome, "normal", 0, None, None, "file")
+    assert outcome_object("ag-aaaaaaaa", run)["state"] == state

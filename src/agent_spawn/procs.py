@@ -28,7 +28,7 @@ import resource
 import signal
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Literal
@@ -578,6 +578,7 @@ def _grandchild(
     ack_r: int,
     ack_timeout: float,
     fd_limit: int,
+    keep_blocked: Collection[int],
 ) -> None:
     """Runs in the grandchild with every signal blocked; never returns."""
     # Move the descriptors we keep above stdio first: with the caller's 0-2 closed, the log
@@ -612,8 +613,9 @@ def _grandchild(
         return
     _close_fds_except(frozenset(), fd_limit)
     # Every disposition is SIG_DFL now: clear the mask just before exec (a signal pending
-    # since the fork is delivered here, with its default action).
-    signal.pthread_sigmask(signal.SIG_SETMASK, [])
+    # since the fork is delivered here, with its default action), except ``keep_blocked``:
+    # the mask survives exec, so the new program decides when those are delivered.
+    signal.pthread_sigmask(signal.SIG_SETMASK, set(keep_blocked))
     try:
         os.execve(argv[0], list(argv), dict(os.environ) if env is None else dict(env))
     except (OSError, ValueError) as exc:
@@ -632,6 +634,7 @@ def _intermediate(
     ack_w: int,
     ack_timeout: float,
     fd_limit: int,
+    keep_blocked: Collection[int],
 ) -> None:
     """Runs in the first child with every signal blocked; never returns."""
     code = 70
@@ -641,7 +644,7 @@ def _intermediate(
         gw.setsid()
         if gw.fork() == 0:  # the grandchild is not a session leader: no controlling tty ever
             try:
-                _grandchild(gw, argv, env, log_fd, id_w, ack_r, ack_timeout, fd_limit)
+                _grandchild(gw, argv, env, log_fd, id_w, ack_r, ack_timeout, fd_limit, keep_blocked)
             finally:
                 gw.exit_now(70)
         code = 0
@@ -710,6 +713,7 @@ def spawn_detached(
     env: Mapping[str, str] | None = None,
     timeout: float = 10.0,
     ack_timeout: float = 60.0,
+    keep_blocked: Collection[int] = (),
     gateway: Gateway | None = None,
 ) -> DetachedStart:
     """Double fork a detached process (``setsid``; stdin ``/dev/null``; stdout and stderr to
@@ -723,6 +727,10 @@ def spawn_detached(
     closed before the acknowledgement, is a failed detached fork (``DetachedForkError``) and
     no exec happens. ``argv[0]`` must be an absolute path; argv and env strings must not
     contain NUL and env names must be non-empty without ``=`` (``ValueError``).
+
+    ``keep_blocked`` signals stay blocked across the exec (the mask is inherited): the new
+    program unblocks them once its handlers are installed, and a signal that arrived meanwhile
+    is delivered then instead of killing it with the default action.
 
     Every signal is blocked from just before the fork until the grandchild's exec, so no
     Python signal handler of the caller ever runs in a forked child. In the caller, signals
@@ -751,7 +759,17 @@ def spawn_detached(
         if pid == 0:
             try:
                 _intermediate(
-                    gw, argv, env, log_fd, id_r, id_w, ack_r, ack_w, ack_timeout, fd_limit
+                    gw,
+                    argv,
+                    env,
+                    log_fd,
+                    id_r,
+                    id_w,
+                    ack_r,
+                    ack_w,
+                    ack_timeout,
+                    fd_limit,
+                    keep_blocked,
                 )
             finally:
                 gw.exit_now(70)

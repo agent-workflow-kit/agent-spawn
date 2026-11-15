@@ -852,8 +852,8 @@ class Store:
             if values.get("promotion_pending") is True:
                 raise ValueError("a park always sets promotion_pending to false")
             values["promotion_pending"] = False
-        if touch:
-            values["updated"] = self._now()
+        if touch and "updated" not in values:
+            values["updated"] = self._now()  # a caller may pass it so its events match it
         if not values:
             raise ValueError("nothing to write")
         sets = ", ".join(f"{name} = ?" for name in values)
@@ -1509,6 +1509,8 @@ def _check_leaf(path: Path, uid: int, *, sidecar: bool) -> tuple[int, int] | Non
         return None
     if stat.S_ISLNK(info.st_mode):
         raise StoreError(f"{path} is a symbolic link: refusing to follow it")
+    if sidecar and info.st_nlink == 0:
+        return None  # unlinked by SQLite while we looked: lstat can report it with no links
     _check_info(info, path, uid)
     if stat.S_IMODE(info.st_mode) == FILE_MODE:
         return info.st_dev, info.st_ino
@@ -1568,6 +1570,8 @@ def _fix_sidecar_modes(db: Path, uid: int) -> None:
             raise StoreError(f"cannot check {side}: {exc}") from exc
         if stat.S_ISLNK(info.st_mode):
             raise StoreError(f"{side} is a symbolic link: refusing to follow it")
+        if info.st_nlink == 0:
+            continue  # a checkpoint removed it while we looked
         _check_info(info, side, uid)
         if stat.S_IMODE(info.st_mode) != FILE_MODE:
             raise StoreError(
