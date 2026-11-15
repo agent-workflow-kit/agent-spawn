@@ -350,13 +350,13 @@ def test_adopt_records_an_unowned_worktree_and_a_second_adopt_adds_the_holder(
     target = tmp_path / "tree"
     target.mkdir()
     first = json.loads(
-        fakebin.run("wtctl", "adopt", str(target), "--holder", "ag-aaaaaaaa", "--json").stdout
+        fakebin.run("wtctl", "adopt", str(target), "--holder", "ag-bbbbbbbb", "--json").stdout
     )
     assert first["existing"] is False and first["record"]["owned"] is False
-    assert first["record"]["holders"] == ["ag-aaaaaaaa"]
+    assert first["record"]["holders"] == ["ag-bbbbbbbb"]
     sibling_schemas.validate(first, "wtctl", "cli/adopt.json")
     second = json.loads(
-        fakebin.run("wtctl", "adopt", str(target), "--holder", "ag-bbbbbbbb", "--json").stdout
+        fakebin.run("wtctl", "adopt", str(target), "--holder", "ag-aaaaaaaa", "--json").stdout
     )
     assert second["existing"] is True and second["record"]["id"] == first["record"]["id"]
     assert second["record"]["holders"] == ["ag-aaaaaaaa", "ag-bbbbbbbb"]

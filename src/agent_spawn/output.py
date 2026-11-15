@@ -331,8 +331,18 @@ def _check_details(details: Mapping[str, Any]) -> None:
         raise ValueError("details cancel_failed must be a boolean")
     if "cancel_code" in details and not isinstance(details["cancel_code"], str):
         raise ValueError("details cancel_code must be a string")
-    if "original_failure" in details and not isinstance(details["original_failure"], Mapping):
-        raise ValueError("details original_failure must be an object")
+    if "original_failure" in details:
+        failure = details["original_failure"]
+        if (
+            not isinstance(failure, Mapping)
+            or set(failure) != {"code", "reason", "message"}
+            or not isinstance(failure["code"], str)
+            or not (failure["reason"] is None or isinstance(failure["reason"], str))
+            or not isinstance(failure["message"], str)
+        ):
+            raise ValueError(
+                "details original_failure must be {code: str, reason: str or null, message: str}"
+            )
     if "hint" in details and not isinstance(details["hint"], str):
         raise ValueError("details hint must be a string")
 

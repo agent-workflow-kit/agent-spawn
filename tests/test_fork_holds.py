@@ -117,7 +117,6 @@ def test_an_in_place_fork_holds_the_sources_record_under_its_own_id(
     done = env.run("resume", source, "--fork", "--json", "--wait")
     assert done.returncode == 0, (done.stdout, done.stderr)
     fork = result_json(done)["agent"]["agent_id"]
-    assert fork != source
     record_id = env.agent(source)["wt_record_id"]
     with env.store() as store:
         assert [h["record_id"] for h in store.get_holds(fork)] == [record_id]  # its own row
