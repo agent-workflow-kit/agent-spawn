@@ -78,19 +78,32 @@ class Flow:
 
     # -- running -----------------------------------------------------------------------
 
-    def check(self, schema_id: str, stdout: str) -> Any:
-        """Parse and validate one ``--json`` output (the error envelope when it is one)."""
+    def check(self, schema_id: str, stdout: str, *, allow_empty: bool = False) -> Any:
+        """Parse and validate one ``--json`` output (the error envelope when it is one).
+
+        Empty output raises unless ``allow_empty`` (a command that prints nothing, such as one
+        killed before it printed): a command that should print JSON cannot pass unvalidated.
+        """
         if not stdout.strip():
-            return None
+            if allow_empty:
+                return None
+            raise AssertionError(f"expected {schema_id} JSON on stdout, got nothing")
         body = json.loads(stdout)
         error = isinstance(body, dict) and "error" in body
         schema_registry.validate(body, ERROR if error else schema_id)
         self.validated += 1
         return body
 
-    def cli(self, schema_id: str, *args: str, extra_env: dict[str, str] | None = None) -> Result:
+    def cli(
+        self,
+        schema_id: str,
+        *args: str,
+        extra_env: dict[str, str] | None = None,
+        allow_empty: bool = False,
+    ) -> Result:
         done = self.env.run(*args, extra_env=extra_env)
-        return Result(done.returncode, self.check(schema_id, done.stdout), done.stdout, done.stderr)
+        body = self.check(schema_id, done.stdout, allow_empty=allow_empty)
+        return Result(done.returncode, body, done.stdout, done.stderr)
 
     def start(
         self, tracker: ProcTracker, *args: str, extra_env: dict[str, str] | None = None
@@ -104,10 +117,19 @@ class Flow:
             stderr=subprocess.PIPE,
         )
 
-    def finish(self, schema_id: str, proc: subprocess.Popen[bytes], timeout: float = 60) -> Result:
+    def finish(
+        self,
+        schema_id: str,
+        proc: subprocess.Popen[bytes],
+        timeout: float = 60,
+        *,
+        allow_empty: bool = False,
+    ) -> Result:
         raw_out, raw_err = proc.communicate(timeout=timeout)
         out, err = raw_out.decode(), raw_err.decode()
-        return Result(proc.returncode, self.check(schema_id, out), out, err)
+        return Result(
+            proc.returncode, self.check(schema_id, out, allow_empty=allow_empty), out, err
+        )
 
     # -- the state -----------------------------------------------------------------------
 
@@ -128,7 +150,9 @@ class Flow:
             if row.get(key) is not None:
                 tracker.record(row[key])
 
-    def script_live_status(self, *, times: int | None = None, **top: Any) -> None:
+    def script_live_status(
+        self, *, times: int | None = None, until_called: str | None = None, **top: Any
+    ) -> None:
         """`claude-session status` reports the current run live in its session phase (``top``
         fields, such as ``csession_dir``, are merged into the status object)."""
         live_run = {
@@ -144,6 +168,7 @@ class Flow:
             "claude-session",
             "status",
             times=times,
+            until_called=until_called,
             merge={"state": "working", "live": True, "run": live_run, **top},
         )
 
@@ -204,12 +229,18 @@ class Flow:
             return []
         return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
-    def validate_everything(self, *, expect_hooks: Sequence[str] = ()) -> None:
+    def validate_everything(
+        self, *, expect_hooks: Sequence[str] = (), expect_log: int = 1, expect_audit: int = 0
+    ) -> None:
         """Every hook payload, log record and audit record the scenario wrote is schema-valid.
 
-        ``expect_hooks`` names hooks that must have fired at least once (so the check cannot
-        pass over an empty directory). Call it after the supervisors have exited.
+        ``expect_hooks`` names hooks that must have fired at least once, ``expect_log`` and
+        ``expect_audit`` are minimum record counts (so the check cannot pass over empty
+        files), and at least one ``--json`` output must have been validated. It reads the
+        files as they are: call it only after the supervisors have settled, or late records
+        are missed.
         """
+        assert self.validated > 0, "no command output was validated"
         payloads = self.hook_payloads()
         for payload in payloads:
             schema_registry.validate(payload, f"agent-spawn/hooks/{payload['hook']}.json")
@@ -218,7 +249,12 @@ class Flow:
         assert not missing, f"hooks that never fired: {sorted(missing)} (fired: {sorted(fired)})"
         event_ids = [p["event_id"] for p in payloads if p["hook"] != "pre-launch"]
         assert len(event_ids) == len(set(event_ids)), "an event was delivered twice"
-        for record in self.log():
+        log, audit = self.log(), self.audit()
+        assert len(log) >= expect_log, f"expected {expect_log} log records, found {len(log)}"
+        assert len(audit) >= expect_audit, (
+            f"expected {expect_audit} audit records, found {len(audit)}"
+        )
+        for record in log:
             schema_registry.validate(record, "agent-spawn/log.json")
-        for record in self.audit():
+        for record in audit:
             schema_registry.validate(record, "agent-spawn/audit.json")

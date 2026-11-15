@@ -1509,6 +1509,31 @@ def test_async_watchdog_is_removed_when_the_hook_ends(state_dir: Path) -> None:
     assert not any(r["event"] == "hook_failed" for r in log_records(state_dir))
 
 
+@linux_only
+def test_async_wrapper_never_orphans_its_watchdog_sleep() -> None:
+    # The wrapper signals the watchdog subshell as soon as a quick command ends, possibly before
+    # the subshell installed its trap; the default action must not leave ``sleep`` in the group.
+    leaked: list[int] = []
+    for _ in range(300):
+        proc = subprocess.Popen(
+            [hooks._SH, "-c", hooks._ASYNC_WRAPPER, "agent-spawn-hook", "true", "30", "2"],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        proc.wait()
+        end = time.monotonic() + 2.0
+        while _group_members(proc.pid) and time.monotonic() < end:
+            time.sleep(0.02)
+        left = _group_members(proc.pid)
+        if left:
+            leaked.extend(left)
+            for pid in left:  # exact pids just read from this probe's own group
+                os.kill(pid, signal.SIGKILL)
+    assert not leaked, f"watchdog processes left in the group: {leaked}"
+
+
 def test_async_command_is_a_positional_parameter_never_interpolated(
     state_dir: Path, tmp_path: Path
 ) -> None:

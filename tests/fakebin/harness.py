@@ -83,9 +83,13 @@ class Fakebin:
         *,
         argv_contains: Sequence[str] = (),
         times: int | None = None,
+        until_called: str | None = None,
         **respond: Any,
     ) -> None:
         """Script the next matching calls of ``tool``'s ``command``.
+
+        ``until_called`` (a subcommand name) ends the rule once a call of that subcommand of
+        ``tool`` is in the log, so a reply can depend on what happened rather than on a count.
 
         Keyword arguments are the response: ``exit`` (code), ``stdout`` (replaces the canned
         output: an object is printed as JSON), ``merge`` (deep-merged into the canned output),
@@ -103,6 +107,8 @@ class Fakebin:
             rule["argv_contains"] = list(argv_contains)
         if times is not None:
             rule["times"] = times
+        if until_called is not None:
+            rule["until_called"] = until_called
         self._rules.append(rule)
         self._write_script()
 

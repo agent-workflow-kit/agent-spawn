@@ -112,18 +112,18 @@ _TEARDOWN_HOOKS = frozenset({"pre-teardown", "post-teardown"})
 _SH = "/bin/sh"
 # Runs an async hook: $1 the command (never interpolated into this text), $2 the timeout and $3
 # the SIGTERM-to-SIGKILL grace, both in whole seconds. The wrapper is the group leader; the
-# watchdog subshell signals the whole group (``kill 0``). The timeout bounds the command itself
-# only: the watchdog stops when the command exits, so background children it leaves behind
-# afterwards are not bounded.
+# watchdog subshell signals the whole group (``kill 0``); its USR1 trap is installed before
+# anything else so an early signal from the wrapper cannot orphan the watchdog's ``sleep`` (the
+# trap kills ``$!``, the most recent background job, which is set at the fork). The timeout
+# bounds the command itself only: the watchdog stops when the command exits, so background
+# children it leaves behind afterwards are not bounded.
 _ASYNC_WRAPPER = """
 (
   trap '' TERM
-  sleep "$2" & s=$!
-  trap 'kill -s KILL "$s" 2>/dev/null; exit 0' USR1
-  wait "$s"
+  trap 'kill -s KILL $! 2>/dev/null; exit 0' USR1
+  sleep "$2" & wait $!
   kill -s TERM 0
-  sleep "$3" & s=$!
-  wait "$s"
+  sleep "$3" & wait $!
   kill -s KILL 0
 ) &
 w=$!

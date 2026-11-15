@@ -314,6 +314,24 @@ def error_exit(respond: dict[str, Any], default: int | None = None) -> int:
     return ERROR_EXITS.get(str(error.get("code")), default or 1)
 
 
+def was_called(tool: str, command: str) -> bool:
+    """Whether the log holds a call of ``tool`` whose first argv token is ``command``."""
+    path = _log_path()
+    if not path.exists():
+        return False
+    for line in path.read_text().splitlines():
+        record = json.loads(line)
+        argv = record.get("argv")
+        if (
+            record.get("event") == "invoke"
+            and record.get("tool") == tool
+            and isinstance(argv, list)
+            and argv[:1] == [command]
+        ):
+            return True
+    return False
+
+
 def find_rule(
     tool: str,
     command: str,
@@ -340,6 +358,9 @@ def find_rule(
         if wanted not in (None, command):
             continue
         if any(token not in argv for token in rule.get("argv_contains", [])):
+            continue
+        until = rule.get("until_called")
+        if isinstance(until, str) and was_called(tool, until):
             continue
         times = rule.get("times")
         if times is not None and counter(f"rule-{index}") > times:

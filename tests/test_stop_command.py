@@ -18,7 +18,7 @@ import pytest
 from agent_spawn import lifecycle, procs
 from agent_spawn.procs import ProcessIdentity
 from agent_spawn.stop import Plan, Stop
-from agent_spawn.store import Store
+from agent_spawn.store import LeaseHeld, Store
 from tests import schema_registry
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
@@ -718,14 +718,24 @@ def test_a_wait_that_sees_tearing_down_ends_when_the_run_is_final(
     seed(env, fakebin, csession_id=SESSION, supervisor=supervisor)
     proc = start_stop(env, proc_tracker)
     env.wait_for(marker.exists, "the supervisor to get SIGTERM")
-    with Store.open(env.state_dir, create=False) as store:  # an ephemeral hand-over to teardown
-        with store.lease(lifecycle.lease_key(AGENT)) as lease:
-            store.compare_and_set(
-                lease,
-                AGENT,
-                expect_status="live",
-                changes={"status": "tearing_down", "teardown_step": "started"},
-            )
+
+    def hand_over() -> (
+        bool
+    ):  # an ephemeral hand-over to teardown; the running stop may hold the lease
+        with Store.open(env.state_dir, create=False) as store:
+            try:
+                with store.lease(lifecycle.lease_key(AGENT)) as lease:
+                    store.compare_and_set(
+                        lease,
+                        AGENT,
+                        expect_status="live",
+                        changes={"status": "tearing_down", "teardown_step": "started"},
+                    )
+            except LeaseHeld:
+                return False
+        return True
+
+    env.wait_for(hand_over, "the agent lease to be free")
     code, body = finish(proc)
     assert code == 0
     check_stop(body)

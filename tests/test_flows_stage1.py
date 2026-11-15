@@ -51,7 +51,7 @@ def test_headless_review_run_to_report_result_file_and_teardown(flow: Flow, tmp_
     # the result file holds exactly what --json printed, mode 0600
     assert result_file.read_text() == done.stdout
     assert result_file.stat().st_mode & 0o777 == 0o600
-    flow.wait_settled(agent_id)
+    assert flow.settled(agent_id)  # --wait returned only after the supervisor exited
 
     shown = flow.cli(schema("show"), "show", agent_id, "--json")
     assert shown.code == 0 and shown.body["runs"][0]["outcome"]["outcome"] == "done"
@@ -65,6 +65,9 @@ def test_headless_review_run_to_report_result_file_and_teardown(flow: Flow, tmp_
     assert not (flow.state_dir / "outcomes" / agent_id).exists()
     tomb = flow.cli(schema("wait"), "wait", agent_id, "--json")
     assert tomb.code == 0 and tomb.body["agent"]["status"] == "torn_down"
+    # a torn-down agent is not found by a prefix either, whatever the command
+    by_prefix = flow.cli(schema("resume"), "resume", agent_id[:8], "--json")
+    assert by_prefix.code == 10, (by_prefix.stdout, by_prefix.stderr)
 
     exported = flow.cli(schema("export"), "export", "--json")
     assert exported.code == 0 and exported.body == []  # no worktree, no --force
@@ -88,7 +91,7 @@ def test_blocked_review_run_is_acknowledged_resumed_and_finished(flow: Flow) -> 
     agent_id = first.body["agent"]["agent_id"]
     assert first.body["outcome"] == "blocked"
     assert first.body["agent"]["needs_attention"] == "blocked"
-    flow.wait_settled(agent_id)
+    assert flow.settled(agent_id)
     listed = flow.cli(schema("list"), "list", "--needs-attention", "--json")
     assert [a["agent_id"] for a in listed.body["agents"]] == [agent_id]
     acked = flow.cli(schema("ack"), "ack", agent_id, "--json")
@@ -98,7 +101,7 @@ def test_blocked_review_run_is_acknowledged_resumed_and_finished(flow: Flow) -> 
     assert resumed.code == 0, (resumed.stdout, resumed.stderr)
     assert resumed.body["outcome"] == "done" and resumed.body["agent"]["status"] == "parked"
     assert flow.agent(agent_id)["run"] == 2
-    flow.wait_settled(agent_id)
+    assert flow.settled(agent_id)
     assert flow.cli(schema("list"), "list", "--needs-attention", "--json").body["agents"] == []
     flow.validate_everything(expect_hooks=["post-launch", "post-escalate", "post-park"])
     escalations = flow.hooks_named("post-escalate", agent_id)
@@ -168,6 +171,7 @@ def test_live_agent_wait_label_stop_resume_fork_and_export(
     flow.end_live_run(agent_id)  # claude-session stop signals the run's exec
     stopped = flow.finish(schema("stop"), stopper)
     waited = flow.finish(schema("wait"), waiter)
+    assert flow.settled(agent_id)  # stop and wait returned only after the supervisor exited
     assert stopped.code == 0, (stopped.stdout, stopped.stderr)
     assert stopped.body["action"] == "session_stop" and stopped.body["already_parked"] is False
     assert stopped.body["agent"]["status"] == "parked"
@@ -182,6 +186,7 @@ def test_live_agent_wait_label_stop_resume_fork_and_export(
     resumed = flow.cli(schema("resume"), "resume", agent_id, "--wait", "--json")
     assert resumed.code == 0, (resumed.stdout, resumed.stderr)
     assert resumed.body["outcome"] == "done" and flow.agent(agent_id)["run"] == 2
+    assert flow.settled(agent_id)
     forked = flow.cli(
         schema("resume"),
         "resume", agent_id, "--fork", "--cwd", "session-dir", "--wait",
@@ -192,9 +197,10 @@ def test_live_agent_wait_label_stop_resume_fork_and_export(
     assert fork_id != agent_id and forked.body["agent"]["forked_from"] == agent_id
     children = flow.cli(schema("list"), "list", "--forked-from", agent_id, "--json")
     assert [a["agent_id"] for a in children.body["agents"]] == [fork_id]
+    by_prefix = flow.cli(schema("list"), "list", "--forked-from", agent_id[:8], "--json")
+    assert [a["agent_id"] for a in by_prefix.body["agents"]] == [fork_id]
     assert flow.agent(agent_id)["status"] == "parked" and flow.agent(agent_id)["run"] == 2
-    flow.wait_settled(agent_id)
-    flow.wait_settled(fork_id)
+    assert flow.settled(agent_id) and flow.settled(fork_id)
 
     # the audit trail: the stop is there, with its actor and decision id
     exported = flow.cli(schema("export"), "export", "--action", "stop", "--json")
@@ -213,7 +219,8 @@ def test_live_agent_wait_label_stop_resume_fork_and_export(
     gone = flow.cli(schema("list"), "list", "--status", "torn_down", "--json")
     assert {a["agent_id"] for a in gone.body["agents"]} == {agent_id, fork_id}
     flow.validate_everything(
-        expect_hooks=["post-launch", "post-state-change", "post-park", "post-teardown"]
+        expect_hooks=["post-launch", "post-state-change", "post-park", "post-teardown"],
+        expect_audit=2,
     )
     assert {p["run"] for p in flow.hooks_named("post-launch", agent_id)} == {1, 2}
     assert [p["fork"] for p in flow.hooks_named("post-launch", fork_id)] == [True]
@@ -249,7 +256,7 @@ def test_launch_wait_under_sigterm_during_the_prelaunch_hooks_parks_killed_with_
     parked = flow.agent(agent_id)
     assert parked["status"] == "parked" and parked["park_reason"] == "killed"
     assert parked["needs_attention"] is None
-    flow.wait_settled(agent_id)
+    assert flow.settled(agent_id)
     assert flow.cli(schema("wait"), "wait", agent_id, "--json").code == 12
     flow.validate_everything(expect_hooks=["post-park"])
     assert [p["reason"] for p in flow.hooks_named("post-park", agent_id)] == ["killed"]
@@ -268,23 +275,26 @@ def test_wait_and_resume_during_an_ephemeral_teardown(
     started = flow.cli(schema("launch"), *EPHEMERAL)
     assert started.code == 0, (started.stdout, started.stderr)
     agent_id = started.body["agent"]["agent_id"]
-    flow.fakebin.wait_for_gate(gate)
+    # tracked before anything can fail, and the gate opens whatever happens, so a failing
+    # assertion never leaves the supervisor or the gated fake unrecorded or running
     flow.track(proc_tracker, agent_id)
-    row = flow.agent(agent_id)
-    assert row["status"] == "tearing_down" and row["teardown_step"] == "hooks_done"
-    supervisor = row["supervisor"]
-    assert supervisor is not None and procs.is_alive(supervisor)
+    try:
+        flow.fakebin.wait_for_gate(gate)
+        row = flow.agent(agent_id)
+        assert row["status"] == "tearing_down" and row["teardown_step"] == "hooks_done"
+        supervisor = row["supervisor"]
+        assert supervisor is not None and procs.is_alive(supervisor)
 
-    # a resume is refused for as long as the teardown runs
-    refused = flow.cli(schema("resume"), "resume", agent_id, "--json")
-    assert refused.code == 20 and refused.body["error"]["reason"] == "tearing_down"
-    assert flow.agent(agent_id)["status"] == "tearing_down"
-    # a wait does not return while the supervisor is alive
-    early = flow.cli(schema("wait"), "wait", agent_id, "--timeout", "300ms", "--json")
-    assert early.code == 22 and early.body["timed_out"] is True
-    waiter = flow.start(proc_tracker, "wait", agent_id, "--json")
-
-    gate.write_text("")  # claude-session forgets the session; the teardown finishes
+        # a resume is refused for as long as the teardown runs
+        refused = flow.cli(schema("resume"), "resume", agent_id, "--json")
+        assert refused.code == 20 and refused.body["error"]["reason"] == "tearing_down"
+        assert flow.agent(agent_id)["status"] == "tearing_down"
+        # a wait does not return while the supervisor is alive
+        early = flow.cli(schema("wait"), "wait", agent_id, "--timeout", "300ms", "--json")
+        assert early.code == 22 and early.body["timed_out"] is True
+        waiter = flow.start(proc_tracker, "wait", agent_id, "--json")
+    finally:
+        gate.write_text("")  # claude-session forgets the session; the teardown finishes
     done = flow.finish(schema("wait"), waiter)
     assert done.code == 0, (done.stdout, done.stderr)
     assert done.body["agent"]["status"] == "torn_down" and done.body["outcome"] == "done"
@@ -314,16 +324,17 @@ def test_stop_is_the_remedy_for_an_ephemeral_agent_left_tearing_down(
     )
     started = flow.cli(schema("launch"), *EPHEMERAL, "--wait")
     agent_id = started.body["agent"]["agent_id"]
-    flow.wait_settled(agent_id)
+    assert flow.settled(agent_id)
     row = flow.agent(agent_id)
     assert row["status"] == "tearing_down" and row["teardown_step"] == "hooks_done"
-    assert row["park_reason"] != "done"
+    assert row["park_reason"] is None  # a tearing_down row carries no park reason
 
     # no supervisor is left: wait answers at once with the last outcome
     waited = flow.cli(schema("wait"), "wait", agent_id, "--json")
     assert waited.code == 0 and waited.body["agent"]["status"] == "tearing_down"
     # the orphan is live: stop acts on it, and a resume stays refused
-    flow.script_live_status(times=1)  # the look before the stop; later looks see it final
+    # the run reads live until a `stop` was logged, whatever number of looks come before
+    flow.script_live_status(until_called="stop")
     # the fake session recorded the run as done; the orphan is a live process of it, so
     # claude-session's stop kills it (scripted: the fake's own bookkeeping says already final)
     flow.fakebin.script(
@@ -352,7 +363,7 @@ def test_stop_is_the_remedy_for_an_ephemeral_agent_left_tearing_down(
     assert retried.body["agent"]["status"] == "torn_down" and retried.body["session_forgotten"]
     stops = flow.cli(schema("export"), "export", "--action", "stop", "--json").body
     assert [r["target"] for r in stops] == [agent_id]
-    flow.validate_everything(expect_hooks=["post-teardown"])
+    flow.validate_everything(expect_hooks=["post-teardown"], expect_audit=1)
 
 
 def test_ephemeral_agent_with_a_pre_teardown_hook_parks_done_with_teardown_refused(
@@ -364,13 +375,14 @@ def test_ephemeral_agent_with_a_pre_teardown_hook_parks_done_with_teardown_refus
     agent_id = started.body["agent"]["agent_id"]
     assert started.body["agent"]["status"] == "parked"
     assert started.body["agent"]["park_reason"] == "done"
-    flow.wait_settled(agent_id)
+    assert flow.settled(agent_id)
     (park,) = flow.hooks_named("post-park", agent_id)
     assert park["reason"] == "done" and park["teardown_refused"] is True
     assert flow.hooks_named("post-teardown", agent_id) == []
     # resume works again: a refused teardown changed nothing
     resumed = flow.cli(schema("resume"), "resume", agent_id, "--wait", "--json")
     assert resumed.code == 0 and flow.agent(agent_id)["run"] == 2
+    assert flow.settled(agent_id)
     flow.validate_everything(expect_hooks=["post-park"])
 
 
@@ -396,11 +408,18 @@ def test_job_launch_wait_canceled_after_the_run_started_parks_killed(
     assert done.body["phase"] == "session" and done.body["outcome"] == "killed"
     assert done.body["agent"]["park_reason"] == "killed"
     assert done.body["agent"]["needs_attention"] is None
-    flow.wait_settled(agent_id)
+    assert flow.settled(agent_id)
     flow.back_to_final_status()
     # the job id travelled as a label and finds the agent
     found = flow.cli(schema("list"), "list", "--label", "job=job-42", "--json")
     assert [a["agent_id"] for a in found.body["agents"]] == [agent_id]
+    # the label cap is 64 pairs, the job= pair included: 63 more are accepted, a 65th is not
+    fill = [f"k{i}=v" for i in range(63)]
+    filled = flow.cli(schema("label-add"), "label", "add", agent_id, *fill, "--json")
+    assert filled.code == 0, (filled.stdout, filled.stderr)
+    assert len(flow.cli(schema("show"), "show", agent_id, "--json").body["agent"]["labels"]) >= 64
+    over = flow.cli(schema("label-add"), "label", "add", agent_id, "one=more", "--json")
+    assert over.code == 2, (over.stdout, over.stderr)
     # a stopped run is never resumed automatically; the caller may resume it deliberately
     assert flow.agent(agent_id)["run"] == 1
     flow.validate_everything(expect_hooks=["post-launch", "post-park"])

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_spawn.lifecycle import lease_key
 from tests import schema_registry
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
@@ -83,3 +84,104 @@ def test_resume_of_a_trusted_run_may_write_into_its_session_dir(
     done = env.run("resume", agent_id, "--json", "--wait", "--result-file", str(target))
     assert done.returncode == 0, (done.stdout, done.stderr)
     assert target.exists()
+
+
+def test_resume_dry_run_refuses_a_result_file_in_the_session_dir(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    csd = tmp_path / "csd"
+    csd.mkdir()
+    agent_id = third_party_agent(env, fakebin, csd)
+    target = csd / "r.json"
+    done = env.run(
+        "resume",
+        agent_id,
+        "--reads-third-party",
+        "--dry-run",
+        "--json",
+        "--result-file",
+        str(target),
+    )
+    assert done.returncode == 2, (done.stdout, done.stderr)
+    assert not target.exists()
+
+
+def test_resume_dry_run_accepts_a_result_file_elsewhere(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    csd = tmp_path / "csd"
+    csd.mkdir()
+    agent_id = third_party_agent(env, fakebin, csd)
+    target = tmp_path / "out" / "r.json"
+    target.parent.mkdir()
+    done = env.run(
+        "resume",
+        agent_id,
+        "--reads-third-party",
+        "--dry-run",
+        "--json",
+        "--result-file",
+        str(target),
+    )
+    assert done.returncode == 0, (done.stdout, done.stderr)
+
+
+def test_the_cwd_rule_comes_before_the_session_dir_result_file_check(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    csd = tmp_path / "csd"
+    csd.mkdir()
+    agent_id = third_party_agent(env, fakebin, csd)
+    with env.store() as store:
+        with store.lease(lease_key(agent_id)) as lease:
+            store.update_agent(lease, agent_id, {"cwd": "session-dir"}, touch=False)
+    fakebin.clear_script("claude-session", "start")
+    fakebin.script(
+        "claude-session",
+        "start",
+        argv_contains=["--dry-run"],
+        merge={"profile": {"reads_third_party": True}, "taints": True, "cwd": "/srv/elsewhere"},
+    )
+    done = env.run("resume", agent_id, "--json", "--wait", "--result-file", str(csd / "r.json"))
+    assert done.returncode == 20, (done.stdout, done.stderr)
+    assert result_json(done)["error"]["reason"] == "third_party_cwd"
+
+
+def test_a_relative_session_dir_from_status_fails_the_resume_check_closed(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    csd = tmp_path / "csd"
+    csd.mkdir()
+    agent_id = third_party_agent(env, fakebin, csd)
+    fakebin.clear_script("claude-session", "status")
+    fakebin.script("claude-session", "status", merge={"csession_dir": "csd"})
+    target = tmp_path / "out" / "r.json"
+    target.parent.mkdir()
+    done = env.run(
+        "resume", agent_id, "--reads-third-party", "--json", "--wait", "--result-file", str(target)
+    )
+    assert done.returncode != 0, (done.stdout, done.stderr)
+    assert not target.exists()
+
+
+def test_a_fork_refuses_a_result_file_in_the_source_sessions_dir(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    csd = tmp_path / "csd"
+    csd.mkdir()
+    agent_id = third_party_agent(env, fakebin, csd)
+    target = csd / "r.json"
+    done = env.run(
+        "resume",
+        agent_id,
+        "--fork",
+        "--cwd",
+        "session-dir",
+        "--reads-third-party",
+        "--json",
+        "--wait",
+        "--result-file",
+        str(target),
+    )
+    assert done.returncode == 2, (done.stdout, done.stderr)
+    assert not target.exists()

@@ -118,6 +118,8 @@ def test_a_malformed_start_result_still_names_a_valid_allocated_session() -> Non
         {"run": True},
         {"run": "1"},
         {"csession_dir": None},
+        {"csession_dir": ""},
+        {"csession_dir": "relative/dir"},
         {"argv": [1]},
         {"warnings": "x"},
         {"forked_from": 5},
@@ -639,7 +641,15 @@ def test_good_status_fields_are_kept(reason: str) -> None:
     assert (status.run.end_reason, status.run.state, status.run.exit_code) == (reason, "exited", 13)
 
 
-@pytest.mark.parametrize("patch", [{"csession_dir": "/a\0b"}, {"csession_id": "cs-abcdefgh\n"}])
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"csession_dir": "/a\0b"},
+        {"csession_id": "cs-abcdefgh\n"},
+        {"csession_dir": ""},
+        {"csession_dir": "relative/dir"},
+    ],
+)
 def test_nul_in_a_classification_field_makes_the_status_unusable(patch: dict[str, Any]) -> None:
     assert parse_status({**status_object(), **patch}) is None
 

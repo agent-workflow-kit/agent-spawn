@@ -535,6 +535,27 @@ def test_result_file_inside_a_third_party_runs_session_dir_exits_2(
     assert (tmp_path / "ok.json").exists()
 
 
+def test_the_session_directory_check_uses_the_agents_stored_claude_session(
+    env: Env, tmp_path: Path
+) -> None:
+    first = result_json(env.run(*LAUNCH))
+    agent_id = first["agent"]["agent_id"]
+    _mark_third_party(env, agent_id)
+    session_dir = env.iso.state / "claude-session" / "sessions" / first["agent"]["csession_id"]
+    inside = session_dir / "work" / "r.json"
+    # claude-session is no longer on PATH: only the path stored on the agent finds it
+    refused = env.run(
+        "wait",
+        agent_id,
+        "--json",
+        "--result-file",
+        str(inside),
+        extra_env={"PATH": "/usr/bin:/bin"},
+    )
+    assert refused.returncode == 2, (refused.stdout, refused.stderr)
+    assert not inside.exists()
+
+
 @pytest.mark.parametrize(("code", "error_code"), [(1, "internal"), (12, "failed"), (20, "refused")])
 def test_an_unreadable_session_status_fails_closed_for_a_third_party_run(
     env: Env, fakebin: Fakebin, tmp_path: Path, code: int, error_code: str

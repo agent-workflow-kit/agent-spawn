@@ -54,3 +54,30 @@ def test_clear_script_disables_rules_but_keeps_the_counts_of_later_ones(
     assert (first.returncode, second.returncode) == (20, 0)  # the times=1 rule still counts
     status = fakebin.run("claude-session", "status", "cs-cccccccc", "--json")
     assert status.returncode == 0 and json.loads(status.stdout)["state"] != "working"
+
+
+def test_clearing_an_earlier_rule_after_a_later_one_was_answered_keeps_its_count(
+    fakebin: Fakebin,
+) -> None:
+    for session in ("cs-abcdefgh", "cs-bbbbbbbb", "cs-cccccccc"):
+        fakebin.seed_session(session)
+    fakebin.script("claude-session", "status", merge={"state": "working"})  # index 0
+    fakebin.script("claude-session", "forget", times=1, error={"code": "refused", "message": "x"})
+    first = fakebin.run("claude-session", "forget", "cs-abcdefgh", "--json")
+    fakebin.clear_script("claude-session", "status")  # an earlier index goes away
+    second = fakebin.run("claude-session", "forget", "cs-bbbbbbbb", "--json")
+    third = fakebin.run("claude-session", "forget", "cs-cccccccc", "--json")
+    assert (first.returncode, second.returncode, third.returncode) == (20, 0, 0)
+
+
+def test_a_rule_with_until_called_stops_matching_after_that_subcommand_was_called(
+    fakebin: Fakebin,
+) -> None:
+    fakebin.seed_session("cs-abcdefgh")
+    fakebin.script("claude-session", "status", until_called="stop", merge={"state": "working"})
+    before = json.loads(fakebin.run("claude-session", "status", "cs-abcdefgh", "--json").stdout)
+    again = json.loads(fakebin.run("claude-session", "status", "cs-abcdefgh", "--json").stdout)
+    fakebin.run("claude-session", "stop", "cs-abcdefgh", "--json")
+    after = json.loads(fakebin.run("claude-session", "status", "cs-abcdefgh", "--json").stdout)
+    assert (before["state"], again["state"]) == ("working", "working")
+    assert after["state"] != "working"
