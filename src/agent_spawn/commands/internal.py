@@ -14,5 +14,6 @@ def supervise(inv: Invocation) -> NoReturn:
 
 def session_event(inv: Invocation) -> NoReturn:
     # TODO(#14): the relay. It must exit 0 always once implemented (interface.md, State relay);
-    # the usage checks of cli.py run before this handler.
+    # the usage checks and the config load (config_invalid, exit 2) of cli.py run before this
+    # handler.
     not_implemented("_session-event", 14)

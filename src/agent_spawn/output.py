@@ -435,7 +435,8 @@ class Outcome:
     """
 
     exit_code: int
-    payload: dict[str, Any] | None
+    # An object, or an array for the commands whose schema is one (export).
+    payload: dict[str, Any] | list[Any] | None
     kind: PayloadKind
     human: str | None = None
 
@@ -481,6 +482,7 @@ def emit(outcome: Outcome, *, as_json: bool, stdout: TextIO, stderr: TextIO) -> 
     if outcome.kind is PayloadKind.NONE or payload is None:
         return
     if outcome.kind is PayloadKind.ENVELOPE:
+        assert isinstance(payload, dict)  # an envelope is always an object
         error = payload["error"]
         line = f"agent-spawn: error: {error['message']}"
         hint = (error.get("details") or {}).get("hint")

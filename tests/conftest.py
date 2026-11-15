@@ -14,7 +14,7 @@ from tests import isolation
 from tests.fakebin.harness import Fakebin
 from tests.private_tmux import PrivateTmux
 
-pytest_plugins = ["pytester"]
+pytest_plugins = ["pytester", "tests.procguard"]
 
 #: The real tmux, found before any test changes ``PATH`` (the fakes shadow it later).
 REAL_TMUX = shutil.which("tmux")
@@ -55,6 +55,8 @@ def isolation_env(
     }
     for path in paths.values():
         path.mkdir(parents=True)
+    zdotdir = root / "zdotdir"
+    zdotdir.mkdir()
     # termctl refuses a socket directory that others can write (and tmux wants 0700 anyway)
     paths["tmux_tmpdir"].chmod(0o700)
     for name in list(os.environ):
@@ -67,6 +69,7 @@ def isolation_env(
         "XDG_DATA_HOME": paths["data"],
         "XDG_CACHE_HOME": paths["cache"],
         "TMUX_TMPDIR": paths["tmux_tmpdir"],
+        "ZDOTDIR": zdotdir,
     }
     for name, path in settings.items():
         monkeypatch.setenv(name, str(path))
@@ -74,6 +77,8 @@ def isolation_env(
     assert not problems, "test environment is not isolated:\n" + "\n".join(problems)
     sub_env = {name: str(path) for name, path in settings.items()}
     sub_env["LANG"] = "C.UTF-8"
+    monkeypatch.setenv("SHELL", "/bin/sh")
+    sub_env["SHELL"] = "/bin/sh"
     yield Isolation(env=sub_env, **paths)
     problems = isolation.environment_problems(os.environ)
     assert not problems, "the test left a non-isolated environment:\n" + "\n".join(problems)
