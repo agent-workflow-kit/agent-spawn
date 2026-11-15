@@ -454,9 +454,8 @@ def _take_holds(sup: Supervisor, wt: _Wtctl, cwds: list[str]) -> None:
                 # idempotent: re-adds a lost holder
                 adopted, _ = backend.adopt(record.path, agent_id)
                 with store.lease(lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT) as lease:
-                    store.reacquire_hold(
-                        lease, agent_id, adopted.id, adopted.path, owned=adopted.owned is True
-                    )
+                    # adopt-taken holds are released at teardown, never removed
+                    store.reacquire_hold(lease, agent_id, adopted.id, adopted.path, owned=False)
             _store_nearest(sup, around)
     except CliError as error:
         raise failure_of(error) from None

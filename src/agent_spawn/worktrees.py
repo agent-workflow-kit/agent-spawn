@@ -46,6 +46,8 @@ TOMBSTONES = frozenset({"removed", "forgotten", "gone"})
 #: ``wtctl create`` may clone, fetch and bootstrap; the other calls only read or write the state.
 CREATE_TIMEOUT = 3600.0
 CALL_TIMEOUT = 120.0
+#: ``wtctl remove`` refreshes the mirror (a fetch) and runs hooks.
+REMOVE_TIMEOUT = 1800.0
 _PATH_MAX = 4096
 _BRANCH_FORBIDDEN = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
 
@@ -86,6 +88,12 @@ def check_branch(value: str, flag: str) -> str:
 def check_sha(value: str) -> str:
     if SHA.fullmatch(value) is None:
         raise CliError.usage("--ref must be a full 40-character lowercase hex sha")
+    return value
+
+
+def check_merged_head(value: str) -> str:
+    if SHA.fullmatch(value) is None:
+        raise CliError.usage("--merged-head must be a full 40-character lowercase hex sha")
     return value
 
 
@@ -260,6 +268,21 @@ class CreatePlan:
     copy_env: bool = False
 
 
+@dataclass(frozen=True)
+class WtResult:
+    """A wtctl call that completed: wtctl's result verbatim (untrusted; ``None`` when ``already``
+    or unparseable) and whether the record was a tombstone already (exit 10)."""
+
+    data: dict[str, Any] | None
+    already: bool = False
+
+    @property
+    def record_state(self) -> str | None:
+        record = self.data.get("record") if self.data is not None else None
+        state = record.get("state") if isinstance(record, dict) else None  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        return state if isinstance(state, str) else None
+
+
 @dataclass
 class _Reply:
     code: int
@@ -325,7 +348,7 @@ class WtctlBackend:
                 details={"hint": "install wtctl"},
             ) from None
         except subprocess.TimeoutExpired:
-            if args and args[0] == "create":  # the outcome of a create is unknown
+            if args and args[0] in ("create", "remove"):  # the outcome of these is unknown
                 raise CliError("failed", "wtctl did not answer in time", tool=TOOL) from None
             # adopt, forget, show and list change nothing that a retry cannot repeat: retryable
             raise self._fail(
@@ -461,23 +484,72 @@ class WtctlBackend:
                 found.append(record)
         return found
 
-    def forget(self, record_id: str, holder: str) -> list[str]:
-        """``forget <id> --holder <h>``: the holder is released. Returns wtctl's warnings; exit 10
-        for a record that is already a tombstone counts as done. Any other failure raises."""
+    def release(self, record_id: str, holder: str) -> WtResult:
+        """``forget <id> --holder <h>``: the holder is released. Exit 10 for a record that is
+        already a tombstone counts as done (``already`` set, no result). Any other failure
+        raises."""
         if RECORD_ID.fullmatch(record_id) is None:
             raise CliError.usage("not a wtctl record id")
         reply = self.call(
             ["forget", record_id, _flag("--holder", holder), *self.audit_flags(), "--json"]
         )
         if reply.code == 10:
-            details = _details(reply)
-            if details.get("state") in TOMBSTONES:
-                return []
+            if _details(reply).get("state") in TOMBSTONES:
+                return WtResult(None, already=True)
             raise self._fail(reply, "forget")
         if reply.code != 0:
             raise self._fail(reply, "forget")
-        warnings = reply.data.get("warnings") if reply.data is not None else None
+        return WtResult(reply.data)
+
+    def forget(self, record_id: str, holder: str) -> list[str]:
+        """``release`` for callers that only need wtctl's warnings."""
+        data = self.release(record_id, holder).data
+        warnings = data.get("warnings") if data is not None else None
         return [w for w in warnings if isinstance(w, str)] if isinstance(warnings, list) else []  # pyright: ignore[reportUnknownVariableType]
+
+    def remove(
+        self,
+        record_id: str,
+        holder: str,
+        *,
+        merged_head: str | None = None,
+        force: bool = False,
+        override_escalation: bool = False,
+    ) -> WtResult:
+        """``remove <id> --yes --holder <h> [--merged-head <sha>] [--force]
+        [--override-escalation]``: the destructive call. Exit 0, or exit 10 with a tombstone
+        state, completes the record. Any other result raises (``WtctlError`` for what wtctl
+        answered)."""
+        if RECORD_ID.fullmatch(record_id) is None:
+            raise CliError.usage("not a wtctl record id")
+        argv = ["remove", record_id, "--yes", _flag("--holder", holder)]
+        if merged_head is not None:
+            argv.append(_flag("--merged-head", check_merged_head(merged_head)))
+        if force:
+            argv.append("--force")
+        if override_escalation:
+            argv.append("--override-escalation")
+        reply = self.call([*argv, *self.audit_flags(), "--json"], timeout=REMOVE_TIMEOUT)
+        if reply.code == 10 and _details(reply).get("state") in TOMBSTONES:
+            return WtResult(None, already=True)
+        if reply.code != 0:
+            raise self._fail(reply, "remove")
+        return WtResult(reply.data)
+
+    def status(self, record_id: str, holder: str, *, merged_head: str | None = None) -> WtResult:
+        """``status <id> --holder <h> [--merged-head <sha>]``: what ``remove`` would do (the
+        dry run). Exit 10 with a tombstone state is ``already``."""
+        if RECORD_ID.fullmatch(record_id) is None:
+            raise CliError.usage("not a wtctl record id")
+        argv = ["status", record_id, _flag("--holder", holder)]
+        if merged_head is not None:
+            argv.append(_flag("--merged-head", check_merged_head(merged_head)))
+        reply = self.call([*argv, "--json"], timeout=REMOVE_TIMEOUT)
+        if reply.code == 10 and _details(reply).get("state") in TOMBSTONES:
+            return WtResult(None, already=True)
+        if reply.code != 0 or reply.data is None:
+            raise self._fail(reply, "status")
+        return WtResult(reply.data)
 
 
 def _details(reply: _Reply) -> dict[str, Any]:

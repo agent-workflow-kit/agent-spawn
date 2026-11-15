@@ -230,17 +230,6 @@ def test_a_session_reported_missing_is_skipped(env: Env, fakebin: Fakebin) -> No
     assert forget_calls(fakebin) == []
 
 
-def test_agents_with_worktrees_are_refused_before_any_change(env: Env, fakebin: Fakebin) -> None:
-    # TODO(#23): worktree teardown replaces this refusal.
-    agent_id = seed(env, fakebin, wt_record_id="wt-abcdefgh", wt_path="/x", wt_owned=True)
-    done = td(env, agent_id)
-    body = result_json(done)
-    assert done.returncode == 1
-    assert body["error"]["code"] == "internal" and "not implemented" in body["error"]["message"]
-    assert env.agent(agent_id)["status"] == "parked"
-    assert (env.state_dir / "prompts" / agent_id).exists()
-
-
 def test_a_configured_pre_teardown_hook_is_refused_not_skipped(env: Env, fakebin: Fakebin) -> None:
     # TODO(#32): the hook runs instead of refusing.
     agent_id = seed(env, fakebin)

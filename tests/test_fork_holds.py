@@ -1,7 +1,8 @@
 """Forks and their holds (interface.md, Resume order and Records of a cwd): the fork's own id
 holds the source's records, every failure path releases exactly the holds this fork took, a fork
 into a throwaway runs holding nothing, and an in-place fork holds the source's record under its
-own id (what makes wtctl refuse the original's `remove` with `held`; checked end to end in #23)."""
+own id (what makes wtctl refuse the original's `remove` with `held`; checked end to end in
+test_teardown_worktrees.py)."""
 
 from __future__ import annotations
 
@@ -112,7 +113,7 @@ def test_an_in_place_fork_holds_the_sources_record_under_its_own_id(
     """The precondition of acceptance 3: the fork holds the source's record under its own id,
     distinct from the source's, and the store's `agent_holds` row and wtctl's holder list agree.
     The end-to-end check (`agent-spawn teardown <source>` -> 20 `held`, the source still parked)
-    belongs to #23."""
+    is in test_teardown_worktrees.py."""
     source = launched_in_worktree(env)
     done = env.run("resume", source, "--fork", "--json", "--wait")
     assert done.returncode == 0, (done.stdout, done.stderr)
