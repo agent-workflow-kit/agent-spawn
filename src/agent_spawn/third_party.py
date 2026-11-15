@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from .output import CliError
 from .validate import KIND
@@ -259,3 +259,16 @@ def check_error(decision: CheckDecision, *, agent_id: str | None) -> CliError:
         else "the run's third-party classification could not be confirmed after start"
     )
     return CliError("launch_failed", message, agent_id=agent_id, details={"cause": cause})
+
+
+# --- the result-file rule ---------------------------------------------------------------------
+
+
+def inside(path: str, directory: str) -> bool:
+    """Whether ``path`` equals ``directory`` or lies below it (both realpaths, component-wise)."""
+    return path == directory or path.startswith(directory.rstrip("/") + "/")
+
+
+def drop_result_file(inv: Any) -> None:
+    """Forget ``inv.result_file``: a refused path gets nothing written, not even the error."""
+    inv.result_file = None

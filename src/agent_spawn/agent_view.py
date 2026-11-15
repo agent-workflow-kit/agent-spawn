@@ -106,6 +106,25 @@ def agent_object(
     }
 
 
+def chain_first_working_at(
+    store: Store, row: Mapping[str, Any], run: int | None = None
+) -> str | None:
+    """``first_working_at`` of the run chain's first run (launch, resume and wait results).
+
+    An automatic report resume belongs to the run before it.
+    """
+    number = run if run is not None else row.get("run")
+    if not isinstance(number, int) or number < 1:
+        return None
+    run_row = store.get_run(row["agent_id"], number)
+    while run_row is not None and run_row.get("auto_resumed") and number > 1:
+        earlier = store.get_run(row["agent_id"], number - 1)
+        if earlier is None:
+            break
+        number, run_row = number - 1, earlier
+    return ts(run_row.get("first_working_at")) if run_row else None
+
+
 def _text_or_none(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
