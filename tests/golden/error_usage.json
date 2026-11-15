@@ -1,0 +1,16 @@
+{
+  "error": {
+    "code": "usage",
+    "message": "--force needs a human",
+    "reason": null,
+    "agent_id": null,
+    "tool": "agent-spawn",
+    "lower_code": null,
+    "lower_error": null,
+    "details": null,
+    "candidates": [],
+    "hook": null,
+    "hook_stderr": null,
+    "decision_ids": []
+  }
+}
