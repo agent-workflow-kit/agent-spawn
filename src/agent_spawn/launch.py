@@ -307,6 +307,7 @@ class Launch:
         self.wt: WtctlBackend | None = None  # resolved on first use; None under wtctl_cmd: null
         self.wt_argv: list[str] | None = None
         self.wt_records: list[WtRecord] | None = None  # the last `wtctl list`
+        self.stored_wtctl: str | None = None  # the absolute wtctl path stored with the agent
 
     # -- logging ------------------------------------------------------------------------------
 
@@ -558,6 +559,7 @@ class Launch:
         command = self.config.wtctl_cmd
         if command is None:
             return None
+        stored = stored or self.stored_wtctl
         try:
             argv = resolve_tool(command, "wtctl")
         except CliError as missing:
@@ -1071,6 +1073,8 @@ class Launch:
             adopted, _ = backend.adopt(record.path, agent_id)
             self.wt_records = None
             self.store_hold(agent_id, adopted.id, adopted.path, owned=False)
+        row = self.store.get_agent(agent_id)
+        assert row is not None
         if row.get("wt_record_id") is None:
             nearest = max(around, key=lambda r: len(os.path.realpath(r.path)))
             self.store_nearest(agent_id, nearest)
@@ -1081,7 +1085,7 @@ class Launch:
             with self.store.lease(
                 lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT
             ) as lease:
-                self.store.put_hold(lease, agent_id, record_id, path, owned=owned)
+                self.store.reacquire_hold(lease, agent_id, record_id, path, owned=owned)
 
     def store_nearest(self, agent_id: str, record: WtRecord) -> None:
         """No worktree was created or adopted at launch: the agent's ``worktree`` is the nearest

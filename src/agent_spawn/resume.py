@@ -19,15 +19,21 @@ differs is the lifecycle entry and its undoing:
 
 Prompt and input text travels only in files (the private copies), never in argv or environment.
 
-TODO(#20): worktrees (step 5 of Resume order, holds, the records of the cwd, escalation
-overrides of wtctl). TODO(#27): interactive resumes with a window; TODO(#30): ``--placement
-here``. TODO(#31): the liveness check that precedes the lifecycle entry.
+Worktrees: an agent without a session re-runs launch step 4 as resume step 5 (``resume_worktree``:
+``wtctl show`` by the stored id, else the ``wtctl list --repo`` lookup of the planned name, else
+``create``/``adopt``); every run takes its holds (``take_holds``) before ``start``. A busy wtctl,
+or any failure that left the agent's state unchanged, restores the pre-resume row; a wtctl veto
+or escalation of ``create``, a ``creating`` record and a record in another state park it.
+
+TODO(#27): interactive resumes with a window; TODO(#30): ``--placement here``. TODO(#31): the
+liveness check that precedes the lifecycle entry.
 """
 
 from __future__ import annotations
 
 import os
 import secrets
+import shlex
 import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -35,6 +41,7 @@ from typing import Any, NoReturn
 
 from . import hooks as hooklib
 from . import lifecycle, third_party
+from . import worktrees as wtlib
 from .agent_view import outcome_object
 from .ids import resolve_agent_id
 from .labels import Label, LabelSet, job_label, parse_run_labels, parse_selector
@@ -72,6 +79,7 @@ from .session_backend import (
 )
 from .store import AgentMissing, CasLost, Store, StoreError, StoreMissing
 from .validate import GrammarError, validate_name
+from .worktrees import CreatePlan, WtctlBackend, WtctlError, WtRecord
 
 SIGNAL_NAME = {2: "SIGINT", 1: "SIGHUP", 15: "SIGTERM"}
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -152,6 +160,7 @@ class Resume(Launch):
         self.override_audit: list[str] = []
         self.new_copies: _Copies | None = None
         self.unseen_session: str | None = None  # a plain resume's session whose status failed
+        self.wt_override = False  # --override-escalation goes to `wtctl create` (step 5)
 
     # -- step 1: usage checks ---------------------------------------------------------------
 
@@ -281,6 +290,9 @@ class Resume(Launch):
                 details={"hint": "launch the agent again"},
             )
         self.source_session = session if isinstance(session, str) else None
+        self.stored_wtctl = (
+            row.get("wtctl_path") if isinstance(row.get("wtctl_path"), str) else None
+        )
         self.args.repo = row.get("repo") or self.stored.get("repo")
         if self.source_session is None and self.fork:
             if row["status"] == "tearing_down":
@@ -289,11 +301,6 @@ class Resume(Launch):
         if self.source_session is None:
             if a.reset or a.allow_tainted:
                 raise CliError.usage("--reset and --allow-tainted need an agent with a session")
-            if self.stored.get("worktree", "none") != "none" or row.get("wt_record_id"):
-                raise CliError.of(
-                    "internal",
-                    "resuming an agent with a worktree is not implemented yet (tracked in #20)",
-                )  # TODO(#20): step 5 of Resume order
         # Mode, then the checks that depend on it.
         stored_mode = self.stored.get("mode") if self.source_session is None else None
         mode = a.mode or stored_mode or self.last_mode(store, row) or self.stored.get("mode")
@@ -325,10 +332,13 @@ class Resume(Launch):
         if by == "claude-session" and ended_escalated and self.source_session is not None:
             self.pass_override = True
             return
+        if by == "wtctl" and self.source_session is None and self.worktree_mode() == "new":
+            self.wt_override = True  # goes to `wtctl create` at step 5, and to nothing else
+            return
         raise CliError.usage(
             "--override-escalation has no target: the agent was not escalated by a tool this "
             "resume calls"
-        )  # TODO(#20, #27): wtctl and termctl overrides
+        )  # TODO(#27): the termctl override
 
     def plan_skill(self, store: Store, row: Mapping[str, Any]) -> None:
         a = self.args
@@ -397,10 +407,25 @@ class Resume(Launch):
 
     # -- the spec -------------------------------------------------------------------------
 
+    def worktree_mode(self) -> str:
+        """The stored worktree mode of an agent without a session (``new``, a path or ``none``);
+        ``none`` for every other run: those run in the cwd they recorded."""
+        if self.fork or self.source_session is not None:
+            return "none"
+        mode = self.stored.get("worktree")
+        return mode if isinstance(mode, str) and mode else "none"
+
     def run_cwd(self, row: Mapping[str, Any]) -> str | None:
         """The cwd of the run, for the pre-start checks (``session-dir``, a realpath or None)."""
         if self.fork:
             return self.fork_cwd(row)
+        mode = self.worktree_mode()
+        if mode == "new":
+            recorded = row.get("cwd")  # known only once an earlier attempt got past step 5
+            return os.path.realpath(recorded) if isinstance(recorded, str) else None
+        if mode != "none":
+            given = self.stored.get("cwd")
+            return wtlib.resolve_in(mode, given if isinstance(given, str) else None)
         recorded = row.get("cwd")
         if isinstance(recorded, str):
             return recorded if recorded == third_party.SESSION_DIR else os.path.realpath(recorded)
@@ -606,15 +631,16 @@ class Resume(Launch):
     # -- checks -----------------------------------------------------------------------------
 
     def check_cwd_rule(self, classification: third_party.Classification, cwd: str | None) -> None:
-        """Pre-start checks 3 (4 and 2 belong to #20): fail closed for a third-party-reading run."""
-        if not classification.reads_third_party:
-            return
-        try:
-            third_party.require_cwd_rule(True, cwd)
-        except CliError as error:
-            self.log("third_party_refused", level="warn", details={"reason": error.reason})
-            raise
-        if cwd is not None and cwd != third_party.SESSION_DIR and self.result_file_inside([cwd]):
+        """Pre-start checks 2 to 4: the records of the cwd (one ``wtctl list``), the cwd rule
+        of a third-party-reading run, the throwaway check of a trusted one."""
+        reads = classification.reads_third_party
+        self.enforce_rules(reads, cwd, self.records_for(cwd))
+        if (
+            reads
+            and cwd is not None
+            and cwd != third_party.SESSION_DIR
+            and self.result_file_inside([cwd])
+        ):
             raise CliError.usage("--result-file lies inside a third-party-reading run's cwd")
 
     def check_plan_cwd(self, classification: third_party.Classification, cwd: str | None) -> None:
@@ -642,11 +668,7 @@ class Resume(Launch):
             )
         except CliError:
             pass  # unknown: the rule below fails closed
-        try:
-            third_party.require_cwd_rule(True, real, session_work=work)
-        except CliError as error:
-            self.log("third_party_refused", level="warn", details={"reason": error.reason})
-            raise
+        self.enforce_rules(True, real, self.live_records(), session_work=work)
 
     # -- the whole resume ---------------------------------------------------------------------
 
@@ -782,8 +804,6 @@ class Resume(Launch):
         """Step 3 of a fork: the fork's record (status ``launching``, no session)."""
         assert self.store is not None
         a = self.args
-        import shlex  # noqa: PLC0415 - only the fork needs it
-
         fields: dict[str, Any] = {
             "status": "launching",
             "forked_from": row["agent_id"],
@@ -841,13 +861,20 @@ class Resume(Launch):
             ):
                 self.session_missing(run_id)
             raise
-        if cwd is None and self.source_session is None:
+        if self.worktree_mode() != "none":
+            if classification.reads_third_party:
+                # A stored worktree: the cwd will be one, so the run is refused before any wtctl
+                # call (`create` or `adopt`).
+                self.enforce_rules(True, None, [])
+            cwd = self.resume_worktree(source_row, run_id)  # step 5
+        elif cwd is None and self.source_session is None:
             cwd = self.effective_cwd(classification)  # the plan's cwd, as launch step 4
         elif cwd is None:
             cwd = classification.cwd
         self.check_cwd_rule(classification, cwd)
         self.check_plan_cwd(classification, cwd)
         self.resume_cwd = cwd
+        self.take_holds(run_id, cwd)  # step 6
         # The session (step 7).
         spec = self.build_spec(run_id, None, cwd, copies)
         outcome_file = new_outcome_file(self.state_dir, run_id)
@@ -873,35 +900,188 @@ class Resume(Launch):
 
     start_result: StartResult
 
+    # -- step 5: the worktree of an agent without a session --------------------------------------
+
+    def create_plan(self, agent_id: str) -> CreatePlan:
+        """The stored launch settings as a ``wtctl create`` (re-validated: the store is not
+        trusted to hold only what the launch checked)."""
+        stored = self.stored
+
+        def text(key: str) -> str | None:
+            value = stored.get(key)
+            return value if isinstance(value, str) else None
+
+        branch, base, ref = text("branch"), text("base"), text("ref")
+        name = text("worktree_name")
+        return CreatePlan(
+            agent_id=agent_id,
+            repo=wtlib.check_repo(str(self.args.repo or "")),
+            name=wtlib.planned_name(
+                agent_id, wtlib.check_worktree_name(name) if name is not None else None
+            ),
+            branch=wtlib.check_branch(branch, "--branch") if branch is not None else None,
+            base=wtlib.check_branch(base, "--base") if base is not None else None,
+            ref=wtlib.check_sha(ref) if ref is not None else None,
+            detach=bool(stored.get("detach")),
+            no_bootstrap=bool(stored.get("no_bootstrap")),
+            copy_env=bool(stored.get("copy_env")),
+        )
+
+    def worktree_cwd_arg(self) -> str | None:
+        given = self.stored.get("cwd")
+        return given if isinstance(given, str) else None
+
+    def resume_worktree(self, row: dict[str, Any], agent_id: str) -> str:
+        """Resume step 5: find or create the agent's worktree and return the run's cwd.
+
+        ``wt_record_id`` set: ``wtctl show``; unset (``--worktree new``): the ``wtctl list --repo``
+        lookup of the live record of the planned name that this agent holds. ``active`` skips
+        ``create``, a tombstone is ``worktree_gone``, ``creating`` parks with the reconcile hint,
+        any other live state parks ``worktree_state``; no record runs launch step 4 again with
+        the stored settings.
+        """
+        backend = self.wtctl_backend(row.get("wtctl_path"))
+        if backend is None:  # config says there is no wtctl on this machine now
+            raise CliError.usage("this agent's worktree needs wtctl, but wtctl_cmd is null")
+        mode = self.worktree_mode()
+        record = self.known_record(row, backend, agent_id)
+        if record is None:
+            record = self.make_record(row, backend, agent_id)
+        else:
+            if record.state == "creating":
+                self.park_launch_failed(
+                    agent_id,
+                    CliError(
+                        "launch_failed",
+                        "the worktree record is still being created",
+                        details={"hint": "run `wtctl reconcile`"},
+                    ),
+                )
+            if record.state != "active":
+                self.park_launch_failed(
+                    agent_id,
+                    CliError(
+                        "failed",
+                        "the worktree record is not active",
+                        details={
+                            "cause": "worktree_state",
+                            "retryable": False,
+                            "hint": f"`wtctl show {record.id}`; a human repairs or forgets the "
+                            "record",
+                        },
+                    ),
+                )
+            owned = bool(row.get("wt_owned")) if row.get("wt_record_id") else mode == "new"
+            self.store_worktree(agent_id, record.id, path=record.path, owned=owned)
+        root = record.path if mode == "new" else mode
+        cwd = self.cwd_in_worktree(root)
+        self.update_cwd(agent_id, cwd)
+        return cwd
+
+    def known_record(
+        self, row: dict[str, Any], backend: WtctlBackend, agent_id: str
+    ) -> WtRecord | None:
+        stored_id = row.get("wt_record_id")
+        if isinstance(stored_id, str):
+            record = backend.show(stored_id)
+            if record is None or record.tombstone:
+                raise CliError(
+                    "worktree_gone",
+                    "the agent's worktree record no longer exists",
+                    details={"hint": "tear the agent down, or launch again"},
+                )
+            return record
+        if self.worktree_mode() != "new":
+            return None  # `--worktree <path>`: adopt is idempotent
+        plan = self.create_plan(agent_id)
+        found = [
+            r
+            for r in backend.list_records(repo=plan.repo)
+            if r.object_type == "worktree" and r.name == plan.name and agent_id in r.holders
+        ]
+        if len(found) > 1:  # names are unique per repo among live records: never expected
+            raise CliError("failed", "several worktree records match the planned name")
+        return found[0] if found else None
+
+    def make_record(self, row: dict[str, Any], backend: WtctlBackend, agent_id: str) -> WtRecord:
+        """Launch step 4 again: ``create`` (with the wtctl override when the human gave it) or
+        ``adopt``. A veto or an escalation parks the agent; any other failure raises and the
+        pre-resume row is restored (a busy wtctl keeps the agent's attention)."""
+        mode = self.worktree_mode()
+        try:
+            if mode == "new":
+                if self.wt_override:
+                    self.audit_wt_override("ok", agent_id)
+                try:
+                    return self.run_create(
+                        agent_id, self.create_plan(agent_id), override_escalation=self.wt_override
+                    )
+                except CliError:
+                    if self.wt_override:
+                        self.audit_wt_override("error", agent_id)
+                    raise
+            record, _ = backend.adopt(mode, agent_id, repo=self.args.repo or None)
+            self.store_worktree(agent_id, record.id, path=record.path, owned=False)
+            return record
+        except WtctlError as error:
+            kind = wtlib.failure_kind(error)
+            if kind in ("vetoed", "escalated"):
+                fields = wtlib.park_fields(kind)
+                self.park_with(agent_id, fields, error)
+            raise
+
+    def park_with(self, agent_id: str, fields: Mapping[str, str | None], error: CliError) -> None:
+        """Park the agent (the second row of Resume failures) and raise ``error``."""
+        assert self.store is not None
+        lifecycle.park(
+            self.store,
+            agent_id,
+            from_status="launching",
+            park_reason=str(fields["park_reason"]),
+            needs_attention=fields["needs_attention"],
+            escalated_by=fields["escalated_by"],
+        )
+        self.settled = True
+        self.log("status_change", level="warn", details={"to": "parked", **fields})
+        error.agent_id = agent_id
+        error.decision_ids = list(self.decision_ids)
+        raise error
+
+    def park_launch_failed(self, agent_id: str, error: CliError) -> None:
+        self.park_with(agent_id, wtlib.park_fields("other"), error)
+
+    def audit_wt_override(self, result: str, agent_id: str) -> None:
+        self.audit_one("resume_escalation_override", result, agent_id)
+
     def audit_overrides(self, result: str, agent_id: str) -> None:
         """``resume_tainted`` and ``resume_escalation_override`` (audit.jsonl), once the
         human-only flag was actually passed to ``claude-session start``."""
         a = self.args
-        names: list[str] = []
         if a.allow_tainted and self.source_session is not None:
-            names.append("resume_tainted")
+            self.audit_one("resume_tainted", result, agent_id)
         if self.pass_override:
-            names.append("resume_escalation_override")
-        for action in names:
-            try:
-                append_audit(
-                    self.state_dir,
-                    actor=self.inv.actor,
-                    decision_ids=self.decision_ids,
-                    target=self.source_id if self.fork else agent_id,
-                    action=action,
-                    inputs={
-                        "labels": self.new_labels.texts(),
-                        "repo": self.args.repo,
-                        "worktree": None,
-                        "csession_id": self.source_session,
-                        "merged_head": None,
-                        "force": False,
-                    },
-                    result=result,
-                )
-            except (RecordsError, ValueError, OSError) as error:
-                self.warnings.append(f"could not write the audit log ({type(error).__name__})")
+            self.audit_one("resume_escalation_override", result, agent_id)
+
+    def audit_one(self, action: str, result: str, agent_id: str) -> None:
+        try:
+            append_audit(
+                self.state_dir,
+                actor=self.inv.actor,
+                decision_ids=self.decision_ids,
+                target=self.source_id if self.fork else agent_id,
+                action=action,
+                inputs={
+                    "labels": self.new_labels.texts(),
+                    "repo": self.args.repo,
+                    "worktree": None,
+                    "csession_id": self.source_session,
+                    "merged_head": None,
+                    "force": False,
+                },
+                result=result,
+            )
+        except (RecordsError, ValueError, OSError) as error:
+            self.warnings.append(f"could not write the audit log ({type(error).__name__})")
 
     def record_resumed(
         self,
@@ -916,8 +1096,6 @@ class Resume(Launch):
         """The run exists: record the session and run, the labels and the stored paths. From here
         on the agent is parked (never restored) by any failure."""
         assert self.store is not None
-        import shlex  # noqa: PLC0415
-
         store = self.store
         changes: dict[str, object] = {
             "csession_id": result.csession_id,
@@ -938,6 +1116,8 @@ class Resume(Launch):
         }
         if cwd is not None:
             changes["cwd"] = cwd
+        if self.wt_argv is not None:
+            changes["wtctl_path"] = shlex.join(self.wt_argv)
         if self.source_session is None and not self.fork:
             changes["settings"] = {
                 "settings": self.resumed_settings(),
@@ -1178,10 +1358,34 @@ class Resume(Launch):
             pass  # another process already settled the agent
         self.settled = True
 
-    def drop_fork(self, agent_id: str) -> None:
-        """A fork that failed before its session existed: its record and prompt copies go, its
-        id stays reserved (the holds a worktree fork took belong to #20)."""
+    def release_fork_holds(self, agent_id: str) -> None:
+        """``wtctl forget --holder <fork id>`` for every record the failed fork holds
+        (``not_a_holder`` and a tombstone count as released); a failure is only logged."""
         assert self.store is not None
+        holds = self.store.get_holds(agent_id)
+        if not holds:
+            return
+        try:
+            backend = self.wtctl_backend(self.stored_wtctl)
+        except CliError:
+            backend = None
+        for hold in holds:
+            try:
+                if backend is None:
+                    raise CliError("tool_missing", "wtctl is not available", tool="wtctl")
+                backend.forget(hold["record_id"], agent_id)
+            except CliError:
+                self.log(
+                    "warning",
+                    level="warn",
+                    message=f"could not release the fork's hold on {hold['record_id']}",
+                )
+
+    def drop_fork(self, agent_id: str) -> None:
+        """A fork that failed before its session existed: the holds it took are released, its
+        record and prompt copies go, its id stays reserved."""
+        assert self.store is not None
+        self.release_fork_holds(agent_id)
         with self.store.lease(lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT) as lease:
             self.store.delete_agent(lease, agent_id)
         remove_copies(os.path.join(self.state_dir, "prompts", agent_id))
@@ -1316,9 +1520,8 @@ class Resume(Launch):
                 refuse = "unknown"
             if refuse is None and not self.fork and row["status"] in ("launching", "live"):
                 refuse = "live"
-            if refuse is None and classification.reads_third_party:
-                if not third_party.cwd_rule_allows(True, cwd):
-                    refuse = "third_party_cwd"
+            if refuse is None:
+                refuse = self.dry_run_rules(classification, cwd)
             names = [] if copies is None else copies.input_names
             argv = [
                 *cs_argv,
@@ -1334,6 +1537,18 @@ class Resume(Launch):
             )
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
+
+    def dry_run_rules(
+        self, classification: third_party.Classification, cwd: str | None
+    ) -> str | None:
+        """Pre-start checks 2 to 4, read-only. A stored worktree is always refused for a
+        third-party-reading run; its other checks need the cwd of step 5 (not planned here)."""
+        reads = classification.reads_third_party
+        if self.worktree_mode() != "none":
+            return "third_party_cwd" if reads else None
+        if third_party.cwd_rule_allows(reads, cwd, records=self.records_for(cwd)):
+            return None
+        return "third_party_cwd" if reads else "third_party_run"
 
     def dry_plan(
         self,
@@ -1380,7 +1595,7 @@ class Resume(Launch):
             "reads_third_party": reads,
             "session_plan": session_plan,
             "would_refuse": would_refuse,
-            "tools": {"claude-session": list(cs_argv), "termctl": None, "wtctl": None},
+            "tools": {"claude-session": list(cs_argv), "termctl": None, "wtctl": self.wt_argv},
             "worktree_plan": None,
             "term_plan": None,
             "session_start_argv": argv or [],

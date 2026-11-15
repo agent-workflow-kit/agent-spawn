@@ -546,3 +546,69 @@ def test_a_signal_during_create_parks_killed_and_stores_no_record(
     assert row["wt_record_id"] is None
     ended = next(i for i in fakebin.invocations("wtctl") if i.argv[0] == "create")
     assert signal.SIGTERM in ended.signals
+
+
+# --- the post-start check over the records ------------------------------------------------------
+
+
+def status_says(fakebin: Fakebin, **run: Any) -> None:
+    fakebin.script("claude-session", "status", times=1, merge={"run": run})
+
+
+def test_a_trusted_classification_that_turns_out_third_party_at_a_throwaway_root_continues(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    throwaway = fake_throwaway(fakebin)
+    status_says(fakebin, reads_third_party=True, cwd=throwaway["path"])
+    done = env.run(*LAUNCH, "--cwd", str(tmp_path))
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    log = [json.loads(line) for line in (env.state_dir / "log.jsonl").read_text().splitlines()]
+    assert [r for r in log if r["event"] == "classification_mismatch" and r["level"] == "warn"]
+
+
+def test_a_third_party_classification_that_turns_out_trusted_inside_a_throwaway_is_cancelled(
+    env: Env, fakebin: Fakebin
+) -> None:
+    throwaway = fake_throwaway(fakebin)
+    status_says(fakebin, reads_third_party=False, cwd=throwaway["path"])
+    done = env.run(*LAUNCH, "--cwd", throwaway["path"], "--reads-third-party")
+    assert done.returncode == 12, (done.stdout, done.stderr)
+    assert json.loads(done.stdout)["error"]["details"] == {"cause": "classification_mismatch"}
+    (row,) = env.agents()
+    assert (row["status"], row["needs_attention"]) == ("parked", "launch_failed")
+
+
+def test_a_failed_lookup_in_the_post_start_check_cancels_as_unknown(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    status_says(fakebin, reads_third_party=True, cwd="/tmp/somewhere")
+    fakebin.script("wtctl", "list", times=1)  # the pre-start lookup answers
+    fakebin.script("wtctl", "list", times=1)  # the holds
+    fakebin.script("wtctl", "list", times=1, error={"code": "internal", "message": "x"}, exit=1)
+    done = env.run(*LAUNCH, "--cwd", str(tmp_path))
+    assert done.returncode == 12, (done.stdout, done.stderr)
+    assert json.loads(done.stdout)["error"]["details"] == {"cause": "classification_unknown"}
+
+
+def test_actor_and_decision_ids_reach_create_adopt_and_nothing_else(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    root = tree(tmp_path)
+    fake_adopted(fakebin, root)
+    setup = len(fakebin.argvs("wtctl"))
+    done = env.run(
+        *LAUNCH, "--repo", REPO, "--worktree", "new", "--cwd", ".",
+        "--actor", "human:me", "--decision-id", "d-1", "--decision-id", "d-2",
+    )  # fmt: skip
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    audit = ["--actor=human:me", "--decision-id=d-1", "--decision-id=d-2"]
+    create = wtctl_calls(fakebin, "create")[-1]
+    assert create[-4:] == [*audit[:1], *audit[1:], "--json"][-4:]
+    for call in fakebin.argvs("wtctl")[setup:]:
+        carries = any(a.startswith("--actor") for a in call)
+        assert carries == (call[0] in ("create", "adopt", "forget")), call
+    # an adopting launch carries them too
+    again = env.run(*LAUNCH, "--worktree", str(root), "--actor", "human:me", "--decision-id", "d-3")
+    assert again.returncode == 0, (again.stdout, again.stderr)
+    adopt = wtctl_calls(fakebin, "adopt")[-1]
+    assert adopt[-3:] == ["--actor=human:me", "--decision-id=d-3", "--json"]

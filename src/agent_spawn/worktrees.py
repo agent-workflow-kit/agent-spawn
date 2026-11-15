@@ -176,10 +176,11 @@ class WtctlError(CliError):
     """A failed wtctl call (``tool: wtctl``, wtctl's error verbatim in ``lower_error``).
 
     ``record_id`` is the record the error names (``details.record`` of ``bootstrap_failed``),
-    which the caller stores before anything else can fail.
+    which the caller stores before anything else can fail. ``operation`` is the wtctl command
+    (only ``create`` runs hooks, so only it can be vetoed or escalated).
     """
 
-    def __init__(self, base: CliError, record_id: str | None) -> None:
+    def __init__(self, base: CliError, record_id: str | None, operation: str = "") -> None:
         super().__init__(
             base.code,
             base.message,
@@ -192,20 +193,23 @@ class WtctlError(CliError):
             decision_ids=base.decision_ids,
         )
         self.record_id = record_id
-        self.wtctl_exit = base.exit_code
+        self.operation = operation  # the wtctl command that failed
 
 
 def failure_kind(error: CliError) -> FailureKind:
     """How a failed ``create``/``adopt`` parks the agent (interface.md, Launch order step 4)."""
     if error.tool != TOOL:
         return "other"
-    if error.exit_code == 11:
+    # `adopt` fires no hooks and has no override, so it never vetoes or escalates: whatever it
+    # exits with is a failure (busy keeps its own rule).
+    hooks = getattr(error, "operation", "create") == "create"
+    if hooks and error.exit_code == 11:
         return "vetoed"
-    if error.exit_code == 13 and error.code == "escalated":
+    if hooks and error.exit_code == 13 and error.code == "escalated":
         return "escalated"
     if error.exit_code == 12 and error.lower_code == "busy":
         return "busy"
-    if error.exit_code == 12 and error.lower_code == "bootstrap_failed":
+    if hooks and error.exit_code == 12 and error.lower_code == "bootstrap_failed":
         return "bootstrap_failed"
     return "other"
 
@@ -315,7 +319,7 @@ class WtctlBackend:
             raise CliError("failed", f"wtctl could not run ({error.strerror})", tool=TOOL) from None
         return _Reply(done.returncode, _loads(done.stdout))
 
-    def _fail(self, reply: _Reply) -> WtctlError:
+    def _fail(self, reply: _Reply, operation: str) -> WtctlError:
         error = reply.data.get("error") if reply.data is not None else None
         base = from_lower_tool(TOOL, reply.code, error)
         record_id: str | None = None
@@ -324,7 +328,7 @@ class WtctlBackend:
             named = details.get("record") if isinstance(details, dict) else None  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
             if isinstance(named, str) and RECORD_ID.fullmatch(named):
                 record_id = named
-        wrapped = WtctlError(base, record_id)
+        wrapped = WtctlError(base, record_id, operation)
         if failure_kind(wrapped) == "busy":
             wrapped.details = {"retryable": True}
         return wrapped
@@ -366,7 +370,7 @@ class WtctlBackend:
             timeout=CREATE_TIMEOUT,
         )
         if reply.code != 0:
-            raise self._fail(reply)
+            raise self._fail(reply, "create")
         record = parse_record(reply.data.get("record") if reply.data is not None else None)
         if record is None or reply.data is None:
             raise self._unusable("a create result")
@@ -376,7 +380,7 @@ class WtctlBackend:
         """``create --dry-run --json`` verbatim (the dry run's ``worktree_plan``)."""
         reply = self.call([*self.create_argv(plan), "--dry-run", "--json"], timeout=CREATE_TIMEOUT)
         if reply.code != 0:
-            raise self._fail(reply)
+            raise self._fail(reply, "create")
         if reply.data is None:
             raise self._unusable("a create plan")
         return reply.data
@@ -389,7 +393,7 @@ class WtctlBackend:
             argv.append(_flag("--repo", repo))
         reply = self.call([*argv, *self.audit_flags(), "--json"])
         if reply.code != 0:
-            raise self._fail(reply)
+            raise self._fail(reply, "adopt")
         record = parse_record(reply.data.get("record") if reply.data is not None else None)
         if record is None or reply.data is None:
             raise self._unusable("an adopt result")
@@ -403,7 +407,7 @@ class WtctlBackend:
         if reply.code == 10:
             return None
         if reply.code != 0:
-            raise self._fail(reply)
+            raise self._fail(reply, "show")
         record = parse_record(reply.data)
         if record is None:
             raise self._unusable("a record")
@@ -416,7 +420,7 @@ class WtctlBackend:
             argv.append(_flag("--repo", repo))
         reply = self.call([*argv, "--json"])
         if reply.code != 0:
-            raise self._fail(reply)
+            raise self._fail(reply, "list")
         raw = reply.data.get("records") if reply.data is not None else None
         if not isinstance(raw, list):
             raise self._unusable("a record list")
@@ -441,9 +445,9 @@ class WtctlBackend:
             details = _details(reply)
             if details.get("state") in TOMBSTONES:
                 return []
-            raise self._fail(reply)
+            raise self._fail(reply, "forget")
         if reply.code != 0:
-            raise self._fail(reply)
+            raise self._fail(reply, "forget")
         warnings = reply.data.get("warnings") if reply.data is not None else None
         return [w for w in warnings if isinstance(w, str)] if isinstance(warnings, list) else []  # pyright: ignore[reportUnknownVariableType]
 

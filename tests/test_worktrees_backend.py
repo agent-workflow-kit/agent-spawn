@@ -417,3 +417,23 @@ def test_record_paths_with_dots_are_normalized(tmp_path: Path) -> None:
     tw.mkdir()
     sneaky = os.path.join(str(tw), "..", "tw")
     assert wt.is_throwaway_root([record(sneaky, "throwaway")], str(tw))
+
+
+@pytest.mark.parametrize("exit_code", [11, 13])
+def test_only_create_can_be_vetoed_or_escalated(
+    fakebin: Fakebin, tmp_path: Path, exit_code: int
+) -> None:
+    code = "vetoed" if exit_code == 11 else "escalated"
+    api = backend(fakebin)
+    scripted(fakebin, "adopt", error={"code": code, "message": "x"}, exit=exit_code)
+    with pytest.raises(wt.WtctlError) as caught:
+        api.adopt(str(tmp_path), AGENT)
+    assert wt.failure_kind(caught.value) == "other"
+    scripted(fakebin, "list", error={"code": code, "message": "x"}, exit=exit_code)
+    with pytest.raises(wt.WtctlError) as listed:
+        api.list_records()
+    assert wt.failure_kind(listed.value) == "other"
+    scripted(fakebin, "create", error={"code": code, "message": "x"}, exit=exit_code)
+    with pytest.raises(wt.WtctlError) as created:
+        api.create(plan())
+    assert wt.failure_kind(created.value) == ("vetoed" if exit_code == 11 else "escalated")
