@@ -401,7 +401,8 @@ def test_a_launching_fork_deleted_by_its_launcher_is_removed(
     check_stop(body)
     assert body["removed"] is True and body["agent"] is None
     assert body["action"] == "signal_launcher" and body["already_parked"] is False
-    assert audits(env) == [] or audits(env)[-1]["action"] == "stop"
+    records = audits(env)
+    assert len(records) == 1 and records[0]["action"] == "stop" and records[0]["result"] == "ok"
 
 
 def test_a_launching_agent_without_a_session_signals_its_launcher_and_waits_for_the_park(
@@ -543,3 +544,239 @@ def test_a_unique_prefix_resolves(env: Env, fakebin: Fakebin) -> None:
     done = env.run("stop", "ag-abcdef", "--json")
     assert done.returncode == 0
     assert result_json(done)["agent"]["agent_id"] == AGENT
+
+
+# --- review round 1 -------------------------------------------------------------------------
+
+
+def run_patched(
+    env: Env, prelude: str, *args: str, timeout: float = 60.0
+) -> subprocess.CompletedProcess[str]:
+    """Run the CLI in a child that first executes ``prelude`` (patches of the stop module)."""
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import agent_spawn.stop as s; import agent_spawn.lifecycle as lc; "
+            + prelude
+            + "; from agent_spawn.cli import main; sys.exit(main(sys.argv[1:]))",
+            *args,
+        ],
+        capture_output=True,
+        text=True,
+        env=env.env(),
+        stdin=subprocess.DEVNULL,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def test_dry_run_with_a_final_run_and_nothing_alive_reports_none_and_parks_nothing(
+    env: Env, fakebin: Fakebin
+) -> None:
+    fakebin.seed_session(SESSION)  # final run, no supervisor: a real run would park (exit 0)
+    seed(env, fakebin, csession_id=SESSION)
+    done = env.run("stop", AGENT, "--json", "--dry-run", *AUDIT_ARGS)
+    body = result_json(done)
+    assert done.returncode == 0, done.stderr
+    check_stop(body)
+    assert body["action"] == "none" and body["dry_run"] is True
+    assert agent_row(env)["status"] == "live"
+    assert audits(env) == []
+
+
+def test_a_final_run_with_nothing_alive_is_parked_by_the_liveness_rule(
+    env: Env, fakebin: Fakebin
+) -> None:
+    fakebin.seed_session(SESSION)
+    seed(env, fakebin, csession_id=SESSION)
+    done = env.run("stop", AGENT, "--json", *AUDIT_ARGS)
+    body = result_json(done)
+    assert done.returncode == 0, done.stderr
+    check_stop(body)
+    assert body["action"] == "none" and body["agent"]["status"] == "parked"
+    assert body["agent"]["park_reason"] is not None
+    assert audits(env)[-1]["result"] == "ok"
+
+
+def test_a_lost_park_race_replans_from_the_new_row(env: Env, fakebin: Fakebin) -> None:
+    fakebin.seed_session(SESSION)
+    seed(env, fakebin, csession_id=SESSION)
+    # Another process wins the compare-and-set: the park happens but this caller is told no.
+    prelude = "orig = lc.park; lc.park = lambda *a, **k: (orig(*a, **k), None)[1]"
+    done = run_patched(env, prelude, "stop", AGENT, "--json", *AUDIT_ARGS)
+    body = json.loads(done.stdout)
+    assert done.returncode == 0, done.stderr
+    check_stop(body)
+    assert body["action"] == "none" and body["already_parked"] is True
+    assert body["agent"]["status"] == "parked"
+
+
+def test_the_wait_loop_parks_a_final_run_whose_supervisor_died(
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
+) -> None:
+    fakebin.seed_session(SESSION)
+    supervisor, marker = stand_in(env, proc_tracker, tmp_path)  # exits on SIGTERM, parks nothing
+    seed(env, fakebin, csession_id=SESSION, supervisor=supervisor)
+    proc = start_stop(env, proc_tracker)
+    code, body = finish(proc)
+    assert code == 0 and marker.exists()
+    check_stop(body)
+    assert body["action"] == "signal_supervisor" and body["agent"]["status"] == "parked"
+
+
+def test_a_replanned_third_attempt_is_acted_on(env: Env, fakebin: Fakebin) -> None:
+    seed(env, fakebin)
+    stop = make_stop(env, fakebin)
+    try:
+        row = stop.store.get_agent(AGENT)  # type: ignore[union-attr]
+        assert row is not None
+        signal_plan = Plan("signal_supervisor", row, target=None, field="supervisor")
+        plans = iter([signal_plan, signal_plan, Plan("none", row)])
+        sends: list[int] = []
+        stop.backend = object()  # type: ignore[assignment]
+        stop.plan = lambda _row: next(plans)  # type: ignore[method-assign]
+        stop.send = lambda _plan: sends.append(1) or False  # type: ignore[method-assign]
+        outcome = stop.act(row)
+    finally:
+        assert stop.store is not None
+        stop.store.close()
+    assert (
+        len(sends) == 2
+        and isinstance(outcome.payload, dict)
+        and outcome.payload["action"] == "none"
+    )
+
+
+def test_exhausted_attempts_with_a_signal_still_failing_exit_12(env: Env, fakebin: Fakebin) -> None:
+    seed(env, fakebin)
+    stop = make_stop(env, fakebin)
+    try:
+        row = stop.store.get_agent(AGENT)  # type: ignore[union-attr]
+        assert row is not None
+        signal_plan = Plan("signal_supervisor", row, target=None, field="supervisor")
+        stop.backend = object()  # type: ignore[assignment]
+        stop.plan = lambda _row: signal_plan  # type: ignore[method-assign]
+        stop.send = lambda _plan: False  # type: ignore[method-assign]
+        with pytest.raises(Exception) as caught:
+            stop.act(row)
+    finally:
+        assert stop.store is not None
+        stop.store.close()
+    assert getattr(caught.value, "exit_code", None) == 12
+
+
+def test_a_stop_reply_already_final_replans_and_signals_the_supervisor(
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
+) -> None:
+    fakebin.seed_session(SESSION, adopted=True, final=False)
+    script_live_run(fakebin, times=1)  # live at the first look, final afterwards
+    fakebin.script("claude-session", "stop", merge={"already_final": True, "signals": []})
+    supervisor, marker = stand_in(env, proc_tracker, tmp_path)
+    seed(env, fakebin, csession_id=SESSION, supervisor=supervisor)
+    proc = start_stop(env, proc_tracker)
+    env.wait_for(marker.exists, "the supervisor to get SIGTERM")
+    park(env)
+    code, body = finish(proc)
+    assert code == 0
+    check_stop(body)
+    assert body["action"] == "signal_supervisor"
+    assert body["agent"]["status"] == "parked"
+
+
+def test_a_wait_that_sees_tearing_down_ends_when_the_run_is_final(
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
+) -> None:
+    fakebin.seed_session(SESSION)
+    supervisor, marker = stand_in(env, proc_tracker, tmp_path)
+    seed(env, fakebin, csession_id=SESSION, supervisor=supervisor)
+    proc = start_stop(env, proc_tracker)
+    env.wait_for(marker.exists, "the supervisor to get SIGTERM")
+    with Store.open(env.state_dir, create=False) as store:  # an ephemeral hand-over to teardown
+        with store.lease(lifecycle.lease_key(AGENT)) as lease:
+            store.compare_and_set(
+                lease,
+                AGENT,
+                expect_status="live",
+                changes={"status": "tearing_down", "teardown_step": "started"},
+            )
+    code, body = finish(proc)
+    assert code == 0
+    check_stop(body)
+    assert body["agent"]["status"] == "tearing_down"
+
+
+def test_lease_contention_exits_12_and_is_audited_with_the_real_action(
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
+) -> None:
+    fakebin.seed_session(SESSION)
+    supervisor, marker = stand_in(env, proc_tracker, tmp_path)
+    seed(env, fakebin, csession_id=SESSION, supervisor=supervisor)
+    with Store.open(env.state_dir, create=False) as store:
+        with store.lease(lifecycle.lease_key(AGENT)):
+            done = run_patched(env, "lc.LEASE_WAIT = 0.2", "stop", AGENT, "--json", *AUDIT_ARGS)
+    assert done.returncode == 12, done.stderr
+    check_error(json.loads(done.stdout))
+    record = audits(env)[-1]
+    assert record["result"] == "error" and record["action"] == "stop"
+    assert not marker.exists()
+
+
+def test_a_missing_tool_is_audited(env: Env, fakebin: Fakebin) -> None:
+    seed(env, fakebin, csession_id=SESSION, claude_session_path=None)
+    done = env.run(
+        "stop",
+        AGENT,
+        "--json",
+        *AUDIT_ARGS,
+        extra_env={"PATH": "/nonexistent-dir"},
+    )
+    assert done.returncode != 0
+    assert audits(env)[-1]["result"] in ("error", "refused")
+
+
+def test_a_signal_target_that_died_after_the_plan_is_not_signaled(
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
+) -> None:
+    gone = dead_identity(env, proc_tracker, tmp_path)
+    seed(env, fakebin, supervisor=gone)
+    stop = make_stop(env, fakebin)
+    try:
+        row = stop.store.get_agent(AGENT)  # type: ignore[union-attr]
+        assert row is not None
+        plan = Plan("signal_supervisor", row, target=gone, field="supervisor")
+        assert stop.send(plan) is False
+    finally:
+        assert stop.store is not None
+        stop.store.close()
+
+
+def test_a_record_vanishing_under_a_supervisor_signal_exits_1(
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
+) -> None:
+    fakebin.seed_session(SESSION)
+    supervisor, marker = stand_in(env, proc_tracker, tmp_path)
+    seed(env, fakebin, csession_id=SESSION, supervisor=supervisor)
+    proc = start_stop(env, proc_tracker)
+    env.wait_for(marker.exists, "the supervisor to get SIGTERM")
+    delete_record(env)
+    code, body = finish(proc)
+    assert code == 1
+    check_error(body)
+    assert audits(env)[-1]["result"] == "error"
+
+
+def test_dry_run_of_a_signal_action_signals_nothing(
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
+) -> None:
+    fakebin.seed_session(SESSION)
+    supervisor, marker = stand_in(env, proc_tracker, tmp_path)
+    seed(env, fakebin, csession_id=SESSION, supervisor=supervisor)
+    done = env.run("stop", AGENT, "--json", "--dry-run", *AUDIT_ARGS)
+    body = result_json(done)
+    assert done.returncode == 0, done.stderr
+    check_stop(body)
+    assert body["action"] == "signal_supervisor" and body["dry_run"] is True
+    time.sleep(0.3)
+    assert not marker.exists() and procs.is_alive(supervisor)
+    assert agent_row(env)["status"] == "live" and audits(env) == []

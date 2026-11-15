@@ -35,10 +35,10 @@ from .output import CliError, Outcome, PayloadKind
 from .procs import ProcessIdentity
 from .records import RecordsError, append_audit, append_log
 from .session_backend import SessionBackend, SessionStatus
-from .store import Store, StoreError, StoreMissing, default_state_dir
+from .store import LeaseHeld, Store, StoreError, StoreMissing, default_state_dir
 
 WAIT_MARGIN = 30.0  # seconds added to the grace
-DEFAULT_GRACE = 30.0  # claude-session's kill_grace when --grace is not given
+DEFAULT_GRACE = 10.0  # claude-session's kill_grace default; TODO(#13): read it from the config
 POLL = 0.1  # seconds between looks at the agent row while waiting
 STATUS_EVERY = 1.0  # seconds between looks at `claude-session status` while waiting
 ATTEMPTS = 3  # plans made when the state changes under a signal
@@ -65,6 +65,9 @@ class Stop:
         self.store: Store | None = None
         self.backend: SessionBackend | None = None
         self.agent_id = ""
+        self.action = "none"  # the planned action, for the audit record
+        self.result = "error"  # the audit result if the command ends without finish()
+        self.audited = False
 
     # -- records ------------------------------------------------------------------------------
 
@@ -96,6 +99,7 @@ class Stop:
             )
         except (RecordsError, ValueError, OSError, StoreError) as error:
             self.warnings.append(f"could not write the audit log ({type(error).__name__})")
+        self.audited = True
         self.log("stop", details={"action": action, "result": result})
 
     # -- the command --------------------------------------------------------------------------
@@ -123,16 +127,26 @@ class Stop:
                 agent_id=self.agent_id,
                 details={"status": "torn_down"} if resolved.torn_down else None,
             )
-        self.backend = self.make_backend(row)
         try:
+            self.backend = self.make_backend(row)
             return self.act(row)
         except CliError as error:
             if error.agent_id is None:
                 error.agent_id = self.agent_id
-            fresh = store.get_agent(self.agent_id) or row
-            if not self.dry_run:
-                self.audit(fresh, "refused" if error.exit_code == 20 else "error", "none")
+            self.result = "refused" if error.exit_code == 20 else "error"
             raise
+        except LeaseHeld as held:
+            raise CliError.of(
+                "failed",
+                "the agent is busy (its lease is held by another process)",
+                exit_code=12,
+                agent_id=self.agent_id,
+            ) from held
+        finally:
+            # Whatever ends the command after this point (also a signal or an unexpected error)
+            # leaves one audit record with the action that was planned.
+            if not self.audited and not self.dry_run:
+                self.audit(store.get_agent(self.agent_id) or row, self.result, self.action)
 
     def make_backend(self, row: dict[str, Any]) -> SessionBackend:
         stored = row.get("claude_session_path")
@@ -153,34 +167,47 @@ class Stop:
         grace = self.args.grace
         budget = (self.grace_seconds(grace) if grace else DEFAULT_GRACE) + WAIT_MARGIN
         plan = self.plan(row)
+        self.action = plan.action
+        session_stop: dict[str, Any] | None = None
+        settled = False
         for _attempt in range(ATTEMPTS):
-            if plan.action not in ("signal_supervisor", "signal_launcher") or self.dry_run:
+            if self.dry_run or plan.action == "none":
+                settled = True
                 break
-            if self.send(plan):
+            if plan.action == "session_stop":
+                assert plan.session is not None
+                session_stop = self.backend.stop(plan.session, grace=grace, dry_run=False)
+                if session_stop.get("ended") is False:
+                    raise CliError.of(
+                        "failed",
+                        "the run is still live after claude-session's stop",
+                        exit_code=12,
+                        agent_id=self.agent_id,
+                        tool="claude-session",
+                    )
+                if not session_stop.get("already_final"):
+                    settled = True
+                    break
+                session_stop = None  # the run ended on its own: what is left to stop is next
+            elif self.send(plan):
+                settled = True
                 break
             fresh = self.store.get_agent(self.agent_id)
             if fresh is None:
                 return self.finish(plan, None, None, removed=True)
             plan = self.plan(fresh)
-        else:
-            raise CliError.of(
-                "failed",
-                "the agent changed while it was being stopped (try again)",
-                exit_code=12,
-                agent_id=self.agent_id,
-            )
-        session_stop: dict[str, Any] | None = None
-        if plan.action == "session_stop":
-            assert plan.session is not None
-            session_stop = self.backend.stop(plan.session, grace=grace, dry_run=self.dry_run)
-            if not self.dry_run and session_stop.get("ended") is False:
+            self.action = plan.action
+        if not settled:
+            if plan.action != "none":
                 raise CliError.of(
                     "failed",
-                    "the run is still live after claude-session's stop",
+                    "the agent changed while it was being stopped (try again)",
                     exit_code=12,
                     agent_id=self.agent_id,
-                    tool="claude-session",
                 )
+        if self.dry_run and plan.action == "session_stop":
+            assert plan.session is not None
+            session_stop = self.backend.stop(plan.session, grace=grace, dry_run=True)
         if plan.action == "none" or self.dry_run:
             return self.finish(plan, session_stop, self.store.get_agent(self.agent_id))
         final = self.wait(plan, budget)
@@ -199,8 +226,8 @@ class Stop:
             identity, gateway=self.gateway
         )
 
-    def plan(self, row: dict[str, Any]) -> Plan:
-        assert self.backend is not None
+    def plan(self, row: dict[str, Any], depth: int = 0) -> Plan:
+        assert self.backend is not None and self.store is not None
         status = row["status"]
         if status == "torn_down":
             raise CliError.of("not_found", "agent is torn down", agent_id=self.agent_id)
@@ -209,15 +236,34 @@ class Stop:
         session = row.get("csession_id")
         current: SessionStatus | None = None
         if isinstance(session, str):
+            # TODO(#31): exit 10 (the session is missing) blocks stop with not_found for an
+            # existing agent; the liveness check parks it as session_missing instead.
             current = self.backend.status(session)
             if current.run.outcome is None:  # pending or live
                 return Plan("session_stop", row, session=session)
         if status == "tearing_down":
             return Plan("none", row)  # no pending or live run left to stop
-        if not self.dry_run:
+        if self.orphan_applies(row, current):
+            assert current is not None
+            if self.dry_run:
+                return Plan("none", row)  # a real run would park it
             parked = self.park_orphan(row, current)
             if parked is not None:
                 return Plan("none", parked)
+            # Another process changed the agent first: plan again from what is true now.
+            fresh = self.store.get_agent(self.agent_id)
+            if fresh is None:
+                raise CliError.of(
+                    "failed", "the agent record disappeared", exit_code=1, agent_id=self.agent_id
+                )
+            if depth + 1 >= ATTEMPTS:
+                raise CliError.of(
+                    "failed",
+                    "the agent changed while it was being stopped (try again)",
+                    exit_code=12,
+                    agent_id=self.agent_id,
+                )
+            return self.plan(fresh, depth + 1)
         supervisor = row.get("supervisor")
         if self.alive(supervisor):
             return Plan("signal_supervisor", row, target=supervisor, field="supervisor")
@@ -231,23 +277,22 @@ class Stop:
             agent_id=self.agent_id,
         )
 
-    def park_orphan(
-        self, row: dict[str, Any], current: SessionStatus | None
-    ) -> dict[str, Any] | None:
-        """The liveness rule for a run that is final while nothing is left to bookkeep it: no
-        live supervisor (and, while ``launching``, no live launcher) -> park per the outcome
-        table, without the automatic report resume or promotion. ``None`` when it does not
-        apply or another process parked the agent first.
+    def orphan_applies(self, row: dict[str, Any], current: SessionStatus | None) -> bool:
+        """A final run with no live supervisor (and, while ``launching``, no live launcher)."""
+        if current is None or current.run.outcome is None or current.run.exit_code is None:
+            return False
+        if self.alive(row.get("supervisor")):
+            return False
+        return not (row["status"] == "launching" and self.alive(row.get("launcher")))
+
+    def park_orphan(self, row: dict[str, Any], current: SessionStatus) -> dict[str, Any] | None:
+        """The liveness rule for a run that is final while nothing is left to bookkeep it: park
+        per the outcome table, without the automatic report resume or promotion. ``None`` when
+        another process parked the agent first.
 
         TODO(#31): this belongs to the liveness check; remove it when that lands.
         """
         assert self.store is not None
-        if current is None or current.run.outcome is None or current.run.exit_code is None:
-            return None
-        if self.alive(row.get("supervisor")):
-            return None
-        if row["status"] == "launching" and self.alive(row.get("launcher")):
-            return None
         result = current.outcome()
         table = park_row(result.outcome or "failed", result.end_reason)
         outcome = outcome_object(self.agent_id, result, current.raw.get("run"))
@@ -301,7 +346,7 @@ class Stop:
         is final. ``None`` when the record disappeared. Exit 12 when the budget runs out."""
         assert self.store is not None and self.backend is not None
         deadline = self.gateway.monotonic() + budget
-        tearing = plan.row["status"] == "tearing_down"
+        planned_tearing = plan.row["status"] == "tearing_down"
         next_status = 0.0
         while True:
             row = self.store.get_agent(self.agent_id)
@@ -309,31 +354,34 @@ class Stop:
                 return None
             status = row["status"]
             now = self.gateway.monotonic()
-            if tearing:
-                if status != "tearing_down":
-                    return row
+            if status == "tearing_down":
+                # Teardown owns the agent: done once its run is final (or it has no session).
                 if now >= next_status:
                     next_status = now + STATUS_EVERY
                     session = row.get("csession_id")
                     if not isinstance(session, str) or self.backend.status(session).run.outcome:
                         return row
-            elif status not in IN_PROGRESS and status != "tearing_down":
+            elif planned_tearing:
+                return row
+            elif status not in IN_PROGRESS:
                 if not self.alive(row.get("supervisor")):
                     return row
             elif status in IN_PROGRESS and now >= next_status:
                 next_status = now + STATUS_EVERY
                 session = row.get("csession_id")
                 if isinstance(session, str):
-                    parked = self.park_orphan(row, self.backend.status(session))
-                    if parked is not None:
-                        return parked
+                    current = self.backend.status(session)
+                    if self.orphan_applies(row, current):
+                        parked = self.park_orphan(row, current)
+                        if parked is not None:
+                            return parked
             if now >= deadline:
                 raise CliError.of(
                     "failed",
                     "the agent is still live after the wait",
                     exit_code=12,
                     agent_id=self.agent_id,
-                    details={"status": status} if status in ("launching",) else None,
+                    details={"status": status} if status == "launching" else None,
                 )
             self.gateway.sleep(POLL)
 
