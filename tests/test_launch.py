@@ -468,7 +468,8 @@ def test_result_file_gets_the_json(env: Env, tmp_path: Path) -> None:
 def test_hooks_are_delivered_through_the_outbox(env: Env, fakebin: Fakebin, tmp_path: Path) -> None:
     config = "hooks:\n"
     for name in ("post-launch", "post-park", "post-state-change"):
-        config += f'  {name}:\n    - cmd: "cat >> {tmp_path}/{name}.jsonl; echo >> {tmp_path}/{name}.jsonl"\n'
+        sink = f"{tmp_path}/{name}.jsonl"
+        config += f'  {name}:\n    - cmd: "cat >> {sink}; echo >> {sink}"\n'
     env = Env(fakebin, env.iso, config)
     done = env.run(*LAUNCH, "--wait")
     assert done.returncode == 0, (done.stdout, done.stderr)
