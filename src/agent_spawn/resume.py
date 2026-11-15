@@ -35,7 +35,7 @@ from . import hooks as hooklib
 from . import lifecycle, third_party
 from .agent_view import outcome_object
 from .ids import resolve_agent_id
-from .labels import Label, LabelSet, job_label, parse_run_labels
+from .labels import Label, LabelSet, job_label, parse_run_labels, parse_selector
 from .launch import (
     Launch,
     SignalState,
@@ -213,7 +213,7 @@ class Resume(Launch):
                 )
             agent_id = resolved.agent_id
         else:
-            found = store.find_agents(list(a.select))
+            found = store.find_agents([parse_selector(text) for text in a.select])
             if not found:
                 raise CliError.of("not_found", "no agent matches the --select pairs")
             if len(found) > 1:
