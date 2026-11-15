@@ -483,3 +483,15 @@ def test_hooks_are_delivered_through_the_outbox(env: Env, fakebin: Fakebin, tmp_
     assert park["reason"] == "done" and park["outcome"]["outcome"] == "done"
     launched = json.loads((tmp_path / "post-launch.jsonl").read_text().splitlines()[0])
     assert launched["run"] == 1 and launched["resumed"] is False
+
+
+def test_failed_launch_delivers_its_park_events(env: Env, fakebin: Fakebin, tmp_path: Path) -> None:
+    sink = tmp_path / "park.json"
+    env = Env(fakebin, env.iso, f'hooks:\n  post-park:\n    - cmd: "cat > {sink}"\n')
+    fakebin.script("claude-session", "start", argv_contains=["--dry-run"])
+    fakebin.script("claude-session", "start", error={"code": "not_found", "message": "x"}, exit=10)
+    done = env.run(*LAUNCH)
+    assert done.returncode == 10
+    payload = json.loads(sink.read_text())
+    schema_registry.validate(payload, "agent-spawn/hooks/post-park.json")
+    assert payload["reason"] == "launch_failed" and payload["outcome"] is None

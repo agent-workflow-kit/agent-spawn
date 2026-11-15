@@ -33,6 +33,8 @@ from .store import Store, StoreError
 STATUS_EVERY = 1.0  # seconds between looks at `claude-session status` and the outbox
 TICK = 0.05  # seconds between looks at `exec`
 SUPERVISOR_ACTOR = "auto:agent-spawn"
+# Exit 0 cannot carry "nothing", so the supervisor prints `{}` (its stdout is its log).
+DONE = Outcome(0, {}, PayloadKind.COMMAND)
 FORWARDED = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 
 
@@ -231,7 +233,7 @@ class Supervisor:
             if cancel:
                 lifecycle.park(store, self.agent_id, park_reason="killed", needs_attention=None)
                 self.deliver()
-                return Outcome(0, None, PayloadKind.NONE)
+                return DONE
             raise
         if not result.final:
             raise CliError.of("internal", "exec exited but the run is not final")
@@ -261,7 +263,7 @@ class Supervisor:
         # TODO(#12): an ephemeral agent whose run ended `done` is torn down here.
         self.deliver()
         self.drain()
-        return Outcome(0, None, PayloadKind.NONE)
+        return DONE
 
     def record_run(self, run: int, result: RunOutcome, outcome: dict[str, Any]) -> None:
         assert self.store is not None

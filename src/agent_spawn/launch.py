@@ -281,6 +281,21 @@ class Launch:
         except (RecordsError, ValueError, OSError) as error:
             self.warnings.append(f"could not write the audit log ({type(error).__name__})")
 
+    def deliver(self) -> None:
+        """Deliver the queued hook events of a failed or interrupted launch (best effort)."""
+        if self.store is None or not self.agent_inserted or self.agent_id is None:
+            return
+        try:
+            hooklib.deliver_outbox(
+                self.store,
+                self.agent_id,
+                self.config.hooks,
+                state_dir=self.state_dir,
+                gateway=self.gateway,
+            )
+        except (StoreError, OSError):
+            pass  # hook failures never change the command's result
+
     # -- step 1: usage checks and preflight -------------------------------------------------
 
     def usage_checks(self) -> None:
@@ -1181,12 +1196,15 @@ def launch(inv: Any) -> Outcome:
         try:
             return launch_run.run()
         except LaunchInterrupted as exc:
-            return launch_run.interrupted(exc.signum)
+            outcome = launch_run.interrupted(exc.signum)
+            launch_run.deliver()
+            return outcome
         except CliError as error:
             if launch_run.copies is not None and not launch_run.agent_inserted:
                 remove_copies(launch_run.copies.directory)
             if error.agent_id is None and launch_run.agent_inserted:
                 error.agent_id = launch_run.agent_id
+            launch_run.deliver()
             raise
     finally:
         restore()
