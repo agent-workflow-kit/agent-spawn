@@ -14,7 +14,8 @@ parking and the stored ids; they use:
 * ``WtctlBackend.create`` / ``adopt`` / ``show`` / ``list_records`` / ``forget``: the calls;
 * ``failure_kind`` and ``park_fields``: the exit mapping of a failed ``create`` or ``adopt``;
 * the pure rules of the records of a cwd: ``records_containing``, ``is_throwaway_root``,
-  ``inside_throwaway`` and ``cwd_rule_allows`` (the third-party rule over the records).
+  ``inside_throwaway`` and ``worktrees_containing`` (the third-party rule over the records is
+  ``third_party.cwd_rule_allows``).
 
 Behavior that rests on the wtctl interface document alone (the real wtctl was a scaffold when
 this was written) is listed in docs/design.md, "Live verification".
@@ -72,6 +73,8 @@ def check_branch(value: str, flag: str) -> str:
         or "@{" in value
         or "//" in value
         or value == "@"
+        or value == "HEAD"  # wtctl exits 2 for a branch or base named HEAD
+        or value.startswith("refs/")
         or _BRANCH_FORBIDDEN.search(value) is not None
         or any(part.startswith(".") or part.endswith(".lock") for part in value.split("/"))
     )
@@ -175,12 +178,21 @@ def parse_record(data: object) -> WtRecord | None:
 class WtctlError(CliError):
     """A failed wtctl call (``tool: wtctl``, wtctl's error verbatim in ``lower_error``).
 
-    ``record_id`` is the record the error names (``details.record`` of ``bootstrap_failed``),
-    which the caller stores before anything else can fail. ``operation`` is the wtctl command
-    (only ``create`` runs hooks, so only it can be vetoed or escalated).
+    ``record`` / ``record_id`` are the record a ``create`` that exited 12 ``bootstrap_failed``
+    names in ``details.record`` (wtctl's schema: the whole record object; an id string is also
+    accepted), which the caller verifies and stores before anything else can fail. They are
+    ``None`` for every other error: another failure's ``details.record`` (``path_exists`` names a
+    foreign holder) is never taken. ``operation`` is the wtctl command (only ``create`` runs
+    hooks, so only it can be vetoed or escalated).
     """
 
-    def __init__(self, base: CliError, record_id: str | None, operation: str = "") -> None:
+    def __init__(
+        self,
+        base: CliError,
+        record_id: str | None,
+        operation: str = "",
+        record: WtRecord | None = None,
+    ) -> None:
         super().__init__(
             base.code,
             base.message,
@@ -193,6 +205,7 @@ class WtctlError(CliError):
             decision_ids=base.decision_ids,
         )
         self.record_id = record_id
+        self.record = record
         self.operation = operation  # the wtctl command that failed
 
 
@@ -312,7 +325,13 @@ class WtctlBackend:
                 details={"hint": "install wtctl"},
             ) from None
         except subprocess.TimeoutExpired:
-            raise CliError("failed", "wtctl did not answer in time", tool=TOOL) from None
+            if args and args[0] == "create":  # the outcome of a create is unknown
+                raise CliError("failed", "wtctl did not answer in time", tool=TOOL) from None
+            # adopt, forget, show and list change nothing that a retry cannot repeat: retryable
+            raise self._fail(
+                _Reply(12, {"error": {"code": "busy", "message": "wtctl did not answer in time"}}),
+                args[0] if args else "",
+            ) from None
         except gw.OutputTooLarge:
             raise CliError("failed", "wtctl printed too much output", tool=TOOL) from None
         except OSError as error:
@@ -323,12 +342,21 @@ class WtctlBackend:
         error = reply.data.get("error") if reply.data is not None else None
         base = from_lower_tool(TOOL, reply.code, error)
         record_id: str | None = None
-        if isinstance(error, dict):
+        record: WtRecord | None = None
+        if (
+            operation == "create"
+            and reply.code == 12
+            and isinstance(error, dict)
+            and error.get("code") == "bootstrap_failed"  # pyright: ignore[reportUnknownMemberType]
+        ):
             details = error.get("details")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
             named = details.get("record") if isinstance(details, dict) else None  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
             if isinstance(named, str) and RECORD_ID.fullmatch(named):
                 record_id = named
-        wrapped = WtctlError(base, record_id, operation)
+            else:
+                record = parse_record(named)
+                record_id = record.id if record is not None else None
+        wrapped = WtctlError(base, record_id, operation, record)
         if failure_kind(wrapped) == "busy":
             wrapped.details = {"retryable": True}
         return wrapped

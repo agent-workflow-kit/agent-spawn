@@ -154,6 +154,7 @@ class Resume(Launch):
         self.expect_run_after: int | None = None
         self.entered = False  # a plain resume left `parked` (the pre-resume row is saved)
         self.fork_inserted = False
+        self.kept_fork_failure: CliError | None = None  # a fork kept because a hold stayed
         self.start_attempted = False
         self.settled = False  # a run of this resume is recorded (or the agent parked): no restore
         self.run_recorded = False
@@ -668,7 +669,9 @@ class Resume(Launch):
             )
         except CliError:
             pass  # unknown: the rule below fails closed
-        self.enforce_rules(True, real, self.live_records(), session_work=work)
+        # The session's own `work/` lies in no record: no lookup for it.
+        records = [] if work is not None and real == work else self.live_records()
+        self.enforce_rules(True, real, records, session_work=work)
 
     # -- the whole resume ---------------------------------------------------------------------
 
@@ -971,8 +974,7 @@ class Resume(Launch):
                         },
                     ),
                 )
-            owned = bool(row.get("wt_owned")) if row.get("wt_record_id") else mode == "new"
-            self.store_worktree(agent_id, record.id, path=record.path, owned=owned)
+            self.store_worktree(agent_id, record.id, path=record.path, owned=record.owned is True)
         root = record.path if mode == "new" else mode
         cwd = self.cwd_in_worktree(root)
         self.update_cwd(agent_id, cwd)
@@ -1010,18 +1012,25 @@ class Resume(Launch):
         mode = self.worktree_mode()
         try:
             if mode == "new":
-                if self.wt_override:
-                    self.audit_wt_override("ok", agent_id)
                 try:
-                    return self.run_create(
+                    record = self.run_create(
                         agent_id, self.create_plan(agent_id), override_escalation=self.wt_override
                     )
-                except CliError:
+                except BaseException as error:
+                    # audited once, with the real result (a refusal is exit 20)
+                    refused = isinstance(error, CliError) and error.exit_code == 20
                     if self.wt_override:
-                        self.audit_wt_override("error", agent_id)
+                        self.audit_wt_override("refused" if refused else "error", agent_id)
                     raise
-            record, _ = backend.adopt(mode, agent_id, repo=self.args.repo or None)
-            self.store_worktree(agent_id, record.id, path=record.path, owned=False)
+                if self.wt_override:
+                    self.audit_wt_override("ok", agent_id)
+                return record
+            # the literal --repo given at launch (stored), never the one derived for the row
+            given = self.stored.get("repo")
+            record, _ = backend.adopt(
+                mode, agent_id, repo=given if isinstance(given, str) else None
+            )
+            self.store_worktree(agent_id, record.id, path=record.path, owned=record.owned is True)
             return record
         except WtctlError as error:
             kind = wtlib.failure_kind(error)
@@ -1358,34 +1367,66 @@ class Resume(Launch):
             pass  # another process already settled the agent
         self.settled = True
 
-    def release_fork_holds(self, agent_id: str) -> None:
-        """``wtctl forget --holder <fork id>`` for every record the failed fork holds
-        (``not_a_holder`` and a tombstone count as released); a failure is only logged."""
+    def release_fork_holds(self, agent_id: str) -> CliError | None:
+        """``wtctl forget --holder <fork id>`` for every record the failed fork holds: the stored
+        rows and, since a crash between ``adopt`` and the row would hide one, the worktree
+        records of the fork's cwd that list the fork as a holder. ``not_a_holder`` (exit 0) and
+        a tombstone or unknown record (exit 10) count as released. Returns the first other
+        failure (every record is still tried); the caller then keeps the fork."""
         assert self.store is not None
-        holds = self.store.get_holds(agent_id)
-        if not holds:
-            return
+        record_ids = [hold["record_id"] for hold in self.store.get_holds(agent_id)]
+        if not record_ids and not self.holds_started:
+            return None
+        failure: CliError | None = None
         try:
             backend = self.wtctl_backend(self.stored_wtctl)
-        except CliError:
-            backend = None
-        for hold in holds:
+        except CliError as error:
+            backend, failure = None, error
+        cwd = self.resume_cwd
+        if backend is not None and self.holds_started and self.needs_records(cwd):
+            assert cwd is not None
+            try:
+                for record in wtlib.worktrees_containing(backend.list_records(), cwd):
+                    if agent_id in record.holders and record.id not in record_ids:
+                        record_ids.append(record.id)
+            except CliError as error:  # the holds are unknown: the fork must stay
+                failure = failure or error
+        for record_id in record_ids:
             try:
                 if backend is None:
                     raise CliError("tool_missing", "wtctl is not available", tool="wtctl")
-                backend.forget(hold["record_id"], agent_id)
-            except CliError:
+                backend.forget(record_id, agent_id)
+            except CliError as error:
+                if error.exit_code == 10:
+                    continue
                 self.log(
                     "warning",
                     level="warn",
-                    message=f"could not release the fork's hold on {hold['record_id']}",
+                    message=f"could not release the fork's hold on {record_id}",
                 )
+                failure = failure or error
+        return failure
 
     def drop_fork(self, agent_id: str) -> None:
         """A fork that failed before its session existed: the holds it took are released, its
-        record and prompt copies go, its id stays reserved."""
+        record and prompt copies go, its id stays reserved. When a hold could not be released
+        the fork row (the only handle on that hold) stays, parked ``launch_failed``, and the
+        release failure is what the command reports."""
         assert self.store is not None
-        self.release_fork_holds(agent_id)
+        failure = self.release_fork_holds(agent_id)
+        if failure is not None:
+            fields = wtlib.park_fields("other")
+            lifecycle.park(
+                self.store,
+                agent_id,
+                from_status="launching",
+                park_reason=str(fields["park_reason"]),
+                needs_attention=fields["needs_attention"],
+            )
+            self.log("status_change", level="warn", details={"to": "parked", **fields})
+            self.kept_fork_failure = failure
+            self.settled = True
+            return
         with self.store.lease(lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT) as lease:
             self.store.delete_agent(lease, agent_id)
         remove_copies(os.path.join(self.state_dir, "prompts", agent_id))
@@ -1421,12 +1462,17 @@ class Resume(Launch):
             # TODO(#31): the liveness check restores a launching agent whose launcher died.
             self.log("warning", level="warn", message="could not undo the resume's entry")
 
-    def cleanup_failed(self, failure: CliError) -> None:
+    def cleanup_failed(self, failure: CliError) -> CliError:
         definite = isinstance(failure, StartError) and not failure.maybe_allocated
         self.undo_entry(interrupted=False, search_orphan=not definite)
-        if self.fork and not self.agent_inserted:
+        if self.kept_fork_failure is not None:  # the fork stays: report why its hold stayed
+            failure = self.kept_fork_failure
+            failure.agent_id = self.agent_id
+            failure.decision_ids = list(self.decision_ids)
+        elif self.fork and not self.agent_inserted:
             failure.agent_id = None  # no fork remains
         # Prompt and input copies of a plain or sessionless resume stay (see the module doc).
+        return failure
 
     def interrupted(self, signum: int) -> Outcome:
         self.sig.raising = False

@@ -385,10 +385,14 @@ def test_adopt_refusals(fakebin: Fakebin, tmp_path: Path) -> None:
 def test_create_can_script_a_bootstrap_failure_that_keeps_the_record(fakebin: Fakebin) -> None:
     fakebin.script("wtctl", "create", bootstrap_failed="install")
     done = fakebin.run("wtctl", "create", "--repo", "example.org/o/r", "--branch", "m", "--json")
-    error = json.loads(done.stdout)["error"]
+    body = json.loads(done.stdout)
+    sibling_schemas.validate(body, "wtctl", "cli/error.json")  # details.record is a full record
+    error = body["error"]
     assert done.returncode == 12 and error["code"] == "bootstrap_failed"
-    assert error["details"]["step"] == "install"
-    shown = fakebin.run("wtctl", "show", error["details"]["record"], "--json")
+    assert error["details"]["step"]["argv"] == ["install"]
+    record = error["details"]["record"]
+    assert isinstance(record, dict) and record["state"] == "active"
+    shown = fakebin.run("wtctl", "show", record["id"], "--json")
     assert json.loads(shown.stdout)["state"] == "active"
 
 
@@ -399,6 +403,86 @@ def test_an_explicit_name_collision_is_refused_not_suffixed(fakebin: Fakebin) ->
     error = json.loads(second.stdout)["error"]
     assert second.returncode == 20 and error["reason"] == "path_exists"
     assert error["holder_id"] == first["id"]
+
+
+def test_an_explicit_name_collision_of_the_same_holder_is_reused_for_detach(
+    fakebin: Fakebin,
+) -> None:
+    args = ("--detach", "--name", "same", "--holder", "ag-aaaaaaaa")
+    first = create(fakebin, *args)
+    again = create(fakebin, *args)
+    assert again["reused"] is True and again["record"] == first["record"]
+    assert again["branch_action"] is None and again["bootstrap"] is None
+    code, error = error_of(
+        fakebin, "wtctl", "create", "--repo", REPO, "--detach", "--name", "same",
+        "--holder", "ag-bbbbbbbb",
+    )  # fmt: skip
+    assert (code, error["reason"]) == (20, "path_exists")
+
+
+def test_an_explicit_name_with_an_explicit_branch_is_reused_by_its_holder(
+    fakebin: Fakebin,
+) -> None:
+    args = ("--branch", "feat/q", "--name", "same", "--holder", "ag-aaaaaaaa")
+    first = create(fakebin, *args)
+    again = create(fakebin, *args)
+    assert again["reused"] is True and again["record"] == first["record"]
+
+
+def test_a_template_branch_collision_with_an_explicit_name_is_branch_exists(
+    fakebin: Fakebin,
+) -> None:
+    args = ("--name", "same", "--holder", "ag-aaaaaaaa")  # no --branch, no --detach: template
+    create(fakebin, *args)
+    code, error = error_of(fakebin, "wtctl", "create", "--repo", REPO, *args)
+    assert (code, error["reason"]) == (20, "branch_exists")
+    assert "tip" in error["details"]
+
+
+def test_a_dry_run_applies_the_refusals_and_never_reuses(fakebin: Fakebin) -> None:
+    args = ("--detach", "--name", "same", "--holder", "ag-aaaaaaaa")
+    create(fakebin, *args)
+    code, error = error_of(fakebin, "wtctl", "create", "--repo", REPO, *args, "--dry-run")
+    assert (code, error["reason"]) == (20, "path_exists")
+    create(fakebin, "--branch", "b9", "--holder", "ag-aaaaaaaa")
+    code, error = error_of(
+        fakebin, "wtctl", "create", "--repo", REPO, "--branch", "b9",
+        "--holder", "ag-aaaaaaaa", "--dry-run",
+    )  # fmt: skip
+    assert (code, error["reason"]) == (20, "branch_in_use")
+
+
+def _set_state(fakebin: Fakebin, record_id: str, state: str) -> None:
+    path = Path(str(fakebin.log) + ".records.json")
+    data = json.loads(path.read_text())
+    data[record_id]["state"] = state
+    path.write_text(json.dumps(data))
+
+
+@pytest.mark.parametrize(
+    ("state", "code", "reason"),
+    [
+        ("missing", 10, None),
+        ("clone_missing", 20, "unlinked"),
+        ("partial", 20, "unlinked"),
+        ("unlinked", 20, "unlinked"),
+        ("creating", 20, "path_exists"),
+    ],
+)
+def test_adopt_of_a_recorded_path_in_a_state_follows_the_state_table(
+    fakebin: Fakebin, tmp_path: Path, state: str, code: int, reason: str | None
+) -> None:
+    target = tmp_path / "tree"
+    target.mkdir()
+    adopted = json.loads(fakebin.run("wtctl", "adopt", str(target), "--json").stdout)["record"]
+    _set_state(fakebin, adopted["id"], state)
+    done = fakebin.run("wtctl", "adopt", str(target), "--holder", "ag-aaaaaaaa", "--json")
+    body = json.loads(done.stdout)
+    sibling_schemas.validate(body, "wtctl", "cli/error.json")
+    assert done.returncode == code
+    assert body["error"].get("reason") == reason
+    if state == "creating":
+        assert body["error"]["holder_id"] == adopted["id"]
 
 
 def test_forgetting_the_last_holder_forgets_an_adopted_record_only(

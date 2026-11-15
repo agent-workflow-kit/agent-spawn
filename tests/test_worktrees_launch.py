@@ -179,6 +179,10 @@ def test_cwd_outside_the_adopted_worktree_exits_2_before_anything(
         ("--cwd", "../up"),
         ("--cwd", "/abs"),
         ("--cwd", "session-dir"),
+        ("--branch", ""),
+        ("--base", ""),
+        ("--ref", ""),
+        ("--worktree-name", ""),
     ],
 )
 def test_worktree_new_usage_errors_exit_2_before_anything(
@@ -189,9 +193,69 @@ def test_worktree_new_usage_errors_exit_2_before_anything(
     assert env.agents() == [] and wtctl_calls(fakebin) == []
 
 
+@pytest.mark.parametrize("flag", ["--branch", "--base", "--ref", "--worktree-name"])
+def test_an_empty_worktree_flag_without_worktree_new_exits_2(
+    env: Env, fakebin: Fakebin, flag: str, tmp_path: Path
+) -> None:
+    for extra in ((), ("--worktree", str(tree(tmp_path)))):
+        done = env.run(*LAUNCH, flag, "", *extra)
+        assert done.returncode == 2, (done.stdout, done.stderr)
+    assert env.agents() == [] and wtctl_calls(fakebin) == []
+
+
+@pytest.mark.parametrize("flag", ["--branch", "--base", "--ref", "--worktree-name"])
+def test_an_empty_worktree_flag_with_wtctl_null_exits_2(
+    fakebin: Fakebin, isolation_env: Isolation, flag: str
+) -> None:
+    standalone = Env(fakebin, isolation_env, "wtctl_cmd: null\n")
+    done = standalone.run(*LAUNCH, flag, "")
+    assert done.returncode == 2, (done.stdout, done.stderr)
+    assert standalone.agents() == []
+
+
 def test_a_bad_repo_id_exits_2(env: Env, fakebin: Fakebin) -> None:
     done = env.run(*LAUNCH, "--worktree", "new", "--repo", "not a repo")
     assert done.returncode == 2 and env.agents() == [] and wtctl_calls(fakebin) == []
+
+
+def test_worktree_new_with_a_cwd_runs_in_that_directory_of_the_worktree(
+    env: Env, fakebin: Fakebin
+) -> None:
+    done = env.run(*LAUNCH, "--repo", REPO, "--worktree", "new", "--cwd", "pkg")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    agent_id = result_json(done)["agent"]["agent_id"]
+    record = next(iter(records(fakebin).values()))
+    expected = os.path.join(os.path.realpath(record["path"]), "pkg")
+    assert env.agent(agent_id)["cwd"] == expected
+    assert f"--cwd={expected}" in real_starts(fakebin)[-1]
+
+
+def test_a_symlink_escape_inside_the_new_worktree_is_launch_failed_and_keeps_the_record(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    root = Path(fake_throwaway(fakebin)["path"]).parent.parent
+    tree_dir = root / "worktrees" / REPO.split("/", 1)[0] / "team" / "project" / "escape-tree"
+    tree_dir.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tree_dir / "pkg").symlink_to(outside)
+    done = env.run(*LAUNCH, "--repo", REPO, "--worktree", "new", "--worktree-name", "escape-tree",
+                   "--cwd", "pkg")  # fmt: skip
+    assert done.returncode == 12, (done.stdout, done.stderr)
+    error = json.loads(done.stdout)["error"]
+    assert error["code"] == "launch_failed" and error["details"]["retryable"] is False
+    row = parked_row(env)
+    assert row["wt_record_id"] is not None  # the created record is stored for the resume
+    assert (row["park_reason"], row["needs_attention"]) == ("launch_failed", "launch_failed")
+    assert real_starts(fakebin) == []
+
+
+def test_an_unparseable_wtctl_list_fails_closed(env: Env, fakebin: Fakebin, tmp_path: Path) -> None:
+    fakebin.script("wtctl", "list", stdout="not json")
+    done = env.run(*LAUNCH, "--cwd", str(tmp_path))
+    assert done.returncode != 0, (done.stdout, done.stderr)
+    assert json.loads(done.stdout)["error"]["tool"] == "wtctl"
+    assert env.agents() == [] and real_starts(fakebin) == []
 
 
 # --- the exit mapping -------------------------------------------------------------------------
@@ -226,6 +290,14 @@ FAILURES = [
     (
         {"error": {"code": "refused", "message": "x", "reason": "path_exists"}, "exit": 20},
         20,
+        "launch_failed",
+        "launch_failed",
+        None,
+        None,
+    ),
+    (  # exit 13 that is not an escalation: a confirmation, parked launch_failed with attention
+        {"error": {"code": "confirmation_required", "message": "x"}, "exit": 13},
+        13,
         "launch_failed",
         "launch_failed",
         None,
@@ -288,14 +360,97 @@ def test_bootstrap_failed_stores_the_record_and_keeps_the_hold(env: Env, fakebin
     assert real_starts(fakebin) == []
 
 
-def test_bootstrap_failed_still_stores_the_id_when_show_fails(env: Env, fakebin: Fakebin) -> None:
+def test_bootstrap_failed_stores_the_record_from_the_error_without_show(
+    env: Env, fakebin: Fakebin
+) -> None:
     fakebin.script("wtctl", "create", bootstrap_failed="install")
     fakebin.script("wtctl", "show", error={"code": "internal", "message": "x"}, exit=1)
     done = env.run(*LAUNCH, "--repo", REPO, "--worktree", "new")
     assert done.returncode == 12
     row = parked_row(env)
     record = next(iter(records(fakebin).values()))
-    assert row["wt_record_id"] == record["id"] and row["wt_path"] is None
+    assert row["wt_record_id"] == record["id"] and row["wt_path"] == record["path"]
+    assert wtctl_calls(fakebin, "show") == []  # the error carries the whole record
+
+
+def foreign_record(fakebin: Fakebin, **changes: Any) -> dict[str, Any]:
+    """A record some other holder created, as wtctl would print it in an error."""
+    done = fakebin.run("wtctl", "create", "--repo", REPO, "--holder", "ag-zzzzzzzz",
+                       "--name", "someone-elses", "--detach", "--json")  # fmt: skip
+    assert done.returncode == 0, done.stderr
+    return {**json.loads(done.stdout)["record"], **changes}
+
+
+def test_an_id_only_bootstrap_failed_is_verified_with_show(env: Env, fakebin: Fakebin) -> None:
+    other = foreign_record(fakebin)
+    fakebin.script(
+        "wtctl",
+        "create",
+        error={"code": "bootstrap_failed", "message": "x", "details": {"record": other["id"]}},
+        exit=12,
+    )
+    done = env.run(*LAUNCH, "--repo", REPO, "--worktree", "new")
+    assert done.returncode == 12
+    row = parked_row(env)
+    assert row["wt_record_id"] is None  # not the agent's name, not held by it
+    assert wtctl_calls(fakebin, "show")
+
+
+def test_a_bootstrap_failed_naming_a_record_that_is_not_ours_is_a_plain_failure(
+    env: Env, fakebin: Fakebin
+) -> None:
+    other = foreign_record(fakebin)
+    fakebin.script(
+        "wtctl",
+        "create",
+        error={"code": "bootstrap_failed", "message": "x", "details": {"record": other,
+               "step": {"argv": ["x"], "exit": 1, "duration_ms": 0, "output_tail": ""}}},
+        exit=12,
+    )  # fmt: skip
+    done = env.run(*LAUNCH, "--repo", REPO, "--worktree", "new")
+    assert done.returncode == 12
+    row = parked_row(env)
+    assert row["wt_record_id"] is None and row["wt_path"] is None
+    with env.store() as store:
+        assert store.get_holds(row["agent_id"]) == []
+
+
+def test_a_foreign_record_in_the_details_of_another_failure_is_not_stored(
+    env: Env, fakebin: Fakebin
+) -> None:
+    other = foreign_record(fakebin)
+    fakebin.script(
+        "wtctl",
+        "create",
+        error={"code": "refused", "message": "x", "reason": "path_exists",
+               "details": {"record": other}},
+        exit=20,
+    )  # fmt: skip
+    done = env.run(*LAUNCH, "--repo", REPO, "--worktree", "new")
+    assert done.returncode == 20
+    row = parked_row(env)
+    assert row["wt_record_id"] is None
+    with env.store() as store:
+        assert store.get_holds(row["agent_id"]) == []
+
+
+def test_a_reused_adopted_record_is_stored_with_wtctls_owned_flag(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    adopted = fake_adopted(fakebin, tree(tmp_path))
+    fakebin.script(
+        "wtctl",
+        "create",
+        stdout={"record": adopted, "branch_action": None, "bootstrap": None, "reused": True,
+                "warnings": [], "dry_run": False},
+    )  # fmt: skip
+    done = env.run(*LAUNCH, "--repo", REPO, "--worktree", "new")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    agent_id = result_json(done)["agent"]["agent_id"]
+    row = env.agent(agent_id)
+    assert row["wt_record_id"] == adopted["id"] and row["wt_owned"] is False
+    with env.store() as store:
+        assert [h["owned"] for h in store.get_holds(agent_id)] == [False]
 
 
 def test_adopt_failures_park_per_the_spec(env: Env, fakebin: Fakebin, tmp_path: Path) -> None:
@@ -469,6 +624,14 @@ def test_wtctl_missing_does_not_matter_for_a_session_dir_run(
 ) -> None:
     missing = Env(fakebin, isolation_env, f"wtctl_cmd: ['{tmp_path / 'no' / 'wtctl'}']\n")
     done = missing.run(*LAUNCH, "--cwd", "session-dir")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+
+
+def test_a_third_party_run_in_its_work_dir_needs_no_records_lookup(
+    fakebin: Fakebin, isolation_env: Isolation, tmp_path: Path
+) -> None:
+    missing = Env(fakebin, isolation_env, f"wtctl_cmd: ['{tmp_path / 'no' / 'wtctl'}']\n")
+    done = missing.run(*LAUNCH, "--cwd", "session-dir", "--reads-third-party")
     assert done.returncode == 0, (done.stdout, done.stderr)
 
 

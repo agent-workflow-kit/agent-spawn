@@ -349,6 +349,22 @@ def do_create(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
     dry = p.has("--dry-run")
 
     def create(data: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], bool]:
+        # wtctl's Create order: a refusal (branch_in_use, branch_exists, path_exists) that names
+        # an active record the holder holds is a retry after a crash and returns that record
+        # (`reused`); a dry run applies the refusals and never reuses. An explicit --name is
+        # never suffixed.
+        def refuse_or_reuse(existing: dict[str, Any], reason: str, **extra: Any) -> Any:
+            if reason != "branch_exists" and not dry:
+                if existing["state"] == "active" and holder in existing["holders"]:
+                    return existing, True  # retry after a crash: the record, unchanged
+            ctx.fail(
+                20,
+                "refused",
+                f"{reason}: {existing['name']!r}",
+                reason=reason,
+                **extra,
+            )
+
         if branch is not None:
             for existing in data.values():
                 if (
@@ -356,13 +372,9 @@ def do_create(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
                     and existing["repo"] == repo
                     and existing["branch"] == branch
                 ):
-                    if existing["state"] == "active" and holder in existing["holders"]:
-                        return existing, True  # retry after a crash: the record, unchanged
-                    ctx.fail(
-                        20,
-                        "refused",
-                        f"branch {branch!r} is in use",
-                        reason="branch_in_use",
+                    return refuse_or_reuse(
+                        existing,
+                        "branch_in_use",
                         holder_id=existing["id"],
                         holder_path=existing["path"],
                     )
@@ -372,22 +384,22 @@ def do_create(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
             r["name"] for r in data.values() if r["state"] in LIVE_STATES and r["repo"] == repo
         }
         wanted = name or derive_name(branch, record_id[3:])
-        if name is not None and name in taken and not dry:
-            # An explicit --name is never suffixed: the real wtctl refuses (path_exists, or
-            # branch_exists first for a template-built branch) before any reuse, and agent-spawn
-            # finds its own record by name (the fake never takes the reuse path for a name).
+        if name is not None and name in taken:
             holder_record = next(
                 r
                 for r in data.values()
                 if r["state"] in LIVE_STATES and r["repo"] == repo and r["name"] == name
             )
-            ctx.fail(
-                20,
-                "refused",
-                f"the name {name!r} is taken",
-                reason="path_exists",
-                holder_id=holder_record["id"],
-            )
+            if branch is None and not p.has("--detach"):
+                # the template-built branch collides first: never reused
+                ctx.fail(
+                    20,
+                    "refused",
+                    f"the branch of the name {name!r} exists",
+                    reason="branch_exists",
+                    details={"tip": holder_record["head_at_create"]},
+                )
+            return refuse_or_reuse(holder_record, "path_exists", holder_id=holder_record["id"])
         final, n = wanted, 1
         while final in taken:
             n += 1
@@ -460,7 +472,15 @@ def do_create(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
             12,
             "bootstrap_failed",
             "a bootstrap step failed",
-            details={"record": record["id"], "step": str(failed_step)},
+            details={
+                "record": record,
+                "step": {
+                    "argv": [str(failed_step)],
+                    "exit": 1,
+                    "duration_ms": 0,
+                    "output_tail": "",
+                },
+            },
         )
     if record["object_type"] == "throwaway":
         action = None
@@ -478,7 +498,7 @@ def do_create(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         "bootstrap": bootstrap,
         "reused": reused,
         "warnings": [],
-        "dry_run": dry,
+        "dry_run": dry and not reused,
     }
     return 0, out, "create"
 
@@ -508,9 +528,19 @@ def do_adopt(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
     def adopt(data: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], bool]:
         for existing in data.values():
             if existing["state"] in LIVE_STATES and os.path.realpath(existing["path"]) == real:
-                if existing["state"] != "active":
-                    reason = "unlinked" if existing["state"] == "unlinked" else "path_exists"
-                    ctx.fail(20, "refused", f"the record is {existing['state']}", reason=reason)
+                state = existing["state"]
+                if state == "missing":  # the path is not a git worktree any more
+                    ctx.fail(10, "not_found", f"{raw!r} is not a git worktree")
+                if state == "creating":
+                    ctx.fail(
+                        20,
+                        "refused",
+                        "the record is being created",
+                        reason="path_exists",
+                        holder_id=existing["id"],
+                    )
+                if state != "active":  # unlinked, clone_missing, partial
+                    ctx.fail(20, "refused", f"the record is {state}", reason="unlinked")
                 if holder is not None and holder not in existing["holders"] and not dry:
                     existing["holders"] = [*existing["holders"], holder]
                 return dict(existing), True

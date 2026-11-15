@@ -160,7 +160,8 @@ def test_values_after_equals_stay_values(fakebin: Fakebin) -> None:
 @pytest.mark.parametrize(
     "value",
     ["", "-x", "a..b", "a b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "a\\b", "x.lock", "a/",
-     "/a", "a//b", "@", "a@{b", ".hidden", "a/.b", "trailing.", "tab\tx", "nul\0", "z" * 256],
+     "/a", "a//b", "@", "a@{b", "HEAD", "refs/heads/x", "refs/x", ".hidden", "a/.b", "trailing.",
+     "tab\tx", "nul\0", "z" * 256],
 )  # fmt: skip
 def test_check_branch_refuses_what_cannot_be_a_branch(value: str) -> None:
     with pytest.raises(CliError):
@@ -273,9 +274,79 @@ def test_bootstrap_failed_names_the_record(fakebin: Fakebin) -> None:
         backend(fakebin).create(plan())
     error = caught.value
     assert wt.failure_kind(error) == "bootstrap_failed" and error.exit_code == 12
+    assert error.record is not None and error.record.id == error.record_id
+    assert error.record.holders == (AGENT,) and error.record.state == "active"
     shown = backend(fakebin).show(error.record_id or "")
     assert shown is not None and shown.state == "active" and shown.holders == (AGENT,)
     assert wt.park_fields("bootstrap_failed")["needs_attention"] == "launch_failed"
+
+
+def test_an_id_string_in_details_record_is_still_accepted(fakebin: Fakebin) -> None:
+    scripted(
+        fakebin,
+        "create",
+        error={"code": "bootstrap_failed", "message": "x", "details": {"record": "wt-aaaaaaab"}},
+        exit=12,
+    )
+    with pytest.raises(wt.WtctlError) as caught:
+        backend(fakebin).create(plan())
+    assert caught.value.record_id == "wt-aaaaaaab" and caught.value.record is None
+
+
+def test_only_bootstrap_failed_names_a_record(fakebin: Fakebin) -> None:
+    api = backend(fakebin)
+    other, _ = api.create(plan(name="other", detach=True))
+    for respond in (
+        {"error": {"code": "refused", "message": "x", "reason": "path_exists",
+                   "details": {"record": other.id}}, "exit": 20},
+        {"error": {"code": "fetch_failed", "message": "x", "details": {"record": other.id}},
+         "exit": 12},
+    ):  # fmt: skip
+        scripted(fakebin, "create", times=1, **respond)
+        with pytest.raises(wt.WtctlError) as caught:
+            api.create(plan(name="again", detach=True))
+        assert caught.value.record_id is None and caught.value.record is None
+    # the adopt of a failed bootstrap code does not name one either
+    scripted(
+        fakebin,
+        "adopt",
+        error={"code": "bootstrap_failed", "message": "x", "details": {"record": other.id}},
+        exit=12,
+    )
+    with pytest.raises(wt.WtctlError) as caught:
+        api.adopt(other.path, AGENT)
+    assert caught.value.record_id is None
+
+
+class _TimingOutGateway(FakebinGateway):
+    def run(self, argv: Any, **kwargs: Any) -> Any:
+        import subprocess
+
+        raise subprocess.TimeoutExpired(list(argv), 1.0)
+
+
+@pytest.mark.parametrize("command", ["adopt", "forget", "show", "list"])
+def test_a_timeout_of_a_repeatable_call_is_busy_and_retryable(
+    fakebin: Fakebin, tmp_path: Path, command: str
+) -> None:
+    api = wt.WtctlBackend([str(fakebin.bin_dir / "wtctl")], gateway=_TimingOutGateway(fakebin))
+    calls = {
+        "adopt": lambda: api.adopt(str(tmp_path), AGENT),
+        "forget": lambda: api.forget("wt-aaaaaaab", AGENT),
+        "show": lambda: api.show("wt-aaaaaaab"),
+        "list": lambda: api.list_records(),
+    }
+    with pytest.raises(wt.WtctlError) as caught:
+        calls[command]()
+    assert wt.failure_kind(caught.value) == "busy" and caught.value.details == {"retryable": True}
+    assert wt.park_fields("busy")["needs_attention"] is None
+
+
+def test_a_timeout_of_create_stays_a_plain_failure(fakebin: Fakebin) -> None:
+    api = wt.WtctlBackend([str(fakebin.bin_dir / "wtctl")], gateway=_TimingOutGateway(fakebin))
+    with pytest.raises(CliError) as caught:
+        api.create(plan())
+    assert not isinstance(caught.value, wt.WtctlError) and caught.value.code == "failed"
 
 
 def test_a_record_id_that_is_not_an_id_is_not_taken_from_an_error(fakebin: Fakebin) -> None:

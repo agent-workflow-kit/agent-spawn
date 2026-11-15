@@ -529,7 +529,7 @@ def test_a_failed_hold_of_a_resume_restores_the_row(
     assert after["run"] == before["run"]
 
 
-def test_a_hold_wtctl_already_has_is_stored_without_adopting(
+def test_a_hold_wtctl_has_but_no_local_row_is_adopted_again_and_stored(
     env: Env, fakebin: Fakebin, tmp_path: Path
 ) -> None:
     done = env.run(*LAUNCH, "--cwd", str(tmp_path))
@@ -542,7 +542,175 @@ def test_a_hold_wtctl_already_has_is_stored_without_adopting(
     again = env.run("resume", agent_id, "--json", "--wait")
     assert again.returncode == 0, (again.stdout, again.stderr)
     assert [h["record_id"] for h in result_json(again)["agent"]["holds"]] == [record_id]
-    assert not [c for c in wtctl_calls(fakebin, "adopt") if f"--holder={agent_id}" in c]
+    # `adopt` is idempotent: the hold is re-asserted rather than trusted
+    assert len([c for c in wtctl_calls(fakebin, "adopt") if f"--holder={agent_id}" in c]) == 1
+
+
+def test_holders_emptied_externally_are_adopted_again_on_resume(env: Env, fakebin: Fakebin) -> None:
+    agent_id = launched_in_worktree(env)
+    record_id = env.agent(agent_id)["wt_record_id"]
+    fakebin.run("wtctl", "forget", record_id, "--holder", agent_id, "--json")
+    assert agent_id not in records(fakebin)[record_id]["holders"]
+    with env.store() as store:
+        assert [h["record_id"] for h in store.get_holds(agent_id)] == [record_id]  # row remains
+    done = env.run("resume", agent_id, "--json", "--wait")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert len(wtctl_calls(fakebin, "adopt")) == 1
+    assert agent_id in records(fakebin)[record_id]["holders"]
+    assert [h["record_id"] for h in result_json(done)["agent"]["holds"]] == [record_id]
+
+
+def test_a_busy_forget_keeps_the_failed_fork_parked_with_its_holds(
+    env: Env, fakebin: Fakebin
+) -> None:
+    source = launched_in_worktree(env)
+    fakebin.script("claude-session", "start", argv_contains=["--dry-run"])
+    fakebin.script("claude-session", "start", exit=20,
+                   error={"code": "refused", "message": "no", "reason": "live"})  # fmt: skip
+    fakebin.script("wtctl", "forget", times=1, **BUSY)
+    done = env.run("resume", source, "--fork", "--json")
+    assert done.returncode == 12, (done.stdout, done.stderr)
+    error = json.loads(done.stdout)["error"]
+    assert error["tool"] == "wtctl" and error["details"]["retryable"] is True
+    (fork,) = [a for a in env.agents() if a["agent_id"] != source]
+    assert error["agent_id"] == fork["agent_id"]
+    assert (fork["status"], fork["park_reason"]) == ("parked", "launch_failed")
+    with env.store() as store:
+        assert [h["record_id"] for h in store.get_holds(fork["agent_id"])] == [
+            env.agent(source)["wt_record_id"]
+        ]
+    record = records(fakebin)[env.agent(source)["wt_record_id"]]
+    assert fork["agent_id"] in record["holders"]  # still held: the row is the handle
+
+
+def test_adopt_retry_at_resume_passes_the_repo_given_at_launch_not_the_derived_one(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    derived = "example.org/derived/repo"
+    fakebin.script("claude-session", "start", times=1, argv_contains=["--dry-run"],
+                   merge={"repo": derived})  # fmt: skip
+    fakebin.script("wtctl", "adopt", times=1, **BUSY)
+    done = env.run(*LAUNCH, "--worktree", str(root), "--prompt", "P")
+    assert done.returncode == 12
+    agent_id = str(only_agent(env)["agent_id"])
+    assert env.agent(agent_id)["repo"] == derived  # the row has a repo the user never gave
+    first = wtctl_calls(fakebin, "adopt")[0]
+    assert not [a for a in first if a.startswith("--repo")]
+    done = env.run("resume", agent_id, "--json", "--wait")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    retry = wtctl_calls(fakebin, "adopt")[1]
+    assert not [a for a in retry if a.startswith("--repo")]
+
+
+def test_the_literal_repo_given_with_a_worktree_path_is_passed_again_at_resume(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    fakebin.script("wtctl", "adopt", times=1, **BUSY)
+    done = env.run(*LAUNCH, "--worktree", str(root), "--repo", REPO, "--prompt", "P")
+    assert done.returncode == 12
+    agent_id = str(only_agent(env)["agent_id"])
+    env.run("resume", agent_id, "--json", "--wait")
+    assert f"--repo={REPO}" in wtctl_calls(fakebin, "adopt")[1]
+
+
+def test_a_record_found_by_name_takes_wtctls_owned_flag(env: Env, fakebin: Fakebin) -> None:
+    agent_id = failed_launch(env, fakebin)
+    path = Path(str(fakebin.log)).parent / "adopted-tree"
+    path.mkdir()
+    done = fakebin.run("wtctl", "adopt", str(path), "--repo", REPO, "--name", agent_id,
+                       "--holder", agent_id, "--json")  # fmt: skip
+    assert done.returncode == 0, done.stderr
+    left = json.loads(done.stdout)["record"]
+    assert left["owned"] is False
+    done = env.run("resume", agent_id, "--json", "--wait")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    row = env.agent(agent_id)
+    assert row["wt_record_id"] == left["id"] and row["wt_owned"] is False
+
+
+def test_a_plan_cwd_equal_to_the_session_work_dir_needs_no_records_lookup(
+    fakebin: Fakebin, isolation_env: Isolation, tmp_path: Path
+) -> None:
+    first = Env(fakebin, isolation_env)
+    done = first.run(*LAUNCH, "--cwd", "session-dir", "--reads-third-party")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    agent_id = str(result_json(done)["agent"]["agent_id"])
+    session = first.agent(agent_id)["csession_id"]
+    status = fakebin.run("claude-session", "status", session, "--json", env=first.env())
+    work = os.path.realpath(os.path.join(json.loads(status.stdout)["csession_dir"], "work"))
+    broken = Env(fakebin, isolation_env, f"wtctl_cmd: ['{tmp_path / 'no' / 'wtctl'}']\n")
+    fakebin.script("claude-session", "start", times=1, argv_contains=["--dry-run"],
+                   merge={"profile": {"reads_third_party": True}, "taints": True,
+                          "cwd": work})  # fmt: skip
+    done = broken.run("resume", agent_id, "--allow-tainted", "--actor", "human:me", "--json",
+                      "--wait")  # fmt: skip
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert wtctl_calls(fakebin) == []
+
+
+def test_a_failed_override_create_is_audited_once_with_the_real_result(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = failed_launch(env, fakebin, error={"code": "escalated", "message": "ask"}, exit=13)
+    fakebin.script("wtctl", "create", times=1, **BUSY)
+    done = env.run("resume", agent_id, "--override-escalation", "--actor", "human:me", "--json")
+    assert done.returncode == 12, (done.stdout, done.stderr)
+    audit = [json.loads(x) for x in (env.state_dir / "audit.jsonl").read_text().splitlines()]
+    assert [(r["action"], r["result"]) for r in audit] == [("resume_escalation_override", "error")]
+
+
+def test_a_refused_override_create_is_audited_as_refused(env: Env, fakebin: Fakebin) -> None:
+    agent_id = failed_launch(env, fakebin, error={"code": "escalated", "message": "ask"}, exit=13)
+    fakebin.script("wtctl", "create", times=1,
+                   error={"code": "refused", "message": "x", "reason": "path_exists"},
+                   exit=20)  # fmt: skip
+    done = env.run("resume", agent_id, "--override-escalation", "--actor", "human:me", "--json")
+    assert done.returncode == 20, (done.stdout, done.stderr)
+    audit = [json.loads(x) for x in (env.state_dir / "audit.jsonl").read_text().splitlines()]
+    assert [(r["action"], r["result"]) for r in audit] == [
+        ("resume_escalation_override", "refused")
+    ]
+
+
+def test_a_sessionless_agent_with_a_stored_worktree_path_adopts_and_shows_nothing(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    fakebin.script("wtctl", "adopt", times=1, **BUSY)
+    done = env.run(*LAUNCH, "--worktree", str(root), "--prompt", "P")
+    assert done.returncode == 12
+    agent_id = str(only_agent(env)["agent_id"])
+    assert env.agent(agent_id)["wt_record_id"] is None  # nothing stored yet: no show, no id
+    done = env.run("resume", agent_id, "--json", "--wait")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert wtctl_calls(fakebin, "show") == []
+    assert len(wtctl_calls(fakebin, "adopt")) == 2
+
+
+def test_a_stored_record_of_a_sessionless_agent_is_shown_and_adopt_is_skipped(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    # the adopt succeeded and the launch then failed before a session: the record id is stored
+    fakebin.script("claude-session", "start", argv_contains=["--dry-run"])
+    fakebin.script("claude-session", "start", exit=12, times=1,
+                   error={"code": "launch_failed", "message": "x"})  # fmt: skip
+    done = env.run(*LAUNCH, "--worktree", str(root), "--prompt", "P")
+    assert done.returncode != 0
+    agent_id = str(only_agent(env)["agent_id"])
+    row = env.agent(agent_id)
+    assert row["wt_record_id"] is not None and row["csession_id"] is None
+    adopts = len(wtctl_calls(fakebin, "adopt"))
+    done = env.run("resume", agent_id, "--json", "--wait")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert [c[1] for c in wtctl_calls(fakebin, "show")] == [row["wt_record_id"]]
+    assert len(wtctl_calls(fakebin, "adopt")) == adopts  # known record: adopt is skipped
 
 
 def test_reacquiring_a_hold_replaces_the_id_of_a_re_adopted_record(
@@ -591,3 +759,33 @@ def test_a_signal_during_step_5_restores_the_pre_resume_row(
         assert after[field] == before[field], field
     assert after["launcher"] is None and after["pre_resume"] is None
     assert starts(fakebin) == [] and after["wt_record_id"] is None
+
+
+def test_a_fork_hold_wtctl_has_but_no_row_stores_is_found_by_the_cwd_lookup(
+    fakebin: Fakebin, tmp_path: Path
+) -> None:
+    from agent_spawn import worktrees as wtlib
+    from agent_spawn.resume import Resume
+    from tests.session_backend_support import FakebinGateway
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    fork = "ag-fffffff2"
+    done = fakebin.run("wtctl", "adopt", str(tree), "--holder", fork, "--json")
+    record_id = json.loads(done.stdout)["record"]["id"]
+
+    class NoRows:
+        def get_holds(self, _agent_id: str) -> list[dict[str, Any]]:
+            return []  # the crash came between `adopt` and the stored row
+
+    resume = Resume.__new__(Resume)
+    resume.store = NoRows()  # type: ignore[assignment]
+    resume.holds_started = True
+    resume.resume_cwd = str(tree)
+    resume.stored_wtctl = None
+    resume.log = lambda *_a, **_k: None  # type: ignore[method-assign]
+    resume.wtctl_backend = lambda _stored=None: wtlib.WtctlBackend(  # type: ignore[method-assign]
+        [str(fakebin.bin_dir / "wtctl")], gateway=FakebinGateway(fakebin)
+    )
+    assert resume.release_fork_holds(fork) is None
+    assert fork not in records(fakebin)[record_id]["holders"]
