@@ -832,6 +832,28 @@ def test_async_hook_timeout_is_enforced_while_the_starter_lives(
     assert any(r["event"] == "hook_timeout" for r in log_records(state_dir))
 
 
+def test_async_timeout_is_reported_even_when_the_watchdog_fires_before_poll(
+    state_dir: Path,
+) -> None:
+    state_dir.mkdir()
+    runner = AsyncRunner(state_dir)
+    assert runner.start("sleep 60", b"{}", hook="post-park", agent_id=ID, timeout=0.3) is None
+    time.sleep(1.8)  # the watchdog (1 s, rounded up) kills the group before the first poll
+    assert runner.wait(10) == 0
+    events = [r["event"] for r in log_records(state_dir)]
+    assert "hook_timeout" in events and "hook_failed" not in events
+    quiesce()  # the watchdog subshell lingers through its SIGKILL grace
+
+
+def test_async_command_killed_by_a_signal_reports_the_signal(state_dir: Path) -> None:
+    state_dir.mkdir()
+    runner = AsyncRunner(state_dir)
+    runner.start("kill -s KILL $$", b"{}", hook="post-park", agent_id=ID, timeout=30)
+    assert runner.wait(10) == 0
+    (record,) = [r for r in log_records(state_dir) if r["event"] == "hook_failed"]
+    assert record["details"]["signal"] == 9
+
+
 def test_async_failure_is_logged(state_dir: Path) -> None:
     state_dir.mkdir()
     runner = AsyncRunner(state_dir)

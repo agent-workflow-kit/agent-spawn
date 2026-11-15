@@ -102,6 +102,7 @@ REAP_TIMEOUT = 5.0
 MAX_ASYNC = 16  # async hooks one runner keeps running at once
 ASYNC_CAP_WAIT = 10.0  # seconds ``AsyncRunner.start`` waits for a free slot
 WATCHDOG_GRACE = 2  # whole seconds between the watchdog's SIGTERM and SIGKILL
+_KILL_CODES = frozenset({-15, -9, 143, 137})  # SIGTERM/SIGKILL as a signal or as 128 + signal
 ESCALATE_EXIT = 13
 MAX_DECISION_IDS = 32
 _AGENT_ID = re.compile(r"ag-[a-z2-7]{8}")
@@ -111,7 +112,9 @@ _TEARDOWN_HOOKS = frozenset({"pre-teardown", "post-teardown"})
 _SH = "/bin/sh"
 # Runs an async hook: $1 the command (never interpolated into this text), $2 the timeout and $3
 # the SIGTERM-to-SIGKILL grace, both in whole seconds. The wrapper is the group leader; the
-# watchdog subshell signals the whole group (``kill 0``).
+# watchdog subshell signals the whole group (``kill 0``). The timeout bounds the command itself
+# only: the watchdog stops when the command exits, so background children it leaves behind
+# afterwards are not bounded.
 _ASYNC_WRAPPER = """
 (
   trap '' TERM
@@ -761,7 +764,19 @@ class AsyncRunner:
             child = item.group.child
             if child.poll() is not None:
                 code: int = child.returncode
-                if code != 0:
+                if code != 0 and gw.monotonic() >= item.deadline and code in _KILL_CODES:
+                    # The watchdog fired before this poll: the wrapper died of its SIGTERM/SIGKILL
+                    # (negative code) or the command did and ``exit "$rc"`` passed 128 + signal on.
+                    _log(
+                        self.state_dir,
+                        "hook_timeout",
+                        level="warn",
+                        agent_id=item.agent_id,
+                        hook=item.hook,
+                        message="async hook timed out",
+                        details={"async": True},
+                    )
+                elif code != 0:
                     _log(
                         self.state_dir,
                         "hook_failed",
@@ -772,7 +787,7 @@ class AsyncRunner:
                         details={
                             "exit_code": code if code > 0 else None,
                             "async": True,
-                            "signal": -code if code < 0 else None,
+                            "signal": -code if code < 0 else (code - 128 if code > 128 else None),
                         },
                     )
             elif gw.monotonic() >= item.deadline:
