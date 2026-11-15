@@ -101,9 +101,11 @@ class _Wait:
         session = row.get("csession_id")
         if not isinstance(session, str):
             return found
+        config = self.inv.config
+        assert config is not None
         try:
             status = SessionBackend(
-                launch.resolve_tool(self.inv.config.claude_session_cmd, "claude-session"),
+                launch.resolve_tool(config.claude_session_cmd, "claude-session"),
                 gateway=self.gateway,
             ).status(session)
         except CliError as error:
@@ -184,7 +186,8 @@ class _Wait:
                 if alive and holder is not None and holder != handle_identity:
                     if handle is not None:
                         handle.close()
-                    handle, handle_identity = procs.open_verified(holder, gateway=self.gateway), holder
+                    handle = procs.open_verified(holder, gateway=self.gateway)
+                    handle_identity = holder
                 if handle is not None and alive:
                     handle.wait_exit(POLL)  # a wake-up only: the next look decides
                 else:
