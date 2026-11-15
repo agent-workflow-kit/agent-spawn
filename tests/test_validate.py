@@ -420,3 +420,23 @@ def test_since_duration_beyond_the_epoch_range_is_rejected_not_an_overflow() -> 
     far = datetime(1, 1, 2, tzinfo=UTC)
     with pytest.raises(GrammarError):
         validate.parse_since("2d", far)
+
+
+@pytest.mark.parametrize("value", ["implement", "a", "0x", "a_b-c", "a" * 64])
+def test_kind_grammar_accepts(value: str) -> None:
+    assert validate.KIND.fullmatch(value)
+
+
+@pytest.mark.parametrize("value", ["", "-a", "_a", "A", "a" * 65, "a b", "a\n", "\uff11"])
+def test_kind_grammar_rejects(value: str) -> None:
+    assert not validate.KIND.fullmatch(value)
+
+
+@pytest.mark.parametrize("value", ["host/o/r", "git.example.com:8443/o/r", "h/a/b/c", "a-b.c/x_y"])
+def test_repo_id_grammar_accepts(value: str) -> None:
+    assert validate.REPO_ID.fullmatch(value)
+
+
+@pytest.mark.parametrize("value", ["", "host", "host/", "host/../r", "Host/o", "h/o r", "h/o\n"])
+def test_repo_id_grammar_rejects(value: str) -> None:
+    assert not validate.REPO_ID.fullmatch(value)

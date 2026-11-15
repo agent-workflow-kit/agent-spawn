@@ -21,8 +21,10 @@ from decimal import Decimal
 __all__ = [
     "AGENT_ID",
     "GrammarError",
+    "KIND",
     "MAX_DECISION_IDS",
     "MAX_DURATION_SECONDS",
+    "REPO_ID",
     "arg_type",
     "default_name",
     "duration_arg",
@@ -37,6 +39,13 @@ __all__ = [
 ]
 
 AGENT_ID = re.compile(r"ag-[a-z2-7]{8}")
+#: A kind name (schemas/defs.json); matched with ``fullmatch``.
+KIND = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+#: A repo id, ``host[:port]/path`` (schemas/defs.json); matched with ``fullmatch``.
+REPO_ID = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?"
+    r"(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+)+"
+)
 _ACTOR = re.compile(r"(?:human|auto):[A-Za-z0-9._@-]{1,64}")
 _DECISION_ID = re.compile(r"[A-Za-z0-9._:@/-]{1,128}")
 _MERGED_HEAD = re.compile(r"[0-9a-f]{40}")

@@ -53,6 +53,16 @@ tmux:
 
 - Only the client options, `-V`, `;` splitting, command aliases and the "no server" failure are modeled; every other command needs a scripted reply. A rule for a command also answers its alias (`ls` for `list-sessions`; the table is tmux 3.5a's), and a rule with an empty response is still a rule. `start-server` succeeds silently; `list-commands` is `fake_unsupported`. For real tmux behavior use the `private_tmux` fixture (a real server on `-S <tmp>/sock -f /dev/null` with a private `HOME`).
 
+## Known fake leniencies (claude-session)
+
+Places where the claude-session fake accepts or answers what the real tool (per its interface) would refuse or answer differently. Tests must not rely on them.
+
+- `forget` of a pending or live session succeeds; the real tool refuses a live run.
+- `start --dry-run` answers constants: `taints` is false and `would_refuse` is null whatever the session's state (use `fakebin.script` to get a refusal).
+- `status` never reports a pending run, `recent_events` is always empty and `reconcile` finds nothing.
+- The outcome-file refusal of launch step 2 (a path under a session-writable path) is not modeled.
+- A plain `--resume` with `--cwd` is accepted; the real tool exits 2 when it differs from the stored cwd.
+
 ## Unverified
 
 - claude-session: the real 0.38.4 in the build environment failed with an internal `ModuleNotFoundError` for every call that gets past argument parsing, so the human-only flag checks, `--actor` grammar, a missing `--prompt-file` and everything that needs state or config were compared with the interface document only (rows marked `False` in `fidelity_cases.py`). The shapes of `start`, `exec`, `status`, `stop`, `wait`, `list`, `forget` and `reconcile` outputs are the schema's, not observed.

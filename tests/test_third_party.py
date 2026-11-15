@@ -27,7 +27,7 @@ def plan(**changes: Any) -> dict[str, Any]:
         "taints": False,
         "repo": None,
         "cwd": "/somewhere",
-        "profile": {"reads_third_party": False, "cwd": "repo"},
+        "profile": {"reads_third_party": False, "cwd": "caller"},
         "would_refuse": None,
         "would_fail": None,
     }
@@ -87,13 +87,38 @@ def test_missing_taints_is_unusable_not_false() -> None:
         parse_plan(value)
 
 
-def test_cwd_is_the_requested_one_else_the_kinds_default() -> None:
+def test_cwd_is_the_requested_one_else_the_plans() -> None:
     assert parse_plan(plan(), requested_cwd="/x").cwd == "/x"
-    assert parse_plan(plan(profile={"reads_third_party": True, "cwd": "session-dir"})).cwd == (
-        SESSION_DIR
-    )
     assert parse_plan(plan()).cwd == "/somewhere"
     assert parse_plan(plan(cwd=None)).cwd is None
+
+
+def test_a_resume_plan_with_a_session_dir_profile_keeps_the_real_cwd() -> None:
+    # The profile's cwd is the default of a new session; a resume runs in the previous cwd.
+    profile = {"reads_third_party": True, "cwd": "session-dir"}
+    assert parse_plan(plan(profile=profile, cwd="/repo")).cwd == "/repo"
+
+
+@pytest.mark.parametrize(
+    "path", ["/s/sessions/cs-aaaaaaaa/work", "/s/cs-k3v7q2xa/work/", "/s/cs-k3v7q2xa/x/../work"]
+)
+def test_a_session_work_dir_is_session_dir(path: str) -> None:
+    assert parse_plan(plan(cwd=path)).cwd == SESSION_DIR
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/s/cs-aaaaaaaa/work/sub",
+        "/s/cs-aaaaaaaa",
+        "/s/other/work",
+        "work",
+        "/work",
+        "/s/cs-AAAA/work",
+    ],
+)
+def test_anything_else_stays_the_real_path(path: str) -> None:
+    assert parse_plan(plan(cwd=path)).cwd == path
 
 
 def test_repo_comes_from_the_plan() -> None:
@@ -115,6 +140,19 @@ def test_would_refuse_is_an_exit_20_refusal_naming_claude_session() -> None:
 def test_a_would_refuse_that_is_not_a_reason_becomes_unknown() -> None:
     error = refusal(parse_plan(plan(would_refuse="Not A Reason!\n")))
     assert error is not None and error.reason == "unknown"
+
+
+@pytest.mark.parametrize("reason", ["third_party_cwd", "third_party_run", "other", "", 5])
+def test_a_would_refuse_outside_the_schema_enum_is_unknown(reason: Any) -> None:
+    value = Classification(False, "implement", None, None, reason, None)
+    error = refusal(value)
+    assert error is not None and error.reason == "unknown"
+
+
+@pytest.mark.parametrize("reason", ["live", "tainted", "already_adopted", "expired"])
+def test_the_schema_reasons_are_kept(reason: str) -> None:
+    error = refusal(parse_plan(plan(would_refuse=reason)))
+    assert error is not None and error.reason == reason
 
 
 def test_would_fail_alone_does_not_refuse() -> None:
@@ -144,6 +182,13 @@ def test_a_symlink_to_the_session_work_dir_counts_by_realpath(tmp_path: Any) -> 
     assert cwd_rule_allows(True, str(link), session_work=str(work))
 
 
+def test_a_path_the_os_refuses_is_not_allowed(tmp_path: Any) -> None:
+    assert not cwd_rule_allows(True, "/a\0b", session_work=str(tmp_path))
+    assert not cwd_rule_allows(True, str(tmp_path), session_work="/a\0b")
+    with pytest.raises(CliError):
+        require_cwd_rule(True, "/a\0b", session_work=str(tmp_path))
+
+
 def test_a_trusted_run_has_no_throwaway_to_be_refused_in_without_wtctl() -> None:
     assert cwd_rule_allows(False, "/any/where")
     assert cwd_rule_allows(False, None)
@@ -167,37 +212,40 @@ def test_require_cwd_rule_refuses_with_third_party_cwd() -> None:
 
 
 def allows(value: bool):
-    return lambda _actual: value
+    return lambda _actual, _cwd: value
+
+
+CWD = "/some/where"
 
 
 def test_agreement_is_accepted_whatever_the_rule_says() -> None:
     for expected in (True, False):
-        decision = decide_check(expected, expected, rule_allows=allows(False))
+        decision = decide_check(expected, expected, cwd=CWD, rule_allows=allows(False))
         assert (decision.verdict, decision.cause) == ("accept", None)
 
 
 def test_a_mismatch_the_rule_allows_continues_with_a_warning() -> None:
-    decision = decide_check(False, True, rule_allows=allows(True))
+    decision = decide_check(False, True, cwd=CWD, rule_allows=allows(True))
     assert (decision.verdict, decision.cause) == ("warn", None)
-    decision = decide_check(True, False, rule_allows=allows(True))
+    decision = decide_check(True, False, cwd=CWD, rule_allows=allows(True))
     assert decision.verdict == "warn"
 
 
 def test_a_mismatch_the_rule_forbids_is_cancelled() -> None:
-    decision = decide_check(False, True, rule_allows=allows(False))
+    decision = decide_check(False, True, cwd=CWD, rule_allows=allows(False))
     assert (decision.verdict, decision.cause) == ("cancel", "classification_mismatch")
 
 
 def test_the_rule_is_asked_about_the_actual_class() -> None:
-    asked: list[bool] = []
+    asked: list[tuple[bool, str | None]] = []
 
-    def rule(actual: bool) -> bool:
-        asked.append(actual)
+    def rule(actual: bool, cwd: str | None) -> bool:
+        asked.append((actual, cwd))
         return True
 
-    decide_check(False, True, rule_allows=rule)
-    decide_check(True, False, rule_allows=rule)
-    assert asked == [True, False]
+    decide_check(False, True, cwd=CWD, rule_allows=rule)
+    decide_check(True, False, cwd=CWD, rule_allows=rule)
+    assert asked == [(True, CWD), (False, CWD)]
 
 
 def test_an_actual_third_party_run_also_needs_its_result_file_check() -> None:
@@ -207,7 +255,9 @@ def test_an_actual_third_party_run_also_needs_its_result_file_check() -> None:
         calls.append("checked")
         return False
 
-    decision = decide_check(False, True, rule_allows=allows(True), result_file_allows=result_file)
+    decision = decide_check(
+        False, True, cwd=CWD, rule_allows=allows(True), result_file_allows=result_file
+    )
     assert (decision.verdict, decision.cause) == ("cancel", "classification_mismatch")
     assert calls == ["checked"]
 
@@ -217,19 +267,19 @@ def test_the_result_file_check_is_not_run_for_an_actual_trusted_run() -> None:
         raise AssertionError("not for a trusted run")
 
     assert decide_check(
-        True, False, rule_allows=allows(True), result_file_allows=never
+        True, False, cwd=CWD, rule_allows=allows(True), result_file_allows=never
     ).verdict == ("warn")
 
 
 def test_an_unreadable_status_is_cancelled_as_unknown() -> None:
-    decision = decide_check(False, None, rule_allows=allows(True))
+    decision = decide_check(False, None, cwd=CWD, rule_allows=allows(True))
     assert (decision.verdict, decision.cause) == ("cancel", "classification_unknown")
 
 
 def test_the_error_of_a_cancelled_check_is_launch_failed_with_its_cause() -> None:
     for cause, actual in (("classification_mismatch", True), ("classification_unknown", None)):
         error = check_error(
-            decide_check(False, actual, rule_allows=allows(False)), agent_id="ag-aaaaaaaa"
+            decide_check(False, actual, cwd=CWD, rule_allows=allows(False)), agent_id="ag-aaaaaaaa"
         )
         assert (error.exit_code, error.code, error.tool, error.agent_id) == (
             12,
@@ -242,9 +292,34 @@ def test_the_error_of_a_cancelled_check_is_launch_failed_with_its_cause() -> Non
 
 def test_only_a_cancelled_check_has_an_error() -> None:
     with pytest.raises(ValueError):
-        check_error(decide_check(False, False, rule_allows=allows(True)), agent_id=None)
+        check_error(decide_check(False, False, cwd=CWD, rule_allows=allows(True)), agent_id=None)
 
 
 def test_classification_is_a_value_object() -> None:
     value = Classification(True, "review", None, None, None, None)
     assert value.classification == "third_party"
+
+
+@pytest.mark.parametrize("cwd", [None, 5, b"/x"])
+def test_a_third_party_run_without_a_string_cwd_is_cancelled_as_unknown(cwd: Any) -> None:
+    decision = decide_check(False, True, cwd=cwd, rule_allows=allows(True))
+    assert (decision.verdict, decision.cause) == ("cancel", "classification_unknown")
+
+
+def test_a_trusted_run_without_a_cwd_is_still_judged_by_the_rule() -> None:
+    assert decide_check(True, False, cwd=None, rule_allows=allows(True)).verdict == "warn"
+
+
+@pytest.mark.parametrize("where", ["rule", "result_file"])
+def test_a_callback_that_raises_cancels_as_unknown(where: str) -> None:
+    def boom(*_args: Any) -> bool:
+        raise RuntimeError("boom")
+
+    decision = decide_check(
+        False,
+        True,
+        cwd=CWD,
+        rule_allows=boom if where == "rule" else allows(True),
+        result_file_allows=boom if where == "result_file" else (lambda: True),
+    )
+    assert (decision.verdict, decision.cause) == ("cancel", "classification_unknown")

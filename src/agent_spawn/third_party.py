@@ -18,11 +18,13 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .output import CliError
+from .validate import KIND
 
 SESSION_DIR = "session-dir"
 
-_KIND = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
-_REASON = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_SESSION_DIR_NAME = re.compile(r"cs-[a-z2-7]{8}")
+#: The reasons of the pinned dry-run schema (``would_refuse``); anything else is "unknown".
+WOULD_REFUSE_REASONS = frozenset({"live", "tainted", "already_adopted", "expired"})
 _REPO_MAX = 512
 _CWD_MAX = 4096
 
@@ -55,12 +57,24 @@ def _text(value: object, name: str, limit: int) -> str | None:
     return value
 
 
+def _is_session_work(path: str) -> bool:
+    """Whether ``path`` is ``<...>/cs-xxxxxxxx/work`` (lexically; nothing is resolved)."""
+    if not os.path.isabs(path):
+        return False
+    head, name = os.path.split(os.path.normpath(path))
+    return name == "work" and _SESSION_DIR_NAME.fullmatch(os.path.basename(head)) is not None
+
+
 def parse_plan(plan: object, *, requested_cwd: str | None = None) -> Classification:
     """Read the classification out of a dry-run plan.
 
     The run is third-party-reading when ``profile.reads_third_party`` or ``taints`` is true.
     ``requested_cwd`` is the ``--cwd`` the dry run was given; without one the run's cwd is the
-    kind's default, which is ``session-dir`` when ``profile.cwd`` says so, else the plan's cwd.
+    plan's cwd, mapped to ``session-dir`` only when that is a session work directory
+    (``.../cs-xxxxxxxx/work``: the new-session placeholder or a session's own). The kind's
+    ``profile.cwd`` is not used: a resume runs in the previous run's cwd and a fork in its
+    source's, whatever the kind says. Any other path stays the real path (the cwd rule then
+    fails closed).
     """
     if not isinstance(plan, dict):
         raise PlanError("the plan is not an object")
@@ -74,7 +88,7 @@ def parse_plan(plan: object, *, requested_cwd: str | None = None) -> Classificat
     if not isinstance(reads, bool) or not isinstance(taints, bool):
         raise PlanError("the plan does not say whether the run reads third-party content")
     run_kind = plan.get("run_kind")
-    if not isinstance(run_kind, str) or _KIND.fullmatch(run_kind) is None:
+    if not isinstance(run_kind, str) or KIND.fullmatch(run_kind) is None:
         raise PlanError("the plan has no valid run kind")
     refuse = _text(plan.get("would_refuse"), "would_refuse", 64)
     fail = _text(plan.get("would_fail"), "would_fail", 64)
@@ -83,7 +97,7 @@ def parse_plan(plan: object, *, requested_cwd: str | None = None) -> Classificat
     cwd: str | None
     if requested_cwd is not None:
         cwd = requested_cwd
-    elif profile.get("cwd") == SESSION_DIR:
+    elif plan_cwd is not None and _is_session_work(plan_cwd):
         cwd = SESSION_DIR
     else:
         cwd = plan_cwd
@@ -102,7 +116,7 @@ def refusal(classification: Classification) -> CliError | None:
     reason = classification.would_refuse
     if reason is None:
         return None
-    if _REASON.fullmatch(reason) is None:
+    if not isinstance(reason, str) or reason not in WOULD_REFUSE_REASONS:
         reason = "unknown"
     return CliError(
         "refused",
@@ -141,7 +155,12 @@ def cwd_rule_allows(
         return False
     if cwd == SESSION_DIR:
         return True
-    return session_work is not None and _real(cwd) == _real(session_work)
+    if session_work is None:
+        return False
+    try:
+        return _real(cwd) == _real(session_work)
+    except (ValueError, OSError):  # a NUL or another path the OS refuses
+        return False
 
 
 def require_cwd_rule(
@@ -180,20 +199,30 @@ def decide_check(
     expected: bool,
     actual: bool | None,
     *,
-    rule_allows: Callable[[bool], bool],
+    cwd: str | None,
+    rule_allows: Callable[[bool, str | None], bool],
     result_file_allows: Callable[[], bool] = lambda: True,
 ) -> CheckDecision:
     """Apply interface.md, Classification check.
 
     ``actual`` is None when ``status`` failed or could not be read: cancel as unknown.
-    ``rule_allows(c)`` says whether the run's cwd satisfies the cwd rule for class ``c``;
-    ``result_file_allows()`` runs the result-file check for an actual third-party-reading run.
+    ``cwd`` is the run's actual cwd (``status`` ``run.cwd``); a third-party-reading run whose
+    cwd is not a string is cancelled as unknown. ``rule_allows(c, cwd)`` says whether ``cwd``
+    satisfies the cwd rule for class ``c`` (supplied by the caller: #11, #13, #14, which own
+    the records of the cwd); ``result_file_allows()`` runs the result-file check for an actual
+    third-party-reading run. A callback that raises cancels as unknown (fail closed).
     """
     if actual is None:
         return CheckDecision("cancel", "classification_unknown", expected, None)
+    if actual and not isinstance(cwd, str):
+        return CheckDecision("cancel", "classification_unknown", expected, actual)
     if actual == expected:
         return CheckDecision("accept", None, expected, actual)
-    if rule_allows(actual) and (not actual or result_file_allows()):
+    try:
+        allowed = rule_allows(actual, cwd) and (not actual or result_file_allows())
+    except Exception:  # noqa: BLE001 - any failure of a caller's check fails closed
+        return CheckDecision("cancel", "classification_unknown", expected, actual)
+    if allowed:
         return CheckDecision("warn", None, expected, actual)
     return CheckDecision("cancel", "classification_mismatch", expected, actual)
 

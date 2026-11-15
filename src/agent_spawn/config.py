@@ -42,17 +42,10 @@ MAX_DROPINS = 256
 DROPIN_DIR = "config.d"
 
 # --- grammars (shape only) ------------------------------------------------------------------
-# The duration and label grammars are owned by validate.py and labels.py. The kind and repo-id
-# grammars have no shared home yet, so config keeps private copies mirroring schemas/defs.json.
-# TODO(#4): move the kind and repo-id grammars into validate.py when a second user needs them.
+# The duration, kind and repo-id grammars are owned by validate.py, the label grammar by labels.py.
 
-_KIND = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _ME_NAME = re.compile(r"[A-Za-z0-9._@-]{1,64}")
-_REPO_ID = re.compile(
-    r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?"
-    r"(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+)+"
-)
 
 
 def _pattern(regex: re.Pattern[str], what: str) -> Any:
@@ -91,8 +84,8 @@ def parse_duration(value: object) -> float:
 
 
 Duration = Annotated[float, BeforeValidator(parse_duration)]
-Kind = Annotated[str, _pattern(_KIND, "kind name")]
-RepoId = Annotated[str, _pattern(_REPO_ID, "repo id")]
+Kind = Annotated[str, _pattern(validate.KIND, "kind name")]
+RepoId = Annotated[str, _pattern(validate.REPO_ID, "repo id")]
 
 
 def _label_key(value: str) -> str:

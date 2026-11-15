@@ -28,7 +28,7 @@ import secrets
 import shlex
 import stat
 import subprocess
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, TypeGuard
 
@@ -45,7 +45,7 @@ from .third_party import (
     parse_plan,
     refusal,
 )
-from .validate import GrammarError
+from .validate import GrammarError, parse_duration
 
 TOOL = "claude-session"
 SESSION_ID = re.compile(r"cs-[a-z2-7]{8}")
@@ -55,6 +55,9 @@ MAX_OUTPUT = 8 * 1024 * 1024
 #: An outcome file is a small JSON object; anything larger is not one.
 MAX_OUTCOME_FILE = 1024 * 1024
 DEFAULT_TIMEOUT = 120.0
+#: ``stop`` waits for the grace, claude-session's ``kill_grace`` and 5 s; this is the margin.
+STOP_MARGIN = 15.0
+RECONCILE_TIMEOUT = 300.0
 
 OUTCOMES = frozenset(
     {
@@ -72,6 +75,52 @@ OUTCOMES = frozenset(
     }
 )
 PHASES = ("launch", "session")
+STATES = frozenset(
+    {
+        "starting",
+        "working",
+        "idle",
+        "needs-input",
+        "reported",
+        "exited",
+        "exited-unreported",
+        "killed",
+        "timeout",
+        "lost",
+        "not-started",
+    }
+)
+#: The outcome -> exit code table (claude-session interface.md, Outcome mapping).
+OUTCOME_EXIT_CODES = {
+    "done": 0,
+    "blocked": 13,
+    "needs-input": 13,
+    "failed": 18,
+    "exited-unreported": 14,
+    "killed": 15,
+    "timeout": 16,
+    "lost": 17,
+    "not-started": 12,
+    "vetoed": 11,
+    "escalated": 13,
+}
+END_REASONS = frozenset(
+    {
+        "normal", "auto_exit", "user_exit", "forwarded_term", "forwarded_hup", "forwarded_int",
+        "stopped", "timeout", "max_turns", "api_error", "no_result", "no_report",
+        "result_rejected", "no_session_start", "wrapper_lost", "lost", "internal_error",
+        "hook_veto", "hook_escalate", "hook_timeout", "canceled", "never_adopted",
+        "launch_interrupted", "config_invalid", "claude_not_found", "sandbox_unavailable",
+        "socket_path_too_long", "invalid_permission_profile", "unsafe_cwd", "unsafe_path",
+        "unsafe_plugin_dir", "unsafe_read_dir", "plugin_dir_missing", "git_dir_changed",
+        "no_git_cwd", "fork_cwd_unsupported", "no_tty", "tmpdir_unsafe", "session_dir_unsafe",
+        "unsafe_claude_args", "unsafe_setting_sources", "claude_too_old",
+    }
+)  # fmt: skip
+_END_REASON_PATTERN = re.compile(r"exit_[0-9]+|signal_[a-z0-9]+")
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+#: The events window of ``status`` holds the last 20 events.
+EVENT_WINDOW = 20
 
 
 # --- the run specification ----------------------------------------------------------------------
@@ -115,6 +164,25 @@ class RunSpec:
     input_files: tuple[str, ...] = ()
 
 
+def _in(value: object, options: Collection[str]) -> bool:
+    """``value`` is one of ``options`` (an unhashable or non-string value never is)."""
+    return isinstance(value, str) and value in options
+
+
+def _clean(value: object) -> str | None:
+    """``value`` when it is a string without NUL and without a lone surrogate, else None."""
+    if isinstance(value, str) and "\0" not in value and _LONE_SURROGATE.search(value) is None:
+        return value
+    return None
+
+
+def _session_id(value: object) -> str:
+    """A positional session id: exactly a csession_id, so it can never be read as a flag."""
+    if not isinstance(value, str) or SESSION_ID.fullmatch(value) is None:
+        raise CliError.usage("the session id is not a csession_id")
+    return value
+
+
 def _arg(value: str, name: str) -> str:
     """A flag value that can travel in argv: text without NUL and with a strict UTF-8 form."""
     try:
@@ -146,10 +214,19 @@ def _check_spec(spec: RunSpec) -> None:
             raise ValueError("RunSpec.resume is not a csession_id")
         if spec.fork and spec.override_escalation:
             raise ValueError("--override-escalation cannot be combined with --fork")
+        if not spec.fork and spec.cwd is not None:
+            raise ValueError("a plain resume runs in the stored cwd; --cwd needs --fork")
     if spec.max_turns is not None and (
         isinstance(spec.max_turns, bool) or not isinstance(spec.max_turns, int)
     ):
         raise ValueError("RunSpec.max_turns must be an int")
+    paths = [*spec.plugin_dirs, *spec.input_files]
+    if spec.cwd is not None and spec.cwd != "session-dir":
+        paths.append(spec.cwd)
+    if spec.prompt_file is not None:
+        paths.append(spec.prompt_file)
+    if not all(isinstance(path, str) and os.path.isabs(path) for path in paths):
+        raise ValueError("RunSpec cwd, prompt_file, input_files and plugin_dirs must be absolute")
     for pair in spec.labels:
         try:
             label = parse_label(pair)
@@ -330,15 +407,28 @@ class RunOutcome:
         return self.outcome is not None
 
 
+def _end_reason_ok(value: object) -> bool:
+    return _in(value, END_REASONS) or (
+        isinstance(value, str) and _END_REASON_PATTERN.fullmatch(value) is not None
+    )
+
+
+def _exit_code_ok(code: object, outcome: object) -> TypeGuard[int]:
+    if not _is_int(code) or not 0 <= code <= 255:
+        return False
+    expected = OUTCOME_EXIT_CODES.get(outcome) if isinstance(outcome, str) else None
+    return expected is None or code == expected
+
+
 def _outcome_fields(data: Mapping[str, Any]) -> dict[str, Any] | None:
     """Validated outcome fields of an outcome object (a final one), else None."""
     phase, outcome, reason = data.get("phase"), data.get("outcome"), data.get("end_reason")
     code, state, report = data.get("exit_code"), data.get("state"), data.get("report")
-    if phase not in PHASES or outcome not in OUTCOMES or not _is_int(code):
+    if not _in(phase, PHASES) or not _in(outcome, OUTCOMES) or not _exit_code_ok(code, outcome):
         return None
-    if reason is not None and not isinstance(reason, str):
+    if reason is not None and not _end_reason_ok(reason):
         return None
-    if state is not None and not isinstance(state, str):
+    if state is not None and not _in(state, STATES):
         return None
     if report is not None and not isinstance(report, dict):
         return None
@@ -405,13 +495,31 @@ class SessionStatus:
 
 
 def _str_or_none(value: object) -> str | None:
-    return value if isinstance(value, str) else None
+    return _clean(value)
+
+
+def _field(value: object, ok: bool) -> Any:
+    return value if ok else None
+
+
+def _window_reaches_back(events: list[object], run: int) -> bool:
+    """Whether a full events window shows what precedes the run: an event of an earlier run, or
+    event 1 (the window lists the last 20 events, oldest first)."""
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        number, other = event.get("event_id"), event.get("run")
+        if (_is_int(other) and other < run) or (_is_int(number) and number <= 1):
+            return True
+    return False
 
 
 def _first_working(events: object, run: int) -> str | None:
     """The ``event_ts`` of the run's first event with ``to_activity: working``, else None."""
     if not isinstance(events, list):
         return None
+    if len(events) >= EVENT_WINDOW and not _window_reaches_back(events, run):
+        return None  # the window may have cut the run's first events off
     best: tuple[int, str] | None = None
     for event in events:
         if not isinstance(event, dict) or event.get("to_activity") != "working":
@@ -440,13 +548,24 @@ def parse_status(data: Mapping[str, Any]) -> SessionStatus | None:
     ):
         return None
     number, reads, phase = run.get("run"), run.get("reads_third_party"), run.get("phase")
-    if not _is_int(number) or number < 1 or not isinstance(reads, bool) or phase not in PHASES:
+    if (
+        not _is_int(number)
+        or number < 1
+        or not isinstance(reads, bool)
+        or not isinstance(phase, str)
+        or phase not in PHASES
+    ):
         return None
     by_run = data.get("tainted_by_run")
+    if by_run is not None and not _is_int(by_run):
+        return None
+    if _clean(session_id) is None or _clean(directory) is None:
+        return None
     outcome, code = run.get("outcome"), run.get("exit_code")
-    if outcome is not None and outcome not in OUTCOMES:
+    if outcome is not None and not _in(outcome, OUTCOMES):
         return None
     report = run.get("report")
+    reason, state = run.get("end_reason"), run.get("state")
     run_status = RunStatus(
         run=number,
         run_kind=_str_or_none(run.get("run_kind")),
@@ -455,9 +574,9 @@ def parse_status(data: Mapping[str, Any]) -> SessionStatus | None:
         pending=run.get("pending") is True,
         cwd=_str_or_none(run.get("cwd")),
         outcome=outcome,
-        end_reason=_str_or_none(run.get("end_reason")),
-        exit_code=code if _is_int(code) else None,
-        state=_str_or_none(run.get("state")),
+        end_reason=_field(reason, _end_reason_ok(reason)),
+        exit_code=_field(code, _exit_code_ok(code, outcome)),
+        state=_field(state, _in(state, STATES)),
         report=report if isinstance(report, dict) else None,
         first_working_at=_first_working(data.get("recent_events"), number),
     )
@@ -465,7 +584,7 @@ def parse_status(data: Mapping[str, Any]) -> SessionStatus | None:
         csession_id=session_id,
         csession_dir=directory,
         tainted=tainted,
-        tainted_by_run=by_run if _is_int(by_run) else None,
+        tainted_by_run=by_run,
         current_run=current,
         pending=data.get("pending") is True,
         repo=_str_or_none(data.get("repo")),
@@ -497,7 +616,16 @@ class StartResult:
 class StartError(CliError):
     """A failed ``start``. ``csession_id`` and ``run`` are set when a run was allocated (the
     exit-12 ``launch_failed`` envelope, or a success the output of which is malformed): the
-    caller records them and parks the agent. Both are None when nothing is known."""
+    caller records them and parks the agent. Both are None when nothing is known.
+
+    ``maybe_allocated`` is True when claude-session may have allocated a session although the
+    error does not name it (a timeout, an unrunnable or signaled process, an unusable success
+    output, exit 1 or 12 other than a clean ``schema_newer``, too much output). It is False for
+    a usage error (exit 2), the clean refusals and lookups (10, 11, 20, 21) and ``schema_newer``,
+    and when the tool could not be run at all. **Recovery** when it is True and ``csession_id``
+    is None: ``SessionBackend.list_by_label("agent=<agent_id>")`` finds the orphan; ``stop`` it
+    (a pending run is canceled) and ``forget`` it, or adopt it.
+    """
 
     def __init__(
         self,
@@ -506,11 +634,13 @@ class StartError(CliError):
         *,
         csession_id: str | None = None,
         run: int | None = None,
+        maybe_allocated: bool = False,
         **fields: Any,
     ) -> None:
         super().__init__(code, message, **fields)
         self.csession_id = csession_id
         self.run = run
+        self.maybe_allocated = maybe_allocated or csession_id is not None
 
 
 def _allocated(error: object) -> tuple[str | None, int | None]:
@@ -522,6 +652,17 @@ def _allocated(error: object) -> tuple[str | None, int | None]:
     return (
         session if isinstance(session, str) and SESSION_ID.fullmatch(session) else None,
         run if _is_int(run) and run >= 1 else None,
+    )
+
+
+def _maybe_allocated(code: int, envelope: object) -> bool:
+    """Whether a failed ``start`` may have left a session behind: not for a usage error, a clean
+    refusal or lookup (2, 10, 11, 20, 21) or a clean ``schema_newer``; yes for a signal, exit 1,
+    12 and every other code."""
+    if code in (2, 10, 11, 20, 21):
+        return False
+    return not (
+        code == 12 and isinstance(envelope, dict) and envelope.get("code") == "schema_newer"
     )
 
 
@@ -570,6 +711,8 @@ class ClassificationCheck:
     status: SessionStatus | None
     cancel: dict[str, Any] | None = None
     cancel_error: CliError | None = None
+    #: True only when the cancel was sent and the run ended (``stop`` answered ``ended: true``).
+    cancelled: bool = False
 
     @property
     def verdict(self) -> Literal["accept", "warn", "cancel"]:
@@ -605,6 +748,7 @@ class SessionBackend:
         decision_ids: Sequence[str] = (),
         gateway: gw.Gateway | None = None,
         timeout: float | None = DEFAULT_TIMEOUT,
+        kill_grace: float = 30.0,
     ) -> None:
         if not command:
             raise ValueError("an empty claude-session command")
@@ -613,6 +757,7 @@ class SessionBackend:
         self.decision_ids = list(decision_ids)
         self._gateway = gateway
         self.timeout = timeout
+        self.kill_grace = kill_grace
 
     # -- plumbing
 
@@ -628,13 +773,15 @@ class SessionBackend:
             flags.append(_flag("--decision-id", value))
         return flags
 
-    def _call(self, args: Sequence[str], *, stdin: str | None = None) -> _Reply:
+    def _call(
+        self, args: Sequence[str], *, stdin: str | None = None, timeout: float | None = None
+    ) -> _Reply:
         """Run one command. Lower-tool exit codes are returned, not raised; a missing tool, a
         timeout and an unusable (huge or non-JSON) output are the only failures raised here
         or reported as ``data=None``."""
         argv = [*self.command, *args]
         try:
-            done = self.gateway.run(argv, stdin=stdin, timeout=self.timeout)
+            done = self.gateway.run(argv, stdin=stdin, timeout=self._timeout_for(timeout))
         except FileNotFoundError:
             raise CliError(
                 "tool_missing",
@@ -651,11 +798,24 @@ class SessionBackend:
             ) from None
         except subprocess.TimeoutExpired:
             raise CliError("failed", "claude-session did not answer in time", tool=TOOL) from None
+        except gw.OutputTooLarge:
+            raise CliError("failed", "claude-session printed too much output", tool=TOOL) from None
         except OSError as error:
             raise CliError(
                 "failed", f"claude-session could not run ({error.strerror})", tool=TOOL
             ) from None
         return _Reply(done.returncode, _loads(done.stdout))
+
+    def _timeout_for(self, wanted: float | None) -> float | None:
+        """The call timeout: the default, or a longer one a slow command needs."""
+        if self.timeout is None or wanted is None:
+            return self.timeout
+        return max(self.timeout, wanted)
+
+    def _check_actor(self, spec: RunSpec) -> None:
+        # claude-session accepts these human-only flags only with an actor; fail before a call.
+        if self.actor is None and (spec.allow_tainted or spec.override_escalation):
+            raise CliError.usage("--allow-tainted and --override-escalation need an actor")
 
     def _fail(self, reply: _Reply, *, agent_id: str | None = None) -> CliError:
         """The pass-through error of a failed call (its envelope verbatim in ``lower_error``)."""
@@ -669,7 +829,9 @@ class SessionBackend:
 
     def dry_run_argv(self, spec: RunSpec) -> list[str]:
         """``start ... --dry-run --json``: the real command without hook and outcome file."""
-        return ["start", *_launch_flags(spec), *self._audit_flags(), "--dry-run", "--json"]
+        flags = _launch_flags(spec)
+        self._check_actor(spec)
+        return ["start", *flags, *self._audit_flags(), "--dry-run", "--json"]
 
     def classify(self, spec: RunSpec, *, refuse: bool = True) -> Classification:
         """Run the dry run and read the classification.
@@ -685,6 +847,8 @@ class SessionBackend:
                 classification = parse_plan(plan, requested_cwd=spec.cwd)
             except PlanError:
                 raise self._unusable("a dry-run plan") from None
+            if spec.reads_third_party and not classification.reads_third_party:
+                classification = replace(classification, reads_third_party=True)
             if refuse:
                 problem = refusal(classification)
                 if problem is None and reply.code == 20:
@@ -713,9 +877,11 @@ class SessionBackend:
         """
         if not os.path.isabs(outcome_file):
             raise ValueError("the outcome file must be an absolute path")
+        flags = _launch_flags(spec)
+        self._check_actor(spec)
         args = [
             "start",
-            *_launch_flags(spec),
+            *flags,
             *(_flag("--hook", value) for value in (hook, *extra_hooks)),
             _flag("--outcome-file", outcome_file),
             *self._audit_flags(),
@@ -730,6 +896,7 @@ class SessionBackend:
                 exit_code=error.exit_code,
                 tool=error.tool,
                 details=error.details,
+                maybe_allocated=error.code != "tool_missing",
             ) from None
         data = reply.data
         if reply.code == 0:
@@ -743,6 +910,7 @@ class SessionBackend:
                 "claude-session printed an unusable start result",
                 csession_id=session,
                 run=run,
+                maybe_allocated=True,
                 tool=TOOL,
             )
         failure = self._fail(reply)
@@ -753,6 +921,7 @@ class SessionBackend:
             str(failure),
             csession_id=session,
             run=run,
+            maybe_allocated=_maybe_allocated(reply.code, envelope),
             exit_code=failure.exit_code,
             reason=failure.reason,
             tool=TOOL,
@@ -764,7 +933,7 @@ class SessionBackend:
 
     def status(self, csession_id: str, run: int | None = None) -> SessionStatus:
         """``status <id> [--run n] --json``; raises a pass-through error or ``internal``."""
-        args = ["status", _arg(csession_id, "session id")]
+        args = ["status", _session_id(csession_id)]
         if run is not None:
             args.append(_flag("--run", str(run)))
         reply = self._call([*args, "--json"])
@@ -780,7 +949,7 @@ class SessionBackend:
         started: StartResult,
         expected: Classification,
         *,
-        rule_allows: Callable[[bool], bool],
+        rule_allows: Callable[[bool, str | None], bool],
         result_file_allows: Callable[[], bool] = lambda: True,
     ) -> ClassificationCheck:
         """Compare the dry-run classification with ``status`` right after ``start``.
@@ -790,6 +959,13 @@ class SessionBackend:
         unusable or names another run, the pending run is cancelled here (``claude-session
         stop``: no process can adopt it yet) and the verdict is ``cancel``. Parking the agent
         and the exit-12 error (``ClassificationCheck.error``) are the caller's.
+
+        ``rule_allows(actual, cwd)`` is the caller's cwd rule (it owns the records of the cwd:
+        #11, #13, #14); ``cwd`` is the run's actual cwd from ``status``. A third-party-reading
+        run without a string cwd, and any exception from a callback, cancel as
+        ``classification_unknown``. The cancel is reported in ``cancelled`` (True only when
+        ``stop`` answered ``ended: true``); a stop that left the run live, or failed, sets
+        ``cancel_error`` and the caller must not treat the run as gone.
         """
         status: SessionStatus | None
         actual: bool | None
@@ -806,12 +982,18 @@ class SessionBackend:
                 status, actual = None, None
             else:
                 actual = status.run.reads_third_party or status.tainted_by_run == started.run
-        decision = decide_check(
-            expected.reads_third_party,
-            actual,
-            rule_allows=rule_allows,
-            result_file_allows=result_file_allows,
-        )
+        try:
+            decision = decide_check(
+                expected.reads_third_party,
+                actual,
+                cwd=status.run.cwd if status is not None else None,
+                rule_allows=rule_allows,
+                result_file_allows=result_file_allows,
+            )
+        except Exception:  # noqa: BLE001 - fail closed, whatever the callers' code did
+            decision = CheckDecision(
+                "cancel", "classification_unknown", expected.reads_third_party, actual
+            )
         if decision.verdict != "cancel":
             return ClassificationCheck(decision, status)
         cancel: dict[str, Any] | None = None
@@ -820,7 +1002,16 @@ class SessionBackend:
             cancel = self.stop(started.csession_id)
         except CliError as error:
             cancel_error = error
-        return ClassificationCheck(decision, status, cancel, cancel_error)
+        else:
+            if cancel.get("ended") is not True:
+                cancel_error = CliError(
+                    "launch_failed",
+                    "the run could not be canceled and is still live",
+                    details={"cause": decision.cause},
+                )
+        return ClassificationCheck(
+            decision, status, cancel, cancel_error, cancelled=cancel_error is None
+        )
 
     # -- outcome
 
@@ -852,10 +1043,15 @@ class SessionBackend:
     def stop(self, csession_id: str, *, grace: str | None = None) -> dict[str, Any]:
         """``stop <id> [--grace D]``. Returns the stop object verbatim for exit 0, and for exit
         12 with ``ended: false`` (still live: the caller checks ``["ended"]``); else raises."""
-        args = ["stop", _arg(csession_id, "session id"), *self._audit_flags()]
+        args = ["stop", _session_id(csession_id), *self._audit_flags()]
+        wanted: float | None = None
         if grace is not None:
+            try:
+                wanted = parse_duration(grace) + self.kill_grace + STOP_MARGIN
+            except GrammarError as error:
+                raise CliError.usage(str(error)) from None
             args.append(_flag("--grace", grace))
-        reply = self._call([*args, "--json"])
+        reply = self._call([*args, "--json"], timeout=wanted)
         data = reply.data
         if reply.code == 0 or (
             reply.code == 12
@@ -870,9 +1066,7 @@ class SessionBackend:
 
     def forget(self, csession_id: str) -> dict[str, Any]:
         """``forget <id>``; exit 10 (unknown) raises ``not_found`` (callers count it as done)."""
-        reply = self._call(
-            ["forget", _arg(csession_id, "session id"), *self._audit_flags(), "--json"]
-        )
+        reply = self._call(["forget", _session_id(csession_id), *self._audit_flags(), "--json"])
         if reply.code != 0:
             raise self._fail(reply)
         if reply.data is None:
@@ -887,7 +1081,7 @@ class SessionBackend:
                 parse_label(pair)
             except GrammarError as error:
                 raise CliError.usage(str(error)) from None
-        reply = self._call(["label", action, _arg(csession_id, "session id"), *pairs, "--json"])
+        reply = self._call(["label", action, _session_id(csession_id), *pairs, "--json"])
         if reply.code != 0:
             raise self._fail(reply)
         if reply.data is None:
@@ -903,9 +1097,7 @@ class SessionBackend:
     def verify_secret(self, csession_id: str, secret: str) -> bool:
         """``verify-secret <id>`` with the secret on stdin (never argv). True only for exit 0
         with ``{"match": true}``; exit 11 is False; anything else raises."""
-        reply = self._call(
-            ["verify-secret", _arg(csession_id, "session id"), "--json"], stdin=secret
-        )
+        reply = self._call(["verify-secret", _session_id(csession_id), "--json"], stdin=secret)
         if reply.code == 11:
             return False
         if reply.code != 0:
@@ -934,7 +1126,7 @@ class SessionBackend:
 
     def reconcile(self, *, dry_run: bool = False) -> dict[str, Any]:
         args = ["reconcile", *(["--dry-run"] if dry_run else []), "--json"]
-        reply = self._call(args)
+        reply = self._call(args, timeout=RECONCILE_TIMEOUT)
         if reply.code != 0:
             raise self._fail(reply)
         if reply.data is None:

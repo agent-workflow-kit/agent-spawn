@@ -255,13 +255,37 @@ def test_a_fork_of_a_respond_source_is_third_party_reading(fakebin: Fakebin) -> 
     assert "--fork" in starts(fakebin)[0]
 
 
-def test_classification_reads_repo_and_the_kinds_default_cwd(fakebin: Fakebin) -> None:
+def test_classification_reads_repo_and_a_session_work_cwd(fakebin: Fakebin) -> None:
     dry_script(
         fakebin,
-        merge={"repo": "host/o/r", "profile": {"cwd": "session-dir", "reads_third_party": True}},
+        merge={
+            "repo": "host/o/r",
+            "cwd": "/s/sessions/cs-aaaaaaaa/work",
+            "profile": {"cwd": "session-dir", "reads_third_party": True},
+        },
     )
     result = fake_backend(fakebin).classify(spec())
     assert (result.repo, result.cwd) == ("host/o/r", "session-dir")
+
+
+def test_a_resume_plan_is_not_session_dir_just_because_the_profile_says_so(
+    fakebin: Fakebin,
+) -> None:
+    fakebin.seed_session(SESSION, kind="respond")
+    dry_script(
+        fakebin,
+        merge={"cwd": "/repo", "profile": {"cwd": "session-dir", "reads_third_party": True}},
+    )
+    result = fake_backend(fakebin).classify(spec(resume=SESSION, skill=None))
+    assert result.cwd == "/repo"
+
+
+def test_the_spec_reads_third_party_flag_is_kept_over_a_plan_that_says_false(
+    fakebin: Fakebin,
+) -> None:
+    dry_script(fakebin, merge={"taints": False, "profile": {"reads_third_party": False}})
+    result = fake_backend(fakebin).classify(spec(reads_third_party=True))
+    assert result.reads_third_party is True
 
 
 def test_a_dry_run_failure_starts_nothing(fakebin: Fakebin) -> None:
@@ -416,7 +440,7 @@ def stops(fakebin: Fakebin) -> list[list[str]]:
 def test_agreement_is_accepted_and_nothing_is_stopped(fakebin: Fakebin, tmp_path: Path) -> None:
     backend = fake_backend(fakebin)
     run = started(fakebin, tmp_path, backend)
-    check = backend.check_classification(run, expected(False), rule_allows=lambda _: False)
+    check = backend.check_classification(run, expected(False), rule_allows=lambda _a, _c: False)
     assert check.verdict == "accept" and check.status is not None
     assert check.status.csession_id == run.csession_id
     assert stops(fakebin) == []
@@ -427,8 +451,17 @@ def test_a_mismatch_the_cwd_rule_allows_warns_and_continues(
 ) -> None:
     backend = fake_backend(fakebin)
     run = started(fakebin, tmp_path, backend)
-    fakebin.script("claude-session", "status", merge={"run": {"reads_third_party": True}})
-    check = backend.check_classification(run, expected(False), rule_allows=lambda _: True)
+    fakebin.script(
+        "claude-session", "status", merge={"run": {"reads_third_party": True, "cwd": "/s/w"}}
+    )
+    seen: list[tuple[bool, str | None]] = []
+
+    def rule(actual: bool, cwd: str | None) -> bool:
+        seen.append((actual, cwd))
+        return True
+
+    check = backend.check_classification(run, expected(False), rule_allows=rule)
+    assert seen == [(True, "/s/w")]
     assert check.verdict == "warn"
     assert (check.decision.expected, check.decision.actual) == (False, True)
     assert stops(fakebin) == []
@@ -439,8 +472,10 @@ def test_a_mismatch_the_rule_forbids_cancels_the_pending_run(
 ) -> None:
     backend = fake_backend(fakebin, actor="auto:t")
     run = started(fakebin, tmp_path, backend)
-    fakebin.script("claude-session", "status", merge={"run": {"reads_third_party": True}})
-    check = backend.check_classification(run, expected(False), rule_allows=lambda _: False)
+    fakebin.script(
+        "claude-session", "status", merge={"run": {"reads_third_party": True, "cwd": "/s/w"}}
+    )
+    check = backend.check_classification(run, expected(False), rule_allows=lambda _a, _c: False)
     assert check.verdict == "cancel"
     assert check.decision.cause == "classification_mismatch"
     assert check.cancel is not None and check.cancel_error is None
@@ -458,7 +493,7 @@ def test_a_trusted_actual_run_in_a_forbidden_place_is_cancelled(
 ) -> None:
     backend = fake_backend(fakebin)
     run = started(fakebin, tmp_path, backend)
-    check = backend.check_classification(run, expected(True), rule_allows=lambda actual: actual)
+    check = backend.check_classification(run, expected(True), rule_allows=lambda actual, _c: actual)
     assert check.verdict == "cancel" and check.decision.cause == "classification_mismatch"
 
 
@@ -467,8 +502,12 @@ def test_a_taint_by_this_run_counts_as_third_party_reading(
 ) -> None:
     backend = fake_backend(fakebin)
     run = started(fakebin, tmp_path, backend)
-    fakebin.script("claude-session", "status", merge={"tainted": True, "tainted_by_run": run.run})
-    check = backend.check_classification(run, expected(True), rule_allows=lambda _: False)
+    fakebin.script(
+        "claude-session",
+        "status",
+        merge={"tainted": True, "tainted_by_run": run.run, "run": {"cwd": "/s/w"}},
+    )
+    check = backend.check_classification(run, expected(True), rule_allows=lambda _a, _c: False)
     assert check.verdict == "accept"
 
 
@@ -476,7 +515,7 @@ def test_a_taint_by_an_earlier_run_does_not(fakebin: Fakebin, tmp_path: Path) ->
     backend = fake_backend(fakebin)
     run = started(fakebin, tmp_path, backend)
     fakebin.script("claude-session", "status", merge={"tainted": True, "tainted_by_run": 99})
-    check = backend.check_classification(run, expected(True), rule_allows=lambda _: False)
+    check = backend.check_classification(run, expected(True), rule_allows=lambda _a, _c: False)
     assert (check.verdict, check.decision.actual) == ("cancel", False)
 
 
@@ -487,7 +526,7 @@ def test_the_result_file_check_decides_an_allowed_mismatch(
     run = started(fakebin, tmp_path, backend)
     fakebin.script("claude-session", "status", merge={"run": {"reads_third_party": True}})
     check = backend.check_classification(
-        run, expected(False), rule_allows=lambda _: True, result_file_allows=lambda: False
+        run, expected(False), rule_allows=lambda _a, _c: True, result_file_allows=lambda: False
     )
     assert check.verdict == "cancel" and stops(fakebin)
 
@@ -496,7 +535,7 @@ def test_a_status_failure_cancels_as_unknown(fakebin: Fakebin, tmp_path: Path) -
     backend = fake_backend(fakebin)
     run = started(fakebin, tmp_path, backend)
     fakebin.script("claude-session", "status", exit=12, error={"code": "failed", "message": "db"})
-    check = backend.check_classification(run, expected(False), rule_allows=lambda _: True)
+    check = backend.check_classification(run, expected(False), rule_allows=lambda _a, _c: True)
     assert check.verdict == "cancel" and check.decision.cause == "classification_unknown"
     assert check.status is None
     assert len(stops(fakebin)) == 1
@@ -513,7 +552,7 @@ def test_unparseable_status_cancels_as_unknown(
     backend = fake_backend(fakebin)
     run = started(fakebin, tmp_path, backend)
     fakebin.script("claude-session", "status", stdout=stdout)
-    check = backend.check_classification(run, expected(False), rule_allows=lambda _: True)
+    check = backend.check_classification(run, expected(False), rule_allows=lambda _a, _c: True)
     assert (check.verdict, check.decision.cause) == ("cancel", "classification_unknown")
 
 
@@ -534,7 +573,7 @@ def test_a_status_for_another_run_or_with_odd_types_cancels_as_unknown(
     backend = fake_backend(fakebin)
     run = started(fakebin, tmp_path, backend)
     fakebin.script("claude-session", "status", merge=patch)
-    check = backend.check_classification(run, expected(False), rule_allows=lambda _: True)
+    check = backend.check_classification(run, expected(False), rule_allows=lambda _a, _c: True)
     assert (check.verdict, check.decision.cause) == ("cancel", "classification_unknown")
 
 
@@ -543,9 +582,72 @@ def test_a_failing_cancel_is_reported_not_raised(fakebin: Fakebin, tmp_path: Pat
     run = started(fakebin, tmp_path, backend)
     fakebin.script("claude-session", "status", exit=12, error={"code": "failed", "message": "x"})
     fakebin.script("claude-session", "stop", exit=12, error={"code": "failed", "message": "x"})
-    check = backend.check_classification(run, expected(False), rule_allows=lambda _: True)
+    check = backend.check_classification(run, expected(False), rule_allows=lambda _a, _c: True)
     assert check.verdict == "cancel" and check.cancel is None
     assert check.cancel_error is not None and check.cancel_error.exit_code == 12
+
+
+def test_a_cancel_that_leaves_the_run_live_is_reported(fakebin: Fakebin, tmp_path: Path) -> None:
+    backend = fake_backend(fakebin)
+    run = started(fakebin, tmp_path, backend)
+    fakebin.script("claude-session", "status", exit=12, error={"code": "failed", "message": "x"})
+    fakebin.script("claude-session", "stop", exit=12, stdout={"ended": False})
+    check = backend.check_classification(run, expected(False), rule_allows=lambda _a, _c: True)
+    assert check.verdict == "cancel" and check.cancelled is False
+    assert check.cancel == {"ended": False}
+    error = check.cancel_error
+    assert error is not None and (error.code, error.exit_code) == ("launch_failed", 12)
+    assert error.details == {"cause": "classification_unknown"}
+
+
+def test_a_cancel_that_ends_the_run_is_cancelled(fakebin: Fakebin, tmp_path: Path) -> None:
+    backend = fake_backend(fakebin)
+    run = started(fakebin, tmp_path, backend)
+    fakebin.script(
+        "claude-session", "status", merge={"run": {"reads_third_party": True, "cwd": "/s/w"}}
+    )
+    check = backend.check_classification(run, expected(False), rule_allows=lambda _a, _c: False)
+    assert (check.verdict, check.cancelled, check.cancel_error) == ("cancel", True, None)
+
+
+def test_an_accepted_check_cancels_nothing(fakebin: Fakebin, tmp_path: Path) -> None:
+    backend = fake_backend(fakebin)
+    run = started(fakebin, tmp_path, backend)
+    check = backend.check_classification(run, expected(False), rule_allows=lambda _a, _c: True)
+    assert check.cancelled is False
+
+
+@pytest.mark.parametrize("where", ["rule", "result_file"])
+def test_a_raising_callback_cancels_the_pending_run_as_unknown(
+    fakebin: Fakebin, tmp_path: Path, where: str
+) -> None:
+    def boom(*_args: Any) -> bool:
+        raise RuntimeError("boom")
+
+    backend = fake_backend(fakebin)
+    run = started(fakebin, tmp_path, backend)
+    fakebin.script(
+        "claude-session", "status", merge={"run": {"reads_third_party": True, "cwd": "/s/w"}}
+    )
+    check = backend.check_classification(
+        run,
+        expected(False),
+        rule_allows=boom if where == "rule" else (lambda _a, _c: True),
+        result_file_allows=boom if where == "result_file" else (lambda: True),
+    )
+    assert (check.verdict, check.decision.cause) == ("cancel", "classification_unknown")
+    assert check.cancelled and len(stops(fakebin)) == 1
+
+
+def test_a_third_party_run_without_a_cwd_is_cancelled_as_unknown(
+    fakebin: Fakebin, tmp_path: Path
+) -> None:
+    backend = fake_backend(fakebin)
+    run = started(fakebin, tmp_path, backend)
+    fakebin.script("claude-session", "status", merge={"run": {"reads_third_party": True}})
+    check = backend.check_classification(run, expected(False), rule_allows=lambda _a, _c: True)
+    assert (check.verdict, check.decision.cause) == ("cancel", "classification_unknown")
+    assert len(stops(fakebin)) == 1
 
 
 # --- the outcome file ---------------------------------------------------------------------------
@@ -852,8 +954,9 @@ def test_a_start_that_cannot_run_is_a_start_error(tmp_path: Path) -> None:
 
 
 def test_a_hung_claude_session_times_out_and_is_reaped(fakebin: Fakebin) -> None:
-    fakebin.script("claude-session", "reconcile", hang=True)
+    fakebin.seed_session(SESSION)
+    fakebin.script("claude-session", "status", hang=True)
     backend = fake_backend(fakebin, timeout=1.5)
     with pytest.raises(CliError) as caught:
-        backend.reconcile()
+        backend.status(SESSION)
     assert (caught.value.exit_code, caught.value.code) == (12, "failed")

@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from agent_spawn.gateway import OutputTooLarge
 from agent_spawn.output import CliError, render_json
 from agent_spawn.session_backend import (
     MAX_OUTPUT,
@@ -31,7 +32,7 @@ GOOD_PLAN: dict[str, Any] = {
     "taints": False,
     "repo": None,
     "cwd": "/w",
-    "profile": {"reads_third_party": False, "cwd": "repo"},
+    "profile": {"reads_third_party": False, "cwd": "caller"},
     "would_refuse": None,
     "would_fail": None,
 }
@@ -276,7 +277,7 @@ def test_a_tool_that_cannot_be_executed_is_tool_missing(error: OSError) -> None:
 def test_a_timeout_is_a_failure_and_the_timeout_is_passed_to_the_gateway() -> None:
     backend, gateway = backend_for(raising(subprocess.TimeoutExpired(["x"], 1)), timeout=7.0)
     with pytest.raises(CliError) as caught:
-        backend.reconcile()
+        backend.status(SESSION)
     assert (caught.value.exit_code, caught.value.code) == (12, "failed")
     assert gateway.run_timeouts == [7.0]
 
@@ -377,7 +378,7 @@ def argv_of(run: RunSpec) -> list[str]:
 @pytest.mark.parametrize("field", ["skill", "kind", "model", "repo", "cwd", "timeout"])
 def test_a_nul_in_a_value_is_a_usage_error(field: str) -> None:
     with pytest.raises(CliError) as caught:
-        argv_of(spec(**{field: "a\0b"}))
+        argv_of(spec(**{field: "/a\0b" if field == "cwd" else "a\0b"}))
     assert caught.value.exit_code == 2
 
 
@@ -394,11 +395,11 @@ def test_no_value_can_become_a_flag_of_its_own() -> None:
             skill="--hook=x",
             kind="--outcome-file=/etc/passwd",
             model="--json",
-            cwd="--actor=human:root",
+            cwd="/--actor=human:root",
             repo="-x",
-            plugin_dirs=("--dry-run",),
+            plugin_dirs=("/--dry-run",),
             env_allow=("--allow-tainted",),
-            input_files=("--prompt-file=/etc/shadow",),
+            input_files=("/--prompt-file=/etc/shadow",),
             labels=("k=--x",),
         )
     )
@@ -458,3 +459,268 @@ def test_start_never_runs_a_command_for_a_bad_spec() -> None:
     with pytest.raises(CliError):
         backend.start(spec(skill="a\0b"), outcome_file="/o/x.json", hook=RELAY)
     assert gateway.run_calls == []
+
+
+# --- round 1 review -----------------------------------------------------------------------------
+
+
+def routed(**by_command: Any) -> Any:
+    """A ``run_results`` entry answering by the command word (``argv[1]``), else a failure."""
+
+    def run(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        answer = by_command.get(argv[1])
+        if answer is None:
+            return subprocess.CompletedProcess(list(argv), 1, "", "")
+        return answer(argv)
+
+    return run
+
+
+BAD_IDS = ["--help", "-x", "--older-than=1s", "", "cs-ABCDEFGH", "cs-abcdefgh ", "cs-abcdefg", "x"]
+
+
+@pytest.mark.parametrize("bad", BAD_IDS)
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda b, i: b.status(i),
+        lambda b, i: b.stop(i),
+        lambda b, i: b.forget(i),
+        lambda b, i: b.label_add(i, ["a=b"]),
+        lambda b, i: b.label_remove(i, ["a=b"]),
+        lambda b, i: b.verify_secret(i, "s"),
+    ],
+)
+def test_a_positional_session_id_must_be_a_csession_id(bad: str, call: Any) -> None:
+    backend, gateway = backend_for(out({}))
+    with pytest.raises(CliError) as caught:
+        call(backend, bad)
+    assert caught.value.exit_code == 2
+    assert gateway.run_calls == []
+
+
+def test_a_start_error_for_an_output_flood_may_have_allocated() -> None:
+    backend, _ = backend_for(raising(OutputTooLarge()))
+    with pytest.raises(CliError) as caught:
+        backend.status(SESSION)
+    assert (caught.value.exit_code, caught.value.code) == (12, "failed")
+    with pytest.raises(StartError) as started:
+        backend.start(spec(), outcome_file="/o/x.json", hook=RELAY)
+    assert started.value.maybe_allocated is True
+
+
+@pytest.mark.parametrize(
+    ("answer", "maybe"),
+    [
+        (raising(subprocess.TimeoutExpired(["x"], 1)), True),
+        (raising(OSError(5, "io")), True),
+        (raising(FileNotFoundError(2, "no")), False),
+        (raising(PermissionError(13, "no")), False),
+        (out("", -9), True),
+        (out("", -15), True),
+        (out("not json", 0), True),
+        (out({"csession_id": SESSION}, 0), True),
+        (out({"error": {"code": "failed", "message": "m"}}, 1), True),
+        (out({"error": {"code": "failed", "message": "m"}}, 12), True),
+        (out({"error": {"code": "launch_failed", "message": "m"}}, 12), True),
+        (out({"error": {"code": "schema_newer", "message": "m"}}, 12), False),
+        (out({"error": {"code": "usage", "message": "m"}}, 2), False),
+        (out({"error": {"code": "refused", "reason": "live", "message": "m"}}, 20), False),
+        (out({"error": {"code": "not_found", "message": "m"}}, 10), False),
+        (out("", 2), False),
+    ],
+)
+def test_start_error_says_whether_a_session_may_have_been_allocated(
+    answer: Any, maybe: bool
+) -> None:
+    backend, _ = backend_for(answer)
+    with pytest.raises(StartError) as caught:
+        backend.start(spec(), outcome_file="/o/x.json", hook=RELAY)
+    assert caught.value.maybe_allocated is maybe
+
+
+@pytest.mark.parametrize("flag", ["allow_tainted", "override_escalation"])
+def test_human_only_flags_need_an_actor(flag: str) -> None:
+    backend, gateway = backend_for(out(GOOD_PLAN))
+    run = spec(resume=SESSION, **{flag: True})
+    with pytest.raises(CliError) as caught:
+        backend.classify(run)
+    assert caught.value.exit_code == 2
+    with pytest.raises(CliError):
+        backend.start(run, outcome_file="/o/x.json", hook=RELAY)
+    assert gateway.run_calls == []
+    backend, gateway = backend_for(out(GOOD_PLAN), actor="human:me")
+    backend.classify(run)
+    assert any(f"--{flag.replace('_', '-')}" in call for call in gateway.run_calls)
+
+
+@pytest.mark.parametrize("value", ["1", True, 1.0, [1], {"a": 1}])
+def test_tainted_by_run_must_be_an_int_or_null(value: Any) -> None:
+    good = {
+        "csession_id": SESSION,
+        "csession_dir": "/s",
+        "current_run": 1,
+        "tainted": True,
+        "run": {"run": 1, "reads_third_party": False, "phase": "launch"},
+    }
+    assert parse_status(good) is not None
+    assert parse_status({**good, "tainted_by_run": None}) is not None
+    status = parse_status({**good, "tainted_by_run": 1})
+    assert status is not None and status.tainted_by_run == 1
+    assert parse_status({**good, "tainted_by_run": value}) is None
+
+
+def test_per_call_timeouts() -> None:
+    backend, gateway = backend_for(
+        routed(
+            stop=out({"ended": True}),
+            reconcile=out({}),
+            forget=out({}),
+        ),
+        timeout=7.0,
+        kill_grace=10.0,
+    )
+    backend.stop(SESSION)
+    backend.stop(SESSION, grace="60s")
+    backend.stop(SESSION, grace="1s")
+    backend.reconcile()
+    backend.forget(SESSION)
+    assert gateway.run_timeouts == [7.0, 85.0, 26.0, 300.0, 7.0]
+
+
+def test_a_bad_grace_is_a_usage_error() -> None:
+    backend, gateway = backend_for(out({"ended": True}))
+    with pytest.raises(CliError) as caught:
+        backend.stop(SESSION, grace="soon")
+    assert caught.value.exit_code == 2 and gateway.run_calls == []
+
+
+def status_object(**run: Any) -> dict[str, Any]:
+    return {
+        "csession_id": SESSION,
+        "csession_dir": "/s",
+        "current_run": 1,
+        "tainted": False,
+        "run": {"run": 1, "reads_third_party": False, "phase": "session", **run},
+    }
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        {"end_reason": "made_up"},
+        {"end_reason": "exit_"},
+        {"end_reason": "x\0y"},
+        {"end_reason": ["normal"]},
+        {"state": "dancing"},
+        {"state": ["idle"]},
+        {"exit_code": True},
+        {"exit_code": 256},
+        {"exit_code": -1},
+        {"exit_code": "0"},
+        {"outcome": "done", "exit_code": 13},
+        {"cwd": "/a\0b"},
+        {"cwd": "/a\udcffb"},
+    ],
+)
+def test_odd_status_fields_are_dropped_not_trusted(field: dict[str, Any]) -> None:
+    status = parse_status(status_object(**field))
+    assert status is not None
+    key = next(k for k in field if k != "outcome")
+    assert getattr(status.run, key) is None
+
+
+@pytest.mark.parametrize("reason", ["normal", "exit_3", "signal_kill", "unsafe_cwd"])
+def test_good_status_fields_are_kept(reason: str) -> None:
+    status = parse_status(
+        status_object(end_reason=reason, state="exited", outcome="blocked", exit_code=13)
+    )
+    assert status is not None
+    assert (status.run.end_reason, status.run.state, status.run.exit_code) == (reason, "exited", 13)
+
+
+@pytest.mark.parametrize("patch", [{"csession_dir": "/a\0b"}, {"csession_id": "cs-abcdefgh\n"}])
+def test_nul_in_a_classification_field_makes_the_status_unusable(patch: dict[str, Any]) -> None:
+    assert parse_status({**status_object(), **patch}) is None
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"exit_code": True},
+        {"exit_code": 256},
+        {"exit_code": 1.0},
+        {"outcome": "done", "exit_code": 13},
+        {"outcome": "blocked", "exit_code": 0},
+        {"state": "dancing"},
+        {"end_reason": "made_up"},
+        {"end_reason": "a\0b"},
+        {"end_reason": "\udcff"},
+        {"phase": "later"},
+        {"outcome": "mystery"},
+    ],
+)
+def test_an_outcome_file_with_odd_fields_is_not_used(tmp_path: Any, patch: dict[str, Any]) -> None:
+    from agent_spawn.session_backend import read_outcome_file
+
+    good = {
+        "csession_id": SESSION,
+        "run": 1,
+        "phase": "session",
+        "outcome": "done",
+        "end_reason": "normal",
+        "exit_code": 0,
+        "state": "exited",
+        "report": None,
+    }
+    path = tmp_path / "o.json"
+    path.write_text(json.dumps(good))
+    assert read_outcome_file(str(path), SESSION, 1) is not None
+    path.write_text(json.dumps({**good, **patch}))
+    assert read_outcome_file(str(path), SESSION, 1) is None
+
+
+def _events(first: int, count: int, run: int = 2) -> list[dict[str, Any]]:
+    return [
+        {"event_id": first + i, "run": run, "event_ts": f"t{first + i}", "to_activity": "working"}
+        for i in range(count)
+    ]
+
+
+def test_a_full_events_window_without_the_run_start_gives_no_first_working() -> None:
+    from agent_spawn.session_backend import _first_working
+
+    assert _first_working(_events(30, 20), 2) is None
+    # an event of an earlier run, or event 1, shows the start of the run is in view
+    assert _first_working([*_events(10, 1, run=1), *_events(11, 19)], 2) == "t11"
+    assert _first_working(_events(1, 20, run=1), 1) == "t1"
+    # a short window is complete
+    assert _first_working(_events(30, 5), 2) == "t30"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"cwd": "relative/dir"},
+        {"cwd": ""},
+        {"prompt_file": "p.md"},
+        {"input_files": ("/ok", "rel.txt")},
+        {"plugin_dirs": ("plugins",)},
+        {"resume": SESSION, "fork": True, "cwd": "rel"},
+    ],
+)
+def test_path_fields_must_be_absolute(change: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        argv_of(spec(**change))
+
+
+def test_absolute_paths_and_the_session_dir_literal_are_fine() -> None:
+    argv_of(spec(cwd="/w", prompt_file="/p", input_files=("/i",), plugin_dirs=("/d",)))
+    argv_of(spec(cwd="session-dir"))
+    argv_of(spec(resume=SESSION, fork=True, cwd="session-dir"))
+
+
+def test_a_plain_resume_takes_no_cwd() -> None:
+    with pytest.raises(ValueError):
+        argv_of(spec(resume=SESSION, cwd="/w"))
+    argv_of(spec(resume=SESSION))
