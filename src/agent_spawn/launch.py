@@ -1174,9 +1174,10 @@ class Launch:
             decision_ids=list(self.decision_ids),
         )
 
-    def first_working_at(self, row: dict[str, Any]) -> str | None:
+    def first_working_at(self, row: dict[str, Any], run: int | None = None) -> str | None:
         assert self.store is not None
-        run_row = self.store.get_run(row["agent_id"], row["run"]) if row.get("run") else None
+        number = run if run is not None else row.get("run")
+        run_row = self.store.get_run(row["agent_id"], number) if number else None
         return ts(run_row.get("first_working_at")) if run_row else None
 
     def forward_signal(self, received: int) -> Outcome | None:
@@ -1197,7 +1198,8 @@ class Launch:
         store = self.store
         agent_id = row["agent_id"]
         agent = agent_object(store, row, warnings=self.warnings)
-        first = self.first_working_at(row)
+        last_run = (row.get("last_outcome") or {}).get("run") if final else None
+        first = self.first_working_at(row, last_run if isinstance(last_run, int) else None)
         if not final:
             payload = result_object(agent=agent, first_working_at=first, warnings=self.warnings)
             return Outcome(0, payload, PayloadKind.RESULT)
