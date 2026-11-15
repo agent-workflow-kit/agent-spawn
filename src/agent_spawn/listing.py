@@ -10,8 +10,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .agent_lookup import open_existing, resolve_existing, store_failed
-from .agent_view import agent_object
+from .agent_view import CORRUPT_ROW, agent_object, unusable_row
 from .commands.base import Invocation
+from .ids import ID_CHARS, check_agent_id_text
 from .labels import Label, parse_user_label
 from .output import CliError, Outcome, PayloadKind, safe_text
 from .session_backend import STATES
@@ -114,7 +115,16 @@ def _select(
 ) -> list[dict[str, Any]]:
     forked_from = None
     if args.forked_from is not None:
-        forked_from = resolve_existing(store, args.forked_from).agent_id
+        text: str = args.forked_from
+        try:
+            body = check_agent_id_text(text)
+        except GrammarError as exc:
+            raise CliError.usage(str(exc)) from None
+        if len(body) == ID_CHARS:
+            # a full id is compared as it is: the parent's record may be gone, its children not
+            forked_from = "ag-" + body
+        else:
+            forked_from = resolve_existing(store, text).agent_id
     ids = set(store.find_agents(labels, include_torn_down=True)) if labels else None
     wanted = {
         "statuses": statuses,
@@ -126,9 +136,18 @@ def _select(
         "forked_from": forked_from,
         "since": since,
     }
-    rows = [row for row in store.list_agents() if _matches(row, ids, wanted)]
-    # TODO(#31): run the inline liveness check for the live and launching rows here (it may park
-    # an agent), then re-read them; it records its changes and delivers no hook.
-    rows.sort(key=lambda row: row["agent_id"])
-    rows.sort(key=lambda row: row["created"], reverse=True)
-    return [agent_object(store, row) for row in rows]
+    try:
+        rows = [row for row in store.list_agents() if _matches(row, ids, wanted)]
+        # TODO(#31): run the inline liveness check for the live and launching rows here (it may
+        # park an agent), then re-read them; it records its changes and delivers no hook.
+        rows.sort(key=lambda row: row["agent_id"])
+        rows.sort(key=lambda row: row["created"], reverse=True)
+    except CORRUPT_ROW:
+        raise unusable_row() from None
+    agents: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            agents.append(agent_object(store, row))
+        except CORRUPT_ROW:
+            raise unusable_row(row.get("agent_id")) from None
+    return agents

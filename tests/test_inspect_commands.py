@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -14,7 +15,7 @@ from agent_spawn.store import Store
 from tests import schema_registry
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
-from tests.inspect_support import A1, A2, A3, SESSION, labels_of, seed_agent
+from tests.inspect_support import A1, A2, A3, SESSION, labels_of, run_inprocess, seed_agent
 from tests.launch_support import Env
 
 LIST = "agent-spawn/cli/list.json"
@@ -116,7 +117,7 @@ def test_list_since_matches_updated(env: Env) -> None:
 
 def test_list_unknown_forked_from_and_bad_choices(env: Env) -> None:
     seed_agent(env, A1)
-    assert out(env.run("list", "--forked-from", "ag-zzzzzzzz", "--json"), ERROR, 10)
+    assert out(env.run("list", "--forked-from", "zzzz", "--json"), ERROR, 10)  # a prefix
     assert out(env.run("list", "--status", "nope", "--json"), ERROR, 2)["error"]["code"] == "usage"
     done = env.run("list", "--session-state", "nope", "--json")
     assert out(done, ERROR, 2)["error"]["code"] == "usage"
@@ -466,3 +467,230 @@ def test_corrupt_database_is_an_expected_failure(env: Env) -> None:
     done = env.run("list", "--json")
     assert done.returncode == 12
     schema_registry.validate(json.loads(done.stdout), ERROR)
+
+
+# --- review round 1 ----------------------------------------------------------------------------
+
+
+def test_list_forked_from_a_full_id_without_a_record_lists_its_children(env: Env) -> None:
+    # R10: the parent's tombstone may be deleted; its children stay listable
+    seed_agent(env, A2, forked_from=A1)
+    seed_agent(env, A3)
+    assert ids(out(env.run("list", "--forked-from", A1, "--json"), LIST)) == [A2]
+    assert ids(out(env.run("list", "--forked-from", "ag-zzzzzzzz", "--json"), LIST)) == []
+    assert out(env.run("list", "--forked-from", "ag-zz", "--json"), ERROR, 2)
+
+
+@pytest.mark.parametrize("bad", [1e300, "abc"])
+@pytest.mark.parametrize("command", ["list", "show"])
+def test_a_corrupt_row_is_exit_12_not_internal(env: Env, command: str, bad: Any) -> None:
+    # R14
+    seed_agent(env, A1)
+    db = sqlite3.connect(env.state_dir / "state.db")
+    with db:
+        db.execute("UPDATE agents SET updated = ?", (bad,))
+    db.close()
+    args = [command] if command == "list" else [command, A1]
+    body = out(env.run(*args, "--json"), ERROR, 12)
+    assert body["error"]["code"] == "failed"
+    assert body["error"]["message"].startswith("state.db row unusable")
+
+
+def test_show_a_session_answering_for_another_id_is_null_with_a_warning(
+    env: Env, fakebin: Fakebin
+) -> None:
+    # R13
+    fakebin.seed_session(SESSION)
+    fakebin.script("claude-session", "status", merge={"csession_id": "cs-zzzzzzzz"})
+    seed_agent(
+        env, A1, status="live", csession_id=SESSION,
+        claude_session_path=str(fakebin.bin_dir / "claude-session"),
+    )  # fmt: skip
+    body = out(env.run("show", A1, "--json"), SHOW)
+    assert body["session"] is None
+    assert any("another session" in w for w in body["warnings"])
+
+
+def test_show_an_unreadable_supervisor_entry_fails_closed(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # R2: never "dead" when the process entry cannot be read
+    from agent_spawn import procs
+
+    with Store.open(env.state_dir) as store:
+        me = store.holder_identity()
+    seed_agent(env, A1, status="live", supervisor=me)
+
+    def unreadable(*_a: Any, **_k: Any) -> bool:
+        raise procs.ProcessIdentityError("/proc/123/stat said SECRETPROC")
+
+    monkeypatch.setattr(procs, "is_alive", unreadable)
+    code, stdout, stderr = run_inprocess(env, monkeypatch, capsys, "show", A1, "--json")
+    body = json.loads(stdout)
+    assert code == 12 and body["error"]["code"] == "failed"
+    schema_registry.validate(body, ERROR)
+    assert "SECRETPROC" not in stdout + stderr and "alive" not in stdout
+
+
+def test_show_third_party_run_is_null_with_a_warning_when_wtctl_is_set(env: Env) -> None:
+    # R6d (until #21 looks the records up)
+    seed_agent(env, A1, cwd="/work/x")
+    body = out(env.run("show", A1, "--json"), SHOW)
+    assert body["third_party_run"] is None
+    assert any("throwaway records" in w for w in body["warnings"])
+
+
+def test_ack_on_a_held_lease_is_retryable_exit_12(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # R6a: leases are not reentrant, so a lease held by this very process fails at once
+    seed_agent(env, A1, needs_attention="blocked")
+    seed_agent(env, A2)
+    with Store.open(env.state_dir) as store, store.lease(f"agent:{A1}"):
+        for argv in (("ack", A1), ("label", "add", A1, "a=1")):
+            code, stdout, _ = run_inprocess(env, monkeypatch, capsys, *argv, "--json")
+            body = json.loads(stdout)
+            assert code == 12, stdout
+            assert body["error"]["details"]["retryable"] is True
+    assert env.agent(A1)["needs_attention"] == "blocked" and labels_of(env, A1) == []
+
+
+def test_label_add_on_an_older_schema_exits_12_with_the_hint(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # R6b: the self-label store is opened without migrating
+    seed_agent(env, A1, csession_id=SESSION)
+    db = sqlite3.connect(env.state_dir / "state.db")
+    with db:
+        db.execute("UPDATE meta SET value = '0' WHERE key = 'schema_version'")
+    db.close()
+    code, stdout, _ = run_inprocess(
+        env, monkeypatch, capsys, "label", "add", "--session", SESSION, "pr=1", "--json",
+        extra_env={"CSESSION_ID": SESSION, "CSESSION_DIR": str(env.state_dir)},
+    )  # fmt: skip
+    body = json.loads(stdout)
+    assert code == 12 and "older schema" in body["error"]["message"]
+    assert fakebin_untouched(env)
+
+
+def fakebin_untouched(env: Env) -> bool:
+    return env.fakebin.argvs("claude-session") == []
+
+
+def hook_sink(env_: Env, fakebin: Fakebin, tmp_path: Path, cmd: str | None = None) -> Env:
+    sink = tmp_path / "sink.jsonl"
+    cmd = cmd or f"cat >> {sink}; echo >> {sink}"
+    return Env(fakebin, env_.iso, f'hooks:\n  post-state-change:\n    - cmd: "{cmd}"\n')
+
+
+def test_ack_delivers_its_event_with_the_stored_updated(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    # R6c and R9: the delivered payload carries the stored row's `updated`
+    hooked = hook_sink(env, fakebin, tmp_path)
+    seed_agent(env, A1, status="live", needs_attention="blocked")
+    out(hooked.run("ack", A1, "--json"), ACK)
+    sink = tmp_path / "sink.jsonl"
+    hooked.wait_for(sink.exists, "the post-state-change hook")
+    payload = json.loads(sink.read_text().splitlines()[0])
+    schema_registry.validate(payload, "agent-spawn/hooks/post-state-change.json")
+    from agent_spawn.agent_view import ts
+
+    assert payload["agent"]["updated"] == ts(hooked.agent(A1)["updated"])
+    assert payload["agent"]["needs_attention"] is None
+
+
+def test_a_failing_hook_is_swallowed_by_ack(env: Env, fakebin: Fakebin, tmp_path: Path) -> None:
+    # R6c
+    hooked = hook_sink(env, fakebin, tmp_path, cmd="exit 3")
+    seed_agent(env, A1, needs_attention="blocked")
+    body = out(hooked.run("ack", A1, "--json"), ACK)
+    assert body["changed"] is True and hooked.agent(A1)["needs_attention"] is None
+
+
+def test_label_edit_delivers_pending_outbox_events(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    # R12: the next mutating command delivers what an earlier command queued
+    from agent_spawn.agent_view import agent_object
+    from agent_spawn.hooks import agent_event
+
+    hooked = hook_sink(env, fakebin, tmp_path)
+    seed_agent(env, A1, status="live")
+    with hooked.store() as store:
+        row = store.get_agent(A1)
+        assert row is not None
+        store.add_events(
+            A1,
+            [
+                agent_event(
+                    "post-state-change",
+                    agent_object(store, row),
+                    reads_third_party=False,
+                    extra={
+                        "change": "agent",
+                        "previous_status": "parked",
+                        "previous_needs_attention": None,
+                    },
+                )
+            ],
+        )
+    out(hooked.run("label", "add", A1, "a=1", "--json"), ADD)
+    sink = tmp_path / "sink.jsonl"
+    hooked.wait_for(sink.exists, "the queued event's hook")
+    assert json.loads(sink.read_text().splitlines()[0])["agent"]["agent_id"] == A1
+
+
+def test_label_dry_run_delivers_nothing(env: Env, fakebin: Fakebin, tmp_path: Path) -> None:
+    hooked = hook_sink(env, fakebin, tmp_path)
+    seed_agent(env, A1)
+    out(hooked.run("label", "add", A1, "a=1", "--dry-run", "--json"), ADD)
+    assert not (tmp_path / "sink.jsonl").exists()
+
+
+def test_human_label_output_prints_warnings_on_stderr(env: Env, fakebin: Fakebin) -> None:
+    # R3
+    fakebin.seed_session(SESSION)
+    fakebin.script("claude-session", "label add", exit=12, error={"code": "failed", "message": "m"})
+    seed_agent(
+        env, A1, csession_id=SESSION, claude_session_path=str(fakebin.bin_dir / "claude-session")
+    )
+    done = env.run("label", "add", A1, "a=1")
+    assert done.returncode == 0
+    assert done.stderr.count("warning: ") == 1 and "queued for reconcile" in done.stderr
+    assert "warning" not in done.stdout
+    quiet = env.run("label", "add", A1, "b=2", "--json")
+    assert "warning" not in quiet.stderr
+
+
+def test_ack_log_warnings_are_reported_in_both_modes(env: Env) -> None:
+    # R3: a log that cannot be written is a warning in the result and on stderr in human mode
+    seed_agent(env, A1, needs_attention="blocked")
+    seed_agent(env, A2, needs_attention="blocked")
+    (env.state_dir / "log.jsonl").mkdir()
+    body = out(env.run("ack", A1, "--json"), ACK)
+    assert any("could not write the log" in w for w in body["agent"]["warnings"])
+    done = env.run("ack", A2)
+    assert done.returncode == 0
+    assert "warning: could not write the log" in done.stderr
+    assert "warning" not in done.stdout
+
+
+def test_a_failed_resolution_closes_the_store(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # R8
+    seed_agent(env, A1)
+    closed: list[int] = []
+    real = Store.close
+
+    def counting(self: Store) -> None:
+        closed.append(1)
+        real(self)
+
+    monkeypatch.setattr(Store, "close", counting)
+    gone = "ag-zzzzzzzz"
+    for argv in (("ack", gone), ("show", gone), ("label", "add", gone, "a=1")):
+        closed.clear()
+        code, _, _ = run_inprocess(env, monkeypatch, capsys, *argv, "--json")
+        assert code == 10 and closed, argv

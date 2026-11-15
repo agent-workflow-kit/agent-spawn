@@ -13,9 +13,20 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .hooks import agent_event
+from .ids import is_agent_id
+from .output import CliError
 from .records import format_ts
 from .session_backend import RunOutcome
 from .store import OutboxEvent, Store
+
+#: What rendering a corrupt stored row can raise (an out-of-range or non-numeric time, ...).
+CORRUPT_ROW = (OverflowError, TypeError, ValueError, OSError)
+
+
+def unusable_row(agent_id: str | None = None) -> CliError:
+    """The expected failure for a row that cannot be rendered (exit 12, never a traceback)."""
+    known = agent_id if agent_id is not None and is_agent_id(agent_id) else None
+    return CliError("failed", "state.db row unusable", agent_id=known, exit_code=12)
 
 
 def ts(moment: float | None) -> str | None:

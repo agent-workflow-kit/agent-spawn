@@ -13,7 +13,7 @@ from typing import Any
 from . import gateway as gw
 from . import procs
 from .agent_lookup import backend_for, open_existing, resolve_existing, store_failed
-from .agent_view import agent_object, ts
+from .agent_view import CORRUPT_ROW, agent_object, ts, unusable_row
 from .commands.base import Invocation
 from .output import CliError, Outcome, PayloadKind, safe_text
 from .session_backend import STATES, SessionStatus
@@ -67,6 +67,8 @@ def run_objects(store: Store, row: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "mode": mode if mode in _MODES else row.get("mode"),
                 "promoted": bool(stored.get("promoted")),
                 "auto_resumed": bool(stored.get("auto_resumed")),
+                # TODO(#12): nothing writes agent_runs.started_at; the supervisor must write it
+                # when it adopts the session.
                 "adopted_at": ts(stored.get("started_at")),
                 "ended_at": ts(stored.get("ended_at")),
                 "first_working_at": ts(stored.get("first_working_at")),
@@ -77,15 +79,20 @@ def run_objects(store: Store, row: Mapping[str, Any]) -> list[dict[str, Any]]:
     return runs
 
 
-def supervisor_object(row: Mapping[str, Any], warnings: list[str]) -> dict[str, Any] | None:
+def supervisor_object(row: Mapping[str, Any]) -> dict[str, Any] | None:
     sup, exec_proc = row.get("supervisor"), row.get("exec_proc")
     if sup is None:
         return None
     try:
         alive = procs.is_alive(sup, gateway=gw.get_gateway())
     except procs.ProcessIdentityError:
-        warnings.append("the supervisor's liveness could not be determined")
-        alive = False
+        # An unreadable process entry is an error, never "dead" (interface.md, Liveness).
+        raise CliError(
+            "failed",
+            "the supervisor's process entry could not be read",
+            agent_id=row["agent_id"],
+            exit_code=12,
+        ) from None
     return {
         "pid": sup.pid,
         "alive": alive,
@@ -105,6 +112,9 @@ def _session(inv: Invocation, row: Mapping[str, Any], warnings: list[str]) -> di
             warnings.append("claude-session reports the session not found")
         else:
             warnings.append(f"claude-session status failed ({safe_text(error.code)})")
+        return None
+    if status.csession_id != session_id:
+        warnings.append("claude-session answered for another session")
         return None
     summary = session_summary(status)
     if summary is None:
@@ -152,7 +162,12 @@ def _human(payload: Mapping[str, Any]) -> str:
 
 def show(inv: Invocation) -> Outcome:
     store = open_existing(inv)
-    resolved = resolve_existing(store, inv.args.agent_id)
+    try:
+        resolved = resolve_existing(store, inv.args.agent_id)
+    except BaseException:
+        if store is not None:
+            store.close()
+        raise
     assert store is not None
     warnings: list[str] = []
     try:
@@ -160,8 +175,11 @@ def show(inv: Invocation) -> Outcome:
             row = store.get_agent(resolved.agent_id)
             if row is None:
                 raise CliError.of("not_found", "no such agent")
-            agent = agent_object(store, row)
-            runs = run_objects(store, row)
+            try:
+                agent = agent_object(store, row)
+                runs = run_objects(store, row)
+            except CORRUPT_ROW:
+                raise unusable_row(resolved.agent_id) from None
     except StoreError as error:
         raise store_failed(error) from None
     if row["status"] == "torn_down":
@@ -169,7 +187,7 @@ def show(inv: Invocation) -> Outcome:
         third = None
     else:
         # TODO(#31): the inline liveness check of a live or launching agent runs first.
-        supervisor = supervisor_object(row, warnings)
+        supervisor = supervisor_object(row)
         session = _session(inv, row, warnings)
         third = third_party_run(inv, row, warnings)
         config_changed = repo_config_changed(row, warnings)

@@ -14,7 +14,7 @@ from agent_spawn.output import CliError
 from tests import schema_registry
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
-from tests.inspect_support import A1, A2, SESSION, labels_of, seed_agent
+from tests.inspect_support import A1, A2, SESSION, labels_of, run_inprocess, seed_agent
 from tests.launch_support import Env
 
 ADD = "agent-spawn/cli/label-add.json"
@@ -337,3 +337,81 @@ def test_read_secret_refuses_non_utf8(tmp_path: Path) -> None:
     (tmp_path / "secret").chmod(0o600)
     with pytest.raises(CliError):
         self_label.read_secret(str(tmp_path), os.getuid())
+
+
+# --- review round 1 ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("command", ["status", "verify-secret"])
+def test_lower_tool_failure_text_is_never_echoed(bare_rig: Rig, command: str) -> None:
+    # R1: the lower tool's message may carry the directory and the secret
+    leaky = f"cannot read {bare_rig.dir}: {SECRET}"
+    bare_rig.fakebin.script(
+        "claude-session", command, exit=12, error={"code": "failed", "message": leaky}
+    )
+    done = bare_rig.run("pr=1")
+    body = bare_rig.refused(done, 12)
+    assert str(bare_rig.dir) not in done.stdout + done.stderr
+    assert body["error"]["code"] == "failed"
+    assert body["error"].get("lower_error") is None
+    assert body["error"].get("lower_code") is None
+
+
+def test_read_secret_refuses_a_directory_swapped_after_the_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R4: the opened descriptor must be the directory the path names now
+    (tmp_path / "secret").write_text("abc")
+    (tmp_path / "secret").chmod(0o600)
+    real_stat = os.stat
+
+    def swapped(path: Any, *args: Any, **kwargs: Any) -> Any:
+        info = real_stat(path, *args, **kwargs)
+        if path == str(tmp_path):
+            fields = list(info)
+            fields[1] += 1  # st_ino
+            return os.stat_result(fields)
+        return info
+
+    monkeypatch.setattr(self_label.os, "stat", swapped)
+    with pytest.raises(CliError) as caught:
+        self_label.read_secret(str(tmp_path), os.getuid())
+    assert caught.value.exit_code == 11 and str(tmp_path) not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "UPDATE agents SET tainted = 1",
+        "UPDATE agents SET status = 'tearing_down'",
+        "UPDATE agents SET status = 'torn_down', torn_down_at = 1",
+        "UPDATE agents SET csession_id = 'cs-zzzzzzzz'",
+    ],
+)
+def test_the_agent_is_rechecked_under_its_lease(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], sql: str
+) -> None:
+    # R5: the row picked before the lease may change before the lease is taken
+    import sqlite3
+    from contextlib import contextmanager
+
+    real = self_label.agent_lease
+    db_path = rig.env.state_dir / "state.db"
+
+    @contextmanager
+    def racing(store: Any, agent_id: str) -> Any:
+        db = sqlite3.connect(db_path)
+        with db:
+            db.execute(sql)
+        db.close()
+        with real(store, agent_id) as lease:
+            yield lease
+
+    monkeypatch.setattr(self_label, "agent_lease", racing)
+    code, stdout, stderr = run_inprocess(
+        rig.env, monkeypatch, capsys, "label", "add", "--session", SESSION, "pr=1", "--json",
+        extra_env={"CSESSION_ID": SESSION, "CSESSION_DIR": str(rig.dir)},
+    )  # fmt: skip
+    assert code in (10, 11), stdout
+    assert rig.labels() == []
+    assert SECRET not in stdout + stderr

@@ -7,6 +7,7 @@ a warning and the change stays in the pending-mirror queue for ``reconcile``.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any, Literal
@@ -21,7 +22,7 @@ from .agent_lookup import (
     store_failed,
     torn_down_error,
 )
-from .agent_view import agent_object, lifecycle_events
+from .agent_view import agent_object, lifecycle_events, ts
 from .commands.base import Invocation
 from .labels import Label, LabelChange, LabelSet, parse_user_label
 from .lifecycle import LEASE_WAIT, lease_key, reads_third_party_of
@@ -30,7 +31,7 @@ from .records import RecordsError, append_log
 from .store import AgentMissing, Lease, LeaseHeld, LeaseLost, Store, StoreError
 from .validate import GrammarError
 
-__all__ = ["ack", "label_edit", "mirror_session"]
+__all__ = ["ack", "label_edit", "mirror_session", "print_warnings"]
 
 
 @contextmanager
@@ -62,6 +63,34 @@ def log_quietly(inv: Invocation, warnings: list[str], event: str, **fields: Any)
         warnings.append(f"could not write the log ({type(error).__name__})")
 
 
+def print_warnings(inv: Invocation, warnings: Sequence[str]) -> None:
+    """In human mode each warning is one ``warning: ...`` line on stderr (``--json`` carries them
+    in the result instead)."""
+    if inv.as_json:
+        return
+    for warning in warnings:
+        try:
+            sys.stderr.write(safe_text(f"warning: {warning}") + "\n")
+            sys.stderr.flush()
+        except (BrokenPipeError, OSError):
+            return
+
+
+def _open_and_resolve(inv: Invocation, text: str) -> tuple[Store, str]:
+    """The store and the agent id ``text`` names; the store is closed if resolving fails."""
+    store = open_existing(inv)
+    try:
+        resolved = resolve_existing(store, text)
+        if resolved.torn_down:
+            raise torn_down_error(resolved.agent_id)
+    except BaseException:
+        if store is not None:
+            store.close()
+        raise
+    assert store is not None
+    return store, resolved.agent_id
+
+
 def _live_row(store: Store, agent_id: str) -> dict[str, Any]:
     row = store.get_agent(agent_id)
     if row is None:
@@ -75,13 +104,7 @@ def _live_row(store: Store, agent_id: str) -> dict[str, Any]:
 
 
 def ack(inv: Invocation) -> Outcome:
-    store = open_existing(inv)
-    resolved = resolve_existing(store, inv.args.agent_id)
-    assert store is not None
-    if resolved.torn_down:
-        store.close()
-        raise torn_down_error(resolved.agent_id)
-    agent_id = resolved.agent_id
+    store, agent_id = _open_and_resolve(inv, inv.args.agent_id)
     warnings: list[str] = []
     try:
         with store:
@@ -93,10 +116,14 @@ def ack(inv: Invocation) -> Outcome:
                     changed, after = False, before
                 else:
                     reads = reads_third_party_of(store, row)
-                    prospective = {**before, "needs_attention": None}
+                    now = store.gateway.wall_time()  # the stored value: the event matches it
+                    prospective = {**before, "needs_attention": None, "updated": ts(now)}
                     events = lifecycle_events(before, prospective, reads_third_party=reads)
                     updated = store.update_agent(
-                        lease, agent_id, {"needs_attention": None}, events=events
+                        lease,
+                        agent_id,
+                        {"needs_attention": None, "updated": now},
+                        events=events,
                     )
                     changed, after = True, agent_object(store, updated)
             if changed:
@@ -111,6 +138,7 @@ def ack(inv: Invocation) -> Outcome:
             after = {**after, "warnings": [*after["warnings"], *warnings]} if warnings else after
     except StoreError as error:
         raise store_failed(error) from None
+    print_warnings(inv, warnings)
     human = (
         f"{agent_id}: needs_attention cleared" if changed else f"{agent_id}: nothing to acknowledge"
     )
@@ -179,13 +207,7 @@ def label_edit(inv: Invocation, direction: Direction) -> Outcome:
         pairs = list(dict.fromkeys(parse_user_label(text) for text in args.pairs))
     except GrammarError as exc:
         raise CliError.usage(str(exc)) from None
-    store = open_existing(inv)
-    resolved = resolve_existing(store, args.agent_id)
-    assert store is not None
-    if resolved.torn_down:
-        store.close()
-        raise torn_down_error(resolved.agent_id)
-    agent_id = resolved.agent_id
+    store, agent_id = _open_and_resolve(inv, args.agent_id)
     warnings: list[str] = []
     key = "added" if direction == "add" else "removed"
     try:
@@ -216,8 +238,11 @@ def label_edit(inv: Invocation, direction: Direction) -> Outcome:
                     mirror_session(inv, store, row, direction, applied, warnings)
                     # TODO(#27): mirror to the live pane (termctl label add|remove) for the first
                     # 30 stored labels; a change beyond them is a warning, never queued.
+                # a mutating command delivers what earlier commands queued (label queues nothing)
+                _deliver(inv, store, agent_id)
     except StoreError as error:
         raise store_failed(error) from None
+    print_warnings(inv, warnings)
     payload = {
         "agent_id": agent_id,
         "labels": final,

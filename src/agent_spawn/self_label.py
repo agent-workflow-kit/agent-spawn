@@ -24,7 +24,7 @@ from typing import Any
 
 from . import gateway as gw
 from .agent_lookup import backend_for, open_existing, store_failed
-from .annotate import agent_lease, log_quietly, mirror_session
+from .annotate import agent_lease, log_quietly, mirror_session, print_warnings
 from .commands.base import Invocation
 from .labels import Label, parse_user_label
 from .output import CliError, Outcome, PayloadKind
@@ -62,6 +62,15 @@ def read_secret(directory: str, uid: int) -> str:
             )
         except OSError:
             raise refused("the session secret cannot be opened") from None
+        # The descriptor must be the directory the path names now (a swap after the realpath
+        # check would otherwise open another session's secret).
+        try:
+            named = os.stat(directory)
+            opened = os.fstat(dir_fd)
+        except OSError:
+            raise refused("the session directory cannot be checked") from None
+        if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+            raise refused("the session directory changed while it was opened")
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise refused("the session secret is not a regular file")
@@ -85,6 +94,21 @@ def read_secret(directory: str, uid: int) -> str:
         for descriptor in (fd, dir_fd):
             if descriptor >= 0:
                 os.close(descriptor)
+
+
+def _lower_failed(command: str, error: CliError) -> CliError:
+    """A failed lower-tool call as a fixed message: no lower text, same exit code."""
+    return CliError("failed", f"claude-session {command} failed", exit_code=error.exit_code)
+
+
+def _check_agent(row: dict[str, Any], session_id: str) -> None:
+    """The checks on the agent record that a self-label needs (run before and under the lease)."""
+    if row["status"] == "torn_down" or row.get("csession_id") != session_id:
+        raise CliError.of("not_found", "no agent has this session")
+    if row["status"] == "tearing_down":
+        raise refused("the agent is being torn down")
+    if row.get("tainted") is True:
+        raise refused("the agent is recorded as tainted")
 
 
 def _realpath(path: str) -> str:
@@ -132,7 +156,10 @@ def self_label(inv: Invocation) -> Outcome:
         with store:
             # 4. claude-session's view of the session (any failure refuses: fail closed)
             backend = backend_for(inv)
-            status = backend.status(session_id)
+            try:
+                status = backend.status(session_id)
+            except CliError as error:  # the lower tool's text may carry the directory
+                raise _lower_failed("status", error) from None
             if status.csession_id != session_id:
                 raise refused("claude-session answered for another session")
             if status.tainted:
@@ -145,7 +172,11 @@ def self_label(inv: Invocation) -> Outcome:
             # 5. the secret file
             secret = read_secret(real_dir, gw.get_gateway().getuid())
             # 6. verified by claude-session; the secret travels on stdin only
-            if backend.verify_secret(session_id, secret) is not True:
+            try:
+                verified = backend.verify_secret(session_id, secret)
+            except CliError as error:  # the lower tool's text may carry the secret
+                raise _lower_failed("verify-secret", error) from None
+            if verified is not True:
                 raise refused("the session secret does not match")
             # 7. the agent whose session this is
             matches = [
@@ -157,11 +188,14 @@ def self_label(inv: Invocation) -> Outcome:
                 raise CliError.of("not_found", "no agent has this session")
             if len(matches) > 1:
                 raise CliError("internal", "several agents claim this session")
-            row = matches[0]
-            if row.get("tainted") is True:
-                raise refused("the agent is recorded as tainted")
-            agent_id = row["agent_id"]
+            _check_agent(matches[0], session_id)
+            agent_id = matches[0]["agent_id"]
             with agent_lease(store, agent_id) as lease:
+                # the row was read before the lease: read it again and repeat the checks
+                row = store.get_agent(agent_id)
+                if row is None:
+                    raise CliError.of("not_found", "no agent has this session")
+                _check_agent(row, session_id)
                 try:
                     change = store.edit_labels(lease, agent_id, "add", pairs)
                 except GrammarError as exc:
@@ -180,6 +214,7 @@ def self_label(inv: Invocation) -> Outcome:
                 # TODO(#27): mirror to the live pane as `label add` does.
     except StoreError as error:
         raise store_failed(error) from None
+    print_warnings(inv, warnings)
     payload: dict[str, Any] = {
         "agent_id": agent_id,
         "labels": final,
