@@ -59,6 +59,7 @@ __all__ = [
     "LeaseHeld",
     "LeaseLost",
     "OutboxEvent",
+    "SchemaNewer",
     "SchemaOlder",
     "Store",
     "StoreBusy",
@@ -143,6 +144,15 @@ class SchemaOlder(StoreError):
 
     def __init__(self, found: int, expected: int) -> None:
         super().__init__(f"state.db has schema {found}, this agent-spawn needs {expected}")
+        self.found = found
+        self.expected = expected
+
+
+class SchemaNewer(CliError):
+    """The database schema is newer than this agent-spawn understands (``schema_newer``)."""
+
+    def __init__(self, found: int, expected: int, message: str) -> None:
+        super().__init__("schema_newer", message)
         self.found = found
         self.expected = expected
 
@@ -282,8 +292,9 @@ def _read_version(conn: sqlite3.Connection, path: Path) -> int | None:
 def _check_version(version: int | None, wanted: int, *, migrate: bool) -> None:
     """Refuse a newer schema (exit 12) and, without ``migrate``, an older or empty one."""
     if version is not None and version > wanted:
-        raise CliError.of(
-            "schema_newer",
+        raise SchemaNewer(
+            version,
+            wanted,
             f"state.db has schema {version}; this agent-spawn understands up to "
             f"{wanted}: upgrade agent-spawn",
         )
@@ -454,8 +465,9 @@ class Store:
             # Re-read under the write lock: another process may have migrated meanwhile.
             version = _read_version(self._conn, self.path) or 0
             if version > wanted:
-                raise CliError.of(
-                    "schema_newer",
+                raise SchemaNewer(
+                    version,
+                    wanted,
                     f"state.db has schema {version}; this agent-spawn needs {wanted}",
                 )
             for step in range(version, wanted):

@@ -588,6 +588,13 @@ def _head(argv: Sequence[str]) -> list[str]:
     return head
 
 
+# The public command names (the first word of each parser key); a test keeps it equal to the parser.
+_COMMAND_NAMES = (
+    "ack attach browse cron export label launch list prune reconcile resume show stop "
+    "supervise teardown wait"
+).split()
+
+
 def _is_relay(argv: Sequence[str]) -> bool:
     """Whether the command is ``_session-event``: a standalone token that is no value of a known
     global flag, before any other command name (unknown tokens are skipped), or the token after
@@ -597,7 +604,7 @@ def _is_relay(argv: Sequence[str]) -> bool:
     flag's separate value is skipped as a token, and the converse (``--prompt _session-event
     launch``, where it is a flag's value) also lands on the relay. A failing hook would be worse.
     """
-    commands = {key.split()[0] for key in build_parser().command_parsers}
+    commands = set(_COMMAND_NAMES)
     tokens = list(argv)
     index = 0
     while index < len(tokens):

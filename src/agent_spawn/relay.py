@@ -25,7 +25,7 @@ from .agent_view import agent_object
 from .hooks import agent_event
 from .output import CliError, safe_text
 from .records import RecordsError, append_log, parse_record_ts
-from .store import SchemaOlder, Store, StoreError, StoreMissing
+from .store import SchemaNewer, SchemaOlder, Store, StoreError, StoreMissing
 
 __all__ = ["MAX_PAYLOAD_BYTES", "run"]
 
@@ -120,7 +120,9 @@ def _outcome_consistent(
     final: bool, outcome: str | None, end: str | None, code: int | None, phase: str
 ) -> bool:
     """Whether the final/outcome/end_reason/exit_code/phase combination breaks none of the
-    schema's consistency rules (``outcome`` and ``end`` are already known to be well formed)."""
+    outcome/exit_code/end_reason/phase consistency rules of agent-spawn's schema (``outcome``
+    and ``end`` are already known to be well formed). The other rules, such as outcome to state,
+    outcome to ``report.status`` and final to state, are not checked by the relay."""
     if not final:
         return outcome is None and end is None and code is None
     if outcome is None or end is None or code != _EXIT_CODES[outcome]:
@@ -436,18 +438,17 @@ def _handle(state_dir: str, stdin: Any) -> None:
             details={"found": exc.found, "expected": exc.expected},
         )
         return
+    except SchemaNewer as exc:  # any schema other than ours is `schema_older` in the log
+        _stderr(f"cannot open the state database ({exc.code}); event dropped")
+        _log(
+            state_dir,
+            "schema_older",
+            message="the state database has a newer schema; relay event dropped",
+            details={"found": exc.found, "expected": exc.expected},
+        )
+        return
     except CliError as exc:
         _stderr(f"cannot open the state database ({exc.code}); event dropped")
-        if exc.code == "schema_newer":  # any schema other than ours is `schema_older` in the log
-            versions = re.search(r"schema (\d+);.* up to (\d+)", str(exc))
-            _log(
-                state_dir,
-                "schema_older",
-                message="the state database has a newer schema; relay event dropped",
-                details=(
-                    {"found": int(versions[1]), "expected": int(versions[2])} if versions else {}
-                ),
-            )
         return
     except StoreError as exc:
         _stderr(f"cannot open the state database ({type(exc).__name__}); event dropped")

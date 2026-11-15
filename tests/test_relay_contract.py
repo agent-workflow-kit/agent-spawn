@@ -1,8 +1,10 @@
 """The relay against claude-session's pinned hook schema: enums, and every outcome combination.
 
-The sibling schema is the source of truth for what claude-session sends. The relay must accept
-exactly the final/outcome/end_reason/exit_code/phase combinations that the pinned schema accepts
-and whose relayed form agent-spawn's own hook schema accepts, and drop the rest.
+The sibling schema is the source of truth for what claude-session sends. The relay enforces only
+the outcome/exit_code/end_reason/phase consistency rules of agent-spawn's schema: it must accept
+every final/outcome/end_reason/exit_code/phase combination the pinned sibling schema accepts, and
+never relay one that agent-spawn's own hook schema rejects. Other rules (outcome to state,
+outcome to report status, final to state) are not checked by the relay.
 """
 
 from __future__ import annotations
@@ -158,7 +160,7 @@ def test_the_relay_enums_equal_the_pinned_sibling_schema() -> None:
         assert not relay._END_REASON.fullmatch(value)  # pyright: ignore[reportPrivateUsage]
 
 
-def test_the_relay_accepts_exactly_the_combinations_both_schemas_accept() -> None:
+def test_the_relay_accepts_every_sibling_valid_outcome_combination() -> None:
     valid = 0
     for outcome, end, phase in itertools.product(OUTCOMES, END_REASONS, ("launch", "session")):
         body = final_payload(outcome, end, phase)
@@ -169,8 +171,8 @@ def test_the_relay_accepts_exactly_the_combinations_both_schemas_accept() -> Non
             assert event is not None, f"valid payload dropped: {outcome} {end} {phase}"
         if event is not None:
             assert ours, f"relayed a payload the outbox schema rejects: {outcome} {end} {phase}"
-        # the relay may be stricter than the sibling only where the sibling schema is silent;
-        # it must never accept what agent-spawn's own schema rejects
+        # only the outcome/exit_code/end_reason/phase rules are enforced: a payload the relay
+        # accepts must never be one that agent-spawn's own schema rejects on those rules
         assert event is None or ours
     assert valid > 40
 
