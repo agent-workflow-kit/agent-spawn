@@ -534,7 +534,7 @@ Writes or removes the managed crontab block `# agent-spawn managed`, which runs 
 
 ### `export`
 
-`agent-spawn export [--since <time|duration>] [--action <action>]... [--json]`: audit records, oldest first ([schemas/cli/export.json](../schemas/cli/export.json)); `--since` takes a [time or duration](#durations-and-times).
+`agent-spawn export [--since <time|duration>] [--action <action>]... [--json]`: audit records, oldest first ([schemas/cli/export.json](../schemas/cli/export.json)); `--since` takes a [time or duration](#durations-and-times). `--action` is repeatable (a record matches any of the given actions) and takes one of `teardown`, `stop`, `launch_escalation_override`, `resume_escalation_override`, `teardown_escalation_override`, `resume_tainted`; any other value exits 2. A missing `audit.jsonl` prints an empty list. Lines that are not audit records (torn, not JSON, or not shaped like [schemas/audit.json](../schemas/audit.json)) are skipped with a warning on stderr and the exit stays 0. An `audit.jsonl` that cannot be used (a symbolic link, one with more than one hard link, not a regular file of the user, or unreadable) exits 12 (`failed`).
 
 ### `browse`
 
