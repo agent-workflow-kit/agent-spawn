@@ -1,0 +1,355 @@
+"""Argv cases whose exit code (and error code) the fakes must share with the real programs.
+
+Each row is ``(argv, exit_code, error_code, real_verified)``. ``real_verified`` rows were
+compared against the real program (claude-session 0.38.4 and termctl 0.25.0, argument parsing
+only) and are re-checked by ``tests/live/test_fidelity.py``; the others follow
+``docs/interface.md`` of the sibling because the real program could not reach that check
+(claude-session in the build environment) or does not implement it yet (wtctl is a scaffold).
+Every case fails before any tool touches tmux, a worktree or a session.
+"""
+
+from __future__ import annotations
+
+Case = tuple[list[str], int, str | None, bool]
+
+CASES: dict[str, list[Case]] = {
+    "claude-session": [
+        (["start", "--json", "--bogus"], 2, "usage", True),
+        (["start", "--json", "--mode", "weird"], 2, "usage", True),
+        (["start", "--json", "--mode", "headless"], 2, "usage", True),
+        (
+            ["start", "--json", "--kind", "Bad Kind", "--skill", "x", "--mode", "headless"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--timeout", "0"],
+            2,
+            "usage",
+            True,
+        ),
+        (["start", "--skill", "x", "--mode", "headless"], 2, None, True),
+        (
+            ["start", "--json", "--mode", "headless", "--skill", "x", "--", "do it"],
+            2,
+            "usage",
+            True,
+        ),
+        (["exec", "--json", "--run", "1"], 2, "usage", True),
+        (["stop", "--json"], 2, "usage", True),
+        (["label", "add", "cs-abcdefgh", "--json"], 2, "usage", True),
+        (["forget", "--json"], 2, "usage", True),
+        (["frobnicate", "--json"], 2, "usage", True),
+        (["wait", "cs-abcdefgh", "--timeout", "0", "--json"], 2, "usage", True),
+        (["start", "--json", "--skill", "x", "--mode", "headless", "--fork"], 2, "usage", True),
+        (
+            [
+                "start",
+                "--json",
+                "--resume",
+                "cs-abcdefgh",
+                "--allow-tainted",
+                "--actor",
+                "auto:cron",
+            ],
+            2,
+            "usage",
+            False,
+        ),
+        (["start", "--json", "--resume", "cs-abcdefgh", "--allow-tainted"], 2, "usage", False),
+        (["status", "--json", "cs-aaa"], 2, "usage", True),
+        (["start", "--json", "--skill", "x", "--mode", "headless", "--label"], 2, "usage", True),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--label", "Bad=1"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--max-turns", "0"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--model", "-x"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            [
+                "start",
+                "--json",
+                "--skill",
+                "x",
+                "--mode",
+                "headless",
+                "--hook-timeout",
+                "pre-launch=5s",
+            ],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--hook", "bogus=true"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--input-file", "-"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            [
+                "start",
+                "--json",
+                "--skill",
+                "x",
+                "--mode",
+                "headless",
+                "--prompt-file",
+                "/nonexistent/p",
+            ],
+            2,
+            "usage",
+            False,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--verbose", "--quiet"],
+            2,
+            "usage",
+            True,
+        ),
+        (["exec", "--json", "--session-id", "cs-abcdefgh", "--kind", "review"], 2, "usage", True),
+        (["exec", "--json", "--session-id", "cs-abcdefgh", "--run", "0"], 2, "usage", True),
+        (["forget", "--json", "cs-abcdefgh", "--older-than", "1d"], 2, "usage", True),
+        (["label", "frob", "cs-abcdefgh", "a=b", "--json"], 2, "usage", True),
+        (
+            [
+                "start",
+                "--json",
+                "--resume",
+                "cs-abcdefgh",
+                "--fork",
+                "--override-escalation",
+                "--actor",
+                "human:me",
+            ],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--resume", "cs-abcdefgh", "--reset", "model", "--model", "m"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--reset", "model"],
+            2,
+            "usage",
+            True,
+        ),
+        (["verify-secret", "cs-abcd"], 11, None, True),
+        (["verify-secret", "cs-abcdefgh", "--json"], 11, None, True),
+        # observed on claude-session 0.38.4 (round 1)
+        (["status", "--json", "cs-aaaaaaaa"], 10, "not_found", True),
+        (["status", "--json", "cs-aaaaaaaaaaaaa"], 10, "not_found", True),
+        (["status", "--json", "cs-aaaaaaa1"], 10, "not_found", True),
+        (["status", "--json", "AAAAAAAA"], 10, "not_found", True),
+        (["label", "add", "--json", "cs-aaaaaaaa", "a=b"], 10, "not_found", True),
+        (["--json", "status", "cs-aaaaaaaa"], 2, "usage", True),
+        (["--json"], 2, "usage", True),
+        (["--help"], 0, None, True),
+        (["-h"], 0, None, True),
+        (["forget", "--json", "--older-than", "abc"], 2, "usage", True),
+        (["forget", "--json", "--older-than", "36501d"], 2, "usage", True),
+        (["forget", "--json", "--older-than", "1d", "--state", "bogus"], 2, "usage", True),
+        (["forget", "--json", "--older-than", "1d", "--kind", "Bad"], 2, "usage", True),
+        (["list", "--json", "--limit", "0"], 2, "usage", True),
+        (["list", "--json", "--state", "bogus"], 2, "usage", True),
+        (["list", "--json", "--kind", "Bad"], 2, "usage", True),
+        (["list", "--json", "--kind", ""], 2, "usage", True),
+        (["list", "--json", "--limit", "5"], 0, None, True),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--timeout", "36501d"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--repo", "Bad Repo"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--env-allow", "A*"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--env-allow", ""],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--setting-sources", "User"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--setting-sources", "user,"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--permission-profile", "-x"],
+            2,
+            "usage",
+            True,
+        ),
+        (["start", "--json", "--resume", "cs-abcdefgh", "--reset", "kind"], 2, "usage", True),
+        (["--version"], 0, None, True),
+    ],
+    "termctl": [
+        (["open", "--json", "--"], 2, "usage", True),
+        (["open", "--json", "--name", "x#[y", "--", "sleep", "1"], 2, "usage", True),
+        (["--", "list"], 2, None, True),
+        (["show", "--json", "tc-ab"], 2, "usage", True),
+        (["label", "add", "tc-abcdefgh", "--json"], 2, "usage", True),
+        (["close", "tc-abcdefgh", "--grace", "5s", "--json"], 2, "usage", True),
+        (["open", "--json", "--env", "A=1", "--env", "A=2", "--", "sleep", "1"], 2, "usage", True),
+        (["frobnicate", "--json"], 2, "usage", True),
+        (["open", "--json", "--name", "", "--", "sleep", "1"], 2, "usage", True),
+        (["open", "--json", "--label", "Bad", "--", "sleep", "1"], 2, "usage", True),
+        (["open", "--json", "--session", "a b", "--", "sleep", "1"], 2, "usage", True),
+        (["open", "--json", "--target", "tab", "--", "sleep", "1"], 2, "usage", True),
+        (["open", "--json", "--keep-on-exit", "x", "--", "sleep", "1"], 2, "usage", True),
+        (["open", "--json", "--actor", "root", "--", "sleep", "1"], 2, "usage", True),
+        (["open", "--json", "--hook", "pre-close=true", "--", "sleep", "1"], 2, "usage", True),
+        (["open", "--json", "--bogus", "--", "sleep", "1"], 2, "usage", True),
+        (["open", "--json", "--env", "1A=1", "--", "sleep", "1"], 2, "usage", True),
+        (["--version"], 0, None, True),
+        (["list", "--bogus", "--version"], 0, None, True),
+        (["--json=x", "list"], 2, "usage", True),
+        (["show", "--json"], 2, "usage", True),
+        (["close", "--json", "tc-abcdefgh", "--force"], 2, "usage", True),
+        # observed on termctl 0.25.0 (round 1); `nosuch` is a socket name under TMUX_TMPDIR
+        (
+            ["--json", "--socket", "nosuch", "label", "add", "tc-aaaaaaaa", "a=b"],
+            10,
+            "no_server",
+            True,
+        ),
+        (
+            ["label", "add", "--socket", "nosuch", "tc-aaaaaaaa", "a=b", "--json"],
+            10,
+            "no_server",
+            True,
+        ),
+        (["open", "--json", "--cwd", "", "--", "sleep", "1"], 2, "usage", True),
+        (["open", "--json", "--override-escalation", "--", "sleep", "1"], 2, "usage", True),
+        (
+            ["open", "--json", "--override-escalation", "--actor", "auto:x", "--", "sleep", "1"],
+            2,
+            "usage",
+            True,
+        ),
+        (["--socket", "nosuch", "mark", "tc-aaaaaaaa", "nomarker", "--json"], 2, "usage", True),
+        (
+            ["open", "--json", "--socket", "nosuch", "--dry-run", "--", ""],
+            12,
+            "command_not_found",
+            True,
+        ),
+        (["show", "--json", "tc-aaaaaaa1"], 2, "usage", True),
+    ],
+    "wtctl": [
+        (["create", "--json"], 2, "usage", False),
+        (["create", "--json", "--repo", "Bad Repo"], 2, "usage", False),
+        (
+            ["create", "--json", "--repo", "example.org/o/r", "--branch", "b", "--detach"],
+            2,
+            "usage",
+            False,
+        ),
+        (["create", "--json", "--repo", "example.org/o/r", "--throwaway"], 2, "usage", False),
+        (
+            ["create", "--json", "--repo", "example.org/o/r", "--throwaway", "--ref", "abc"],
+            2,
+            "usage",
+            False,
+        ),
+        (["create", "--json", "--repo", "example.org/o/r", "--source", "local"], 2, "usage", False),
+        (["create", "--json", "--repo", "example.org/o/r", "--name", "-bad"], 2, "usage", False),
+        (["create", "--json", "--repo", "example.org/o/r", "--holder", "a b"], 2, "usage", False),
+        (
+            ["create", "--json", "--repo", "example.org/o/r", "--override-escalation"],
+            2,
+            "usage",
+            False,
+        ),
+        (["create", "--json", "--repo", "example.org/o/r", "--actor", "x"], 2, "usage", False),
+        (["remove", "relative/path", "--json"], 2, "usage", False),
+        (["show", "wt-ab", "--json"], 2, "usage", False),
+        (["remove", "--json"], 2, "usage", False),
+        (["label", "add", "wt-abcdefgh", "--json"], 2, "usage", False),
+        (["prune", "--json"], 2, "usage", False),
+        (["prune", "--throwaways", "--json"], 2, "usage", False),
+        (["list", "--throwaways", "--worktrees", "--json"], 2, "usage", False),
+        (["frobnicate", "--json"], 2, "usage", False),
+        (["--version"], 0, None, False),
+        (
+            ["create", "--json", "--repo", "example.org/o/r", "--hook", "pre-remove=true"],
+            2,
+            "usage",
+            False,
+        ),
+        (["remove", "wt-abcdefgh", "--force", "--json"], 2, "usage", False),
+    ],
+}
+
+
+#: argv whose argument checks the real program passes (it goes on to fail later, or succeeds):
+#: neither the real program nor the fake may answer these with exit 2. Real claude-session
+#: 0.38.4 failed with ``ModuleNotFoundError`` (exit 1) right after its argv checks.
+_HEADLESS = ["start", "--json", "--skill", "x", "--mode", "headless"]
+ACCEPTED: dict[str, list[list[str]]] = {
+    "claude-session": [
+        [*_HEADLESS, "--env-allowlist-only", ""],
+        [*_HEADLESS, "--model", ""],
+        [*_HEADLESS, "--max-turns", "+5"],
+        [*_HEADLESS, "--max-turns", " 5"],
+        [*_HEADLESS, "--max-turns", "\u0665"],
+        [*_HEADLESS, "--max-turns", "1_0"],
+        [*_HEADLESS, "--auto-exit", "--no-auto-exit"],
+        [*_HEADLESS, "--timeout", "1.5h"],
+        [*_HEADLESS, "--timeout", "none"],
+        [*_HEADLESS, "--setting-sources", ""],
+        [*_HEADLESS, "--setting-sources", "user,project"],
+        [*_HEADLESS, "--permission-profile=-x"],
+        [*_HEADLESS, "--hook", "pre-launch="],
+        ["forget", "--json", "--older-than", "0"],
+        ["forget", "--json", "--older-than", "1.5h"],
+    ],
+    "termctl": [],
+}
+
+#: Known differences, kept on purpose: ``(tool, argv, real exit, fake exit)``. The live test pins
+#: the real exit, the offline table test pins the fake's.
+DIVERGENCES: list[tuple[str, list[str], int, int]] = [
+    # interface.md: argv needs `--`; the real termctl 0.25.0 opens a shell pane instead.
+    ("termctl", ["open", "--json", "--socket", "nosuch", "--dry-run"], 0, 2),
+]

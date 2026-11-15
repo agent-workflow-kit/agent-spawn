@@ -75,8 +75,10 @@ def test_invalid_environment_override_fails_fast(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("AGENT_SPAWN_HANDOFF_TIMEOUT", "0")
-    assert cli.main(["list"]) == 2
+    # A context, so the variable is gone before the isolation fixture's teardown check.
+    with monkeypatch.context() as scoped:
+        scoped.setenv("AGENT_SPAWN_HANDOFF_TIMEOUT", "0")
+        assert cli.main(["list"]) == 2
     assert "AGENT_SPAWN_HANDOFF_TIMEOUT" in capsys.readouterr().err
 
 
