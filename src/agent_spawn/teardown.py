@@ -306,6 +306,8 @@ class Teardown:
     def entry_changes(self, row: Mapping[str, Any], **extra: object) -> dict[str, object]:
         """The entry's changes. ``--hook`` values replace the stored hooks; without any, the
         stored value (the first invocation's) is left alone."""
+        # Note: ``--hook`` entries given on a retry replace (not merge with) those stored by
+        # the first invocation; the spec leaves this open.
         changes: dict[str, object] = {"updated": self.store.gateway.wall_time(), **extra}
         if self.hooks:
             self.hooks_before = row.get("hooks")

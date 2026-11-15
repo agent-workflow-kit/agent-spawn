@@ -765,10 +765,22 @@ def test_the_ephemeral_refusal_needs_this_supervisor_as_the_teardown_process(
     assert row["status"] == "tearing_down" and row["teardown_proc"] == dead()
 
 
-def test_the_ephemeral_refusal_needs_the_started_marker(env: Env, fakebin: Fakebin) -> None:
+def test_the_ephemeral_refusal_parks_from_hooks_done(env: Env, fakebin: Fakebin) -> None:
     agent_id = seed(
         env, fakebin, status="tearing_down", teardown_step="hooks_done", teardown_proc=me()
     )
+    with Store.open(env.state_dir) as store:
+        moved = lifecycle.refuse_ephemeral_teardown(store, agent_id, outcome=None)
+    assert moved is not None and moved["status"] == "parked"
+    row = env.agent(agent_id)
+    assert row["teardown_step"] is None and row["teardown_proc"] is None
+
+
+@pytest.mark.parametrize("marker", ["worktree_partial", "session_done"])
+def test_the_ephemeral_refusal_is_refused_from_later_markers(
+    env: Env, fakebin: Fakebin, marker: str
+) -> None:
+    agent_id = seed(env, fakebin, status="tearing_down", teardown_step=marker, teardown_proc=me())
     with Store.open(env.state_dir) as store:
         assert lifecycle.refuse_ephemeral_teardown(store, agent_id, outcome=None) is None
     assert env.agent(agent_id)["status"] == "tearing_down"
