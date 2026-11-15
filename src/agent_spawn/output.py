@@ -83,7 +83,9 @@ ENVELOPE_EXITS = frozenset({1, 2, 10, 11, 12, 13, 20, 21, 130, 143})
 TOOLS = ("agent-spawn", "claude-session", "termctl", "wtctl")
 LOWER_TOOLS = TOOLS[1:]
 HOOKS = ("pre-launch", "pre-teardown")
-DETAIL_KEYS = frozenset({"status", "cause", "retryable", "hint", "cancel_failed", "cancel_code"})
+DETAIL_KEYS = frozenset(
+    {"status", "cause", "retryable", "hint", "cancel_failed", "cancel_code", "original_failure"}
+)
 # Allowed values of ``details.status`` and ``details.cause`` (schemas/cli/error.json).
 DETAIL_STATUSES = frozenset(
     {"torn_down", "session_missing", "parked", "launching", "tearing_down", None}
@@ -329,6 +331,8 @@ def _check_details(details: Mapping[str, Any]) -> None:
         raise ValueError("details cancel_failed must be a boolean")
     if "cancel_code" in details and not isinstance(details["cancel_code"], str):
         raise ValueError("details cancel_code must be a string")
+    if "original_failure" in details and not isinstance(details["original_failure"], Mapping):
+        raise ValueError("details original_failure must be an object")
     if "hint" in details and not isinstance(details["hint"], str):
         raise ValueError("details hint must be a string")
 

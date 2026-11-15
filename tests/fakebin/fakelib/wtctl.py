@@ -542,7 +542,9 @@ def do_adopt(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
                 if state != "active":  # unlinked, clone_missing, partial
                     ctx.fail(20, "refused", f"the record is {state}", reason="unlinked")
                 if holder is not None and holder not in existing["holders"] and not dry:
-                    existing["holders"] = [*existing["holders"], holder]
+                    existing["holders"] = sorted(
+                        [*existing["holders"], holder]
+                    )  # sorted, as wtctl lists them
                 return dict(existing), True
         if not os.path.isdir(real):
             ctx.fail(10, "not_found", f"{raw!r} is not a git worktree")
