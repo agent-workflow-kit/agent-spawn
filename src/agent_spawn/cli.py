@@ -57,7 +57,7 @@ DESCRIPTION = (
 
 _ME_NAME_INVALID = re.compile(r"[^A-Za-z0-9._@-]")
 
-INTERNAL_COMMANDS = ("supervise", "_session-event")
+INTERNAL_COMMANDS = ("supervise",)  # `_session-event` is routed to relay.run before parsing
 # Commands whose --result-file receives what --json prints (interface.md, Result file); browse's
 # file is an intent file its handler writes (interface.md, TUI).
 RESULT_FILE_COMMANDS = ("launch", "resume", "wait")
@@ -371,7 +371,6 @@ def build_parser() -> SpawnParser:
     add(commands, "export", "export", _add_export, "print audit records")
     add(commands, "browse", "browse", _add_browse, "browse agents in a TUI")
     add(commands, "supervise", "supervise", _add_supervise, None)
-    add(commands, "_session-event", "_session-event", lambda p: None, None)
 
     for group_name, verbs in (
         ("label", (("add", True), ("remove", False))),
@@ -432,8 +431,6 @@ def _check_usage(args: argparse.Namespace, key: str) -> None:
     state_dir: str | None = getattr(args, "state_dir", None)
     config: str | None = getattr(args, "config", None)
     if internal:
-        # `_session-event` never gets here: main hands it to relay.run before parsing (it exits 0
-        # whatever its argv, interface.md State relay).
         for flag, value in (("--state-dir", state_dir), ("--config", config)):
             if value is None or not value.startswith("/") or "\0" in value:
                 raise ValueError(f"{key} needs an absolute {flag}")
@@ -592,13 +589,29 @@ def _head(argv: Sequence[str]) -> list[str]:
 
 
 def _is_relay(argv: Sequence[str]) -> bool:
-    """Whether the command (the first token that is no flag or global flag value) is
-    ``_session-event``."""
-    head = _head(argv)
+    """Whether the command is ``_session-event``: a standalone token that is no value of a known
+    global flag, before any other command name (unknown tokens are skipped), or the token after
+    ``--`` when no command came before it.
+
+    Deliberately lenient: the relay is a hook that must exit 0 whatever its argv, so an unknown
+    flag's separate value is skipped as a token, and the converse (``--prompt _session-event
+    launch``, where it is a flag's value) also lands on the relay. A failing hook would be worse.
+    """
+    commands = {key.split()[0] for key in build_parser().command_parsers}
+    tokens = list(argv)
     index = 0
-    while index < len(head) and head[index].startswith("-"):
-        index += 2 if head[index] in _GLOBAL_VALUE_FLAGS else 1
-    return index < len(head) and head[index] == "_session-event"
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return index + 1 < len(tokens) and tokens[index + 1] == "_session-event"
+        if token in _GLOBAL_VALUE_FLAGS:
+            index += 1  # its value is the next token
+        elif token == "_session-event":
+            return True
+        elif token in commands:
+            return False
+        index += 1
+    return False
 
 
 def _json_requested(argv: Sequence[str]) -> bool:

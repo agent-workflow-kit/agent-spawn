@@ -300,8 +300,13 @@ def _hold_checkpoints(conn: sqlite3.Connection, *, hold: bool) -> None:
 
 def _peek_version(path: Path, file_id: tuple[int, int], busy_timeout: float) -> int | None:
     """Read the schema version on a read-only connection, which can never write the database
-    or checkpoint its WAL (a newer database stays exactly as the newer agent-spawn left it)."""
-    conn = _connect(f"file:{urllib.parse.quote(str(path))}?mode=ro", busy_timeout, uri=True)
+    or checkpoint its WAL (a newer database stays exactly as the newer agent-spawn left it).
+    With no ``-wal`` file next to it the database is opened ``immutable``, which also creates no
+    empty ``-wal``/``-shm`` sidecars."""
+    quoted = urllib.parse.quote(str(path))
+    wal = Path(f"{path}-wal")
+    immutable = "" if wal.exists() or wal.is_symlink() else "&immutable=1"
+    conn = _connect(f"file:{quoted}?mode=ro{immutable}", busy_timeout, uri=True)
     try:
         with _mapped():
             version = _read_version(conn, path)

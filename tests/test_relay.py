@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import time
@@ -11,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from agent_spawn import relay
+from agent_spawn import cli, relay
 from agent_spawn.store import RELAY_EVENT_DAYS, Store
 from tests import schema_registry
 from tests.conftest import Isolation
@@ -461,6 +462,9 @@ def test_a_newer_schema_is_not_written_to(rig: Rig) -> None:
     db.close()
     done = rig.send(payload())
     assert done.returncode == 0 and b"schema_newer" in done.stderr
+    # the spec's `schema_older` log event covers any schema other than ours
+    assert [r["event"] for r in rig.log()] == ["schema_older"]
+    assert rig.log()[0]["details"] == {"found": 99, "expected": 1}
     db = sqlite3.connect(rig.state / "state.db")
     assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
     assert db.execute("SELECT COUNT(*) FROM relay_events").fetchone()[0] == 0
@@ -494,14 +498,14 @@ class _Stream:
 
 
 def test_the_relay_never_raises_in_process(
-    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
 ) -> None:
     def boom(*_a: object, **_k: object) -> None:
         raise RuntimeError("boom secret")
 
     monkeypatch.setattr("agent_spawn.relay.record", boom)
     assert relay.run(rig.argv()[1:], stdin=_Stream(json.dumps(payload()).encode())) == 0
-    err = capsys.readouterr().err
+    err = capfd.readouterr().err
     assert "RuntimeError" in err and "secret" not in err
 
 
@@ -533,3 +537,100 @@ def test_main_routes_the_relay_without_parsing_or_config(
 
     monkeypatch.setattr("sys.stdin", type("S", (), {"buffer": _Stream(b"{}")})())
     assert cli.main(["--json", "--state-dir", "relative", "_session-event", "--nonsense"]) == 0
+
+
+# --- review round 1 ----------------------------------------------------------------------------
+
+
+def _set_third_party(rig: Rig, run: int, value: bool) -> None:
+    with Store.open(rig.state, create=False) as store:
+        with store.lease(f"agent:{AGENT}") as lease:
+            store.put_run(lease, AGENT, run, {"reads_third_party": value})
+
+
+@pytest.mark.parametrize(
+    ("old_run", "current_run", "expected"),
+    [(True, False, True), (False, True, True), (False, False, False)],
+)
+def test_a_late_event_of_an_earlier_run_reports_either_runs_third_party_flag(
+    rig: Rig, old_run: bool, current_run: bool, expected: bool
+) -> None:
+    with Store.open(rig.state, create=False) as store:
+        with store.lease(f"agent:{AGENT}") as lease:
+            store.update_agent(lease, AGENT, {"run": 2})
+    _set_third_party(rig, 1, old_run)
+    _set_third_party(rig, 2, current_run)
+    assert rig.send(payload(run=1, event_id=5)).returncode == 0
+    (event,) = rig.outbox()
+    assert event["reads_third_party"] is expected
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--state-dir", "/a", "--config", "/b", "_session-event"],
+        ["--state-dir", "/a", "--config", "/b", "--", "_session-event"],
+        ["--", "_session-event"],
+        ["--bogus", "x", "--state-dir", "/a", "--config", "/b", "_session-event"],
+        ["--conf", "/b", "_session-event"],
+        ["--json", "--bogus=1", "_session-event"],
+        ["--prompt", "_session-event", "launch"],  # accepted trade-off, see cli._is_relay
+    ],
+)
+def test_the_relay_is_recognized_in_every_argv_shape(argv: list[str]) -> None:
+    assert cli._is_relay(argv)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [],
+        ["launch", "_session-event"],
+        ["--state-dir", "_session-event", "list"],  # its value, not the command
+        ["--config", "_session-event"],
+        ["launch", "--", "_session-event"],
+        ["--", "launch", "_session-event"],
+        ["list"],
+    ],
+)
+def test_other_argv_is_not_the_relay(argv: list[str]) -> None:
+    assert not cli._is_relay(argv)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_relay_after_a_double_dash_exits_0_with_an_invalid_config(rig: Rig) -> None:
+    rig.config.write_text("{{{ not yaml")
+    argv = [agent_spawn_path(), "--state-dir", str(rig.state), "--config", str(rig.config)]
+    done = rig.send(payload(), argv=[*argv, "--", "_session-event"])
+    assert done.returncode == 0 and len(rig.outbox()) == 1
+
+
+def test_a_closed_stderr_pipe_does_not_change_the_exit_code(rig: Rig) -> None:
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    try:
+        done = subprocess.run(
+            rig.argv(),
+            input=b"{not json",
+            stdout=subprocess.DEVNULL,
+            stderr=write_end,
+            env={**rig.iso.env},
+            timeout=60,
+            check=False,
+        )
+    finally:
+        os.close(write_end)
+    assert done.returncode == 0
+
+
+@pytest.mark.parametrize("version", ["0", "99"])
+def test_a_foreign_schema_without_sidecars_is_left_byte_for_byte(rig: Rig, version: str) -> None:
+    db = sqlite3.connect(rig.state / "state.db")
+    db.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (version,))
+    db.commit()
+    db.close()
+    before = (rig.state / "state.db").read_bytes()
+    sidecars = [rig.state / "state.db-wal", rig.state / "state.db-shm"]
+    assert not any(p.exists() for p in sidecars)
+    assert rig.send(payload()).returncode == 0
+    assert not any(p.exists() for p in sidecars)
+    assert (rig.state / "state.db").read_bytes() == before

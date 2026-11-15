@@ -14,6 +14,7 @@ lines carry fixed text only, never payload text.
 from __future__ import annotations
 
 import json
+import os
 import re
 import signal
 import sys
@@ -63,13 +64,75 @@ _END_REASON = re.compile(
     r"|launch_interrupted|config_invalid|claude_not_found|sandbox_unavailable"
     r"|socket_path_too_long|invalid_permission_profile|unsafe_cwd|unsafe_path|unsafe_plugin_dir"
     r"|unsafe_read_dir|plugin_dir_missing|git_dir_changed|no_git_cwd|fork_cwd_unsupported"
-    r"|no_tty|tmpdir_unsafe|unsafe_claude_args|claude_too_old|exit_[0-9]+|signal_[a-z0-9]+"
+    r"|no_tty|tmpdir_unsafe|session_dir_unsafe|unsafe_claude_args|unsafe_setting_sources"
+    r"|claude_too_old|exit_[0-9]+|signal_[a-z0-9]+"
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _TS = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?"
     r"(?:Z|[+-][0-9]{2}:[0-9]{2})"
 )
+# The consistency rules of schemas/hooks/post-state-change.json (the same rules claude-session's
+# hook schema carries): outcome -> exit code, outcome -> end_reason, phase -> outcome/end_reason.
+_EXIT_CODES = {
+    "done": 0,
+    "blocked": 13,
+    "needs-input": 13,
+    "failed": 18,
+    "exited-unreported": 14,
+    "killed": 15,
+    "timeout": 16,
+    "lost": 17,
+    "not-started": 12,
+    "vetoed": 11,
+    "escalated": 13,
+}
+_START_FAILURES = frozenset(
+    "canceled never_adopted launch_interrupted config_invalid claude_not_found "
+    "sandbox_unavailable socket_path_too_long invalid_permission_profile unsafe_cwd unsafe_path "
+    "unsafe_plugin_dir unsafe_read_dir plugin_dir_missing git_dir_changed no_git_cwd "
+    "fork_cwd_unsupported no_tty tmpdir_unsafe session_dir_unsafe unsafe_claude_args "
+    "unsafe_setting_sources claude_too_old".split()
+)
+_LAUNCH_END = _START_FAILURES | {"hook_veto", "hook_escalate", "hook_timeout"}
+_LAUNCH_OUTCOMES = ("not-started", "vetoed", "escalated")
+_END_BY_OUTCOME: dict[str, tuple[frozenset[str], re.Pattern[str] | None]] = {
+    "timeout": (frozenset(("timeout", "max_turns")), None),
+    "lost": (frozenset(("lost",)), None),
+    "killed": (
+        frozenset("stopped internal_error forwarded_term forwarded_hup forwarded_int".split()),
+        re.compile(r"signal_[a-z0-9]+"),
+    ),
+    "exited-unreported": (
+        frozenset(
+            "normal user_exit api_error no_result no_report result_rejected "
+            "no_session_start".split()
+        ),
+        re.compile(r"exit_[0-9]+"),
+    ),
+    "vetoed": (frozenset(("hook_veto", "hook_timeout")), None),
+    "escalated": (frozenset(("hook_escalate",)), None),
+    "not-started": (_START_FAILURES, None),
+}
+
+
+def _outcome_consistent(
+    final: bool, outcome: str | None, end: str | None, code: int | None, phase: str
+) -> bool:
+    """Whether the final/outcome/end_reason/exit_code/phase combination breaks none of the
+    schema's consistency rules (``outcome`` and ``end`` are already known to be well formed)."""
+    if not final:
+        return outcome is None and end is None and code is None
+    if outcome is None or end is None or code != _EXIT_CODES[outcome]:
+        return False
+    allowed = _END_BY_OUTCOME.get(outcome)
+    if allowed is not None:
+        names, pattern = allowed
+        if end not in names and not (pattern is not None and pattern.fullmatch(end)):
+            return False
+    if phase == "launch":
+        return outcome in _LAUNCH_OUTCOMES and end in _LAUNCH_END
+    return outcome not in _LAUNCH_OUTCOMES and end not in _LAUNCH_END
 
 
 class _Deadline(BaseException):
@@ -187,9 +250,8 @@ class Event:
             code is None or _is_int(code, -(2**31), 2**31),
             raw["message"] is None or isinstance(raw["message"], str),
             raw["sandbox_active"] is None or isinstance(raw["sandbox_active"], bool),
-            (outcome is not None and code is not None) == (final is True),
         )
-        if not all(checks):
+        if not all(checks) or not _outcome_consistent(final, outcome, end, code, raw["phase"]):
             raise ValueError("invalid session fields")
 
     def first_working_at(self) -> float | None:
@@ -314,6 +376,9 @@ def record(store: Store, event: Event) -> str:
         assert after is not None
         run_row = store.get_run(event.agent_id, after["run"]) if after.get("run") else None
         reads = None if run_row is None else run_row.get("reads_third_party")
+        if after.get("run") != event.run:  # a late event of an earlier run: redact if either is
+            own = store.get_run(event.agent_id, event.run)
+            reads = _either_reads(reads, None if own is None else own.get("reads_third_party"))
         store.add_events(
             event.agent_id,
             [
@@ -328,14 +393,24 @@ def record(store: Store, event: Event) -> str:
     return "recorded"
 
 
+def _either_reads(current: bool | None, own: bool | None) -> bool | None:
+    """``reads_third_party`` for an event of an earlier run: true when either run is true,
+    unknown (``None``, which redacts) when either is unknown, else false."""
+    if current is True or own is True:
+        return True
+    return None if current is None or own is None else False
+
+
 # --- entry point -----------------------------------------------------------------------------
 
 
 def _stderr(message: str) -> None:
+    """One diagnostic line on fd 2, unbuffered: nothing is left in a stream buffer whose flush
+    at interpreter shutdown would fail (a closed pipe) and change the exit code."""
     try:
-        sys.stderr.write(safe_text(f"agent-spawn: _session-event: {message}") + "\n")
-        sys.stderr.flush()
-    except (OSError, ValueError, AttributeError):
+        line = safe_text(f"agent-spawn: _session-event: {message}") + "\n"
+        os.write(2, line.encode("utf-8", "replace"))
+    except OSError:
         pass
 
 
@@ -363,6 +438,16 @@ def _handle(state_dir: str, stdin: Any) -> None:
         return
     except CliError as exc:
         _stderr(f"cannot open the state database ({exc.code}); event dropped")
+        if exc.code == "schema_newer":  # any schema other than ours is `schema_older` in the log
+            versions = re.search(r"schema (\d+);.* up to (\d+)", str(exc))
+            _log(
+                state_dir,
+                "schema_older",
+                message="the state database has a newer schema; relay event dropped",
+                details=(
+                    {"found": int(versions[1]), "expected": int(versions[2])} if versions else {}
+                ),
+            )
         return
     except StoreError as exc:
         _stderr(f"cannot open the state database ({type(exc).__name__}); event dropped")
@@ -408,6 +493,19 @@ def _handle(state_dir: str, stdin: Any) -> None:
         )
 
 
+def _quiet_streams() -> None:
+    """Make sure nothing buffered in ``sys.stdout``/``sys.stderr`` can fail the shutdown flush
+    (a closed pipe turns it into exit 120): a stream that cannot flush is replaced by a sink."""
+    for name in ("stdout", "stderr"):
+        try:
+            getattr(sys, name).flush()
+        except (OSError, ValueError, AttributeError):
+            try:
+                setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))  # noqa: SIM115
+            except OSError:
+                pass
+
+
 def _on_alarm(_signum: int, _frame: object) -> None:
     raise _Deadline
 
@@ -438,4 +536,5 @@ def run(argv: Sequence[str], stdin: Any = None) -> int:
                 signal.signal(signal.SIGALRM, previous)
         except (ValueError, OSError):
             pass
+        _quiet_streams()
     return 0
