@@ -174,7 +174,8 @@ class Event:
         missing = [k for k in _REQUIRED if k not in raw]
         if missing:
             raise ValueError("missing fields")
-        final, end, code, outcome = raw["final"], raw["end_reason"], raw["exit_code"], raw["outcome"]
+        final, outcome = raw["final"], raw["outcome"]
+        end, code = raw["end_reason"], raw["exit_code"]
         checks = (
             _enum(raw["previous_state"], _STATES, nullable=True),
             isinstance(final, bool),
@@ -438,4 +439,3 @@ def run(argv: Sequence[str], stdin: Any = None) -> int:
         except (ValueError, OSError):
             pass
     return 0
-

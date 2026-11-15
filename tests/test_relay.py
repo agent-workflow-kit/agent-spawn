@@ -229,9 +229,10 @@ def test_needs_input_reason_and_a_final_report_are_relayed(rig: Rig) -> None:
     (event,) = rig.outbox()
     validate_outbox(event)
     assert event["final"] is True and event["report"]["summary"] == "text <script>"
-    assert rig.send(
-        payload(event_id=4, state="needs-input", needs_input_reason="question")
-    ).returncode == 0
+    assert (
+        rig.send(payload(event_id=4, state="needs-input", needs_input_reason="question")).returncode
+        == 0
+    )
     assert rig.row()["needs_input_reason"] == "question"
 
 

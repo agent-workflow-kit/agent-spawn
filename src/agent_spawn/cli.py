@@ -20,9 +20,8 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, NoReturn
 
-from . import __version__, gateway
+from . import __version__, gateway, relay
 from . import launch as launch_module
-from . import relay
 from .commands.base import Invocation
 from .commands.table import HANDLERS
 from .config import load_config

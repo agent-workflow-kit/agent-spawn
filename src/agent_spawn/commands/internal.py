@@ -15,5 +15,6 @@ def supervise(inv: Invocation) -> Outcome:
 def session_event(inv: Invocation) -> Outcome:
     """Reached only through a handler call in tests: ``cli.main`` hands the real command to
     ``relay.run`` before parsing, so that it exits 0 whatever its argv or config."""
-    relay.run(["--state-dir", inv.state_dir or "", "--config", inv.config_path or "", "_session-event"])
+    argv = ["--state-dir", inv.state_dir or "", "--config", inv.config_path or ""]
+    relay.run([*argv, "_session-event"])
     return Outcome(0, {}, PayloadKind.COMMAND, quiet=True)
