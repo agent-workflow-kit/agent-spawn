@@ -534,30 +534,54 @@ class Resume(Launch):
         base = stored.directory
         result = _Copies(base, stored.prompt, list(stored.inputs), list(stored.input_names))
         inputs = os.path.join(base, "inputs")
-        old = inputs + ".old"
+        old_inputs = inputs + ".old"
+        prompt = os.path.join(base, "prompt")
+        old_prompt = prompt + ".old"
+        swapped_inputs = swapped_prompt = False
+        had_inputs = had_prompt = False
+        previous = dict(self.stored)
         with _signals_held():
-            if gave_prompt and fresh.prompt is not None:
-                target = os.path.join(base, "prompt")
-                os.replace(fresh.prompt, target)
-                result.prompt = target
-            if gave_inputs:
-                shutil.rmtree(old, ignore_errors=True)
-                had = os.path.isdir(inputs)
-                if had:
-                    os.rename(inputs, old)
-                try:
+            try:
+                # Inputs first (the step that can fail on its own), then the prompt; every
+                # replaced copy is kept as ``*.old`` until the settings are stored, so one
+                # failure anywhere puts the previous copies back and disk and settings agree.
+                if gave_inputs:
+                    shutil.rmtree(old_inputs, ignore_errors=True)
+                    had_inputs = os.path.isdir(inputs)
+                    if had_inputs:
+                        os.rename(inputs, old_inputs)
+                    swapped_inputs = True
                     os.rename(os.path.join(fresh.directory, "inputs"), inputs)
-                except BaseException:
-                    if had:
-                        os.rename(old, inputs)
-                    raise
-                result.inputs = [
-                    os.path.join(inputs, str(index), name)
-                    for index, name in enumerate(fresh.input_names)
-                ]
-                result.input_names = list(fresh.input_names)
-                shutil.rmtree(old, ignore_errors=True)
-            self.store_copy_settings(result, gave_prompt, gave_inputs)
+                    result.inputs = [
+                        os.path.join(inputs, str(index), name)
+                        for index, name in enumerate(fresh.input_names)
+                    ]
+                    result.input_names = list(fresh.input_names)
+                if gave_prompt and fresh.prompt is not None:
+                    if os.path.lexists(old_prompt):
+                        os.remove(old_prompt)
+                    had_prompt = os.path.lexists(prompt)
+                    if had_prompt:
+                        os.rename(prompt, old_prompt)
+                    swapped_prompt = True
+                    os.replace(fresh.prompt, prompt)
+                    result.prompt = prompt
+                self.store_copy_settings(result, gave_prompt, gave_inputs)
+            except BaseException:
+                self.stored = previous
+                if swapped_prompt:
+                    if os.path.lexists(prompt):
+                        os.remove(prompt)
+                    if had_prompt:
+                        os.rename(old_prompt, prompt)
+                if swapped_inputs:
+                    shutil.rmtree(inputs, ignore_errors=True)
+                    if had_inputs:
+                        os.rename(old_inputs, inputs)
+                raise
+            if had_prompt:
+                os.remove(old_prompt)
+            shutil.rmtree(old_inputs, ignore_errors=True)
         shutil.rmtree(fresh.directory, ignore_errors=True)
         self.new_copies = None
         return result
@@ -608,7 +632,7 @@ class Resume(Launch):
         ):
             return
         real = os.path.realpath(plan)
-        if cwd != third_party.SESSION_DIR and real == cwd:
+        if cwd != third_party.SESSION_DIR and real == os.path.realpath(cwd):
             return
         assert self.backend is not None
         work: str | None = None

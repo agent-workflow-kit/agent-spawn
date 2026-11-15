@@ -441,3 +441,123 @@ def test_name_term_placement_and_promote_are_stored_on_success(env: Env) -> None
     row = env.agent(agent_id)
     assert (row["name"], row["term_placement"], row["promote"]) == ("renamed", "main", True)
     assert events(env, agent_id) is not None
+
+
+# --- install_copies keeps the disk and the stored settings consistent ----------------------
+
+
+def _copy_tree(root: Path, prompt: str, inputs: dict[str, str]) -> Any:
+    from agent_spawn.launch import _Copies
+
+    root.mkdir(parents=True)
+    copies = _Copies(str(root))
+    if prompt:
+        (root / "prompt").write_text(prompt)
+        copies.prompt = str(root / "prompt")
+    for index, (name, text) in enumerate(inputs.items()):
+        (root / "inputs" / str(index)).mkdir(parents=True, exist_ok=True)
+        (root / "inputs" / str(index) / name).write_text(text)
+        copies.inputs.append(str(root / "inputs" / str(index) / name))
+        copies.input_names.append(name)
+    return copies
+
+
+def _resume_with_stored(stored: dict[str, Any]) -> Any:
+    from agent_spawn.resume import Resume
+
+    resume = Resume.__new__(Resume)
+    resume.stored = dict(stored)
+    resume.new_copies = None
+    return resume
+
+
+def _snapshot(root: Path) -> dict[str, str]:
+    return {str(p.relative_to(root)): p.read_text() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def test_a_failed_settings_write_puts_the_previous_copies_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stored = _copy_tree(tmp_path / "base", "old prompt", {"a.txt": "old a"})
+    fresh = _copy_tree(tmp_path / "fresh", "new prompt", {"b.txt": "new b"})
+    resume = _resume_with_stored({"has_prompt": True, "input_names": ["a.txt"]})
+    before = _snapshot(tmp_path / "base")
+
+    def boom(*_args: Any) -> None:
+        raise RuntimeError("lease timeout")
+
+    monkeypatch.setattr(resume, "store_copy_settings", boom)
+    with pytest.raises(RuntimeError):
+        resume.install_copies(stored, fresh, True, True)
+    assert _snapshot(tmp_path / "base") == before
+    assert resume.stored == {"has_prompt": True, "input_names": ["a.txt"]}
+
+
+def test_a_failed_inputs_rename_leaves_the_stored_prompt_and_inputs_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    stored = _copy_tree(tmp_path / "base", "old prompt", {"a.txt": "old a"})
+    fresh = _copy_tree(tmp_path / "fresh", "new prompt", {"b.txt": "new b"})
+    resume = _resume_with_stored({"has_prompt": True, "input_names": ["a.txt"]})
+    before = _snapshot(tmp_path / "base")
+    real_rename = os.rename
+
+    def flaky(src: Any, dst: Any) -> None:
+        if str(src) == str(tmp_path / "fresh" / "inputs"):
+            raise OSError("rename failed")
+        real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", flaky)
+    called: list[bool] = []
+    monkeypatch.setattr(resume, "store_copy_settings", lambda *_a: called.append(True))
+    with pytest.raises(OSError):
+        resume.install_copies(stored, fresh, True, True)
+    assert _snapshot(tmp_path / "base") == before
+    assert not called
+
+
+def test_a_successful_swap_replaces_both_and_leaves_no_old_files(tmp_path: Path) -> None:
+    stored = _copy_tree(tmp_path / "base", "old prompt", {"a.txt": "old a"})
+    fresh = _copy_tree(tmp_path / "fresh", "new prompt", {"b.txt": "new b"})
+    resume = _resume_with_stored({})
+    resume.store_copy_settings = lambda *_a: None
+    result = resume.install_copies(stored, fresh, True, True)
+    assert _snapshot(tmp_path / "base") == {"prompt": "new prompt", "inputs/0/b.txt": "new b"}
+    assert result.input_names == ["b.txt"]
+
+
+# --- the cwd rule compares canonical paths -----------------------------------------------
+
+
+def test_a_symlinked_recorded_cwd_equal_to_the_plan_cwd_needs_no_status_call(
+    tmp_path: Path,
+) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    from agent_spawn.resume import Resume
+
+    resume = Resume.__new__(Resume)
+    resume.fork = False
+    resume.source_session = "s"
+    resume.log = lambda *_a, **_k: None  # type: ignore[method-assign]
+
+    class Backend:
+        def status(self, _session: str) -> Any:
+            raise AssertionError("status must not be called")
+
+    resume.backend = Backend()  # type: ignore[assignment]
+    from agent_spawn import third_party
+
+    classification = third_party.Classification(
+        reads_third_party=True,
+        run_kind="x",
+        repo=None,
+        cwd=str(real),
+        would_refuse=None,
+        would_fail=None,
+    )
+    resume.check_plan_cwd(classification, str(link))  # recorded cwd under a symlink
