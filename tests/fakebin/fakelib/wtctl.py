@@ -1,8 +1,8 @@
 """Fake ``wtctl`` (interface 0.1.0-design).
 
 Implemented commands: ``create`` (worktrees and throwaways, with the retry-after-crash ``reused``
-path), ``list``, ``show``, ``status``, ``remove``, ``forget``, ``label add|remove``, ``locate``,
-``baseline check``, ``reconcile`` and ``prune``. ``adopt``, ``bootstrap``, ``extract``,
+path), ``adopt``, ``list``, ``show``, ``status``, ``remove``, ``forget``, ``label add|remove``,
+``locate``, ``baseline check``, ``reconcile`` and ``prune``. ``bootstrap``, ``extract``,
 ``baseline accept``, ``clone``, ``export`` and ``cron`` exit 1 with ``fake_unsupported``.
 Records live in ``<FAKEBIN_LOG>.records.json``. ``create`` makes the directory (an empty one,
 no git) under ``<state>/wtctl-fake/``; ``remove`` deletes only a directory the fake created.
@@ -69,6 +69,13 @@ SPECS: dict[str, dict[str, str]] = {
         "--source": VALUE,
         "--depth": VALUE,
     },
+    "adopt": {
+        **GLOBAL,
+        "--repo": VALUE,
+        "--name": VALUE,
+        "--holder": VALUE,
+        "--label": MULTI,
+    },
     "list": {
         **GLOBAL,
         "--repo": VALUE,
@@ -103,7 +110,7 @@ SPECS: dict[str, dict[str, str]] = {
         "--label": MULTI,
     },
 }
-UNSUPPORTED = ("adopt", "bootstrap", "extract", "clone", "export", "cron")
+UNSUPPORTED = ("bootstrap", "extract", "clone", "export", "cron")
 CHECK_NAMES = (
     "integrity locked baseline in_use held fetch tracked untracked ignored nested_repos stash "
     "unpushed_head unpushed_branches"
@@ -365,6 +372,22 @@ def do_create(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
             r["name"] for r in data.values() if r["state"] in LIVE_STATES and r["repo"] == repo
         }
         wanted = name or derive_name(branch, record_id[3:])
+        if name is not None and name in taken and not dry:
+            # An explicit --name is never suffixed: the real wtctl refuses (path_exists, or
+            # branch_exists first for a template-built branch) before any reuse, and agent-spawn
+            # finds its own record by name (the fake never takes the reuse path for a name).
+            holder_record = next(
+                r
+                for r in data.values()
+                if r["state"] in LIVE_STATES and r["repo"] == repo and r["name"] == name
+            )
+            ctx.fail(
+                20,
+                "refused",
+                f"the name {name!r} is taken",
+                reason="path_exists",
+                holder_id=holder_record["id"],
+            )
         final, n = wanted, 1
         while final in taken:
             n += 1
@@ -430,6 +453,15 @@ def do_create(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
 
     ctx.check_scripted_error("create")
     record, reused = update_records(create)
+    failed_step = ctx.response("create").get("bootstrap_failed")
+    if failed_step is not None and not dry and not reused:
+        # A failed bootstrap step keeps the worktree and the record (active) and exits 12.
+        ctx.fail(
+            12,
+            "bootstrap_failed",
+            "a bootstrap step failed",
+            details={"record": record["id"], "step": str(failed_step)},
+        )
     if record["object_type"] == "throwaway":
         action = None
         bootstrap = None
@@ -449,6 +481,94 @@ def do_create(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         "dry_run": dry,
     }
     return 0, out, "create"
+
+
+def do_adopt(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
+    if len(p.positionals) != 1:
+        ctx.usage("adopt takes exactly one path")
+    raw = p.positionals[0]
+    if not raw.startswith("/"):
+        ctx.usage(f"adopt needs an absolute path, got {raw!r}")
+    if (repo := p.get("--repo")) is not None:
+        require_pattern(repo, g.REPO_ID, "--repo")
+    if (name := p.get("--name")) is not None:
+        require_pattern(name, g.WT_NAME, "--name")
+    holder = p.get("--holder")
+    if holder is not None:
+        require_pattern(holder, g.HOLDER, "--holder")
+    labels = p.multi("--label")
+    for label in labels:
+        require_pattern(label, g.LABEL, "label")
+    real = os.path.realpath(raw)
+    root = os.path.realpath(fake_root())
+    if real == root or real.startswith(root + os.sep + "throwaways"):
+        ctx.usage("the path lies in wtctl's state dir or throwaway root")
+    dry = p.has("--dry-run")
+
+    def adopt(data: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], bool]:
+        for existing in data.values():
+            if existing["state"] in LIVE_STATES and os.path.realpath(existing["path"]) == real:
+                if existing["state"] != "active":
+                    reason = "unlinked" if existing["state"] == "unlinked" else "path_exists"
+                    ctx.fail(20, "refused", f"the record is {existing['state']}", reason=reason)
+                if holder is not None and holder not in existing["holders"] and not dry:
+                    existing["holders"] = [*existing["holders"], holder]
+                return dict(existing), True
+        if not os.path.isdir(real):
+            ctx.fail(10, "not_found", f"{raw!r} is not a git worktree")
+        record_id = base32_id("wt-", peek_counter("wt") if dry else counter("wt"))
+        base = re.sub(r"[^A-Za-z0-9._-]", "-", os.path.basename(real)).lstrip("-.")[:64]
+        wanted = name or base or record_id[3:]
+        the_repo = repo or "example.invalid/fake/adopted"
+        taken = {
+            r["name"] for r in data.values() if r["state"] in LIVE_STATES and r["repo"] == the_repo
+        }
+        final, n = wanted, 1
+        while final in taken:
+            n += 1
+            final = f"{wanted[: 64 - len(str(n)) - 1]}-{n}"
+        record: dict[str, Any] = {
+            "id": record_id,
+            "object_type": "worktree",
+            "owned": False,
+            "state": "active",
+            "repo": the_repo,
+            "clone_path": f"/fake/clones/{the_repo}",
+            "common_dir": f"/fake/clones/{the_repo}/.git",
+            "admin_dir": f"/fake/clones/{the_repo}/.git/worktrees/{final}",
+            "common_id": "1:1",
+            "dir_id": "1:7",
+            "base_dir": None,
+            "root_id": None,
+            "path": real,
+            "name": final,
+            "branch": None,
+            "created_branch": False,
+            "base": None,
+            "base_sha": None,
+            "head_at_create": "a" * 40,
+            "ref": None,
+            "source": None,
+            "depth": None,
+            "fetch_url": f"https://{the_repo}.git",
+            "remote": "origin",
+            "labels": sorted(set(labels)),
+            "holders": [holder] if holder else [],
+            "baseline_digest": "c" * 64,
+            "bootstrap": {"state": "none", "steps": [], "created_paths_count": 0},
+            "created": FIXED_TS,
+            "updated": FIXED_TS,
+            "missing_since": None,
+            "removed_at": None,
+            "last_error": None,
+        }
+        if not dry:
+            data[record_id] = record
+        return record, False
+
+    ctx.check_scripted_error("adopt")
+    record, existing = update_records(adopt)
+    return 0, {"record": record, "existing": existing, "dry_run": dry}, "adopt"
 
 
 def do_list(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
@@ -687,6 +807,7 @@ def do_prune(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
 
 HANDLERS: dict[str, Callable[[Context, Parsed], tuple[int, Any, str]]] = {
     "create": do_create,
+    "adopt": do_adopt,
     "list": do_list,
     "show": do_show,
     "status": do_status,

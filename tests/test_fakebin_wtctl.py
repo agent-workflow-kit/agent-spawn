@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -44,10 +45,11 @@ def test_create_throwaway_validates(fakebin: Fakebin) -> None:
 
 
 def test_names_are_made_unique_per_repo(fakebin: Fakebin) -> None:
-    first = create(fakebin, "--name", "same")["record"]
-    second = create(fakebin, "--name", "same")["record"]
+    # A derived name that collides gets a suffix (an explicit --name is refused instead).
+    first = create(fakebin, "--branch", "a/x")["record"]
+    second = create(fakebin, "--branch", "a-x")["record"]
     assert isinstance(first, dict) and isinstance(second, dict)
-    assert (first["name"], second["name"]) == ("same", "same-2")
+    assert (first["name"], second["name"]) == ("a-x", "a-x-2")
 
 
 def test_retry_after_a_crash_returns_the_record_unchanged_for_a_holder(fakebin: Fakebin) -> None:
@@ -228,7 +230,7 @@ def test_merge_overrides_canned_fields_and_stays_schema_valid(fakebin: Fakebin) 
 
 def test_version_and_unsupported(fakebin: Fakebin) -> None:
     assert fakebin.run("wtctl", "--version").stdout == "wtctl 0.1.0\n"
-    done = fakebin.run("wtctl", "adopt", "/x", "--json")
+    done = fakebin.run("wtctl", "bootstrap", "wt-aaaaaaaa", "--json")
     assert done.returncode == 1 and json.loads(done.stdout)["error"]["code"] == "fake_unsupported"
 
 
@@ -337,3 +339,56 @@ def test_a_dry_run_create_takes_no_record_id(fakebin: Fakebin) -> None:
     assert not os.path.exists(dry["record"]["path"])  # type: ignore[index]
     real = create(fakebin, "--branch", "b")["record"]
     assert dry["record"]["id"] == real["id"]  # type: ignore[index]
+
+
+# --- adopt (added for worktrees at launch) ---------------------------------------------------
+
+
+def test_adopt_records_an_unowned_worktree_and_a_second_adopt_adds_the_holder(
+    fakebin: Fakebin, tmp_path: Path
+) -> None:
+    target = tmp_path / "tree"
+    target.mkdir()
+    first = json.loads(
+        fakebin.run("wtctl", "adopt", str(target), "--holder", "ag-aaaaaaaa", "--json").stdout
+    )
+    assert first["existing"] is False and first["record"]["owned"] is False
+    assert first["record"]["holders"] == ["ag-aaaaaaaa"]
+    sibling_schemas.validate(first, "wtctl", "cli/adopt.json")
+    second = json.loads(
+        fakebin.run("wtctl", "adopt", str(target), "--holder", "ag-bbbbbbbb", "--json").stdout
+    )
+    assert second["existing"] is True and second["record"]["id"] == first["record"]["id"]
+    assert second["record"]["holders"] == ["ag-aaaaaaaa", "ag-bbbbbbbb"]
+
+
+def test_adopt_refusals(fakebin: Fakebin, tmp_path: Path) -> None:
+    assert fakebin.run("wtctl", "adopt", "relative", "--json").returncode == 2
+    missing = fakebin.run("wtctl", "adopt", str(tmp_path / "nope"), "--json")
+    assert missing.returncode == 10
+    throwaway = json.loads(
+        fakebin.run(
+            "wtctl", "create", "--throwaway", "--repo", "example.org/o/r", "--ref", "a" * 40, "--json"
+        ).stdout
+    )["record"]
+    inside = fakebin.run("wtctl", "adopt", throwaway["path"], "--json")
+    assert inside.returncode == 2
+
+
+def test_create_can_script_a_bootstrap_failure_that_keeps_the_record(fakebin: Fakebin) -> None:
+    fakebin.script("wtctl", "create", bootstrap_failed="install")
+    done = fakebin.run("wtctl", "create", "--repo", "example.org/o/r", "--branch", "m", "--json")
+    error = json.loads(done.stdout)["error"]
+    assert done.returncode == 12 and error["code"] == "bootstrap_failed"
+    assert error["details"]["step"] == "install"
+    shown = fakebin.run("wtctl", "show", error["details"]["record"], "--json")
+    assert json.loads(shown.stdout)["state"] == "active"
+
+
+def test_an_explicit_name_collision_is_refused_not_suffixed(fakebin: Fakebin) -> None:
+    args = ("wtctl", "create", "--repo", "example.org/o/r", "--detach", "--name", "same", "--json")
+    first = json.loads(fakebin.run(*args).stdout)["record"]
+    second = fakebin.run(*args)
+    error = json.loads(second.stdout)["error"]
+    assert second.returncode == 20 and error["reason"] == "path_exists"
+    assert error["holder_id"] == first["id"]
