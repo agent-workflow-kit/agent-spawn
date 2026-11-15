@@ -716,7 +716,10 @@ def do_forget(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         elif holder in current["holders"]:
             if not dry:
                 current["holders"] = [h for h in current["holders"] if h != holder]
-            # An owned record is never forgotten through --holder.
+                # The record becomes forgotten only when this call removed the last holder and
+                # the record is adopted; an owned record is never forgotten through --holder.
+                if not current["holders"] and current["owned"] is False:
+                    current.update(state="forgotten", removed_at=FIXED_TS)
         else:
             warnings.append("not_a_holder")
         return dict(current)

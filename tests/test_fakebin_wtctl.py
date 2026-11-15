@@ -368,7 +368,14 @@ def test_adopt_refusals(fakebin: Fakebin, tmp_path: Path) -> None:
     assert missing.returncode == 10
     throwaway = json.loads(
         fakebin.run(
-            "wtctl", "create", "--throwaway", "--repo", "example.org/o/r", "--ref", "a" * 40, "--json"
+            "wtctl",
+            "create",
+            "--throwaway",
+            "--repo",
+            "example.org/o/r",
+            "--ref",
+            "a" * 40,
+            "--json",
         ).stdout
     )["record"]
     inside = fakebin.run("wtctl", "adopt", throwaway["path"], "--json")
@@ -392,3 +399,26 @@ def test_an_explicit_name_collision_is_refused_not_suffixed(fakebin: Fakebin) ->
     error = json.loads(second.stdout)["error"]
     assert second.returncode == 20 and error["reason"] == "path_exists"
     assert error["holder_id"] == first["id"]
+
+
+def test_forgetting_the_last_holder_forgets_an_adopted_record_only(
+    fakebin: Fakebin, tmp_path: Path
+) -> None:
+    target = tmp_path / "tree"
+    target.mkdir()
+    adopted = json.loads(
+        fakebin.run("wtctl", "adopt", str(target), "--holder", "ag-aaaaaaaa", "--json").stdout
+    )["record"]
+    done = json.loads(
+        fakebin.run("wtctl", "forget", adopted["id"], "--holder", "ag-aaaaaaaa", "--json").stdout
+    )
+    assert done["record"]["state"] == "forgotten"
+    again = fakebin.run("wtctl", "forget", adopted["id"], "--holder", "ag-aaaaaaaa", "--json")
+    assert again.returncode == 10
+    assert json.loads(again.stdout)["error"]["details"]["state"] == "forgotten"
+    owned = create(fakebin, "--branch", "keep", "--holder", "ag-aaaaaaaa")["record"]
+    assert isinstance(owned, dict)
+    kept = json.loads(
+        fakebin.run("wtctl", "forget", owned["id"], "--holder", "ag-aaaaaaaa", "--json").stdout
+    )
+    assert kept["record"]["state"] == "active" and kept["record"]["holders"] == []
