@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from typing import NoReturn
-
 from .. import launch as launch_module
+from .. import resume as resume_module
 from ..output import Outcome
-from .base import Invocation, not_implemented
+from .base import Invocation
 
 
 def launch(inv: Invocation) -> Outcome:
@@ -14,6 +13,6 @@ def launch(inv: Invocation) -> Outcome:
     return launch_module.launch(inv, restore_handlers=False)
 
 
-def resume(inv: Invocation) -> NoReturn:
-    # TODO(#13): resume and fork (interface.md, Resume order).
-    not_implemented("resume", 13)
+def resume(inv: Invocation) -> Outcome:
+    # TODO(#20): worktrees, #27: windows, #30: --placement here (see resume.Resume.plan_run).
+    return resume_module.resume(inv, restore_handlers=False)

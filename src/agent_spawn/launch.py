@@ -215,16 +215,20 @@ class _Copies:
     input_names: list[str] = field(default_factory=lambda: [])
 
 
-def make_copies(state_dir: str, agent_id: str, args: Any) -> _Copies:
+def make_copies(state_dir: str, agent_id: str, args: Any, *, subdir: str | None = None) -> _Copies:
     """Copy the prompt and the inputs into ``<state>/prompts/<agent_id>/`` (launch step 1).
 
     The directory is made exclusively (mode 0700): two launchers that drew the same id never
-    share it. Later steps pass these copies, never the caller's paths.
+    share it. Later steps pass these copies, never the caller's paths. A resume of an agent
+    that already has a prompt directory copies into ``subdir`` below it instead.
     """
     names = input_names(args)  # exit 2 before anything is created
     base = os.path.join(state_dir, "prompts")
     os.makedirs(base, mode=0o700, exist_ok=True)
     directory = os.path.join(base, agent_id)
+    if subdir is not None:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        directory = os.path.join(directory, subdir)
     try:
         os.mkdir(directory, 0o700)
     except FileExistsError:
@@ -594,8 +598,10 @@ class Launch:
         state.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.store = Store.open(self.state_dir, gateway=self.gateway)
         store = self.store
-        # TODO(#13): no `kill_grace` config key exists yet, so every `stop` of this backend uses
-        # claude-session's default grace (30 s); a key needs a spec change first.
+        # No `kill_grace` config key: the launcher never passes `--grace` to `stop`
+        # (claude-session's own grace applies), so the backend's `kill_grace` only widens a call
+        # timeout that is never lengthened here (decided in #13; a key is needed only when a
+        # command takes a grace).
         self.backend = SessionBackend(
             cs_argv,
             actor=self.inv.actor,
@@ -1270,6 +1276,13 @@ class Launch:
         )
         return error_outcome(error, self.inv.decision_ids)
 
+    def cleanup_failed(self, failure: CliError) -> None:
+        """Undo what a failed command left that its error path did not (called once, with
+        signals recorded rather than raised). A launch before its record exists drops its
+        prompt copies; once the record exists they stay for the next resume."""
+        if self.copies is not None and not self.agent_inserted:
+            remove_copies(self.copies.directory)
+
     def store_failed(self, error: StoreError) -> CliError:
         """The state database failed mid-launch: end what is pending and report, never escape.
 
@@ -1393,9 +1406,16 @@ def launch(inv: Any, *, restore_handlers: bool = True) -> Outcome:
     after this returns, so a signal that arrives while the result is printed cannot lose it;
     the caller then calls ``restore_signal_handlers`` once the output is flushed.
     """
+    return run_command(inv, Launch, restore_handlers=restore_handlers)
+
+
+def run_command(
+    inv: Any, make: Callable[[Any, SignalState], Launch], *, restore_handlers: bool
+) -> Outcome:
+    """The signal handling and failure cleanup shared by ``launch`` and ``resume``."""
     global _pending_restore
     sig = SignalState()
-    launch_run = Launch(inv, sig)
+    launch_run = make(inv, sig)
     restore = procs.install_signal_handlers(
         {signal.SIGTERM: sig.handle, signal.SIGHUP: sig.handle, signal.SIGINT: sig.handle}
     )
@@ -1415,8 +1435,7 @@ def launch(inv: Any, *, restore_handlers: bool = True) -> Outcome:
         except CliError as error:
             sig.raising = False
             failure = error
-        if launch_run.copies is not None and not launch_run.agent_inserted:
-            remove_copies(launch_run.copies.directory)
+        launch_run.cleanup_failed(failure)
         if failure.agent_id is None and launch_run.agent_inserted:
             failure.agent_id = launch_run.agent_id
         launch_run.deliver()
