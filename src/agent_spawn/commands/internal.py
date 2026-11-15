@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from typing import NoReturn
 
+from .. import supervise as supervise_module
+from ..output import Outcome
 from .base import Invocation, not_implemented
 
 
-def supervise(inv: Invocation) -> NoReturn:
-    # TODO(#12): the supervisor; it refuses (exit 2) when the agent's record does not expect it.
-    not_implemented("supervise", 12)
+def supervise(inv: Invocation) -> Outcome:
+    # TODO(#12): the full supervisor (see supervise.py for what #11 provides).
+    return supervise_module.supervise(inv)
 
 
 def session_event(inv: Invocation) -> NoReturn:

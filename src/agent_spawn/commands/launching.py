@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from typing import NoReturn
 
+from .. import launch as launch_module
 from ..output import Outcome
 from .base import Invocation, not_implemented
 
 
 def launch(inv: Invocation) -> Outcome:
-    # TODO(#11): launch order for headless agents (interface.md, Launch order).
-    # TODO(#20): worktrees, #27: windows, #30: --placement here.
-    not_implemented("launch", 11)
+    # TODO(#20): worktrees, #27: windows, #30: --placement here (see launch.Launch.usage_checks).
+    return launch_module.launch(inv)
 
 
 def resume(inv: Invocation) -> NoReturn:
