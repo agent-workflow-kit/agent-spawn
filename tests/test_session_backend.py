@@ -507,7 +507,7 @@ def test_a_taint_by_this_run_counts_as_third_party_reading(
         "status",
         merge={"tainted": True, "tainted_by_run": run.run, "run": {"cwd": "/s/w"}},
     )
-    check = backend.check_classification(run, expected(True), rule_allows=lambda _a, _c: False)
+    check = backend.check_classification(run, expected(True), rule_allows=lambda _a, _c: True)
     assert check.verdict == "accept"
 
 

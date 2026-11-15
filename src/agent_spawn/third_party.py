@@ -12,7 +12,6 @@ type is an unusable plan (fail closed), never a guess.
 from __future__ import annotations
 
 import os
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -22,7 +21,6 @@ from .validate import KIND
 
 SESSION_DIR = "session-dir"
 
-_SESSION_DIR_NAME = re.compile(r"cs-[a-z2-7]{8}")
 #: The reasons of the pinned dry-run schema (``would_refuse``); anything else is "unknown".
 WOULD_REFUSE_REASONS = frozenset({"live", "tainted", "already_adopted", "expired"})
 _REPO_MAX = 512
@@ -57,12 +55,24 @@ def _text(value: object, name: str, limit: int) -> str | None:
     return value
 
 
-def _is_session_work(path: str) -> bool:
-    """Whether ``path`` is ``<...>/cs-xxxxxxxx/work`` (lexically; nothing is resolved)."""
+PLACEHOLDER_SESSION = "cs-aaaaaaaa"
+
+
+def _is_new_session_placeholder(
+    plan: dict[str, object], profile: dict[str, object], path: str
+) -> bool:
+    """Whether ``path`` is the ``.../sessions/cs-aaaaaaaa/work`` a new-session dry run shows.
+
+    Exact, not a pattern: the plan has no ``csession_id`` (a new session or fork), the kind's
+    default cwd is ``session-dir``, and the normalized path ends ``sessions/cs-aaaaaaaa/work``.
+    A repo path that merely looks like a session work directory is not this.
+    """
+    if plan.get("csession_id") is not None or profile.get("cwd") != SESSION_DIR:
+        return False
     if not os.path.isabs(path):
         return False
-    head, name = os.path.split(os.path.normpath(path))
-    return name == "work" and _SESSION_DIR_NAME.fullmatch(os.path.basename(head)) is not None
+    parts = os.path.normpath(path).split(os.sep)
+    return parts[-3:] == ["sessions", PLACEHOLDER_SESSION, "work"]
 
 
 def parse_plan(plan: object, *, requested_cwd: str | None = None) -> Classification:
@@ -70,11 +80,12 @@ def parse_plan(plan: object, *, requested_cwd: str | None = None) -> Classificat
 
     The run is third-party-reading when ``profile.reads_third_party`` or ``taints`` is true.
     ``requested_cwd`` is the ``--cwd`` the dry run was given; without one the run's cwd is the
-    plan's cwd, mapped to ``session-dir`` only when that is a session work directory
-    (``.../cs-xxxxxxxx/work``: the new-session placeholder or a session's own). The kind's
-    ``profile.cwd`` is not used: a resume runs in the previous run's cwd and a fork in its
-    source's, whatever the kind says. Any other path stays the real path (the cwd rule then
-    fails closed).
+    plan's cwd, mapped to ``session-dir`` only when that is exactly the new-session placeholder
+    the dry run emits (see ``_is_new_session_placeholder``). The plan carries no
+    ``csession_dir`` (only ``csession_id``), so the work directory of a resumed session cannot
+    be recognized here: it keeps its real path and the cwd rule falls back to the caller's
+    records (TODO(#20)); it fails closed. Any other path, including a repo path that looks
+    like ``.../cs-xxxxxxxx/work``, stays the real path.
     """
     if not isinstance(plan, dict):
         raise PlanError("the plan is not an object")
@@ -97,7 +108,7 @@ def parse_plan(plan: object, *, requested_cwd: str | None = None) -> Classificat
     cwd: str | None
     if requested_cwd is not None:
         cwd = requested_cwd
-    elif plan_cwd is not None and _is_session_work(plan_cwd):
+    elif plan_cwd is not None and _is_new_session_placeholder(plan, profile, plan_cwd):
         cwd = SESSION_DIR
     else:
         cwd = plan_cwd
@@ -206,18 +217,28 @@ def decide_check(
     """Apply interface.md, Classification check.
 
     ``actual`` is None when ``status`` failed or could not be read: cancel as unknown.
-    ``cwd`` is the run's actual cwd (``status`` ``run.cwd``); a third-party-reading run whose
-    cwd is not a string is cancelled as unknown. ``rule_allows(c, cwd)`` says whether ``cwd``
+    ``cwd`` is the run's actual cwd (``status`` ``run.cwd``), null while the run is pending
+    (claude-session schemas/cli/status.json, docs/interface.md status). When the classes agree
+    no cwd is needed (the cwd rule was enforced before start); on a mismatch a third-party
+    actual run with no string cwd is cancelled as unknown, and a string cwd is always checked
+    with ``rule_allows``. ``rule_allows(c, cwd)`` says whether ``cwd``
     satisfies the cwd rule for class ``c`` (supplied by the caller: #11, #13, #14, which own
     the records of the cwd); ``result_file_allows()`` runs the result-file check for an actual
     third-party-reading run. A callback that raises cancels as unknown (fail closed).
     """
     if actual is None:
         return CheckDecision("cancel", "classification_unknown", expected, None)
+    if actual == expected:
+        if isinstance(cwd, str):
+            try:
+                ok = rule_allows(actual, cwd)
+            except Exception:  # noqa: BLE001 - any failure of a caller's check fails closed
+                return CheckDecision("cancel", "classification_unknown", expected, actual)
+            if not ok:
+                return CheckDecision("cancel", "classification_mismatch", expected, actual)
+        return CheckDecision("accept", None, expected, actual)
     if actual and not isinstance(cwd, str):
         return CheckDecision("cancel", "classification_unknown", expected, actual)
-    if actual == expected:
-        return CheckDecision("accept", None, expected, actual)
     try:
         allowed = rule_allows(actual, cwd) and (not actual or result_file_allows())
     except Exception:  # noqa: BLE001 - any failure of a caller's check fails closed

@@ -100,10 +100,16 @@ def test_a_resume_plan_with_a_session_dir_profile_keeps_the_real_cwd() -> None:
 
 
 @pytest.mark.parametrize(
-    "path", ["/s/sessions/cs-aaaaaaaa/work", "/s/cs-k3v7q2xa/work/", "/s/cs-k3v7q2xa/x/../work"]
+    "path",
+    [
+        "/s/sessions/cs-aaaaaaaa/work",
+        "/s/sessions/cs-aaaaaaaa/work/",
+        "/s/sessions/x/../cs-aaaaaaaa/work",
+    ],
 )
-def test_a_session_work_dir_is_session_dir(path: str) -> None:
-    assert parse_plan(plan(cwd=path)).cwd == SESSION_DIR
+def test_the_new_session_placeholder_is_session_dir(path: str) -> None:
+    new = {"reads_third_party": True, "cwd": "session-dir"}
+    assert parse_plan(plan(profile=new, csession_id=None, cwd=path)).cwd == SESSION_DIR
 
 
 @pytest.mark.parametrize(
@@ -115,10 +121,21 @@ def test_a_session_work_dir_is_session_dir(path: str) -> None:
         "work",
         "/work",
         "/s/cs-AAAA/work",
+        "/tmp/x/cs-aaaaaaaa/work",  # a repo path that only looks like the placeholder
+        "/s/sessions/cs-k3v7q2xa/work",  # a real session's dir: the plan cannot vouch for it
     ],
 )
 def test_anything_else_stays_the_real_path(path: str) -> None:
-    assert parse_plan(plan(cwd=path)).cwd == path
+    new = {"reads_third_party": True, "cwd": "session-dir"}
+    assert parse_plan(plan(profile=new, csession_id=None, cwd=path)).cwd == path
+
+
+def test_the_placeholder_path_needs_a_new_session_with_a_session_dir_kind() -> None:
+    path = "/s/sessions/cs-aaaaaaaa/work"
+    caller = {"reads_third_party": True, "cwd": "caller"}
+    assert parse_plan(plan(profile=caller, csession_id=None, cwd=path)).cwd == path
+    resumed = {"reads_third_party": True, "cwd": "session-dir"}
+    assert parse_plan(plan(profile=resumed, csession_id="cs-k3v7q2xa", cwd=path)).cwd == path
 
 
 def test_repo_comes_from_the_plan() -> None:
@@ -218,10 +235,33 @@ def allows(value: bool):
 CWD = "/some/where"
 
 
-def test_agreement_is_accepted_whatever_the_rule_says() -> None:
+def test_agreement_without_a_cwd_is_accepted() -> None:
     for expected in (True, False):
-        decision = decide_check(expected, expected, cwd=CWD, rule_allows=allows(False))
+        decision = decide_check(expected, expected, cwd=None, rule_allows=allows(False))
         assert (decision.verdict, decision.cause) == ("accept", None)
+
+
+def test_agreement_with_a_cwd_the_rule_allows_is_accepted() -> None:
+    assert decide_check(True, True, cwd=CWD, rule_allows=allows(True)).verdict == "accept"
+
+
+def test_agreement_with_a_cwd_the_rule_rejects_is_cancelled() -> None:
+    decision = decide_check(True, True, cwd=CWD, rule_allows=allows(False))
+    assert (decision.verdict, decision.cause) == ("cancel", "classification_mismatch")
+
+
+def test_a_pending_run_has_a_null_cwd_and_is_still_accepted() -> None:
+    """claude-session schemas/cli/status.json (run.cwd) and docs/interface.md (status): run.cwd
+    is null until the working directory is resolved (pending runs), and the check runs right
+    after start, so a null cwd must not cancel an agreeing third-party run."""
+    decision = decide_check(True, True, cwd=None, rule_allows=allows(False))
+    assert (decision.verdict, decision.cause) == ("accept", None)
+
+
+def test_a_mismatch_with_a_null_cwd_is_cancelled_as_unknown_for_third_party_only() -> None:
+    decision = decide_check(False, True, cwd=None, rule_allows=allows(True))
+    assert (decision.verdict, decision.cause) == ("cancel", "classification_unknown")
+    assert decide_check(True, False, cwd=None, rule_allows=allows(True)).verdict == "warn"
 
 
 def test_a_mismatch_the_rule_allows_continues_with_a_warning() -> None:
