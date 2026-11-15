@@ -1365,6 +1365,47 @@ class Store:
                 "DELETE FROM relay_events WHERE received < ?", (cutoff,)
             ).rowcount
 
+    def relay_set_agent(
+        self,
+        agent_id: str,
+        *,
+        run: int,
+        session_state: str,
+        activity: str | None,
+        needs_input_reason: str | None,
+    ) -> bool:
+        """The relay's write of the agent's session fields; it holds no lease, so it can touch
+        only these columns (and ``updated``). False when the agent is gone."""
+        with self.transaction():
+            cursor = self._conn.execute(
+                "UPDATE agents SET run = ?, session_state = ?, activity = ?, "
+                "needs_input_reason = ?, updated = ? WHERE agent_id = ?",
+                (run, session_state, activity, needs_input_reason, self._now(), agent_id),
+            )
+            return cursor.rowcount == 1
+
+    def relay_record_run(
+        self,
+        agent_id: str,
+        run: int,
+        *,
+        session_state: str,
+        activity: str | None,
+        needs_input_reason: str | None,
+        first_working_at: float | None,
+    ) -> None:
+        """The relay's write of one run's last state, activity and reason (the row is created
+        when the launcher has not yet written it). ``first_working_at`` is kept once set."""
+        with self.transaction():
+            self._conn.execute(
+                "INSERT OR IGNORE INTO agent_runs (agent_id, run) VALUES (?, ?)", (agent_id, run)
+            )
+            self._conn.execute(
+                "UPDATE agent_runs SET session_state = ?, activity = ?, needs_input_reason = ?, "
+                "first_working_at = COALESCE(first_working_at, ?) WHERE agent_id = ? AND run = ?",
+                (session_state, activity, needs_input_reason, first_working_at, agent_id, run),
+            )
+
     def add_events(self, agent_id: str, events: Sequence[OutboxEvent]) -> None:
         """Queue events alone (the relay, which holds no lease); use the ``events`` argument of
         a write to commit them with a change."""

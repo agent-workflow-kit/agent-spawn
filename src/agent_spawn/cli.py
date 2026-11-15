@@ -22,6 +22,7 @@ from typing import Any, NoReturn
 
 from . import __version__, gateway
 from . import launch as launch_module
+from . import relay
 from .commands.base import Invocation
 from .commands.table import HANDLERS
 from .config import load_config
@@ -432,9 +433,8 @@ def _check_usage(args: argparse.Namespace, key: str) -> None:
     state_dir: str | None = getattr(args, "state_dir", None)
     config: str | None = getattr(args, "config", None)
     if internal:
-        # TODO(#14): decide relay exit on malformed argv and on an invalid config (State relay
-        # says exit 0 always; Internal commands says exit 2; parse_invocation exits 2 on
-        # config_invalid before the relay handler runs).
+        # `_session-event` never gets here: main hands it to relay.run before parsing (it exits 0
+        # whatever its argv, interface.md State relay).
         for flag, value in (("--state-dir", state_dir), ("--config", config)):
             if value is None or not value.startswith("/") or "\0" in value:
                 raise ValueError(f"{key} needs an absolute {flag}")
@@ -592,6 +592,16 @@ def _head(argv: Sequence[str]) -> list[str]:
     return head
 
 
+def _is_relay(argv: Sequence[str]) -> bool:
+    """Whether the command (the first token that is no flag or global flag value) is
+    ``_session-event``."""
+    head = _head(argv)
+    index = 0
+    while index < len(head) and head[index].startswith("-"):
+        index += 2 if head[index] in _GLOBAL_VALUE_FLAGS else 1
+    return index < len(head) and head[index] == "_session-event"
+
+
 def _json_requested(argv: Sequence[str]) -> bool:
     """Whether ``--json`` was given, for errors raised before parsing finished."""
     return "--json" in _head(argv)
@@ -682,6 +692,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     gateway.reset_sigchld()  # before any subprocess: an ignored SIGCHLD hides exit codes
     _reconfigure_streams()
     argv_list = list(sys.argv[1:] if argv is None else argv)
+    if _is_relay(argv_list):
+        # The relay always exits 0: no argparse, no config load, no error envelope.
+        return relay.run(argv_list)
     try:
         inv = parse_invocation(argv_list)
     except _ParserExit as done:  # --help or --version, printed by argparse

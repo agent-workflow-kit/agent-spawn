@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
-from typing import NoReturn
-
+from .. import relay
 from .. import supervise as supervise_module
-from ..output import Outcome
-from .base import Invocation, not_implemented
+from ..output import Outcome, PayloadKind
+from .base import Invocation
 
 
 def supervise(inv: Invocation) -> Outcome:
     return supervise_module.supervise(inv)
 
 
-def session_event(inv: Invocation) -> NoReturn:
-    # TODO(#14): the relay. It must exit 0 always once implemented (interface.md, State relay);
-    # the usage checks and the config load (config_invalid, exit 2) of cli.py run before this
-    # handler.
-    not_implemented("_session-event", 14)
+def session_event(inv: Invocation) -> Outcome:
+    """Reached only through a handler call in tests: ``cli.main`` hands the real command to
+    ``relay.run`` before parsing, so that it exits 0 whatever its argv or config."""
+    relay.run(["--state-dir", inv.state_dir or "", "--config", inv.config_path or "", "_session-event"])
+    return Outcome(0, {}, PayloadKind.COMMAND, quiet=True)
