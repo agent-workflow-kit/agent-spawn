@@ -217,6 +217,25 @@ class Fakebin:
             time.sleep(0.02)
         raise AssertionError(f"the fake (pid {pid}) never reached its hang")
 
+    def clear_script(self, tool: str, command: str | None = None) -> None:
+        """Disable the rules added so far for ``tool`` (and ``command``).
+
+        A disabled rule keeps its place, because the fakes count answered calls by rule index.
+        """
+        for rule in self._rules:
+            if rule["tool"] == tool and (command is None or rule.get("command") == command):
+                rule["tool"] = "__cleared__"
+        self._write_script()
+
+    def wait_for_gate(self, gate: Path, timeout: float = 20) -> None:
+        """Block until a call scripted with ``gate=<gate>`` is waiting at that gate."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if any(r["path"] == str(gate) for r in self.records("gate_ready")):
+                return
+            time.sleep(0.02)
+        raise AssertionError(f"no call reached the gate {gate}")
+
     def argvs(self, tool: str) -> list[list[str]]:
         return [call.argv for call in self.invocations(tool)]
 

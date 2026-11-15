@@ -399,6 +399,8 @@ class Context:
         install_signal_behavior(response.get("on_signal", {}), self.signaled)
         if response.get("sleep"):
             time.sleep(float(response["sleep"]))
+        if response.get("gate"):
+            gate(self, str(response["gate"]))
         if response.get("hang"):
             hang(self)
 
@@ -473,6 +475,28 @@ def hang(ctx: Context | None = None) -> None:
             raise Exit(124, "", "fakebin: hung call gave up: its parent process is gone\n")
         if time.monotonic() >= deadline:
             raise Exit(124, "", f"fakebin: hung call gave up after {limit:g} seconds\n")
+
+
+def gate(ctx: Context, path: str) -> None:
+    """Block until the file ``path`` exists, then carry on normally (a scripted ``gate``).
+
+    Unlike ``hang`` the call completes after the gate opens, so a test can hold one step of a
+    flow (for example a ``forget`` during a teardown) and release it without a signal. A
+    ``gate_ready`` record names the path once the call is waiting; tests poll for it. Like a
+    hang, a gate never outlives its test (parent gone, or ``FAKEBIN_HANG_SECONDS``).
+    """
+    try:
+        limit = float(os.environ.get("FAKEBIN_HANG_SECONDS", HANG_SECONDS))
+    except ValueError:
+        raise HarnessError("FAKEBIN_HANG_SECONDS must be a number") from None
+    deadline = time.monotonic() + limit
+    log_event("gate_ready", id=ctx.invoke_id, path=path)
+    while not os.path.exists(path):
+        time.sleep(0.02)
+        if _parent_gone():
+            raise Exit(124, "", "fakebin: a gated call gave up: its parent process is gone\n")
+        if time.monotonic() >= deadline:
+            raise Exit(124, "", f"fakebin: a gated call gave up after {limit:g} seconds\n")
 
 
 Handler = Callable[[Context, list[str]], tuple[int, Any]]
