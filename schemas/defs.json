@@ -105,18 +105,21 @@
       "anyOf": [
         {
           "type": "number",
-          "exclusiveMinimum": 0
+          "exclusiveMinimum": 0,
+          "maximum": 3153600000
         },
         {
           "type": "string",
+          "maxLength": 32,
           "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)\\d+(\\.\\d+)?(ms|s|m|h|d)$"
         },
         {
           "type": "string",
+          "maxLength": 32,
           "pattern": "^(?!0+(\\.0+)?$)\\d+(\\.\\d+)?$"
         }
       ],
-      "description": "Seconds as a positive number (fractions allowed), a string <number><unit> with unit ms, s, m, h or d (e.g. '30s', '10m'), or a bare number string meaning seconds (e.g. '90'); zero is refused (exit 2)."
+      "description": "Seconds as a positive number (fractions allowed), a string <number><unit> with unit ms, s, m, h or d (e.g. '30s', '10m'), or a bare number string meaning seconds (e.g. '90'); zero, text over 32 characters and a duration over 36500d (3153600000 seconds) are refused (exit 2)."
     },
     "env_name": {
       "type": "string",
@@ -1971,6 +1974,7 @@
         "cmd": {
           "type": "string",
           "minLength": 1,
+          "pattern": "^[^\u0000]*$",
           "description": "Run via sh -c in its own process group; JSON payload on stdin."
         },
         "timeout": {
@@ -2011,6 +2015,7 @@
         "cmd": {
           "type": "string",
           "minLength": 1,
+          "pattern": "^[^\u0000]*$",
           "description": "Run via sh -c in its own process group; JSON payload on stdin."
         },
         "timeout": {
@@ -2056,6 +2061,7 @@
         "cmd": {
           "type": "string",
           "minLength": 1,
+          "pattern": "^[^\u0000]*$",
           "description": "Run via sh -c in its own process group; JSON payload on stdin."
         },
         "timeout": {
