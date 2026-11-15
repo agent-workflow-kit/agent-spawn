@@ -15,7 +15,7 @@ def stop(inv: Invocation) -> NoReturn:
 
 
 def teardown(inv: Invocation) -> Outcome:
-    # TODO(#23): worktrees and windows; TODO(#32): the pre-teardown hook (see teardown.py).
+    # TODO(#27): windows; TODO(#32): the pre-teardown hook (see teardown.py).
     return teardown_module.teardown_command(inv)
 
 

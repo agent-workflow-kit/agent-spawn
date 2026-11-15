@@ -5,6 +5,7 @@ record, the ephemeral teardown and the fork end to end (#23, and #22's third cri
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,7 @@ from tests.launch_support import Env, result_json
 from tests.test_fork_holds import holders, nested_source
 from tests.test_teardown import dead, events, seed
 from tests.test_worktrees_launch import LAUNCH, REPO, records, wtctl_calls
-from tests.test_worktrees_resume import launched_in_worktree, set_state
+from tests.test_worktrees_resume import launched_in_worktree, records_path, set_state
 
 SHA = "a" * 40
 HUMAN = ("--actor", "human:tester")
@@ -40,6 +41,31 @@ def td(env: Env, agent_id: str, *flags: str) -> Any:
     return env.run("teardown", agent_id, "--json", *flags)
 
 
+def edit_record(fakebin: Fakebin, record_id: str, **changes: Any) -> None:
+    data = records(fakebin)
+    data[record_id].update(changes)
+    records_path(fakebin).write_text(json.dumps(data))
+
+
+def td_with_short_remove_timeout(env: Env, agent_id: str) -> Any:
+    """``teardown`` in a child whose wtctl ``remove`` times out after 2 seconds."""
+    import subprocess
+
+    code = (
+        "import agent_spawn.worktrees as w; w.REMOVE_TIMEOUT = 2.0; "
+        "from agent_spawn.cli import main; raise SystemExit(main())"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", code, "teardown", agent_id, "--json"],
+        capture_output=True,
+        text=True,
+        env=env.env(),
+        stdin=subprocess.DEVNULL,
+        timeout=60,
+        check=False,
+    )
+
+
 def audit_records(env: Env) -> list[dict[str, Any]]:
     path = env.state_dir / "audit.jsonl"
     if not path.exists():
@@ -58,7 +84,6 @@ def hold_rows(env: Env, agent_id: str) -> list[dict[str, Any]]:
 def test_the_owned_record_is_removed_with_the_exact_argv(env: Env, fakebin: Fakebin) -> None:
     agent_id = launched_in_worktree(env)
     record = next(iter(records(fakebin).values()))
-    actor = env.agent(agent_id)["actor"]
     done = td(env, agent_id, "--merged-head", SHA, "--decision-id", "d1")
     body = result_json(done)
     assert done.returncode == 0, (done.stdout, done.stderr)
@@ -75,7 +100,6 @@ def test_the_owned_record_is_removed_with_the_exact_argv(env: Env, fakebin: Fake
             "--json",
         ]
     ]
-    assert actor  # the stored launch actor is not what teardown passes: its own is
     (entry,) = body["worktrees"]
     assert entry["record_id"] == record["id"] and entry["owned"] is True
     assert entry["action"] == "removed" and entry["wtctl"]["record"]["state"] == "removed"
@@ -295,7 +319,8 @@ def test_an_exit_1_from_remove_leaves_the_agent_tearing_down_and_a_retry_finishe
     done = td(env, agent_id)
     assert done.returncode == 1, (done.stdout, done.stderr)
     row = env.agent(agent_id)
-    assert row["status"] == "tearing_down" and row["teardown_step"] == "hooks_done"
+    assert row["status"] == "tearing_down" and row["teardown_step"] == "worktree_partial"
+    assert row["teardown_partial_record"] == env.agent(agent_id)["wt_record_id"]
     again = td(env, agent_id)
     assert again.returncode == 0, (again.stdout, again.stderr)
     assert env.agent(agent_id)["status"] == "torn_down"
@@ -308,6 +333,7 @@ def test_partial_keeps_tearing_down_and_a_retry_checks_the_stored_record(
     record_id = env.agent(agent_id)["wt_record_id"]
     fakebin.script("wtctl", "remove", times=1, **PARTIAL)
     done = td(env, agent_id)
+    set_state(fakebin, record_id, "partial")  # what wtctl leaves behind
     body = result_json(done)
     schema_registry.validate(body, "agent-spawn/cli/error.json")
     assert done.returncode == 12 and body["error"]["code"] == "partial"
@@ -315,7 +341,7 @@ def test_partial_keeps_tearing_down_and_a_retry_checks_the_stored_record(
     row = env.agent(agent_id)
     assert row["status"] == "tearing_down" and row["teardown_step"] == "worktree_partial"
     assert row["teardown_partial_record"] == record_id
-    # The record is still live: the retry shows it, never removes it again, stays partial.
+    # The record is still partial: the retry shows it, never removes it again, stays partial.
     again = td(env, agent_id)
     assert again.returncode == 12, (again.stdout, again.stderr)
     assert len(wtctl_calls(fakebin, "remove")) == 1
@@ -351,9 +377,310 @@ def test_a_partial_marker_naming_a_record_that_is_not_the_agents_stops_the_teard
     )
     done = td(env, agent_id)
     assert done.returncode != 0
+    message = result_json(done)["error"]["message"]
+    assert foreign in message and "human" in message  # names the record, asks for a look
     assert wtctl_calls(fakebin, "remove") == [] and wtctl_calls(fakebin, "forget") == []
     assert records(fakebin)[foreign]["state"] == "active"
     assert env.agent(agent_id)["status"] == "tearing_down"
+
+
+# --- an unknown remove outcome is sticky (R1) ---------------------------------------------------
+
+UNKNOWN = {"error": {"code": "internal", "message": "x"}, "exit": 1}
+
+
+def tearing_down_at(env: Env, agent_id: str, record_id: str) -> None:
+    row = env.agent(agent_id)
+    assert row["status"] == "tearing_down", row["status"]
+    assert row["teardown_step"] == "worktree_partial"
+    assert row["teardown_partial_record"] == record_id
+
+
+def test_an_unknown_remove_then_a_partial_record_stays_tearing_down(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = launched_in_worktree(env)
+    record_id = env.agent(agent_id)["wt_record_id"]
+    fakebin.script("wtctl", "remove", times=1, **UNKNOWN)
+    assert td(env, agent_id).returncode == 1
+    tearing_down_at(env, agent_id, record_id)
+    set_state(fakebin, record_id, "partial")
+    again = td(env, agent_id)
+    assert again.returncode == 12 and result_json(again)["error"]["code"] == "partial"
+    tearing_down_at(env, agent_id, record_id)
+    assert len(wtctl_calls(fakebin, "remove")) == 1
+
+
+def test_an_unknown_remove_then_a_retry_refused_13_stays_tearing_down(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = launched_in_worktree(env)
+    record_id = env.agent(agent_id)["wt_record_id"]
+    fakebin.script("wtctl", "remove", times=1, **UNKNOWN)
+    assert td(env, agent_id).returncode == 1
+    fakebin.script(
+        "wtctl", "remove", times=1,
+        exit=13, error={"code": "confirmation_required", "message": "x"},
+    )  # fmt: skip
+    again = td(env, agent_id)
+    body = result_json(again)
+    assert again.returncode == 13, (again.stdout, again.stderr)
+    assert body["error"]["tool"] == "wtctl" and body["error"]["lower_error"]["code"]
+    tearing_down_at(env, agent_id, record_id)
+    assert len(wtctl_calls(fakebin, "remove")) == 2
+
+
+def test_a_timed_out_remove_leaves_tearing_down_and_a_dirty_retry_does_too(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = launched_in_worktree(env)
+    record_id = env.agent(agent_id)["wt_record_id"]
+    fakebin.script("wtctl", "remove", times=1, sleep=30, **UNKNOWN)
+    done = td_with_short_remove_timeout(env, agent_id)
+    assert done.returncode != 0, (done.stdout, done.stderr)
+    tearing_down_at(env, agent_id, record_id)
+    fakebin.script("wtctl", "remove", times=1, **DIRTY)
+    again = td(env, agent_id)
+    assert again.returncode == 20, (again.stdout, again.stderr)
+    assert result_json(again)["error"]["reason"] == "dirty"
+    tearing_down_at(env, agent_id, record_id)  # never back to parked
+    assert len(wtctl_calls(fakebin, "remove")) == 2  # the retry called remove again
+    last = td(env, agent_id)  # remove works now
+    assert last.returncode == 0, (last.stdout, last.stderr)
+    assert env.agent(agent_id)["status"] == "torn_down"
+
+
+def test_a_timed_out_remove_that_deleted_everything_is_a_tombstone_on_retry(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = launched_in_worktree(env)
+    record_id = env.agent(agent_id)["wt_record_id"]
+    fakebin.script("wtctl", "remove", times=1, sleep=30, **UNKNOWN)
+    assert td_with_short_remove_timeout(env, agent_id).returncode != 0
+    set_state(fakebin, record_id, "removed")
+    again = td(env, agent_id)
+    assert again.returncode == 0, (again.stdout, again.stderr)
+    assert env.agent(agent_id)["status"] == "torn_down"
+    assert len(wtctl_calls(fakebin, "remove")) == 1
+    assert len(audit_records(env)) == 1  # R4: the removal is audited
+
+
+def test_a_retry_over_an_unknown_outcome_with_an_exit_10_tombstone_completes(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = launched_in_worktree(env)
+    fakebin.script("wtctl", "remove", times=1, **UNKNOWN)
+    assert td(env, agent_id).returncode == 1
+    fakebin.script(
+        "wtctl", "remove", times=1,
+        exit=10, error={"code": "not_found", "message": "x", "details": {"state": "removed"}},
+    )  # fmt: skip
+    again = td(env, agent_id)
+    assert again.returncode == 0, (again.stdout, again.stderr)
+    assert env.agent(agent_id)["status"] == "torn_down"
+
+
+def test_an_unknown_outcome_audits_the_removal_once_when_the_record_turns_out_removed(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = launched_in_worktree(env)
+    record_id = env.agent(agent_id)["wt_record_id"]
+    fakebin.script("wtctl", "remove", times=1, **UNKNOWN)
+    assert td(env, agent_id).returncode == 1
+    set_state(fakebin, record_id, "removed")
+    assert td(env, agent_id).returncode == 0
+    (audit,) = audit_records(env)
+    assert audit["action"] == "teardown" and audit["inputs"]["worktree"]["record_id"] == record_id
+    schema_registry.validate(audit, "agent-spawn/audit.json")
+    assert td(env, agent_id).returncode == 10  # torn down already: no second record
+    assert len(audit_records(env)) == 1
+
+
+def test_an_owned_row_whose_record_is_a_tombstone_is_audited(env: Env, fakebin: Fakebin) -> None:
+    agent_id = launched_in_worktree(env)
+    record_id = env.agent(agent_id)["wt_record_id"]
+    set_state(fakebin, record_id, "removed")
+    done = td(env, agent_id)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert [a["inputs"]["worktree"]["record_id"] for a in audit_records(env)] == [record_id]
+
+
+# --- the hold is checked before remove (R2) ------------------------------------------------------
+
+
+def test_a_record_wtctl_says_is_not_owned_is_forgotten_not_removed(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = launched_in_worktree(env)
+    record_id = env.agent(agent_id)["wt_record_id"]
+    edit_record(fakebin, record_id, owned=False)
+    done = td(env, agent_id)
+    body = result_json(done)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert wtctl_calls(fakebin, "remove") == []
+    assert [c[1] for c in wtctl_calls(fakebin, "forget")] == [record_id]
+    assert [(w["action"], w["owned"]) for w in body["worktrees"]] == [("forgotten", False)]
+    assert records(fakebin)[record_id]["state"] == "forgotten"
+
+
+def test_an_owned_row_for_a_record_the_agent_does_not_hold_is_refused_not_held(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = launched_in_worktree(env)
+    record_id = env.agent(agent_id)["wt_record_id"]
+    edit_record(fakebin, record_id, holders=["ag-zzzzzzzz"])
+    done = td(env, agent_id)
+    assert done.returncode == 20 and result_json(done)["error"]["reason"] == "not_held"
+    assert wtctl_calls(fakebin, "remove") == [] and wtctl_calls(fakebin, "forget") == []
+    assert records(fakebin)[record_id]["state"] == "active"
+    row = env.agent(agent_id)
+    assert row["status"] == "parked" and row["teardown_step"] is None
+    assert [r["released"] for r in hold_rows(env, agent_id)] == [False]
+
+
+# --- the override is audited (R5) -----------------------------------------------------------------
+
+
+def test_override_escalation_is_audited_with_the_real_result(env: Env, fakebin: Fakebin) -> None:
+    agent_id = launched_in_worktree(env)
+    assert td(env, agent_id, *HUMAN, "--override-escalation").returncode == 0
+    audit = audit_records(env)
+    assert sorted(a["action"] for a in audit) == ["teardown", "teardown_escalation_override"]
+    override = next(a for a in audit if a["action"] == "teardown_escalation_override")
+    assert override["result"] == "ok" and override["target"] == agent_id
+    assert override["actor"] == "human:tester"
+    schema_registry.validate(override, "agent-spawn/audit.json")
+
+
+def test_a_refused_override_is_audited_as_refused(env: Env, fakebin: Fakebin) -> None:
+    agent_id = launched_in_worktree(env)
+    fakebin.script("wtctl", "remove", times=1, **DIRTY)
+    assert td(env, agent_id, *HUMAN, "--override-escalation").returncode == 20
+    (override,) = audit_records(env)
+    assert override["action"] == "teardown_escalation_override" and override["result"] == "refused"
+
+
+def test_no_override_audit_without_the_flag_or_without_a_remove(env: Env, fakebin: Fakebin) -> None:
+    agent_id = launched_in_worktree(env)
+    assert td(env, agent_id, *HUMAN).returncode == 0
+    assert [a["action"] for a in audit_records(env)] == ["teardown"]
+
+
+# --- exit 2 changed nothing (R7) ---------------------------------------------------------
+
+
+def test_a_wtctl_usage_error_exit_2_returns_the_agent_to_parked(env: Env, fakebin: Fakebin) -> None:
+    agent_id = launched_in_worktree(env)
+    record_id = env.agent(agent_id)["wt_record_id"]
+    fakebin.script("wtctl", "remove", times=1, exit=2, error={"code": "usage", "message": "x"})
+    done = td(env, agent_id)
+    assert done.returncode != 0
+    assert result_json(done)["error"]["tool"] == "wtctl"
+    row = env.agent(agent_id)
+    assert row["status"] == "parked" and row["teardown_step"] is None
+    assert records(fakebin)[record_id]["state"] == "active"
+
+
+@pytest.mark.parametrize("code", [3, 137, 255])
+def test_an_unmapped_wtctl_exit_stays_tearing_down(env: Env, fakebin: Fakebin, code: int) -> None:
+    agent_id = launched_in_worktree(env)
+    record_id = env.agent(agent_id)["wt_record_id"]
+    fakebin.script("wtctl", "remove", times=1, exit=code, error={"code": "x", "message": "x"})
+    assert td(env, agent_id).returncode != 0
+    tearing_down_at(env, agent_id, record_id)
+
+
+# --- the dry run's prediction (R6, R8, R9, R10) ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("flag", "reason"), [("fake_dirty", "dirty"), ("fake_unpushed", "unpushed")]
+)
+def test_dry_run_with_force_overrides_dirty_and_unpushed(
+    env: Env, fakebin: Fakebin, flag: str, reason: str
+) -> None:
+    agent_id = launched_in_worktree(env)
+    edit_record(fakebin, env.agent(agent_id)["wt_record_id"], **{flag: True})
+    plain = td(env, agent_id, "--dry-run")
+    assert plain.returncode == 20 and result_json(plain)["would_refuse"] == reason
+    forced = td(env, agent_id, *HUMAN, "--force", "--dry-run")
+    body = result_json(forced)
+    assert forced.returncode == 0, (forced.stdout, forced.stderr)
+    assert body["would_refuse"] is None
+    schema_registry.validate(body, "agent-spawn/cli/teardown-dry-run.json")
+
+
+def test_dry_run_with_force_does_not_override_other_reasons(env: Env, fakebin: Fakebin) -> None:
+    agent_id = launched_in_worktree(env)
+    fakebin.script(
+        "wtctl", "status",
+        merge={"would_remove": False, "reason": "in_use", "force_overrides": []},
+    )  # fmt: skip
+    done = td(env, agent_id, *HUMAN, "--force", "--dry-run")
+    assert done.returncode == 20 and result_json(done)["would_refuse"] == "in_use"
+
+
+def test_dry_run_predicts_confirmation_required_for_a_non_human_actor(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = launched_in_worktree(env)
+    fakebin.script("wtctl", "status", merge={"human_required": True})
+    robot = td(env, agent_id, "--dry-run")
+    assert robot.returncode == 20
+    assert result_json(robot)["would_refuse"] == "confirmation_required"
+    human = td(env, agent_id, *HUMAN, "--dry-run")
+    assert human.returncode == 0 and result_json(human)["would_refuse"] is None
+
+
+@pytest.mark.parametrize("would_remove", [None, "yes"])
+def test_dry_run_does_not_fail_open_on_an_undetermined_status(
+    env: Env, fakebin: Fakebin, would_remove: object
+) -> None:
+    agent_id = launched_in_worktree(env)
+    fakebin.script("wtctl", "status", merge={"would_remove": would_remove, "reason": None})
+    done = td(env, agent_id, "--dry-run")
+    body = result_json(done)
+    assert done.returncode == 20 and body["would_refuse"] == "unknown"
+    schema_registry.validate(body, "agent-spawn/cli/teardown-dry-run.json")
+
+
+def test_dry_run_does_not_fail_open_on_a_status_without_would_remove(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = launched_in_worktree(env)
+    record_id = env.agent(agent_id)["wt_record_id"]
+    fakebin.script(
+        "wtctl", "status",
+        stdout={"id": record_id, "object_type": "worktree", "reason": None},
+    )  # fmt: skip
+    done = td(env, agent_id, "--dry-run")
+    assert done.returncode == 20 and result_json(done)["would_refuse"] == "unknown"
+
+
+def test_dry_run_reports_not_held_as_would_refuse(env: Env, fakebin: Fakebin) -> None:
+    agent_id = seed(env, fakebin, wt_owned=True)
+    foreign = json.loads(
+        fakebin.run(
+            "wtctl", "create", "--repo", REPO, "--holder", "ag-zzzzzzzz", "--name", "x", "--json"
+        ).stdout
+    )["record"]
+    from agent_spawn.lifecycle import lease_key
+
+    with env.store() as store:
+        with store.lease(lease_key(agent_id)) as lease:
+            store.update_agent(lease, agent_id, {"wt_record_id": foreign["id"]})
+    done = td(env, agent_id, "--dry-run")
+    body = result_json(done)
+    assert done.returncode == 20, (done.stdout, done.stderr)
+    assert body["would_refuse"] == "not_held" and body["dry_run"] is True
+    schema_registry.validate(body, "agent-spawn/cli/teardown-dry-run.json")
+
+
+def test_force_with_no_worktree_still_writes_the_audit_record(env: Env, fakebin: Fakebin) -> None:
+    agent_id = seed(env, fakebin)
+    assert td(env, agent_id, *HUMAN, "--force").returncode == 0
+    (audit,) = audit_records(env)
+    assert audit["inputs"]["worktree"] is None and audit["inputs"]["force"] is True
 
 
 # --- a bootstrap_failed launch: a record id without a path or a hold row -----------------------
@@ -591,3 +918,28 @@ def test_a_record_without_a_wtctl_on_the_machine_is_refused_and_nothing_changes(
     assert result_json(done)["error"]["code"] == "tool_missing"
     assert env.agent(agent_id)["status"] == "parked"
     assert [h["released"] for h in hold_rows(env, agent_id)] == [False]
+
+
+def test_resume_adopting_a_wtctl_owned_record_never_has_it_removed_at_teardown(
+    env: Env, fakebin: Fakebin
+) -> None:
+    created = json.loads(
+        fakebin.run(
+            "wtctl", "create", "--repo", REPO, "--holder", "ag-zzzzzzzz", "--name", "own", "--json"
+        ).stdout
+    )["record"]
+    assert created["owned"] is True
+    fakebin.script("wtctl", "adopt", times=1, exit=12, error={"code": "busy", "message": "x"})
+    failed = env.run(*LAUNCH, "--worktree", created["path"], "--prompt", "P")
+    assert failed.returncode == 12, (failed.stdout, failed.stderr)
+    (agent,) = env.agents()
+    agent_id = str(agent["agent_id"])
+    resumed = env.run("resume", agent_id, "--json", "--wait")
+    assert resumed.returncode == 0, (resumed.stdout, resumed.stderr)
+    assert [h["owned"] for h in hold_rows(env, agent_id)] == [False]
+    assert env.agent(agent_id)["wt_owned"] is False
+    done = td(env, agent_id)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert wtctl_calls(fakebin, "remove") == []
+    assert [w["action"] for w in result_json(done)["worktrees"]] == ["released"]
+    assert records(fakebin)[created["id"]]["state"] == "active"

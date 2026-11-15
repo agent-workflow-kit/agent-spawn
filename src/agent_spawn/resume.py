@@ -1045,7 +1045,7 @@ class Resume(Launch):
             record, _ = backend.adopt(
                 mode, agent_id, repo=given if isinstance(given, str) else None
             )
-            self.store_worktree(agent_id, record.id, path=record.path, owned=record.owned is True)
+            self.store_worktree(agent_id, record.id, path=record.path, owned=False)
             return record
         except WtctlError as error:
             kind = wtlib.failure_kind(error)
@@ -1382,7 +1382,7 @@ class Resume(Launch):
             pass  # another process already settled the agent
         self.settled = True
 
-    # TODO(#23): the teardown of an OWNED source record names its own holder in `wtctl remove`;
+    # Teardown of an OWNED source record names its own holder in `wtctl remove`;
     # wtctl then refuses with `held` while this fork (an in-place fork holds the source's record
     # under its own id, see tests/test_fork_holds.py) still holds it. Teardown passes that
     # refusal through; nothing here decides it. (An adopted source's remove exits 13 before

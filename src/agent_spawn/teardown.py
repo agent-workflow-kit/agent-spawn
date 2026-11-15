@@ -36,7 +36,7 @@ from .output import CliError, Outcome, PayloadKind
 from .records import RecordsError, append_audit, append_log
 from .session_backend import SessionBackend, SessionStatus
 from .store import CasLost, Store, StoreError, StoreMissing, default_state_dir
-from .worktrees import WtctlBackend, WtctlError, WtResult
+from .worktrees import WtctlBackend, WtctlError
 
 TOOL = "claude-session"
 WTCTL = "wtctl"
@@ -188,6 +188,7 @@ class Teardown:
         self.worktrees: list[dict[str, Any]] = []  # step 4's output entries, in processing order
         self.removed: WtItem | None = None  # the owned record this run removed
         self.audited = False
+        self.sticky = False  # a remove with a possibly partial outcome: never back to parked
         self.step4_refused: str | None = None  # step 4 stopped with nothing changed for a record
         self._log = log
 
@@ -210,9 +211,17 @@ class Teardown:
         except (RecordsError, ValueError, OSError) as error:
             self.warnings.append(f"could not write the log ({type(error).__name__})")
 
-    def audit(self, row: Mapping[str, Any]) -> None:
-        """An audit record for a teardown that removed a worktree or was forced."""
-        removed = self.removed
+    def audit(
+        self,
+        row: Mapping[str, Any],
+        *,
+        action: str = "teardown",
+        result: str = "ok",
+        item: WtItem | None = None,
+    ) -> None:
+        """An audit record: ``teardown`` (a teardown that removed a worktree or was forced) or
+        ``teardown_escalation_override`` (``--override-escalation`` reached ``wtctl remove``)."""
+        removed = item or self.removed
         worktree = (
             {"record_id": removed.record_id, "path": removed.path, "owned": removed.owned}
             if removed is not None
@@ -224,7 +233,7 @@ class Teardown:
                 actor=self.actor,
                 decision_ids=self.decision_ids,
                 target=row["agent_id"],
-                action="teardown",
+                action=action,
                 inputs={
                     "labels": self.store.get_labels(row["agent_id"]).texts(),
                     "repo": row.get("repo"),
@@ -233,10 +242,17 @@ class Teardown:
                     "merged_head": self.merged_head,
                     "force": self.force,
                 },
-                result="ok",
+                result=result,
             )
         except (RecordsError, ValueError, OSError) as error:
             self.warnings.append(f"could not write the audit log ({type(error).__name__})")
+
+    def audit_removal(self, row: Mapping[str, Any], item: WtItem) -> None:
+        """The removal's audit record, once per teardown that finished a removal."""
+        self.removed = item
+        if not self.audited:
+            self.audit(row)
+            self.audited = True
 
     # -- lower tools ------------------------------------------------------------------------
 
@@ -636,11 +652,15 @@ class Teardown:
     @staticmethod
     def left_unknown(error: CliError) -> bool:
         """Whether a failed worktree call may have changed something (then the agent stays
-        ``tearing_down``): a partial removal, a call whose outcome is unknown (timeout, wtctl's
-        exit 1) or one of agent-spawn's own failures. Every other result changed nothing."""
+        ``tearing_down``): a partial removal, a call whose outcome is unknown (a timeout,
+        wtctl's exit 1, or an exit the mapping does not know: 3 and up, a signal) or one of
+        agent-spawn's own failures. wtctl's exit 2 (usage) ran nothing, and every other mapped
+        result (refusals, exit 12 and 13) changed nothing."""
         if error.code == "partial":
             return True
         if isinstance(error, WtctlError):
+            if error.lower_exit == 2:
+                return False
             return error.exit_code == 1
         return error.code == "failed" or error.exit_code == 1
 
@@ -651,7 +671,7 @@ class Teardown:
                 return  # no record: the step is skipped and the marker stays
         except CliError as error:
             error.agent_id = agent_id
-            if self.left_unknown(error):
+            if self.sticky or self.left_unknown(error):
                 self.past_refusals = True
                 raise
             self.step4_refused = error.reason or error.code
@@ -669,7 +689,10 @@ class Teardown:
             partial = None
         if partial is not None and all(i.record_id != partial for i in items):
             raise CliError(
-                "failed", "the stored partial record is not one of this agent's", agent_id=agent_id
+                "failed",
+                f"the stored partial record {partial} is not one of this agent's records: "
+                "a human must inspect it",
+                agent_id=agent_id,
             )
         if not items:
             return False
@@ -677,62 +700,100 @@ class Teardown:
             if item.released:
                 self.worktrees.append(self.entry(item, "none", None))
             elif item.record_id == partial:
-                self.finish_partial(row, item)
+                self.finish_marked(row, item)
             else:
                 self.release_or_remove(row, item)
         return True
 
-    def finish_partial(self, row: dict[str, Any], item: WtItem) -> None:
-        """A retry over ``worktree_partial``: the stored record is complete only when wtctl shows
-        a tombstone for it; anything else leaves the agent ``tearing_down``."""
+    def finish_marked(self, row: dict[str, Any], item: WtItem) -> None:
+        """A retry over ``worktree_partial`` (a partial removal, or one whose outcome is
+        unknown): ``wtctl show`` decides. A tombstone completes the record; ``partial`` (or a
+        record wtctl does not know) leaves the agent ``tearing_down``; any other state calls
+        ``remove`` again, and nothing but success lets the agent leave ``tearing_down``."""
         agent_id = row["agent_id"]
         record = self.wtctl(row).show(item.record_id)
-        if record is None or not record.tombstone:
-            raise CliError(
-                "partial",
-                "the partly removed worktree is not finished: finish it with `wtctl remove`",
-                tool=WTCTL,
-                agent_id=agent_id,
-            )
+        if record is None or record.state == "partial":
+            raise self.unfinished(agent_id, item)
+        if not record.tombstone:
+            if agent_id not in record.holders or record.owned is not True:
+                raise self.unfinished(agent_id, item)
+            self.remove_owned(row, item, marked=True)
+            return
         self.mark_released(agent_id, item)
         self.set_step(agent_id, "hooks_done", teardown_partial_record=None)
-        self.removed = item
         self.worktrees.append(self.entry(item, "removed", None))
-        self.audit(row)
-        self.audited = True
+        self.audit_removal(row, item)
+
+    @staticmethod
+    def unfinished(agent_id: str, item: WtItem) -> CliError:
+        return CliError(
+            "partial",
+            f"the worktree record {item.record_id} may be partly removed: "
+            "finish it with `wtctl remove`",
+            tool=WTCTL,
+            agent_id=agent_id,
+        )
 
     def release_or_remove(self, row: dict[str, Any], item: WtItem) -> None:
         agent_id = row["agent_id"]
-        backend = self.wtctl(row)
-        result: WtResult
         if item.owned:
-            try:
-                result = backend.remove(
-                    item.record_id,
-                    agent_id,
-                    merged_head=self.merged_head,
-                    force=self.force,
-                    override_escalation=self.override_escalation,
-                )
-            except CliError as error:
-                if error.code == "partial":
+            # The local row alone never decides a removal: wtctl must say the agent holds a
+            # record that it created. A record wtctl did not create is released instead.
+            record = self.wtctl(row).show(item.record_id)
+            if record is not None and not record.tombstone:
+                if agent_id not in record.holders:
+                    raise CliError(
+                        "refused",
+                        f"the agent does not hold worktree record {item.record_id}",
+                        reason="not_held",
+                        agent_id=agent_id,
+                    )
+                if record.owned is not True:
+                    item.owned = False
+            if item.owned:
+                self.remove_owned(row, item, marked=False)
+                return
+        result = self.wtctl(row).release(item.record_id, agent_id)
+        if result.already:
+            action = "none"
+        else:
+            action = "forgotten" if result.record_state == "forgotten" else "released"
+        self.mark_released(agent_id, item)
+        self.worktrees.append(self.entry(item, action, result.data))
+
+    def remove_owned(self, row: dict[str, Any], item: WtItem, *, marked: bool) -> None:
+        """``wtctl remove`` of the owned record. A failure that is partial or of unknown
+        outcome is sticky: the marker and the record are stored, and the agent never returns
+        to ``parked`` (``marked``: an earlier call had such an outcome, so any failure is)."""
+        agent_id = row["agent_id"]
+        try:
+            result = self.wtctl(row).remove(
+                item.record_id,
+                agent_id,
+                merged_head=self.merged_head,
+                force=self.force,
+                override_escalation=self.override_escalation,
+            )
+        except CliError as error:
+            if self.override_escalation:
+                outcome = "refused" if error.exit_code == 20 else "error"
+                self.audit(row, action="teardown_escalation_override", result=outcome, item=item)
+            if marked or self.left_unknown(error):
+                self.sticky = True
+                if not marked:
                     self.set_step(
                         agent_id, "worktree_partial", teardown_partial_record=item.record_id
                     )
-                raise
-            action = "none" if result.already else "removed"
-        else:
-            result = backend.release(item.record_id, agent_id)
-            if result.already:
-                action = "none"
-            else:
-                action = "forgotten" if result.record_state == "forgotten" else "released"
+            raise
+        if self.override_escalation:
+            self.audit(row, action="teardown_escalation_override", result="ok", item=item)
         self.mark_released(agent_id, item)
-        self.worktrees.append(self.entry(item, action, result.data))
-        if action == "removed":
-            self.removed = item
-            self.audit(row)
-            self.audited = True
+        if marked:
+            self.set_step(agent_id, "hooks_done", teardown_partial_record=None)
+        self.worktrees.append(
+            self.entry(item, "none" if result.already else "removed", result.data)
+        )
+        self.audit_removal(row, item)
 
     def step_session(self, row: Mapping[str, Any]) -> None:
         """Step 6: ``claude-session forget``; exit 10 counts as done, any other failure stops
@@ -872,18 +933,28 @@ def _dry_run(td: Teardown, agent_id: str) -> Outcome:
 _REASON = re.compile(r"[a-z][a-z0-9_]*")
 
 
+# What wtctl's human ``--force`` overrides (wtctl interface, Remove order): the refusal reasons
+# ``wtctl status`` reports for these (its ``force_overrides`` lists check names, not reasons).
+_FORCE_OVERRIDES = ("held", "dirty", "unpushed")
+
+
 def _predicted_refusal(td: Teardown, status: Mapping[str, Any]) -> str | None:
-    """The refusal a ``wtctl status`` object predicts for ``remove`` with this call's flags."""
+    """The refusal a ``wtctl status`` object predicts for ``remove`` with this call's flags.
+
+    Anything but ``would_remove`` true or false (null: wtctl could not tell, a real remove
+    would exit 12; missing or malformed) is ``unknown``: the dry run never fails open."""
     human = td.actor.startswith("human:")
     if status.get("human_required") is True and not human:
         return "confirmation_required"
-    if status.get("would_remove") is not False:
+    would_remove = status.get("would_remove")
+    if would_remove is True:
         return None
+    if would_remove is not False:
+        return "unknown"
     reason = status.get("reason")
     if not isinstance(reason, str) or _REASON.fullmatch(reason) is None:
         return "unknown"
-    overrides = status.get("force_overrides")
-    if td.force and isinstance(overrides, list) and reason in overrides:  # pyright: ignore[reportUnknownVariableType]
+    if td.force and reason in _FORCE_OVERRIDES:
         return None
     return reason
 
@@ -895,9 +966,15 @@ def _dry_run_worktrees(
     the owned one (``wtctl`` is asked only when nothing else refuses already)."""
     agent_id = row["agent_id"]
     done_already = reached(row, "worktree_done")
-    items = td.finished_items(row) if done_already else td.worktree_plan(row)
     entries: list[dict[str, Any]] = []
     predicted: str | None = None
+    try:
+        items = td.finished_items(row) if done_already else td.worktree_plan(row)
+    except CliError as error:
+        if error.code != "refused" or error.reason != "not_held":
+            raise
+        items = td.finished_items(row)  # the stored record is not the agent's: refuse, plan held
+        predicted, ask_wtctl = "not_held", False
     for item in items:
         status: dict[str, Any] | None = None
         action = "none" if item.released else ("removed" if item.owned else "released")

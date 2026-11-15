@@ -200,6 +200,7 @@ class WtctlError(CliError):
         record_id: str | None,
         operation: str = "",
         record: WtRecord | None = None,
+        lower_exit: int | None = None,
     ) -> None:
         super().__init__(
             base.code,
@@ -215,6 +216,7 @@ class WtctlError(CliError):
         self.record_id = record_id
         self.record = record
         self.operation = operation  # the wtctl command that failed
+        self.lower_exit = lower_exit  # wtctl's own exit code (the envelope maps several to 1)
 
 
 def failure_kind(error: CliError) -> FailureKind:
@@ -379,7 +381,7 @@ class WtctlBackend:
             else:
                 record = parse_record(named)
                 record_id = record.id if record is not None else None
-        wrapped = WtctlError(base, record_id, operation, record)
+        wrapped = WtctlError(base, record_id, operation, record, reply.code)
         if failure_kind(wrapped) == "busy":
             wrapped.details = {"retryable": True}
         return wrapped
