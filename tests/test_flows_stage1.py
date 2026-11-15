@@ -13,10 +13,11 @@ from pathlib import Path
 
 import pytest
 
+from agent_spawn import procs
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
-from agent_spawn import procs
 from tests.flow_support import HOOKS, LIVE_LAUNCH_PHASE, Flow, schema
+from tests.launch_support import script_hung_exec
 from tests.procguard import ProcTracker
 
 LAUNCH_HEADLESS = ("launch", "--mode", "headless", "--skill", "do-it", "--json")
@@ -35,7 +36,13 @@ def test_headless_review_run_to_report_result_file_and_teardown(flow: Flow, tmp_
     result_file = tmp_path / "out" / "review.json"
     result_file.parent.mkdir()
     done = flow.cli(
-        schema("launch"), *REVIEW, "--wait", "--label", "ticket=T-1", "--result-file", str(result_file)
+        schema("launch"),
+        *REVIEW,
+        "--wait",
+        "--label",
+        "ticket=T-1",
+        "--result-file",
+        str(result_file),
     )
     assert done.code == 0, (done.stdout, done.stderr)
     agent_id = done.body["agent"]["agent_id"]
@@ -64,7 +71,13 @@ def test_headless_review_run_to_report_result_file_and_teardown(flow: Flow, tmp_
     park = flow.hooks_named("post-park", agent_id)
     assert [p["reason"] for p in park] == ["done"]
     flow.validate_everything(
-        expect_hooks=["pre-launch", "post-launch", "post-state-change", "post-park", "post-teardown"]
+        expect_hooks=[
+            "pre-launch",
+            "post-launch",
+            "post-state-change",
+            "post-park",
+            "post-teardown",
+        ]
     )
 
 
@@ -171,7 +184,8 @@ def test_live_agent_wait_label_stop_resume_fork_and_export(
     assert resumed.body["outcome"] == "done" and flow.agent(agent_id)["run"] == 2
     forked = flow.cli(
         schema("resume"),
-        "resume", agent_id, "--fork", "--cwd", "session-dir", "--wait", "--label", "branch=x", "--json",
+        "resume", agent_id, "--fork", "--cwd", "session-dir", "--wait",
+        "--label", "branch=x", "--json",
     )  # fmt: skip
     assert forked.code == 0, (forked.stdout, forked.stderr)
     fork_id = forked.body["agent"]["agent_id"]
@@ -359,3 +373,35 @@ def test_ephemeral_agent_with_a_pre_teardown_hook_parks_done_with_teardown_refus
     assert resumed.code == 0 and flow.agent(agent_id)["run"] == 2
     flow.validate_everything(expect_hooks=["post-park"])
 
+
+def test_job_launch_wait_canceled_after_the_run_started_parks_killed(
+    flow: Flow, proc_tracker: ProcTracker
+) -> None:
+    flow.script_live_status()
+    script_hung_exec(flow.fakebin)
+    job = flow.start(
+        proc_tracker, *LAUNCH_HEADLESS, "--wait", extra_env={"JOBSCTL_JOB_ID": "job-42"}
+    )
+    flow.env.wait_for(
+        lambda: any(a["status"] == "live" for a in flow.env.agents()), "the run to start"
+    )
+    (row,) = flow.env.agents()
+    agent_id = row["agent_id"]
+    flow.track(proc_tracker, agent_id)
+    flow.fakebin.wait_for_hang(row["exec_proc"].pid)
+    # the cancellation chain: launcher -> supervisor -> exec, each forwarding to the next
+    job.send_signal(signal.SIGTERM)
+    done = flow.finish(schema("launch"), job)
+    assert done.code == 15, (done.stdout, done.stderr)
+    assert done.body["phase"] == "session" and done.body["outcome"] == "killed"
+    assert done.body["agent"]["park_reason"] == "killed"
+    assert done.body["agent"]["needs_attention"] is None
+    flow.wait_settled(agent_id)
+    flow.back_to_final_status()
+    # the job id travelled as a label and finds the agent
+    found = flow.cli(schema("list"), "list", "--label", "job=job-42", "--json")
+    assert [a["agent_id"] for a in found.body["agents"]] == [agent_id]
+    # a stopped run is never resumed automatically; the caller may resume it deliberately
+    assert flow.agent(agent_id)["run"] == 1
+    flow.validate_everything(expect_hooks=["post-launch", "post-park"])
+    assert [p["reason"] for p in flow.hooks_named("post-park", agent_id)] == ["killed"]

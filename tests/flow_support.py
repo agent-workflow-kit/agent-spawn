@@ -88,17 +88,13 @@ class Flow:
         self.validated += 1
         return body
 
-    def cli(
-        self, schema_id: str, *args: str, extra_env: dict[str, str] | None = None
-    ) -> Result:
+    def cli(self, schema_id: str, *args: str, extra_env: dict[str, str] | None = None) -> Result:
         done = self.env.run(*args, extra_env=extra_env)
-        return Result(
-            done.returncode, self.check(schema_id, done.stdout), done.stdout, done.stderr
-        )
+        return Result(done.returncode, self.check(schema_id, done.stdout), done.stdout, done.stderr)
 
     def start(
         self, tracker: ProcTracker, *args: str, extra_env: dict[str, str] | None = None
-    ) -> subprocess.Popen[str]:
+    ) -> subprocess.Popen[bytes]:
         """Start a command in the background (tracked: the test's cleanup kills exactly it)."""
         return tracker.popen(
             self.env.argv(*args),
@@ -106,11 +102,11 @@ class Flow:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
         )
 
-    def finish(self, schema_id: str, proc: subprocess.Popen[str], timeout: float = 60) -> Result:
-        out, err = proc.communicate(timeout=timeout)
+    def finish(self, schema_id: str, proc: subprocess.Popen[bytes], timeout: float = 60) -> Result:
+        raw_out, raw_err = proc.communicate(timeout=timeout)
+        out, err = raw_out.decode(), raw_err.decode()
         return Result(proc.returncode, self.check(schema_id, out), out, err)
 
     # -- the state -----------------------------------------------------------------------
@@ -184,7 +180,9 @@ class Flow:
 
     def hook_payloads(self) -> list[dict[str, Any]]:
         return [
-            json.loads(path.read_text()) for path in sorted(self.hooks_dir.iterdir()) if path.is_file()
+            json.loads(path.read_text())
+            for path in sorted(self.hooks_dir.iterdir())
+            if path.is_file()
         ]
 
     def hooks_named(self, name: str, agent_id: str | None = None) -> list[dict[str, Any]]:

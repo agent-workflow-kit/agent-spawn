@@ -51,7 +51,9 @@ def test_resume_of_a_third_party_run_refuses_a_result_file_in_its_session_dir(
     schema_registry.validate(result_json(done), "agent-spawn/cli/error.json")
     assert not target.exists()  # not even the exit-2 envelope is written there
     assert env.agent(agent_id)["status"] == "parked" and env.agent(agent_id)["run"] == 1
-    starts = [a for a in fakebin.argvs("claude-session") if a[0] == "start" and "--dry-run" not in a]
+    starts = [
+        a for a in fakebin.argvs("claude-session") if a[0] == "start" and "--dry-run" not in a
+    ]
     assert len(starts) == 1  # the refusal came before the second start
 
 
@@ -78,8 +80,6 @@ def test_resume_of_a_trusted_run_may_write_into_its_session_dir(
     fakebin.script("claude-session", "status", merge={"csession_dir": str(csd)})
     agent_id = str(result_json(env.run(*LAUNCH))["agent"]["agent_id"])
     target = csd / "r.json"
-    done = env.run(
-        "resume", agent_id, "--json", "--wait", "--result-file", str(target)
-    )
+    done = env.run("resume", agent_id, "--json", "--wait", "--result-file", str(target))
     assert done.returncode == 0, (done.stdout, done.stderr)
     assert target.exists()

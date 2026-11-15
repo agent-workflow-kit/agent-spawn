@@ -636,7 +636,9 @@ class Resume(Launch):
             raise
         if self.result_file_inside([directory]):
             third_party.drop_result_file(self.inv)
-            raise CliError.usage("--result-file lies inside a third-party-reading run's session dir")
+            raise CliError.usage(
+                "--result-file lies inside a third-party-reading run's session dir"
+            )
 
     def check_plan_cwd(self, classification: third_party.Classification, cwd: str | None) -> None:
         """A plain resume passes no ``--cwd``: the run starts where claude-session's plan says.
