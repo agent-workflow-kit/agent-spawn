@@ -53,6 +53,7 @@ IMPLEMENTED = {
     "show",
     "stop",
     "supervise",
+    "teardown",
     "wait",
 }
 

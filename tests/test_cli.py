@@ -59,4 +59,4 @@ def test_human_only_flag_without_a_tty_exits_2(tmp_path: Path) -> None:
     done = _run(tmp_path, "teardown", "ag-abcdefgh", "--force")
     assert done.returncode == 2
     done = _run(tmp_path, "teardown", "ag-abcdefgh", "--force", "--actor", "human:alice")
-    assert done.returncode == 1  # reached the (stub) handler
+    assert done.returncode == 10  # reached the handler (no agents in the empty state dir)
