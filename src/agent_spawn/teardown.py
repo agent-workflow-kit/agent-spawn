@@ -722,7 +722,8 @@ class Teardown:
         self.mark_released(agent_id, item)
         self.set_step(agent_id, "hooks_done", teardown_partial_record=None)
         self.worktrees.append(self.entry(item, "removed", None))
-        self.audit_removal(row, item)
+        if record.state == "removed":  # a forgotten or gone record was not removed by this agent
+            self.audit_removal(row, item)
 
     @staticmethod
     def unfinished(agent_id: str, item: WtItem) -> CliError:
@@ -793,7 +794,8 @@ class Teardown:
         self.worktrees.append(
             self.entry(item, "none" if result.already else "removed", result.data)
         )
-        self.audit_removal(row, item)
+        if not result.already or result.state == "removed":  # forgotten/gone: not a removal
+            self.audit_removal(row, item)
 
     def step_session(self, row: Mapping[str, Any]) -> None:
         """Step 6: ``claude-session forget``; exit 10 counts as done, any other failure stops

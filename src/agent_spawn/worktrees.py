@@ -277,6 +277,7 @@ class WtResult:
 
     data: dict[str, Any] | None
     already: bool = False
+    state: str | None = None  # the tombstone state wtctl reported with ``already``
 
     @property
     def record_state(self) -> str | None:
@@ -533,7 +534,8 @@ class WtctlBackend:
             argv.append("--override-escalation")
         reply = self.call([*argv, *self.audit_flags(), "--json"], timeout=REMOVE_TIMEOUT)
         if reply.code == 10 and _details(reply).get("state") in TOMBSTONES:
-            return WtResult(None, already=True)
+            state = _details(reply).get("state")
+            return WtResult(None, already=True, state=state if isinstance(state, str) else None)
         if reply.code != 0:
             raise self._fail(reply, "remove")
         return WtResult(reply.data)

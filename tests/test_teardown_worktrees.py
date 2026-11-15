@@ -505,6 +505,31 @@ def test_an_owned_row_whose_record_is_a_tombstone_is_audited(env: Env, fakebin: 
     assert [a["inputs"]["worktree"]["record_id"] for a in audit_records(env)] == [record_id]
 
 
+def test_an_owned_row_whose_record_is_forgotten_or_gone_is_not_audited_as_a_removal(
+    env: Env, fakebin: Fakebin
+) -> None:
+    for state in ("forgotten", "gone"):
+        agent_id = launched_in_worktree(env)
+        record_id = env.agent(agent_id)["wt_record_id"]
+        set_state(fakebin, record_id, state)
+        done = td(env, agent_id)
+        assert done.returncode == 0, (done.stdout, done.stderr)
+        assert env.agent(agent_id)["status"] == "torn_down"
+    assert audit_records(env) == []
+
+
+def test_a_retry_over_a_forgotten_record_is_not_audited_as_a_removal(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = launched_in_worktree(env)
+    record_id = env.agent(agent_id)["wt_record_id"]
+    fakebin.script("wtctl", "remove", times=1, **UNKNOWN)
+    assert td(env, agent_id).returncode == 1
+    set_state(fakebin, record_id, "forgotten")
+    assert td(env, agent_id).returncode == 0
+    assert audit_records(env) == []
+
+
 # --- the hold is checked before remove (R2) ------------------------------------------------------
 
 
