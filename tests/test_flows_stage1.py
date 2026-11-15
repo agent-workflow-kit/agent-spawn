@@ -8,15 +8,18 @@ states are scripted (``live`` status, hung ``exec``, gated ``forget``); nothing 
 
 from __future__ import annotations
 
+import signal
 from pathlib import Path
 
 import pytest
 
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
-from tests.flow_support import Flow, schema
+from agent_spawn import procs
+from tests.flow_support import HOOKS, LIVE_LAUNCH_PHASE, Flow, schema
 from tests.procguard import ProcTracker
 
+LAUNCH_HEADLESS = ("launch", "--mode", "headless", "--skill", "do-it", "--json")
 REVIEW = ("launch", "--mode", "headless", "--kind", "review", "--skill", "review-it", "--json")
 
 
@@ -200,3 +203,159 @@ def test_live_agent_wait_label_stop_resume_fork_and_export(
     )
     assert {p["run"] for p in flow.hooks_named("post-launch", agent_id)} == {1, 2}
     assert [p["fork"] for p in flow.hooks_named("post-launch", fork_id)] == [True]
+
+
+# --- a job-style caller canceled from outside -------------------------------------------------
+
+
+def test_launch_wait_under_sigterm_during_the_prelaunch_hooks_parks_killed_with_a_launch_result(
+    flow: Flow, proc_tracker: ProcTracker
+) -> None:
+    # claude-session's pre-launch hooks are still running: the run is in its launch phase
+    flow.fakebin.script("claude-session", "status", merge={"run": LIVE_LAUNCH_PHASE})
+    # `exec` ends with exit 12 on the forwarded SIGTERM, as it does while claude-session is
+    # still in its launch phase (the scripted `status` below then reports the not-started run)
+    flow.fakebin.script("claude-session", "exec", hang=True, on_signal={"SIGTERM": {"exit": 12}})
+    job = flow.start(proc_tracker, *LAUNCH_HEADLESS, "--wait")
+    flow.env.wait_for(
+        lambda: any(a.get("exec_proc") for a in flow.env.agents()), "the supervisor's exec"
+    )
+    (row,) = flow.env.agents()
+    agent_id = row["agent_id"]
+    flow.track(proc_tracker, agent_id)
+    flow.fakebin.wait_for_hang(row["exec_proc"].pid)
+    assert flow.agent(agent_id)["status"] == "launching"
+    # the cancellation arrives: the run ends in its launch phase, never started
+    flow.fakebin.clear_script("claude-session", "status")
+    flow.fakebin.script("claude-session", "status", outcome="not-started")
+    job.send_signal(signal.SIGTERM)  # the jobs runner's SIGTERM to the launcher
+    done = flow.finish(schema("launch"), job)
+    assert done.code == 12, (done.stdout, done.stderr)
+    assert done.body["phase"] == "launch" and done.body["outcome"] == "not-started"
+    parked = flow.agent(agent_id)
+    assert parked["status"] == "parked" and parked["park_reason"] == "killed"
+    assert parked["needs_attention"] is None
+    flow.wait_settled(agent_id)
+    assert flow.cli(schema("wait"), "wait", agent_id, "--json").code == 12
+    flow.validate_everything(expect_hooks=["post-park"])
+    assert [p["reason"] for p in flow.hooks_named("post-park", agent_id)] == ["killed"]
+
+
+# --- teardown combined with wait, resume and stop (issue #18, criterion 3) ---------------------
+
+EPHEMERAL = (*LAUNCH_HEADLESS, "--ephemeral")
+
+
+def test_wait_and_resume_during_an_ephemeral_teardown(
+    flow: Flow, proc_tracker: ProcTracker, tmp_path: Path
+) -> None:
+    gate = tmp_path / "forget-gate"
+    flow.fakebin.script("claude-session", "forget", gate=str(gate))  # holds teardown step 6
+    started = flow.cli(schema("launch"), *EPHEMERAL)
+    assert started.code == 0, (started.stdout, started.stderr)
+    agent_id = started.body["agent"]["agent_id"]
+    flow.fakebin.wait_for_gate(gate)
+    flow.track(proc_tracker, agent_id)
+    row = flow.agent(agent_id)
+    assert row["status"] == "tearing_down" and row["teardown_step"] == "hooks_done"
+    supervisor = row["supervisor"]
+    assert supervisor is not None and procs.is_alive(supervisor)
+
+    # a resume is refused for as long as the teardown runs
+    refused = flow.cli(schema("resume"), "resume", agent_id, "--json")
+    assert refused.code == 20 and refused.body["error"]["reason"] == "tearing_down"
+    assert flow.agent(agent_id)["status"] == "tearing_down"
+    # a wait does not return while the supervisor is alive
+    early = flow.cli(schema("wait"), "wait", agent_id, "--timeout", "300ms", "--json")
+    assert early.code == 22 and early.body["timed_out"] is True
+    waiter = flow.start(proc_tracker, "wait", agent_id, "--json")
+
+    gate.write_text("")  # claude-session forgets the session; the teardown finishes
+    done = flow.finish(schema("wait"), waiter)
+    assert done.code == 0, (done.stdout, done.stderr)
+    assert done.body["agent"]["status"] == "torn_down" and done.body["outcome"] == "done"
+    assert not procs.is_alive(supervisor)  # it returned only after the supervisor exited
+
+    # the tombstone: resume is refused, wait still answers, no second teardown
+    gone = flow.cli(schema("resume"), "resume", agent_id, "--json")
+    assert gone.code == 10 and gone.body["error"]["details"]["status"] == "torn_down"
+    assert flow.cli(schema("wait"), "wait", agent_id, "--json").code == 0
+    again = flow.cli(schema("teardown"), "teardown", agent_id, "--json")
+    assert again.code == 10 and again.body["error"]["details"]["status"] == "torn_down"
+    assert flow.cli(schema("export"), "export", "--json").body == []
+    flow.validate_everything(expect_hooks=["post-launch", "post-teardown"])
+    assert len(flow.hooks_named("post-teardown", agent_id)) == 1
+    assert flow.hooks_named("post-park", agent_id) == []  # never parked: it went to tombstone
+
+
+def test_stop_is_the_remedy_for_an_ephemeral_agent_left_tearing_down(
+    flow: Flow, proc_tracker: ProcTracker
+) -> None:
+    # the session still has an orphaned child, so claude-session refuses to forget it
+    flow.fakebin.script(
+        "claude-session",
+        "forget",
+        times=1,
+        error={"code": "refused", "message": "a run is still live", "reason": "live"},
+    )
+    started = flow.cli(schema("launch"), *EPHEMERAL, "--wait")
+    agent_id = started.body["agent"]["agent_id"]
+    flow.wait_settled(agent_id)
+    row = flow.agent(agent_id)
+    assert row["status"] == "tearing_down" and row["teardown_step"] == "hooks_done"
+    assert row["park_reason"] != "done"
+
+    # no supervisor is left: wait answers at once with the last outcome
+    waited = flow.cli(schema("wait"), "wait", agent_id, "--json")
+    assert waited.code == 0 and waited.body["agent"]["status"] == "tearing_down"
+    # the orphan is live: stop acts on it, and a resume stays refused
+    flow.script_live_status(times=1)  # the look before the stop; later looks see it final
+    # the fake session recorded the run as done; the orphan is a live process of it, so
+    # claude-session's stop kills it (scripted: the fake's own bookkeeping says already final)
+    flow.fakebin.script(
+        "claude-session",
+        "stop",
+        merge={
+            "already_final": False,
+            "canceled": False,
+            "run_exit_code": 15,
+            "state": "killed",
+            "outcome": "killed",
+            "end_reason": "stopped",
+        },
+    )
+    stopped = flow.cli(schema("stop"), "stop", agent_id, "--json", "--grace", "1s")
+    assert stopped.code == 0, (stopped.stdout, stopped.stderr)
+    assert stopped.body["action"] == "session_stop" and stopped.body["already_parked"] is False
+    assert stopped.body["agent"]["status"] == "tearing_down"
+    assert [a for a in flow.fakebin.argvs("claude-session") if a[0] == "stop"]
+    refused = flow.cli(schema("resume"), "resume", agent_id, "--json")
+    assert refused.code == 20 and refused.body["error"]["reason"] == "tearing_down"
+
+    # the retry now completes where it stopped (the session step)
+    retried = flow.cli(schema("teardown"), "teardown", agent_id, "--json")
+    assert retried.code == 0, (retried.stdout, retried.stderr)
+    assert retried.body["agent"]["status"] == "torn_down" and retried.body["session_forgotten"]
+    stops = flow.cli(schema("export"), "export", "--action", "stop", "--json").body
+    assert [r["target"] for r in stops] == [agent_id]
+    flow.validate_everything(expect_hooks=["post-teardown"])
+
+
+def test_ephemeral_agent_with_a_pre_teardown_hook_parks_done_with_teardown_refused(
+    fakebin: Fakebin, isolation_env: Isolation, tmp_path: Path
+) -> None:
+    flow = Flow(fakebin, isolation_env, tmp_path, hooks=(*HOOKS, "pre-teardown"))
+    started = flow.cli(schema("launch"), *EPHEMERAL, "--wait")
+    assert started.code == 0, (started.stdout, started.stderr)
+    agent_id = started.body["agent"]["agent_id"]
+    assert started.body["agent"]["status"] == "parked"
+    assert started.body["agent"]["park_reason"] == "done"
+    flow.wait_settled(agent_id)
+    (park,) = flow.hooks_named("post-park", agent_id)
+    assert park["reason"] == "done" and park["teardown_refused"] is True
+    assert flow.hooks_named("post-teardown", agent_id) == []
+    # resume works again: a refused teardown changed nothing
+    resumed = flow.cli(schema("resume"), "resume", agent_id, "--wait", "--json")
+    assert resumed.code == 0 and flow.agent(agent_id)["run"] == 2
+    flow.validate_everything(expect_hooks=["post-park"])
+

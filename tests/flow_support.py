@@ -132,7 +132,7 @@ class Flow:
             if row.get(key) is not None:
                 tracker.record(row[key])
 
-    def script_live_status(self, **top: Any) -> None:
+    def script_live_status(self, *, times: int | None = None, **top: Any) -> None:
         """`claude-session status` reports the current run live in its session phase (``top``
         fields, such as ``csession_dir``, are merged into the status object)."""
         live_run = {
@@ -145,7 +145,10 @@ class Flow:
             "report": None,
         }
         self.fakebin.script(
-            "claude-session", "status", merge={"state": "working", "live": True, "run": live_run, **top}
+            "claude-session",
+            "status",
+            times=times,
+            merge={"state": "working", "live": True, "run": live_run, **top},
         )
 
     def live_launch(self, tracker: ProcTracker, *args: str, **status_fields: Any) -> str:
