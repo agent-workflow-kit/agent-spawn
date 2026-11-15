@@ -200,3 +200,82 @@ def test_post_launch_marks_resume_and_fork(env: Env, tmp_path: Path) -> None:
     forked = json.loads((tmp_path / "fork.json").read_text())
     assert (forked["resumed"], forked["fork"]) == (True, True)
     assert forked["agent"]["agent_id"] != agent_id
+
+
+def test_job_label_comes_from_the_environment_but_not_for_a_fork(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = launched(env)
+    env.run("resume", agent_id, "--json", "--wait", extra_env={"JOBSCTL_JOB_ID": "j-7"})
+    assert "--label=job=j-7" in starts(fakebin)[-1]
+    with env.store() as store:
+        assert "job=j-7" in store.get_labels(agent_id).texts()
+    env.run(
+        "resume", agent_id, "--fork", "--cwd", "session-dir", "--json", "--wait",
+        extra_env={"JOBSCTL_JOB_ID": "j-8"},
+    )  # fmt: skip
+    assert not any("job=" in a for a in starts(fakebin)[-1])
+
+
+def test_a_failed_fork_deletes_its_prompt_copies_but_a_failed_resume_keeps_the_new_ones(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    source = launched(env)
+    prompt = tmp_path / "p.txt"
+    prompt.write_text("words")
+    refuse_start(fakebin)
+    assert env.run("resume", source, "--fork", "--cwd", "session-dir", "--prompt-file",
+                   str(prompt), "--json").returncode == 20  # fmt: skip
+    prompts = env.state_dir / "prompts"
+    assert not [p for p in prompts.iterdir()] if prompts.exists() else True
+    refuse_start(fakebin)
+    assert env.run("resume", source, "--prompt-file", str(prompt), "--json").returncode == 20
+    copies = list((prompts / source).glob("resume-*/prompt"))
+    assert len(copies) == 1 and copies[0].read_text() == "words"
+
+
+def test_override_escalation_reaches_claude_session_only_for_its_escalation(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = launched(env)
+    with env.store() as store:
+        from agent_spawn.lifecycle import lease_key
+
+        with store.lease(lease_key(agent_id)) as lease:
+            store.update_agent(
+                lease,
+                agent_id,
+                {
+                    "escalated_by": "claude-session",
+                    "park_reason": "escalated",
+                    "needs_attention": "escalated",
+                    "last_outcome": {"outcome": "escalated", "phase": "launch"},
+                },
+            )
+    done = env.run("resume", agent_id, "--override-escalation", "--actor", "human:me", "--json",
+                   "--wait")  # fmt: skip
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert "--override-escalation" in starts(fakebin)[-1]
+    audit = [
+        json.loads(x)["action"] for x in (env.state_dir / "audit.jsonl").read_text().splitlines()
+    ]
+    assert audit == ["resume_escalation_override"]
+
+
+def test_a_live_agent_makes_no_copies_and_changes_nothing(
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
+) -> None:
+    agent_id = launched(env)
+    script_live_run(fakebin)
+    script_hung_exec(fakebin)
+    assert env.run("resume", agent_id, "--json").returncode == 0
+    track_agent(env, proc_tracker, agent_id)
+    prompt = tmp_path / "p.txt"
+    prompt.write_text("words")
+    done = env.run("resume", agent_id, "--prompt-file", str(prompt), "--json")
+    assert done.returncode == 20
+    assert (
+        not list((env.state_dir / "prompts").glob("*/resume-*"))
+        if (env.state_dir / "prompts").exists()
+        else True
+    )

@@ -40,7 +40,6 @@ from .launch import (
     Launch,
     SignalState,
     _Copies,
-    _rename_copies,
     _signals_held,
     _tty_pair,
     input_names,
@@ -583,7 +582,6 @@ class Resume(Launch):
             raise _refusal("tearing_down", "the agent is being torn down", row["agent_id"])
         if self.args.dry_run:
             return self.dry_run_resume(row, cs_argv)
-        self.check_status(row) if self.fork else None
         proposed = new_agent_id(store) if self.fork else row["agent_id"]
         return self.resume_run(row, proposed, cs_argv, self_path)
 
@@ -592,20 +590,15 @@ class Resume(Launch):
     ) -> Outcome:
         assert self.store is not None and self.backend is not None
         identity = self.store.holder_identity()
-        # Copies first (a usage error leaves nothing behind), then the lifecycle entry.
-        self.copies = self.make_run_copies(row, proposed)
-        copies = self.copies
+        # The lifecycle entry (step 3), then the copies (step 4): a failure of either restores
+        # the pre-resume row or deletes the fork.
         if self.fork:
-            assert copies is not None
-            row_now = self.insert_fork(row, proposed, cs_argv, self_path, identity)
-            if row_now["agent_id"] != proposed:
-                self.copies = copies = _rename_copies(
-                    self.state_dir, copies, row_now["agent_id"], self.args
-                )
-            run_id = row_now["agent_id"]
+            self.resume_cwd = self.fork_cwd(row)
+            run_id = self.insert_fork(row, proposed, cs_argv, self_path, identity)["agent_id"]
         else:
             self.enter(row, identity)
             run_id = row["agent_id"]
+        self.copies = copies = self.make_run_copies(row, run_id)
         self.log("fork" if self.fork else "resume", details={"mode": self.mode})
         self.run_checks_and_start(row, run_id, copies, cs_argv, self_path)
         assert self.csession_id is not None
@@ -661,7 +654,7 @@ class Resume(Launch):
 
     def fork_settings(self, row: Mapping[str, Any], labels: LabelSet) -> dict[str, Any]:
         a = self.args
-        names = self.copies.input_names if self.copies is not None else []
+        names = input_names(a)
         settings = {
             **DEFAULT_SETTINGS,
             **{k: v for k, v in self.stored.items() if k in DEFAULT_SETTINGS},
@@ -746,7 +739,6 @@ class Resume(Launch):
     ) -> None:
         assert self.store is not None and self.backend is not None
         backend = self.backend
-        self.resume_cwd = None
         try:
             cwd = self.run_cwd(source_row)
             spec = self.build_spec(run_id, None, cwd, copies)
