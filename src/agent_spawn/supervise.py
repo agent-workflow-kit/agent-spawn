@@ -27,13 +27,14 @@ from . import hooks as hooklib
 from .agent_view import outcome_object, ts
 from .chain import Final, RunCtx
 from .config import Config
-from .outcome_table import park_row
+from .outcome_table import CANCEL_END_REASONS, park_row
 from .output import CliError, Outcome, PayloadKind
 from .records import RecordsError, append_log, parse_record_ts
-from .session_backend import RunOutcome, SessionBackend, read_outcome_file
+from .session_backend import RunOutcome, SessionBackend
 from .store import Store, StoreError, StoreMissing
 
 STATUS_EVERY = 1.0  # seconds between looks at `claude-session status` and the outbox
+STATUS_TIMEOUT = 5.0  # seconds the watch loop's own `status` poll may take
 RELAY_EVERY = 0.25  # seconds between looks at the relay's records (an early wake-up)
 TICK = 0.05  # seconds between looks at `exec`
 SUPERVISOR_ACTOR = "auto:agent-spawn"
@@ -42,6 +43,8 @@ DONE = Outcome(0, {}, PayloadKind.COMMAND, quiet=True)
 OUTCOME_TRIES = 3  # reads of the final outcome before giving up
 OUTCOME_RETRY = 0.2  # seconds between them
 EXEC_GRACE = 30.0  # seconds `exec` gets after SIGTERM when this supervisor fails
+# TODO(#27): an interactive run ignores SIGINT (the terminal delivers it to `claude`); until
+# interactive hosting lands every supervisor is headless, so SIGINT is forwarded.
 FORWARDED = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 #: Outcomes a run can end with in its launch phase (a supervisor-initiated run that does so
 #: stops the chain early).
@@ -49,16 +52,38 @@ LAUNCH_PHASE_OUTCOMES = frozenset({"not-started", "vetoed", "escalated"})
 
 
 class Signals:
-    """The supervisor's handlers only record the signal; the main loop forwards it."""
+    """The supervisor's handlers record the signal for the main loop's bookkeeping and, while an
+    ``exec`` child is known (``forwarder`` set), forward it themselves: the loop may be blocked
+    in a lower-tool call for a long time, and the signal must reach ``exec`` promptly.
+
+    The forwarder marks a signal before sending it, so a handler that interleaves with the loop's
+    own forward cannot send it twice. The handler logs nothing (a log write could re-enter one
+    in progress); the loop logs what ``take_sent`` returns.
+    """
 
     def __init__(self) -> None:
         self.received: list[int] = []
+        self.forwarder: procs.SignalForwarder | None = None
+        self.sent: list[procs.SignalOutcome] = []
 
     def handle(self, signum: int, frame: FrameType | None) -> None:
         self.received.append(signum)
+        forwarder = self.forwarder
+        if forwarder is None or signum not in FORWARDED:
+            return
+        try:
+            outcome = forwarder.forward(signum)
+        except OSError:
+            return  # the loop retries through its own forward
+        if outcome is not None:
+            self.sent.append(outcome)
 
     def take(self) -> list[int]:
         taken, self.received = self.received, []
+        return taken
+
+    def take_sent(self) -> list[procs.SignalOutcome]:
+        taken, self.sent = self.sent, []
         return taken
 
 
@@ -84,10 +109,12 @@ class Supervisor:
         self.store: Store | None = None
         self.agent_id: str = inv.args.agent_id
         self.forwarder: procs.SignalForwarder | None = None
+        self.child: subprocess.Popen[bytes] | None = None  # the current `exec`
         self.runner: hooklib.AsyncRunner | None = None
         self.terminated = False  # SIGTERM, SIGHUP or SIGINT arrived during this run chain
         self.teardown = unavailable_teardown
         self.relay_seen: tuple[object, ...] = ()
+        self.fallback_sent: set[int] = set()
 
     def log(self, event: str, *, level: str = "info", **fields: Any) -> None:
         try:
@@ -134,18 +161,21 @@ class Supervisor:
         finally:
             self.store.close()
 
-    def backend(self, row: dict[str, Any]) -> SessionBackend:
+    def backend(self, row: dict[str, Any], *, timeout: float | None = None) -> SessionBackend:
+        extra: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
         return SessionBackend(
             shlex.split(row["claude_session_path"]),
             actor=SUPERVISOR_ACTOR,
             decision_ids=row.get("decision_ids") or [],
             gateway=self.gateway,
+            **extra,
         )
 
     def supervise(self, row: dict[str, Any]) -> Outcome:
         assert self.store is not None
         store = self.store
         backend = self.backend(row)
+        poller = self.backend(row, timeout=STATUS_TIMEOUT)  # the watch loop never blocks long
         session = row["csession_id"]
         run = row["run"]
         if not isinstance(session, str) or not isinstance(run, int):
@@ -162,11 +192,37 @@ class Supervisor:
 
         previous: Final | None = None
         while True:
-            child = self.spawn_exec(row, session)
-            self.watch(child, backend, session, ctx)
+            try:
+                child = self.spawn_exec(row, session)
+            except (OSError, StoreError) as error:
+                # `exec` could not be started (or was stopped again because it could not be
+                # recorded): the run it should have adopted must not stay pending.
+                self.log("warning", level="error", message=f"could not start exec: {error}")
+                if previous is None:
+                    return self.park_canceled(backend, session, ctx)
+                run_row = store.get_run(self.agent_id, ctx.run) or {}
+                chain.cancel_pending(
+                    self,
+                    backend,
+                    session,
+                    ctx.run,
+                    hooks=run_row.get("hooks"),
+                    token=run_row.get("outcome_token"),
+                )
+                failure = chain.ChainFailure("agent-spawn", "failed", run=ctx.run)
+                return self.park_chain_failure(previous, failure)
+            self.watch(child, poller, session, ctx)
             self.collect_signals()
             final = self.end_of_run(backend, session, ctx)
             if previous is not None and self.ended_in_launch(final):
+                if (
+                    self.terminated
+                    and final.result.outcome == "not-started"
+                    and final.result.end_reason in CANCEL_END_REASONS
+                ):
+                    # A user's SIGTERM or SIGHUP canceled the chain run: not a chain failure;
+                    # the Signals rule applies (killed, no attention).
+                    return self.park_final(final)
                 # A supervisor-initiated run that ended in its launch phase stops the chain.
                 failure = chain.ChainFailure(
                     "claude-session",
@@ -196,6 +252,7 @@ class Supervisor:
         return bool(taken)
 
     def note_signal(self, received: int) -> None:
+        # TODO(#27): SIGINT of an interactive run is ignored, not a termination.
         if received in FORWARDED:
             self.terminated = True
 
@@ -203,15 +260,19 @@ class Supervisor:
         assert self.store is not None
         argv = [*shlex.split(row["claude_session_path"]), "exec", "--session-id", session]
         child = self.gateway.spawn(argv, stdin=gw.DEVNULL)
+        self.child = child
         self.forwarder = None
+        self.signals.forwarder = None
         try:
             identity = procs.read_identity(child.pid, gateway=self.gateway)
             if identity is not None:
                 self.forwarder = procs.SignalForwarder(identity, gateway=self.gateway)
+                self.signals.forwarder = self.forwarder  # from now on the handler forwards
                 with self.store.lease(lifecycle.lease_key(self.agent_id), wait=30.0) as lease:
                     self.store.update_agent(lease, self.agent_id, {"exec_proc": identity})
         except BaseException:
             # `exec` is running but unrecorded: nothing could adopt it, so end it here.
+            self.signals.forwarder = None
             self.stop_child(child)
             raise
         return child
@@ -224,6 +285,8 @@ class Supervisor:
             next_status = 0.0
             next_relay = 0.0
             while child.poll() is None:
+                for sent in self.signals.take_sent():
+                    self.log_sent(sent)
                 for received in self.signals.take():
                     self.note_signal(received)
                     self.forward(received)
@@ -241,6 +304,10 @@ class Supervisor:
         except BaseException:
             self.stop_child(child)
             raise
+        finally:
+            self.signals.forwarder = None  # `exec` is gone: nothing to forward to
+            for sent in self.signals.take_sent():
+                self.log_sent(sent)
 
     def relay_changed(self) -> bool:
         """The relay recorded something new for the agent: poll `status` now (a wake-up only)."""
@@ -277,11 +344,25 @@ class Supervisor:
         SIGCONT follows every SIGTERM (``procs.forward_signal``). The next link of the
         cancellation chain, `claude`, is claude-session's: `exec` forwards to its own child.
         """
-        if received not in FORWARDED or self.forwarder is None:
+        if received not in FORWARDED:
+            return
+        if self.forwarder is None:
+            # `exec`'s identity could not be read: signal the child we spawned (once).
+            if self.child is not None and received not in self.fallback_sent:
+                self.fallback_sent.add(received)
+                try:
+                    self.child.send_signal(received)
+                except OSError as error:
+                    self.log(
+                        "warning", level="warn", message=f"could not signal exec: {error.strerror}"
+                    )
             return
         outcome = self.forwarder.forward(received)
         if outcome is not None:
-            self.log("signal_sent", pid=outcome.pid, signal=signal.Signals(received).name)
+            self.log_sent(outcome)
+
+    def log_sent(self, outcome: procs.SignalOutcome) -> None:
+        self.log("signal_sent", pid=outcome.pid, signal=signal.Signals(outcome.signal).name)
 
     def look_started(self, backend: SessionBackend, session: str, ctx: RunCtx) -> bool:
         """Poll `status`; when the run is in its session phase (or final) the agent goes live."""
@@ -364,15 +445,14 @@ class Supervisor:
             result = self.read_outcome(backend, ctx.outcome_file, session, ctx.run)
         except CliError as error:
             self.log("warning", level="error", message=f"error: no outcome: {error.code}")
-            # TODO(#32): the liveness check parks an agent whose outcome cannot be read.
+            # TODO(#31): the liveness check parks an agent whose outcome cannot be read.
             raise
-        raw = read_outcome_file(ctx.outcome_file, session, ctx.run)
         run_row = self.store.get_run(self.agent_id, ctx.run) or {}
         # The relay's first `working` activity, else the run's `recent_events` (filled in by
         # `run_outcome`), else null.
         first = ts(run_row.get("first_working_at")) or result.first_working_at
         outcome = outcome_object(
-            self.agent_id, result, raw, first_working_at=first, auto_resumed=ctx.auto_resumed
+            self.agent_id, result, result.raw, first_working_at=first, auto_resumed=ctx.auto_resumed
         )
         if not ctx.started and result.phase == "session":
             ctx.started = self.mark_started(ctx, result.phase)  # it started, then ended
@@ -396,7 +476,7 @@ class Supervisor:
                 return result
             failure = CliError.of("internal", "exec exited but the run is not final")
         assert failure is not None
-        # TODO(#32): the liveness check parks an agent whose run never became final.
+        # TODO(#31): the liveness check parks an agent whose run never became final.
         raise failure
 
     def record_run(self, ctx: RunCtx, result: RunOutcome, outcome: dict[str, Any]) -> None:
@@ -407,7 +487,7 @@ class Supervisor:
             "outcome": outcome,
             "end_reason": result.end_reason,
             "exit_code": result.exit_code,
-            "ended_at": time.time(),
+            "ended_at": self.gateway.wall_time(),
         }
         if isinstance(status, str):
             fields["report_status"] = status
@@ -419,7 +499,10 @@ class Supervisor:
             except ValueError:
                 pass
         with self.store.lease(lifecycle.lease_key(self.agent_id), wait=30.0) as lease:
-            self.store.put_run(lease, self.agent_id, ctx.run, fields)
+            with self.store.transaction():
+                # The run is over: the agent row never names a dead `exec` between runs.
+                self.store.update_agent(lease, self.agent_id, {"exec_proc": None})
+                self.store.put_run(lease, self.agent_id, ctx.run, fields)
 
     # -- the end of the chain ------------------------------------------------------------------
 
@@ -491,7 +574,16 @@ class Supervisor:
         reason = self.teardown(self.store, self.agent_id)
         if reason is not None:
             self.log("warning", level="warn", message=f"ephemeral teardown refused: {reason}")
-            lifecycle.refuse_ephemeral_teardown(self.store, self.agent_id, outcome=final.outcome)
+            moved = lifecycle.refuse_ephemeral_teardown(
+                self.store, self.agent_id, outcome=final.outcome
+            )
+            if moved is None:
+                self.log(
+                    "warning",
+                    level="warn",
+                    message="ephemeral teardown refusal not applied "
+                    "(the status changed or the teardown left a partial state)",
+                )
         return self.finish()
 
     def park_chain_failure(self, trigger: Final, failure: chain.ChainFailure) -> Outcome:

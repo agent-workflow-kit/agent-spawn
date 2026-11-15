@@ -401,6 +401,8 @@ class RunOutcome:
     report: dict[str, Any] | None
     source: Literal["file", "status"]
     first_working_at: str | None = None
+    #: The parsed outcome file this was read from (the extras of ``outcome_object``), if any.
+    raw: dict[str, Any] | None = field(default=None, repr=False, compare=False)
 
     @property
     def final(self) -> bool:
@@ -1048,11 +1050,13 @@ class SessionBackend:
                 except CliError:
                     pass
                 first = status.run.first_working_at if status is not None else None
-                return RunOutcome(csession_id, run, source="file", first_working_at=first, **fields)
+                return RunOutcome(
+                    csession_id, run, source="file", first_working_at=first, raw=data, **fields
+                )
         status = self.status(csession_id, run)
         if status.csession_id != csession_id or status.run.run != run:
             raise self._unusable("a status for another run")
-        return status.outcome()
+        return replace(status.outcome(), raw=data)
 
     # -- other commands
 

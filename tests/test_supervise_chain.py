@@ -260,7 +260,7 @@ def test_classification_mismatch_of_the_resume_cancels_it_and_parks(
     fakebin.script(
         "claude-session",
         "status",
-        merge={"run": {"reads_third_party": True}, "tainted_by_run": 2},
+        merge={"run": {"reads_third_party": True, "cwd": "/tmp/elsewhere"}, "tainted_by_run": 2},
     )
     done = env.run(*LAUNCH, "--wait")
     body = result_json(done)
@@ -268,7 +268,7 @@ def test_classification_mismatch_of_the_resume_cancels_it_and_parks(
     agent_id = body["agent"]["agent_id"]
     failure = chain_failure_of(env, agent_id)
     assert failure is not None and failure["tool"] == "agent-spawn" and failure["run"] == 2
-    assert failure["reason"] in ("classification_mismatch", "classification_unknown")
+    assert failure["reason"] == "classification_mismatch"
     stops = [a for a in fakebin.argvs("claude-session") if a[0] == "stop"]
     assert stops, "the pending run was not canceled"
     execs = [a for a in fakebin.argvs("claude-session") if a[0] == "exec"]

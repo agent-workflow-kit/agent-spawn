@@ -463,9 +463,14 @@ class SignalForwarder:
         """Forward ``sig``; ``None`` when this signal was already forwarded."""
         if sig in self._forwarded:
             return None
-        outcome = forward_signal(self.identity, sig, gateway=self._gateway)
-        self._forwarded.add(sig)  # only a completed forward (sent or gone) counts
-        return outcome
+        # Mark before sending: a signal handler that interleaves with this call must not send
+        # the same signal again. A forward that raised is unmarked, so it can be retried.
+        self._forwarded.add(sig)
+        try:
+            return forward_signal(self.identity, sig, gateway=self._gateway)
+        except BaseException:
+            self._forwarded.discard(sig)
+            raise
 
 
 def install_signal_handlers(
