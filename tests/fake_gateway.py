@@ -179,6 +179,16 @@ class FakeGateway:
             raise ProcessLookupError(errno.ESRCH, "No such process")
         self.killed_by_pid.append((pid, sig))
 
+    def getpgid(self, pid: int) -> int:
+        if pid not in self.procs:
+            raise ProcessLookupError(errno.ESRCH, "No such process")
+        return pid
+
+    def killpg(self, pgid: int, sig: int) -> None:
+        if pgid not in self.procs:
+            raise ProcessLookupError(errno.ESRCH, "No such process")
+        self.killed_by_pid.append((-pgid, sig))
+
     def close(self, fd: int) -> None:
         if fd in self._fds:
             del self._fds[fd]
