@@ -49,7 +49,7 @@ def test_no_arguments_is_a_usage_error(tmp_path: Path) -> None:
 
 
 def test_a_stub_command_fails_through_the_envelope_and_creates_no_state(tmp_path: Path) -> None:
-    done = _run(tmp_path, "--json", "list")
+    done = _run(tmp_path, "--json", "reconcile")
     assert done.returncode == 1
     assert json.loads(done.stdout)["error"]["code"] == "internal"
     assert list(tmp_path.iterdir()) == []

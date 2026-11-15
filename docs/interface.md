@@ -475,6 +475,8 @@ Edits the agent's labels (at least one pair; exit 2 otherwise; keys `agent` and 
 6. It runs `claude-session verify-secret <csession_id>` with the secret on stdin; a mismatch (exit 11) exits 11.
 7. It adds the pairs to the agent whose session is `<csession_id>` (exit 10 if none) and mirrors them.
 
+A failed check (steps 4 to 6) is an error envelope with `code: vetoed` and exit 11; its message never carries the secret, the session directory or any text read from the session.
+
 Supported case: trusted, unsandboxed kinds whose permission profile allows `Bash(agent-spawn label add --session:*)` and whose environment carries `XDG_STATE_HOME` and `XDG_CONFIG_HOME` when they are not the defaults.
 
 ### `stop`
