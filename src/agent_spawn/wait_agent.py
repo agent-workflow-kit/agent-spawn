@@ -12,7 +12,7 @@ import os
 import signal
 from collections.abc import Mapping
 from types import FrameType
-from typing import Any
+from typing import Any, cast
 
 from . import gateway as gw
 from . import launch, lifecycle, procs, third_party
@@ -67,6 +67,15 @@ class _Wait:
     # -- the third-party rule for --result-file ------------------------------------------------
 
     def check_result_file(self, store: Store, row: Mapping[str, Any]) -> None:
+        """Run the check; on any failure forget the file, so ``cli.main`` writes nothing to a
+        path that was never checked."""
+        try:
+            self._check_result_file(store, row)
+        except BaseException:
+            third_party.drop_result_file(self.inv)
+            raise
+
+    def _check_result_file(self, store: Store, row: Mapping[str, Any]) -> None:
         """Exit 2 when the file would lie in a third-party-reading run's cwd or session dir.
 
         The run is the agent's run in progress, else its latest (``row["run"]``). Anything not
@@ -118,6 +127,18 @@ class _Wait:
             found.append(status.run.cwd)
         return found
 
+    def guard(self, store: Store, row: Mapping[str, Any]) -> Outcome | None:
+        """The result-file check; a signal received meanwhile ends the wait via the signal."""
+        try:
+            self.check_result_file(store, row)
+        except Exception:
+            if self.signals.first is not None:
+                return _interrupted(self.signals)
+            raise
+        if self.signals.first is not None:
+            return _interrupted(self.signals)
+        return None
+
     # -- the poll loop -------------------------------------------------------------------------
 
     def run(self) -> Outcome:
@@ -158,16 +179,21 @@ class _Wait:
                 row = store.get_agent(agent_id)
                 if row is None:
                     raise CliError.of("not_found", f"agent {agent_id} no longer exists")
-                self.check_result_file(store, row)
+                stopped = self.guard(store, row)
+                if stopped is not None:
+                    return stopped
                 holder = self.holder(row)
                 alive = holder is not None and procs.is_alive(holder, gateway=self.gateway)
                 if lifecycle.run_settled(row, supervisor_alive=alive):
                     return self.final(store, row)
-                if not alive and row["status"] in ("launching", "live"):
+                if not alive and (
+                    row["status"] in ("launching", "live") or row.get("promotion_pending")
+                ):
                     dead_looks += 1
                     if dead_looks >= DEAD_SUPERVISOR_POLLS:
-                        # TODO(#31): the liveness check parks an agent whose supervisor died;
-                        # until it exists a dead supervisor of a running agent is an error.
+                        # TODO(#31): the liveness check parks an agent whose supervisor died
+                        # and settles its promotion; until it exists a dead supervisor of a
+                        # running agent, or of a pending promotion, is an error.
                         raise CliError.of(
                             "failed",
                             "the supervisor exited before the agent parked (see reconcile)",
@@ -201,15 +227,18 @@ class _Wait:
         """The process whose exit the agent waits for: its supervisor, or while `launching`
         and no supervisor is recorded yet, its launcher."""
         supervisor = row.get("supervisor")
-        if supervisor is not None:
-            return supervisor  # type: ignore[no-any-return]
+        if isinstance(supervisor, procs.ProcessIdentity):
+            return supervisor
         if row["status"] == "launching":
-            return row.get("launcher")  # type: ignore[no-any-return]
+            launcher = row.get("launcher")
+            return launcher if isinstance(launcher, procs.ProcessIdentity) else None
         return None
 
     def final(self, store: Store, row: Mapping[str, Any]) -> Outcome:
         agent_id = row["agent_id"]
-        self.check_result_file(store, row)
+        stopped = self.guard(store, row)
+        if stopped is not None:
+            return stopped
         last = row.get("last_outcome")
         if not isinstance(last, dict):
             if row["status"] == "torn_down":
@@ -220,13 +249,14 @@ class _Wait:
                     details={"status": "torn_down"},
                 )
             raise CliError.of("no_run", f"agent {agent_id} has no run", agent_id=agent_id)
+        outcome = cast(dict[str, Any], last)
         payload = result_object(
             agent=agent_object(store, row, warnings=self.warnings),
-            run=last,  # pyright: ignore[reportUnknownArgumentType]
+            run=outcome,
             first_working_at=chain_first_working_at(store, row),
             warnings=self.warnings,
         )
-        return Outcome(int(last["exit_code"]), payload, PayloadKind.RESULT)  # pyright: ignore[reportUnknownArgumentType]
+        return Outcome(int(outcome["exit_code"]), payload, PayloadKind.RESULT)
 
 
 def wait(inv: Invocation) -> Outcome:

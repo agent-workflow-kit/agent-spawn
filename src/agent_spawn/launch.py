@@ -961,6 +961,10 @@ class Launch:
         if check.verdict == "accept":
             return
         cause = check.decision.cause or "classification_unknown"
+        # The run is third-party-reading or unknown: fail closed, so the error envelope is never
+        # written into its session directory or cwd (only the stdout copy remains).
+        if self.result_file_inside([result.csession_dir, *([cwd] if cwd else [])]):
+            third_party.drop_result_file(self.inv)
         self.log(
             "classification_unknown"
             if cause == "classification_unknown"

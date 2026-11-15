@@ -243,10 +243,72 @@ def test_a_parked_agent_whose_supervisor_is_alive_is_still_waited_on(
     assert env.run("wait", agent_id, "--timeout", "300ms", "--json").returncode == 22
 
 
-def test_a_pending_promotion_is_waited_on(env: Env) -> None:
-    agent_id = seed(env, status="tearing_down", promotion_pending=True)
+def test_a_pending_promotion_is_waited_on(env: Env, proc_tracker: ProcTracker) -> None:
+    _child, identity = sleeper(proc_tracker)
+    agent_id = seed(env, status="tearing_down", promotion_pending=True, supervisor=identity)
     finish(env, agent_id)
     assert env.run("wait", agent_id, "--timeout", "300ms", "--json").returncode == 22
+
+
+def test_tearing_down_with_a_live_supervisor_is_waited_on(
+    env: Env, proc_tracker: ProcTracker
+) -> None:
+    _child, identity = sleeper(proc_tracker)
+    agent_id = seed(env, status="tearing_down", supervisor=identity)
+    finish(env, agent_id)
+    assert env.run("wait", agent_id, "--timeout", "300ms", "--json").returncode == 22
+
+
+def test_tearing_down_with_a_dead_supervisor_returns_the_outcome(
+    env: Env, proc_tracker: ProcTracker
+) -> None:
+    agent_id = seed(env, status="tearing_down", supervisor=dead_identity(proc_tracker))
+    finish(env, agent_id)
+    finished = env.run("wait", agent_id, "--json")
+    assert finished.returncode == 0, (finished.stdout, finished.stderr)
+    assert result_json(finished)["agent"]["status"] == "tearing_down"
+
+
+def test_an_ephemeral_agent_torn_down_after_done_exits_0(env: Env) -> None:
+    agent_id = seed(env, status="torn_down", ephemeral=True)
+    finish(env, agent_id)
+    finished = env.run("wait", agent_id, "--json")
+    assert finished.returncode == 0, (finished.stdout, finished.stderr)
+    body = result_json(finished)
+    assert body["agent"]["status"] == "torn_down" and body["outcome"] == "done"
+
+
+@pytest.mark.parametrize("status", ["parked", "tearing_down"])
+def test_a_pending_promotion_with_a_dead_supervisor_is_reported_not_waited_on_forever(
+    env: Env, proc_tracker: ProcTracker, status: str
+) -> None:
+    # TODO(#31): the liveness check will settle the promotion instead.
+    agent_id = seed(
+        env, status=status, promotion_pending=True, supervisor=dead_identity(proc_tracker)
+    )
+    finish(env, agent_id)
+    finished = env.run("wait", agent_id, "--json")
+    assert finished.returncode == 12
+    assert result_json(finished)["error"]["code"] == "failed"
+
+
+def test_a_pending_promotion_without_any_supervisor_is_reported(env: Env) -> None:
+    agent_id = seed(env, status="parked", promotion_pending=True)
+    finish(env, agent_id)
+    assert env.run("wait", agent_id, "--json").returncode == 12
+
+
+def test_a_parked_agents_report_artifact_is_returned_and_schema_valid(env: Env) -> None:
+    agent_id = seed(env)
+    artifact = {"name": "plan.md", "path": "/x/artifacts/plan.md", "sha256": "ab" * 32, "size": 7}
+    outcome = sample_outcome(agent_id=agent_id)
+    outcome["report"]["artifact"] = artifact
+    update(env, agent_id, last_outcome=outcome, last_end_reason="normal")
+    finished = env.run("wait", agent_id, "--json")
+    body = result_json(finished)
+    assert finished.returncode == 0, (finished.stdout, finished.stderr)
+    schema_registry.validate(body, "agent-spawn/cli/wait.json")
+    assert body["run"]["report"]["artifact"] == artifact
 
 
 def test_a_launching_agent_with_a_live_launcher_is_waited_on(
@@ -473,16 +535,20 @@ def test_result_file_inside_a_third_party_runs_session_dir_exits_2(
     assert (tmp_path / "ok.json").exists()
 
 
+@pytest.mark.parametrize(("code", "error_code"), [(1, "internal"), (12, "failed"), (20, "refused")])
 def test_an_unreadable_session_status_fails_closed_for_a_third_party_run(
-    env: Env, fakebin: Fakebin, tmp_path: Path
+    env: Env, fakebin: Fakebin, tmp_path: Path, code: int, error_code: str
 ) -> None:
     agent_id = result_json(env.run(*LAUNCH))["agent"]["agent_id"]
     _mark_third_party(env, agent_id)
-    fakebin.script("claude-session", "status", exit=1, stderr="boom")
+    fakebin.script(
+        "claude-session", "status", exit=code, error={"code": error_code, "message": "boom"}
+    )
     target = tmp_path / "r.json"
     finished = env.run("wait", agent_id, "--json", "--result-file", str(target))
-    assert finished.returncode != 0
-    assert not target.exists()
+    assert finished.returncode == code, (finished.stdout, finished.stderr)
+    assert result_json(finished)["error"]["code"] == error_code
+    assert not target.exists()  # nothing is written, not even the error envelope
 
 
 # -- after a real launch -------------------------------------------------------------------------
@@ -506,3 +572,141 @@ def test_wait_changes_nothing_in_the_record(env: Env) -> None:
     before = env.agent(agent_id)
     env.run("wait", agent_id, "--json")
     assert env.agent(agent_id) == before
+
+
+# -- review round 1 ------------------------------------------------------------------------------
+
+
+def _inproc(env: Env, agent_id: str, result_file: Any = None) -> Any:
+    from types import SimpleNamespace
+
+    from agent_spawn.wait_agent import _Signals, _Wait  # pyright: ignore[reportPrivateUsage]
+
+    inv = SimpleNamespace(
+        result_file=result_file,
+        args=SimpleNamespace(agent_id=agent_id, timeout=None),
+        warnings=[],
+        decision_ids=[],
+        state_dir=str(env.state_dir),
+        config=None,
+    )
+    return _Wait(inv, _Signals())  # type: ignore[arg-type]
+
+
+def _target(path: Path) -> Any:
+    from agent_spawn import output
+
+    return output.resolve_result_file(str(path))
+
+
+def test_the_result_file_is_checked_again_when_the_run_number_changes(
+    env: Env, tmp_path: Path
+) -> None:
+    from agent_spawn.output import CliError
+
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    agent_id = seed(env, reads_third_party=False, cwd=str(cwd))
+    waiter = _inproc(env, agent_id, _target(cwd / "r.json"))
+    with Store.open(env.state_dir) as store:
+        row = store.get_agent(agent_id)
+        assert row is not None
+        waiter.check_result_file(store, row)  # trusted run 1: allowed, remembered
+        assert waiter.checked_run == (agent_id, 1)
+        with store.lease(lease_key(agent_id), wait=5.0) as lease:
+            store.put_run(lease, agent_id, 2, {"reads_third_party": True})
+            store.update_agent(lease, agent_id, {"run": 2})
+        row = store.get_agent(agent_id)
+        assert row is not None
+        with pytest.raises(CliError) as excinfo:
+            waiter.check_result_file(store, row)  # run 2 reads third-party content
+    assert excinfo.value.exit_code == 2
+    assert waiter.inv.result_file is None  # nothing is written, not even the error
+
+
+def test_a_record_that_disappears_mid_wait_exits_10(
+    env: Env, proc_tracker: ProcTracker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent_spawn.output import CliError
+    from agent_spawn.wait_agent import _Wait  # pyright: ignore[reportPrivateUsage]
+
+    _child, identity = sleeper(proc_tracker)
+    agent_id = seed(env, status="live", supervisor=identity)
+    waiter = _inproc(env, agent_id)
+    gone = False
+    original = _Wait.holder
+
+    def holder(row: Any) -> Any:
+        nonlocal gone
+        gone = True  # the record vanishes after this look
+        return original(row)
+
+    class Vanishing:
+        def __init__(self, store: Store) -> None:
+            self.store = store
+
+        def get_agent(self, key: str) -> Any:
+            return None if gone else self.store.get_agent(key)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.store, name)
+
+    monkeypatch.setattr(_Wait, "holder", staticmethod(holder))
+    with Store.open(env.state_dir) as store:
+        with pytest.raises(CliError) as excinfo:
+            waiter.poll(Vanishing(store), agent_id, None)
+    assert excinfo.value.exit_code == 10 and excinfo.value.code == "not_found"
+
+
+def test_a_gone_session_has_no_directory_to_protect(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    first = result_json(env.run(*LAUNCH))
+    agent_id = first["agent"]["agent_id"]
+    _mark_third_party(env, agent_id)
+    session_dir = env.iso.state / "claude-session" / "sessions" / first["agent"]["csession_id"]
+    fakebin.script(
+        "claude-session", "status", error={"code": "not_found", "message": "gone"}, exit=10
+    )
+    inside = session_dir / "work" / "r.json"
+    inside.parent.mkdir(parents=True, exist_ok=True)
+    finished = env.run("wait", agent_id, "--json", "--result-file", str(inside))
+    assert finished.returncode == 0, (finished.stdout, finished.stderr)
+    assert inside.exists()  # the wait proceeded: the session is gone
+
+
+def test_check_result_file_drops_the_file_on_any_exception(env: Env, tmp_path: Path) -> None:
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    agent_id = seed(env, reads_third_party=True, cwd=str(cwd))
+    waiter = _inproc(env, agent_id, _target(tmp_path / "r.json"))
+
+    class Broken:
+        def get_run(self, *_a: Any) -> Any:
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        waiter.check_result_file(Broken(), {"agent_id": agent_id, "run": 1})
+    assert waiter.inv.result_file is None  # cli.main writes nothing to an unchecked path
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_a_signal_during_the_result_file_check_exits_via_the_signal(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raises: bool
+) -> None:
+    from agent_spawn.output import CliError, PayloadKind
+    from agent_spawn.wait_agent import _Wait  # pyright: ignore[reportPrivateUsage]
+
+    agent_id = seed(env)
+    finish(env, agent_id)
+    waiter = _inproc(env, agent_id, _target(tmp_path / "r.json"))
+
+    def check(self: Any, _store: Any, _row: Any) -> None:
+        self.signals.first = signal.SIGTERM
+        if raises:
+            raise CliError.usage("refused")
+
+    monkeypatch.setattr(_Wait, "check_result_file", check)
+    with Store.open(env.state_dir) as store:
+        outcome = waiter.poll(store, agent_id, None)
+    assert outcome.exit_code == 143 and outcome.kind is PayloadKind.NONE

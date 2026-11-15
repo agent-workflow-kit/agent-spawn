@@ -178,3 +178,18 @@ def test_a_refused_result_file_is_forgotten_so_no_error_envelope_is_written(
         run.pre_start_checks(plan)
     assert excinfo.value.exit_code == 2
     assert inv.result_file is None  # cli.main then writes nothing, not even the error
+
+
+def test_a_post_start_mismatch_with_the_result_file_in_the_session_dir_writes_nothing(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    csd = tmp_path / "csd"
+    csd.mkdir()
+    status_says(fakebin, reads_third_party=True, cwd="/tmp/not-the-session-dir")
+    fakebin.script("claude-session", "start", merge={"csession_dir": str(csd)})
+    fakebin.script("claude-session", "status", merge={"csession_dir": str(csd)})
+    target = csd / "r.json"
+    done = env.run(*LAUNCH, "--result-file", str(target))
+    assert done.returncode == 12, (done.stdout, done.stderr)
+    assert result_json(done)["error"]["details"] == {"cause": "classification_mismatch"}
+    assert not target.exists()  # nothing is written into the run's directory, not even the error
