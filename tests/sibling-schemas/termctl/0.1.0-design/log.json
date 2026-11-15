@@ -1,0 +1,350 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/log.json",
+  "title": "termctl log.jsonl record",
+  "type": "object",
+  "properties": {
+    "ts": {
+      "$ref": "defs.json#/$defs/ts"
+    },
+    "level": {
+      "enum": [
+        "info",
+        "warn",
+        "error"
+      ],
+      "description": "error for result error; warn for warning, refused, vetoed and escalated; else info."
+    },
+    "event": {
+      "enum": [
+        "open",
+        "close",
+        "rename",
+        "mark",
+        "unmark",
+        "label_add",
+        "label_remove",
+        "focus",
+        "hook_failed",
+        "warning"
+      ]
+    },
+    "id": {
+      "oneOf": [
+        {
+          "$ref": "defs.json#/$defs/id"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "null when no id was resolved."
+    },
+    "socket_path": {
+      "oneOf": [
+        {
+          "$ref": "defs.json#/$defs/socket_path"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "result": {
+      "enum": [
+        "ok",
+        "error",
+        "vetoed",
+        "escalated",
+        "refused",
+        "warning"
+      ]
+    },
+    "exit_code": {
+      "type": "integer",
+      "description": "Invocations that fail the usage check (check order step 1) are not logged; every later exit is, for example exit 2 from step 2 of the check order or of open's open order, the exit 2 of a label limit checked after id resolution, exit 1 (internal), and exit 128 plus the signal number when a signal stopped the invocation. Absent when not known: the record a focus without --json writes before it execs tmux (the exit status is then tmux's)."
+    },
+    "actor": {
+      "$ref": "defs.json#/$defs/actor",
+      "description": "open and close only (required there, with decision_ids and escalation_override)."
+    },
+    "decision_ids": {
+      "$ref": "defs.json#/$defs/decision_ids"
+    },
+    "escalation_override": {
+      "type": "boolean"
+    },
+    "force": {
+      "type": "boolean",
+      "description": "close only."
+    },
+    "action": {
+      "enum": [
+        "switched",
+        "attach"
+      ],
+      "description": "focus only; switched also when focus failed before choosing an action. attach is logged before the exec; if the exec itself fails, a second record (result error, attach_failed) follows, the one exception to one record per invocation."
+    },
+    "hooks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "hook": {
+            "enum": [
+              "pre-open",
+              "post-open",
+              "pre-close",
+              "post-close"
+            ]
+          },
+          "cmd": {
+            "type": "string",
+            "minLength": 1
+          },
+          "pgid": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "The process group termctl created for the hook; for an async hook, its watchdog's (also its session)."
+          },
+          "async": {
+            "type": "boolean",
+            "description": "true for an async post-hook: pgid is then its watchdog's group."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "hook",
+          "cmd",
+          "pgid",
+          "async"
+        ]
+      },
+      "description": "open and close only (required there): every hook the step started, in the order it started them, with its process group. A hook that could not be started is not listed."
+    },
+    "message": {
+      "type": "string"
+    },
+    "details": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "ts",
+    "level",
+    "event",
+    "id",
+    "socket_path",
+    "result"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "result": {
+            "const": "error"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "level": {
+            "const": "error"
+          }
+        }
+      },
+      "else": {
+        "if": {
+          "properties": {
+            "result": {
+              "const": "ok"
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "level": {
+              "const": "info"
+            }
+          }
+        },
+        "else": {
+          "properties": {
+            "level": {
+              "const": "warn"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "open",
+              "close"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "actor",
+          "decision_ids",
+          "escalation_override",
+          "hooks"
+        ]
+      },
+      "else": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "actor"
+              ]
+            },
+            {
+              "required": [
+                "escalation_override"
+              ]
+            },
+            {
+              "required": [
+                "hooks"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "close"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "force"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "force"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "focus"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "action"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "action"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "hook_failed",
+              "warning"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "const": "warning"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "result": {
+            "not": {
+              "const": "warning"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "hook_failed"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "properties": {
+              "hook": {
+                "enum": [
+                  "pre-open",
+                  "post-open",
+                  "pre-close",
+                  "post-close"
+                ]
+              },
+              "cmd": {
+                "type": "string",
+                "minLength": 1
+              },
+              "problem": {
+                "type": "string",
+                "description": "termctl's own text; never holds hook output."
+              },
+              "pgid": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "The process group termctl created for the hook (for an async hook, its watchdog's); absent if it could not be started."
+              },
+              "hook_stderr": {
+                "type": "string",
+                "maxLength": 4096,
+                "x-untrusted": true,
+                "description": "Untrusted: the hook's stderr, cut to 4096 bytes at a UTF-8 boundary; absent when empty."
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "hook",
+              "cmd",
+              "problem"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

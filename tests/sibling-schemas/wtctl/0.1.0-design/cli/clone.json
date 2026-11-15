@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/clone.json",
+  "title": "wtctl clone --json",
+  "type": "object",
+  "properties": {
+    "repo": {
+      "$ref": "../defs.json#/$defs/repo_id"
+    },
+    "clone_path": {
+      "$ref": "../defs.json#/$defs/abs_path"
+    },
+    "common_dir": {
+      "$ref": "../defs.json#/$defs/abs_path"
+    },
+    "source": {
+      "enum": [
+        "config",
+        "discovered",
+        "cloned"
+      ]
+    },
+    "fetch_url": {
+      "type": "string",
+      "description": "The clone fetch URL (interface: Clone resolution): the URL of repos.<id>.remote, userinfo stripped, normalized to the repo id, unchanged by ls-remote --get-url; stored with the clone and verified on every resolution. Push target of the clean checkout."
+    },
+    "default_branch": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The remote's default branch, read from the mirror's HEAD as set by its last refresh (never from the clone); null if the mirror was never refreshed."
+    },
+    "cloned": {
+      "type": "boolean",
+      "description": "false: the repo already resolved, or the destination already held a clone of it, and that clone is returned."
+    },
+    "anchors": {
+      "type": "array",
+      "items": {
+        "$ref": "../defs.json#/$defs/anchor_change"
+      },
+      "description": "The clone's common-dir anchor when its identity differed from the recorded one and a human re-accepted it (with mount information); empty otherwise."
+    },
+    "dry_run": {
+      "type": "boolean",
+      "description": "true: what the command would do; nothing was changed and no hooks ran."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "repo",
+    "clone_path",
+    "common_dir",
+    "source",
+    "fetch_url",
+    "default_branch",
+    "cloned",
+    "anchors",
+    "dry_run"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "cloned": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "source": {
+            "const": "cloned"
+          }
+        }
+      }
+    }
+  ]
+}

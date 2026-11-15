@@ -1,0 +1,253 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/audit.json",
+  "title": "termctl audit.jsonl record",
+  "description": "Written, once an id is generated (open) or resolved (close), for close --force of a running pane (any outcome) and for open or close with --override-escalation. A run a signal stops once it has changed something (open from window creation, close from its re-check) is recorded with its output, written before the post hooks; one stopped earlier changed nothing and gets no record.",
+  "type": "object",
+  "properties": {
+    "ts": {
+      "$ref": "defs.json#/$defs/ts"
+    },
+    "actor": {
+      "$ref": "defs.json#/$defs/actor"
+    },
+    "decision_id": {
+      "$ref": "defs.json#/$defs/decision_ids",
+      "description": "All decision ids (the guide's field name; log.jsonl calls it decision_ids)."
+    },
+    "target": {
+      "$ref": "defs.json#/$defs/id"
+    },
+    "action": {
+      "enum": [
+        "open",
+        "close"
+      ]
+    },
+    "force": {
+      "type": "boolean"
+    },
+    "escalation_override": {
+      "type": "boolean"
+    },
+    "inputs": {
+      "type": "object",
+      "properties": {
+        "socket_path": {
+          "$ref": "defs.json#/$defs/socket_path"
+        },
+        "pid": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "The recorded PID; null for open."
+        },
+        "grace_ms": {
+          "oneOf": [
+            {
+              "$ref": "defs.json#/$defs/grace_ms"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "null for open and when not forced."
+        },
+        "name": {
+          "$ref": "defs.json#/$defs/name"
+        },
+        "argv": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "placement": {
+          "$ref": "defs.json#/$defs/placement_name"
+        },
+        "session": {
+          "$ref": "defs.json#/$defs/session_name"
+        },
+        "env_names": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "defs.json#/$defs/env_name"
+          }
+        },
+        "labels": {
+          "$ref": "defs.json#/$defs/labels"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "socket_path",
+        "pid",
+        "grace_ms"
+      ]
+    },
+    "result": {
+      "description": "The command's --json output, or its error output."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "ts",
+    "actor",
+    "decision_id",
+    "target",
+    "action",
+    "force",
+    "escalation_override",
+    "inputs",
+    "result"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "open"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "force": {
+            "const": false
+          },
+          "escalation_override": {
+            "const": true
+          },
+          "inputs": {
+            "required": [
+              "name",
+              "argv",
+              "cwd",
+              "placement",
+              "session",
+              "env_names",
+              "labels"
+            ],
+            "properties": {
+              "pid": {
+                "const": null
+              },
+              "grace_ms": {
+                "const": null
+              }
+            }
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "cli/open.json"
+              },
+              {
+                "$ref": "cli/error.json"
+              }
+            ]
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "inputs": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "name"
+                  ]
+                },
+                {
+                  "required": [
+                    "argv"
+                  ]
+                },
+                {
+                  "required": [
+                    "cwd"
+                  ]
+                },
+                {
+                  "required": [
+                    "placement"
+                  ]
+                },
+                {
+                  "required": [
+                    "session"
+                  ]
+                },
+                {
+                  "required": [
+                    "env_names"
+                  ]
+                },
+                {
+                  "required": [
+                    "labels"
+                  ]
+                }
+              ]
+            }
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "cli/close.json"
+              },
+              {
+                "$ref": "cli/error.json"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "force": {
+            "const": false
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "inputs": {
+            "properties": {
+              "grace_ms": {
+                "const": null
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "anyOf": [
+        {
+          "properties": {
+            "force": {
+              "const": true
+            }
+          }
+        },
+        {
+          "properties": {
+            "escalation_override": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

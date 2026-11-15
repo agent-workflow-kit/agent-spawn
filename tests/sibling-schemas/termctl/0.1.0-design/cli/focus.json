@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/cli/focus.json",
+  "title": "termctl focus --json",
+  "type": "object",
+  "properties": {
+    "id": {
+      "$ref": "../defs.json#/$defs/id"
+    },
+    "action": {
+      "enum": [
+        "switched",
+        "attach"
+      ]
+    },
+    "client": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/client"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The client switched (or, in a dry run, that would be); null for attach."
+    },
+    "argv": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute tmux_bin."
+        },
+        {
+          "const": "-S"
+        },
+        {
+          "$ref": "../defs.json#/$defs/socket_path"
+        },
+        {
+          "const": "attach"
+        },
+        {
+          "const": "-E"
+        },
+        {
+          "const": "-t"
+        },
+        {
+          "type": "string",
+          "pattern": "^=\\$[0-9]+:@[0-9]+\\.%[0-9]+$",
+          "description": "=<session_id>:<window_id>.<pane_id>, with tmux's id ($N) of the pane's session."
+        }
+      ],
+      "minItems": 7,
+      "items": false,
+      "description": "attach only: the command for the caller to exec with its own environment."
+    },
+    "dry_run": {
+      "type": "boolean",
+      "description": "true: the action termctl would take; nothing was changed."
+    },
+    "socket_path": {
+      "$ref": "../defs.json#/$defs/socket_path"
+    },
+    "session": {
+      "$ref": "../defs.json#/$defs/session"
+    },
+    "window_id": {
+      "$ref": "../defs.json#/$defs/window_id"
+    },
+    "pane_id": {
+      "$ref": "../defs.json#/$defs/pane_id"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "action",
+    "client",
+    "dry_run",
+    "socket_path",
+    "session",
+    "window_id",
+    "pane_id"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "attach"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "argv"
+        ],
+        "properties": {
+          "client": {
+            "type": "null"
+          }
+        }
+      },
+      "else": {
+        "not": {
+          "required": [
+            "argv"
+          ]
+        },
+        "properties": {
+          "client": {
+            "$ref": "../defs.json#/$defs/client"
+          }
+        }
+      }
+    }
+  ]
+}

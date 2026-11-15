@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/remove.json",
+  "title": "wtctl remove --json",
+  "description": "First branch: a completed removal. Second branch: remove --dry-run, identical to status with the same arguments plus dry_run: true (exit 0 whatever it found). Refusals print error.json with reason and checks.",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "record": {
+          "$ref": "../defs.json#/$defs/record"
+        },
+        "checks": {
+          "$ref": "../defs.json#/$defs/checks"
+        },
+        "overridden": {
+          "type": "array",
+          "items": {
+            "$ref": "../defs.json#/$defs/forceable_check"
+          },
+          "uniqueItems": true,
+          "description": "The checks a human --force overrode; empty when nothing was forced."
+        },
+        "branch_deleted": {
+          "type": "boolean"
+        },
+        "branch_kept_reason": {
+          "oneOf": [
+            {
+              "$ref": "../defs.json#/$defs/branch_kept_reason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "null when the branch was deleted, and for throwaways."
+        },
+        "warnings": {
+          "$ref": "../defs.json#/$defs/warnings",
+          "description": "Human-readable warnings, e.g. claude-class baseline changes, excluded ancestors whose cwd is inside, a forced fetch failure, a throwaway directory that had already vanished."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "record",
+        "checks",
+        "overridden",
+        "branch_deleted",
+        "branch_kept_reason",
+        "warnings"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "branch_deleted": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "branch_kept_reason": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ],
+      "title": "removal"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "../defs.json#/$defs/id"
+        },
+        "object_type": {
+          "$ref": "../defs.json#/$defs/object_type"
+        },
+        "would_remove": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "What remove with the same flags, run by a human, would do: true, false (reason says why), or null when no refusal was found but the outcome could not be determined (the fetch failed; reason null)."
+        },
+        "reason": {
+          "enum": [
+            "main_worktree",
+            "unlinked",
+            "locked",
+            "repo_config_changed",
+            "in_use",
+            "held",
+            "dirty",
+            "unpushed",
+            null
+          ],
+          "description": "The refusal remove would give (first by precedence), or null."
+        },
+        "human_required": {
+          "type": "boolean",
+          "description": "true: remove is a human-only command for this record (adopted, or a partial worktree); without a human actor it exits 13."
+        },
+        "checks": {
+          "$ref": "../defs.json#/$defs/checks"
+        },
+        "force_overrides": {
+          "type": "array",
+          "items": {
+            "$ref": "../defs.json#/$defs/forceable_check"
+          },
+          "uniqueItems": true,
+          "description": "The failed checks a human --force would override."
+        },
+        "head": {
+          "oneOf": [
+            {
+              "$ref": "../defs.json#/$defs/sha"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The worktree's current HEAD; null for throwaways or when it could not be read (integrity failed)."
+        },
+        "current_branch": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-untrusted": true,
+          "description": "Untrusted: the worktree's current branch, read from files agents can write; null when detached, for throwaways, or when it could not be read."
+        },
+        "warnings": {
+          "$ref": "../defs.json#/$defs/warnings"
+        },
+        "dry_run": {
+          "const": true,
+          "description": "remove --dry-run: the status object for the same arguments; nothing was changed except the mirror refresh and no hooks ran."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "object_type",
+        "would_remove",
+        "reason",
+        "human_required",
+        "checks",
+        "force_overrides",
+        "head",
+        "current_branch",
+        "warnings",
+        "dry_run"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "would_remove": {
+                "const": false
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "main_worktree",
+                  "unlinked",
+                  "locked",
+                  "repo_config_changed",
+                  "in_use",
+                  "held",
+                  "dirty",
+                  "unpushed"
+                ]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "reason": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ],
+      "title": "dry run"
+    }
+  ]
+}

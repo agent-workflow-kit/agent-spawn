@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/cli/close-dry-run.json",
+  "title": "termctl close --dry-run --json",
+  "type": "object",
+  "properties": {
+    "dry_run": {
+      "const": true
+    },
+    "id": {
+      "$ref": "../defs.json#/$defs/id"
+    },
+    "state": {
+      "enum": [
+        "running",
+        "dead"
+      ]
+    },
+    "forced": {
+      "type": "boolean"
+    },
+    "pid": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "pid_mismatch": {
+      "type": "boolean",
+      "description": "The recorded PID fails a check of step 1, or a check cannot be made: it does not equal the pane's #{pane_pid}, the server on the socket is not #{pid} in termctl's PID namespace, /proc shows another PID namespace, the process's parent is not the server or its start time is not the recorded one, or the pane was gone at the check while the process has not exited. A real run would signal nothing."
+    },
+    "signals_possible": {
+      "$ref": "../defs.json#/$defs/signals",
+      "description": "Signals a real run would send if the recorded process outlives the grace period (SIGTERM) and 5 more seconds (SIGKILL)."
+    },
+    "grace_ms": {
+      "$ref": "../defs.json#/$defs/grace_ms"
+    },
+    "socket_path": {
+      "$ref": "../defs.json#/$defs/socket_path"
+    },
+    "actor": {
+      "$ref": "../defs.json#/$defs/actor"
+    },
+    "decision_ids": {
+      "$ref": "../defs.json#/$defs/decision_ids",
+      "description": "From --decision-id (no hooks run in a dry run)."
+    },
+    "override_escalation": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "dry_run",
+    "id",
+    "state",
+    "forced",
+    "pid",
+    "pid_mismatch",
+    "signals_possible",
+    "grace_ms",
+    "socket_path",
+    "actor",
+    "decision_ids",
+    "override_escalation"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "running"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "forced": {
+            "const": true
+          }
+        }
+      },
+      "$comment": "A running pane without --force is refused (exit 20), as in a real run."
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "dead"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "signals_possible": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "pid_mismatch": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "signals_possible": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "pid": {
+            "type": "null"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "signals_possible": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ]
+}

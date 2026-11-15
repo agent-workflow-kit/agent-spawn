@@ -1,0 +1,742 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/config.json",
+  "title": "wtctl config",
+  "type": "object",
+  "properties": {
+    "me": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9._@-]{1,64}$",
+          "default": null,
+          "description": "null: the OS username."
+        }
+      },
+      "additionalProperties": false,
+      "required": [],
+      "default": {
+        "name": null
+      }
+    },
+    "root": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(/|~/)[^\\n]*$",
+      "description": "Base of the default worktree, throwaway and clone roots. Must pass claude-session's unsafe-write-target rules.",
+      "default": "~/wtctl"
+    },
+    "worktree_root": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/dir"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "null: <root>/worktrees."
+    },
+    "throwaway_root": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/dir"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "null: <root>/throwaway."
+    },
+    "worktree_path": {
+      "type": "string",
+      "pattern": "^\\{root\\}/[^\\n]*\\{(name|id)\\}",
+      "default": "{root}/{host}/{path}/{name}",
+      "description": "Must start with {root}/ and contain {name} or {id}."
+    },
+    "branch_template": {
+      "type": "string",
+      "minLength": 1,
+      "default": "wt/{name}"
+    },
+    "branch_prefix": {
+      "type": "string",
+      "default": ""
+    },
+    "search_roots": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/dir"
+      },
+      "default": []
+    },
+    "search_depth": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 3
+    },
+    "auto_clone": {
+      "type": "boolean",
+      "default": false
+    },
+    "clone_root": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/dir"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "null: <root>/clones."
+    },
+    "network_timeout": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*[smhdw]$",
+      "description": "Wall-clock limit of mirror refreshes after the first, ls-remote --symref and shallow throwaway fetches.",
+      "default": "120s"
+    },
+    "clone_timeout": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*[smhdw]$",
+      "description": "Wall-clock limit of clones, a mirror's first refresh, base-commit tree fetches and --depth 0 throwaway fetches.",
+      "default": "30m"
+    },
+    "lease_wait": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*[smhdw]$",
+      "description": "How long a command waits for a held lease before busy (exit 12) or already_running.",
+      "default": "10m"
+    },
+    "hosts": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/host"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/host_config"
+      },
+      "default": {}
+    },
+    "create": {
+      "type": "object",
+      "properties": {
+        "allow_filters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/filter_name"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false,
+      "required": [],
+      "default": {
+        "allow_filters": []
+      }
+    },
+    "baseline": {
+      "type": "object",
+      "properties": {
+        "ignore_config_keys": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9-]*(\\.[^\\n]+)?\\.[A-Za-z][A-Za-z0-9-]*$"
+          },
+          "default": [],
+          "description": "Config keys left out of the baseline: section.key, section.*.key or section.<subsection>.key. Global config only."
+        }
+      },
+      "additionalProperties": false,
+      "required": [],
+      "default": {
+        "ignore_config_keys": []
+      }
+    },
+    "throwaway": {
+      "type": "object",
+      "properties": {
+        "depth": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 50,
+          "description": "Default --depth of throwaway fetches from a remote; 0: full history. A local source copies the full history unless --depth 1."
+        },
+        "max_age": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/duration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "e.g. 30d; null: no automatic pruning. Set it longer than any consumer keeps a throwaway."
+        }
+      },
+      "additionalProperties": false,
+      "required": [],
+      "default": {
+        "depth": 50,
+        "max_age": null
+      }
+    },
+    "remove": {
+      "type": "object",
+      "properties": {
+        "delete_branch": {
+          "type": "boolean",
+          "default": true
+        },
+        "disposable": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "gitignore-syntax patterns.",
+          "default": [
+            "__pycache__/",
+            ".pytest_cache/",
+            ".mypy_cache/",
+            ".ruff_cache/",
+            "node_modules/",
+            ".venv/",
+            "dist/",
+            "build/",
+            "target/",
+            "coverage/",
+            ".coverage",
+            "*.pyc",
+            ".DS_Store"
+          ]
+        },
+        "fetch_retries": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 3
+        },
+        "nested_scan_limit": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 2000000,
+          "description": "Entries walked by the nested_repos check (beyond it the check fails, incomplete) and the in-use walk, and listed per baseline computation (beyond it the remaining items are incomplete)."
+        }
+      },
+      "additionalProperties": false,
+      "required": [],
+      "default": {
+        "delete_branch": true,
+        "disposable": [
+          "__pycache__/",
+          ".pytest_cache/",
+          ".mypy_cache/",
+          ".ruff_cache/",
+          "node_modules/",
+          ".venv/",
+          "dist/",
+          "build/",
+          "target/",
+          "coverage/",
+          ".coverage",
+          "*.pyc",
+          ".DS_Store"
+        ],
+        "fetch_retries": 3,
+        "nested_scan_limit": 2000000
+      }
+    },
+    "extract": {
+      "type": "object",
+      "properties": {
+        "max_file_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1048576
+        },
+        "max_total_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 52428800
+        },
+        "max_files": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1000
+        }
+      },
+      "additionalProperties": false,
+      "required": [],
+      "default": {
+        "max_file_bytes": 1048576,
+        "max_total_bytes": 52428800,
+        "max_files": 1000
+      }
+    },
+    "prune": {
+      "type": "object",
+      "properties": {
+        "protect_labels": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}(=[A-Za-z0-9._:/#@+=,-]{0,256})?$"
+          },
+          "default": [],
+          "description": "key or key=value."
+        }
+      },
+      "additionalProperties": false,
+      "required": [],
+      "default": {
+        "protect_labels": []
+      }
+    },
+    "reconcile": {
+      "type": "object",
+      "properties": {
+        "missing_grace": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*[smhdw]$",
+          "description": "How long a record stays missing before reconcile deletes its admin entry.",
+          "default": "24h"
+        }
+      },
+      "additionalProperties": false,
+      "required": [],
+      "default": {
+        "missing_grace": "24h"
+      }
+    },
+    "tombstone_days": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 30
+    },
+    "git_bin": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^/",
+      "default": null,
+      "description": "Absolute path; null: git on PATH."
+    },
+    "mask_env": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/env_name"
+      },
+      "default": []
+    },
+    "repos": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/repo_id"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/repo_config"
+      },
+      "default": {}
+    },
+    "hooks": {
+      "type": "object",
+      "properties": {
+        "pre-create": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/pre_hook_entry"
+          },
+          "default": []
+        },
+        "post-create": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/post_hook_entry"
+          },
+          "default": []
+        },
+        "pre-remove": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/pre_hook_entry"
+          },
+          "default": []
+        },
+        "post-remove": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/post_hook_entry"
+          },
+          "default": []
+        },
+        "post-reconcile": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/post_hook_entry"
+          },
+          "default": []
+        },
+        "post-baseline-accept": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/post_hook_entry"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false,
+      "default": {
+        "pre-create": [],
+        "post-create": [],
+        "pre-remove": [],
+        "post-remove": [],
+        "post-reconcile": [],
+        "post-baseline-accept": []
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [],
+  "description": "wtctl config (interface: Config). Every key, with its default, is in config.example.yaml.",
+  "$defs": {
+    "bootstrap_step_config": {
+      "type": "object",
+      "properties": {
+        "argv": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "sh": {
+          "type": "boolean",
+          "default": false,
+          "description": "true: argv[0] runs through sh -c, and argv must have one element."
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 600,
+          "description": "Seconds."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "argv"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "sh": {
+                "const": true
+              }
+            },
+            "required": [
+              "sh"
+            ]
+          },
+          "then": {
+            "properties": {
+              "argv": {
+                "maxItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "dir": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(/|~/)[^\\n]*$",
+      "description": "An absolute directory, or one starting with ~/ (expanded once)."
+    },
+    "disposable": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "gitignore-syntax patterns."
+    },
+    "duration": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*[smhdw]$",
+      "description": "DURATION: a positive integer and a unit (s, m, h, d, w)."
+    },
+    "env_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "filter_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "host": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?$",
+      "description": "A repo id's host part: lowercase host, optional :port."
+    },
+    "host_config": {
+      "type": "object",
+      "properties": {
+        "clone_url": {
+          "type": "string",
+          "minLength": 1,
+          "default": "https://{host}/{path}.git",
+          "description": "URL template ({host}, {path})."
+        },
+        "token_env": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/env_name"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Env var holding an HTTPS token; used when set and non-empty."
+        },
+        "token_command": {
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "argv (no shell; an argument equal to {host} is replaced) whose stdout is the token; used when token_env gives none. 10-second timeout."
+        },
+        "token_user": {
+          "type": "string",
+          "minLength": 1,
+          "default": "x-access-token"
+        }
+      },
+      "additionalProperties": false,
+      "required": []
+    },
+    "post_hook_entry": {
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "minLength": 1
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30
+        },
+        "async": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cmd"
+      ],
+      "description": "async: true runs the hook detached (post-hooks only)."
+    },
+    "pre_hook_entry": {
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "minLength": 1
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cmd"
+      ]
+    },
+    "repo_config": {
+      "type": "object",
+      "properties": {
+        "clone": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/dir"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "clone_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "default": null,
+          "description": "Overrides the host's template; may be a file:// URL or a path."
+        },
+        "remote": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "default": "origin"
+        },
+        "worktree_root": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/dir"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "auto_clone": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null,
+          "description": "null: inherit."
+        },
+        "base": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "default": null,
+          "description": "null: the remote's default branch."
+        },
+        "branch_template": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "default": null
+        },
+        "copy_env": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": [],
+          "description": "Env-file globs relative to the main worktree."
+        },
+        "bootstrap": {
+          "type": "object",
+          "properties": {
+            "auto": {
+              "type": "boolean",
+              "default": true
+            },
+            "env": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "propertyNames": {
+                "$ref": "#/$defs/env_name"
+              },
+              "default": {},
+              "description": "Non-secret values only."
+            },
+            "pass_env": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/env_name"
+              },
+              "uniqueItems": true,
+              "default": [],
+              "description": "hosts.*.token_env variables passed to steps after all (they are stripped by default)."
+            },
+            "steps": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/bootstrap_step_config"
+              },
+              "default": []
+            }
+          },
+          "additionalProperties": false,
+          "required": []
+        },
+        "remove": {
+          "type": "object",
+          "properties": {
+            "disposable": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/disposable"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Replaces the global list; null: the global list."
+            }
+          },
+          "additionalProperties": false,
+          "required": []
+        },
+        "create": {
+          "type": "object",
+          "properties": {
+            "allow_filters": {
+              "oneOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/filter_name"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Replaces the global list; null: the global list."
+            }
+          },
+          "additionalProperties": false,
+          "required": []
+        }
+      },
+      "additionalProperties": false,
+      "required": []
+    },
+    "repo_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?(?:/(?!\\.\\.?(?:/|$))[A-Za-z0-9._-]+)+$",
+      "description": "Lowercase host, optional :port for a non-default port, then '/' and one or more path segments of [A-Za-z0-9._-], none equal to '.' or '..' (architecture section 16)."
+    }
+  }
+}

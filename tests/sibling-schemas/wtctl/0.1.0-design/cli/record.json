@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/record.json",
+  "title": "wtctl record object",
+  "description": "The record object printed by show and embedded in other outputs.",
+  "$ref": "../defs.json#/$defs/record"
+}

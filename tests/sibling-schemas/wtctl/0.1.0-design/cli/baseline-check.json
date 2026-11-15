@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/baseline-check.json",
+  "title": "wtctl baseline check --json",
+  "description": "The unchanged case (exit 0). A change exits 20 with error.json: reason repo_config_changed, items, details {digest, recorded_digest, changed_classes}.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "$ref": "../defs.json#/$defs/id"
+    },
+    "changed": {
+      "const": false
+    },
+    "digest": {
+      "$ref": "../defs.json#/$defs/digest",
+      "description": "The recomputed digest (equal to recorded_digest)."
+    },
+    "recorded_digest": {
+      "$ref": "../defs.json#/$defs/digest"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "changed",
+    "digest",
+    "recorded_digest"
+  ]
+}
