@@ -615,7 +615,28 @@ class Resume(Launch):
             self.log("third_party_refused", level="warn", details={"reason": error.reason})
             raise
         if cwd is not None and cwd != third_party.SESSION_DIR and self.result_file_inside([cwd]):
+            third_party.drop_result_file(self.inv)
             raise CliError.usage("--result-file lies inside a third-party-reading run's cwd")
+        self.check_session_dir_for_result_file()
+
+    def check_session_dir_for_result_file(self) -> None:
+        """The resumed session's directory is known up front (unlike a launch's): a result file
+        inside it is refused for every third-party-reading run, whether or not the classes
+        agree (interface.md, Result file). A refused path is never written, not even the error;
+        a status failure other than 10 (no such session) fails closed the same way."""
+        if self.inv.result_file is None or self.fork or self.source_session is None:
+            return
+        assert self.backend is not None
+        try:
+            directory = self.backend.status(self.source_session).csession_dir
+        except CliError as error:
+            if error.exit_code == 10:  # the session is gone: it has no directory to protect
+                return
+            third_party.drop_result_file(self.inv)
+            raise
+        if self.result_file_inside([directory]):
+            third_party.drop_result_file(self.inv)
+            raise CliError.usage("--result-file lies inside a third-party-reading run's session dir")
 
     def check_plan_cwd(self, classification: third_party.Classification, cwd: str | None) -> None:
         """A plain resume passes no ``--cwd``: the run starts where claude-session's plan says.

@@ -375,7 +375,7 @@ class Stop:
             elif planned_tearing:
                 return row
             elif status not in IN_PROGRESS:
-                if not self.alive(row.get("supervisor")):
+                if lifecycle.run_settled(row, supervisor_alive=self.alive(row.get("supervisor"))):
                     return row
             elif status in IN_PROGRESS and now >= next_status:
                 next_status = now + STATUS_EVERY
