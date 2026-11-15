@@ -1382,6 +1382,10 @@ class Resume(Launch):
             pass  # another process already settled the agent
         self.settled = True
 
+    # TODO(#23): the teardown of the original names its own holder in `wtctl remove`; wtctl then
+    # refuses with `held` while this fork (an in-place fork holds the source's record under its
+    # own id, see tests/test_fork_holds.py) still holds it. Teardown (#59/#23) passes that
+    # refusal through; nothing here decides it.
     def release_fork_holds(self, agent_id: str) -> CliError | None:
         """``wtctl forget --holder <fork id>`` for every record the failed fork holds: the stored
         rows and, since a crash between ``adopt`` and the row would hide one, the worktree
