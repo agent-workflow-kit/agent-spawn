@@ -47,6 +47,7 @@ IMPLEMENTED = {
     "launch",
     "resume",
     "supervise",
+    "teardown",
 }  # commands whose issue has landed (no longer stubs)
 
 
