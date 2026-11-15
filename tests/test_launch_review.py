@@ -248,11 +248,26 @@ def _agents(env: Env) -> list[dict[str, Any]]:
 
 # --- M7: the supervisor died while the agent was still launching ---------------------------
 
+#: A run still in its launch phase: not final, no session started yet.
+LIVE_LAUNCH_PHASE = {
+    "phase": "launch",
+    "state": "starting",
+    "outcome": None,
+    "end_reason": None,
+    "exit_code": None,
+    "report": None,
+    "ended_at": None,
+    "session_started_at": None,
+}
+
 
 def test_a_dead_supervisor_of_a_launching_agent_is_parked_by_the_launcher(
     env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
 ) -> None:
-    script_hung_exec(fakebin)  # never reports a session phase: the agent stays `launching`
+    script_hung_exec(fakebin)
+    # `status` reports the run live in its launch phase, so the supervisor's status poll never
+    # moves the agent to `live` (the canned `status` reports a final, session-phase run).
+    fakebin.script("claude-session", "status", merge={"run": LIVE_LAUNCH_PHASE})
     launcher = popen_launcher(env, proc_tracker, *LAUNCH)
     env.wait_for(lambda: any(a.get("exec_proc") for a in _agents(env)), "the supervisor's exec")
     row = env.agents()[0]
