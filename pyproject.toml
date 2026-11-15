@@ -5,7 +5,10 @@ description = "Launch, resume, park and tear down Claude agents: worktree + term
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-dependencies = []
+dependencies = [
+    "pyyaml>=6",
+    "pydantic>=2.7",
+]
 
 [project.scripts]
 agent-spawn = "agent_spawn.cli:main"
