@@ -22,7 +22,7 @@ import stat
 import sys
 import tempfile
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -975,9 +975,9 @@ class Launch:
         )
         error = check.error(agent_id)
         error.decision_ids = list(self.decision_ids)
-        if check.cancel_error is not None or not check.cancelled:
+        if check.cancel_error is not None:
             # The run could not be canceled and may still be live: say so, keep the session.
-            code = check.cancel_error.code if check.cancel_error is not None else "still_live"
+            code = check.cancel_error.code
             self.log(
                 "warning",
                 level="warn",
@@ -1057,6 +1057,7 @@ class Launch:
         """No supervisor exists: cancel the pending run and park ``launch_failed``."""
         assert self.store is not None and self.backend is not None and self.agent_id is not None
         agent_id = self.agent_id
+        self.sig.raising = False  # a signal during this cleanup is recorded, never aborts it
         if self.detached is not None:
             self.detached.abort()
         try:
@@ -1149,11 +1150,8 @@ class Launch:
         assert self.store is not None and self.backend is not None
         agent_id = row["agent_id"]
         session = row.get("csession_id")
-        if isinstance(session, str):
-            try:
-                self.backend.stop(session)
-            except CliError:
-                pass
+        # Park first (a compare-and-swap from `launching`): the row read may be stale, and a
+        # supervisor that made the agent live meanwhile must keep its session.
         parked = lifecycle.park(
             self.store,
             agent_id,
@@ -1163,6 +1161,11 @@ class Launch:
         )
         if parked is None:
             return
+        if isinstance(session, str):
+            try:
+                self.backend.stop(session)
+            except CliError:
+                pass
         self.log("status_change", level="warn", details={"to": "parked", "cause": "supervisor"})
         raise CliError(
             "launch_failed",
@@ -1363,17 +1366,32 @@ def _tty_pair() -> bool:
         return False
 
 
-def launch(inv: Any) -> Outcome:
+_pending_restore: Callable[[], None] | None = None
+
+
+def restore_signal_handlers() -> None:
+    """Put back the handlers ``launch(..., restore_handlers=False)`` replaced (idempotent)."""
+    global _pending_restore
+    restore, _pending_restore = _pending_restore, None
+    if restore is not None:
+        restore()
+
+
+def launch(inv: Any, *, restore_handlers: bool = True) -> Outcome:
     """Run ``launch``; the handler of ``commands.launching``.
 
-    The handlers stay installed after this returns: they only record the signals, so one that
-    arrives while the result is being printed cannot lose it. The process exits right after.
+    With ``restore_handlers=False`` (the command line) the recording handlers stay installed
+    after this returns, so a signal that arrives while the result is printed cannot lose it;
+    the caller then calls ``restore_signal_handlers`` once the output is flushed.
     """
+    global _pending_restore
     sig = SignalState()
     launch_run = Launch(inv, sig)
-    procs.install_signal_handlers(
+    restore = procs.install_signal_handlers(
         {signal.SIGTERM: sig.handle, signal.SIGHUP: sig.handle, signal.SIGINT: sig.handle}
     )
+    if not restore_handlers:
+        _pending_restore = restore
     try:
         failure: CliError
         try:
@@ -1396,5 +1414,7 @@ def launch(inv: Any) -> Outcome:
         raise failure
     finally:
         sig.raising = False
+        if restore_handlers:
+            restore()
         if launch_run.store is not None:
             launch_run.store.close()

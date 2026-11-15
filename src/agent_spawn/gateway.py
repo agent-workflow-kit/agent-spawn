@@ -247,6 +247,11 @@ def _communicate(
         proc.kill()
         proc.wait()
         raise
+    except Exception:
+        # An ordinary failure (e.g. OSError, MemoryError): stop the child at once.
+        proc.kill()
+        proc.wait()
+        raise
     except BaseException:
         # An interrupt (a signal handler raised): ask the exact child to stop, then force it.
         _stop_politely(proc)

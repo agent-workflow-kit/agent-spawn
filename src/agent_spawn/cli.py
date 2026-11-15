@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from typing import Any, NoReturn
 
 from . import __version__, gateway
+from . import launch as launch_module
 from .commands.base import Invocation
 from .commands.table import HANDLERS
 from .config import load_config
@@ -692,8 +693,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _usage_failure(exc, argv_list)
 
     outcome = _run(inv)
-    _emit(outcome, inv.as_json)
-    _write_result_file(inv.result_file, outcome)
+    try:
+        _emit(outcome, inv.as_json)
+        _write_result_file(inv.result_file, outcome)
+    finally:
+        launch_module.restore_signal_handlers()  # no-op unless `launch` kept its handlers installed
     return outcome.exit_code
 
 

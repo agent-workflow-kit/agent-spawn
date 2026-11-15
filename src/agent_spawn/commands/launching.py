@@ -11,7 +11,7 @@ from .base import Invocation, not_implemented
 
 def launch(inv: Invocation) -> Outcome:
     # TODO(#20): worktrees, #27: windows, #30: --placement here (see launch.Launch.usage_checks).
-    return launch_module.launch(inv)
+    return launch_module.launch(inv, restore_handlers=False)
 
 
 def resume(inv: Invocation) -> NoReturn:
