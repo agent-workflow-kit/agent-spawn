@@ -42,6 +42,14 @@ def test_launch_headless_done(env: Env) -> None:
     assert body["outcome"] == "done"
 
 
+def test_supervisor_exits_cleanly_and_logs_no_error(env: Env) -> None:
+    body = result_json(env.run(*LAUNCH, "--wait"))
+    agent_id = body["agent"]["agent_id"]
+    env.wait_for(lambda: not procs.is_alive(env.agent(agent_id)["supervisor"]), "supervisor exit")
+    log = (env.state_dir / "supervise" / f"{agent_id}.log").read_text()
+    assert "error" not in log.lower() and "Traceback" not in log
+
+
 def test_start_argv(env: Env, fakebin: Fakebin, tmp_path: Path) -> None:
     prompt = tmp_path / "prompt.txt"
     prompt.write_text("do the thing")

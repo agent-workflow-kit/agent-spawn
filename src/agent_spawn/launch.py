@@ -1200,6 +1200,7 @@ def launch(inv: Any) -> Outcome:
             launch_run.deliver()
             return outcome
         except CliError as error:
+            sig.raising = False  # a second signal must not interrupt the cleanup below
             if launch_run.copies is not None and not launch_run.agent_inserted:
                 remove_copies(launch_run.copies.directory)
             if error.agent_id is None and launch_run.agent_inserted:
@@ -1207,6 +1208,7 @@ def launch(inv: Any) -> Outcome:
             launch_run.deliver()
             raise
     finally:
+        sig.raising = False
         restore()
         if launch_run.store is not None:
             launch_run.store.close()
