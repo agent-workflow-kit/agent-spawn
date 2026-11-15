@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from agent_spawn.store import Store
+from agent_spawn.store import Store, StoreMissing
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
 
@@ -57,7 +57,11 @@ class Env:
         return Store.open(self.state_dir, create=False)
 
     def agents(self) -> list[dict[str, Any]]:
-        with self.store() as store:
+        try:
+            store = self.store()
+        except StoreMissing:
+            return []
+        with store:
             return store.list_agents()
 
     def agent(self, agent_id: str) -> dict[str, Any]:

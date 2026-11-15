@@ -206,3 +206,279 @@ def test_wait_waiter_sighup_exits_130_and_leaves_agent(
     out, _err = waiter.communicate(timeout=30)
     assert waiter.returncode == 130 and out == b""
     assert started(env, agent_id)
+
+
+# --- failures of `start` ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "code", "park_reason", "attention", "escalated_by"),
+    [
+        (21, "ambiguous", "launch_failed", "launch_failed", None),
+        (10, "not_found", "launch_failed", "launch_failed", None),
+        (12, "launch_failed", "launch_failed", "launch_failed", None),
+        (20, "refused", "launch_failed", None, None),
+        (11, "vetoed", "vetoed", None, None),
+        (13, "escalated", "escalated", "escalated", "claude-session"),
+    ],
+)
+def test_failed_start_parks(
+    env: Env,
+    fakebin: Fakebin,
+    exit_code: int,
+    code: str,
+    park_reason: str,
+    attention: str | None,
+    escalated_by: str | None,
+) -> None:
+    error: dict[str, Any] = {"code": code, "message": "scripted"}
+    if code == "refused":
+        error["reason"] = "live"
+    fakebin.script("claude-session", "start", argv_contains=["--dry-run"])  # classification passes
+    fakebin.script("claude-session", "start", error=error, exit=exit_code)
+    done = env.run(*LAUNCH)
+    body = result_json(done)
+    assert done.returncode == exit_code, (done.stdout, done.stderr)
+    schema_registry.validate(body, "agent-spawn/cli/error.json")
+    assert body["error"]["tool"] == "claude-session"
+    (row,) = env.agents()
+    assert body["error"]["agent_id"] == row["agent_id"]
+    assert row["status"] == "parked"
+    assert row["park_reason"] == park_reason
+    assert row["needs_attention"] == attention
+    assert row["escalated_by"] == escalated_by
+    assert not fakebin.invocations("claude-session")[-1].argv[:1] == ["exec"]
+
+
+def non_dry(fakebin: Fakebin, command: str) -> list[list[str]]:
+    return [a for a in fakebin.argvs("claude-session") if a[0] == command and "--dry-run" not in a]
+
+
+def test_launcher_interrupted_before_supervisor_parks_killed(
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    fakebin.script("claude-session", "start", argv_contains=["--dry-run"])
+    fakebin.script("claude-session", "start", sleep=30)
+    launcher = proc_tracker.popen(
+        env.argv(*LAUNCH),
+        env=env.env(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    env.wait_for(lambda: bool(non_dry(fakebin, "start")), "the real start")
+    launcher.send_signal(signal.SIGTERM)
+    out, _err = launcher.communicate(timeout=30)
+    body = json.loads(out)
+    assert launcher.returncode == 143
+    schema_registry.validate(body, "agent-spawn/cli/error.json")
+    error = body["error"]
+    assert error["code"] == "launch_failed" and error["details"] == {"cause": "interrupted"}
+    (row,) = env.agents()
+    assert error["agent_id"] == row["agent_id"]
+    assert row["status"] == "parked" and row["park_reason"] == "killed"
+    assert row["needs_attention"] is None
+    assert not non_dry(fakebin, "exec")
+
+
+def test_launcher_sigint_before_supervisor_exits_130(
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    fakebin.script("claude-session", "start", argv_contains=["--dry-run"])
+    fakebin.script("claude-session", "start", sleep=30)
+    launcher = proc_tracker.popen(
+        env.argv(*LAUNCH),
+        env=env.env(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    env.wait_for(lambda: bool(non_dry(fakebin, "start")), "the real start")
+    launcher.send_signal(signal.SIGINT)
+    out, _err = launcher.communicate(timeout=30)
+    assert launcher.returncode == 130
+    assert json.loads(out)["error"]["details"] == {"cause": "interrupted"}
+
+
+def test_interrupt_before_the_record_exists_creates_nothing(
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    fakebin.script("claude-session", "start", sleep=30)  # the classification dry run hangs
+    launcher = proc_tracker.popen(
+        env.argv(*LAUNCH),
+        env=env.env(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    env.wait_for(lambda: bool(fakebin.invocations("claude-session")), "the dry run")
+    launcher.send_signal(signal.SIGTERM)
+    out, _err = launcher.communicate(timeout=30)
+    assert launcher.returncode == 143
+    assert json.loads(out)["error"]["agent_id"] is None
+    assert env.agents() == []
+    assert not list((env.state_dir / "prompts").glob("*"))
+
+
+# --- pre-launch hooks, dry run, usage -----------------------------------------------------
+
+
+def test_pre_launch_hook_vetoes(env: Env, fakebin: Fakebin) -> None:
+    done = env.run(*LAUNCH, "--hook", "pre-launch=echo nope >&2; exit 1")
+    body = result_json(done)
+    assert done.returncode == 11
+    schema_registry.validate(body, "agent-spawn/cli/error.json")
+    assert body["error"]["hook"] == "pre-launch" and "nope" in body["error"]["hook_stderr"]
+    assert env.agents() == []
+    assert not non_dry(fakebin, "start")
+    assert not list((env.state_dir / "prompts").glob("*"))
+
+
+def test_pre_launch_hook_escalates_and_is_overridden(env: Env, fakebin: Fakebin) -> None:
+    done = env.run(*LAUNCH, "--hook", "pre-launch=exit 13")
+    assert done.returncode == 13 and env.agents() == []
+    done = env.run(*LAUNCH, "--hook", "pre-launch=exit 13", "--override-escalation",
+                   "--actor", "human:tester", "--wait")  # fmt: skip
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    audit = (env.state_dir / "audit.jsonl").read_text()
+    assert "launch_escalation_override" in audit
+
+
+def test_pre_launch_payload_matches_schema(env: Env, tmp_path: Path) -> None:
+    sink = tmp_path / "payload.json"
+    done = env.run(*LAUNCH, "--hook", f"pre-launch=cat > {sink}", "--label", "a=b", "--wait")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    payload = json.loads(sink.read_text())
+    schema_registry.validate(payload, "agent-spawn/hooks/pre-launch.json")
+    assert payload["labels"] == ["a=b"] and payload["object_id"] is None
+    assert payload["mode"] == "headless" and payload["settings"]["skill"] == "do-it"
+
+
+def test_dry_run_prints_plan_and_creates_nothing(env: Env, fakebin: Fakebin) -> None:
+    done = env.run(*LAUNCH, "--dry-run", "--label", "x=y")
+    body = result_json(done)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    schema_registry.validate(body, "agent-spawn/cli/launch-dry-run.json")
+    assert body["would_refuse"] is None and body["resume"] is False
+    assert body["session_start_argv"][1] == "start"
+    assert env.agents() == [] and not list((env.state_dir / "prompts").glob("*"))
+    assert not non_dry(fakebin, "start")
+
+
+def test_dry_run_third_party_outside_session_dir_is_refused(env: Env, fakebin: Fakebin) -> None:
+    done = env.run(*LAUNCH, "--dry-run", "--reads-third-party", "--cwd", "/tmp")
+    body = result_json(done)
+    assert done.returncode == 20
+    schema_registry.validate(body, "agent-spawn/cli/launch-dry-run.json")
+    assert body["would_refuse"] == "third_party_cwd"
+
+
+def test_third_party_run_outside_session_dir_exits_20_before_allocation(
+    env: Env, fakebin: Fakebin
+) -> None:
+    done = env.run(*LAUNCH, "--reads-third-party", "--cwd", "/tmp")
+    body = result_json(done)
+    assert done.returncode == 20
+    assert body["error"]["reason"] == "third_party_cwd" and body["error"]["tool"] == "agent-spawn"
+    assert env.agents() == [] and not non_dry(fakebin, "start")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("launch", "--mode", "headless"),  # neither a skill nor a prompt
+        ("launch", "--mode", "headless", "--skill", "s", "--branch", "b"),  # needs --worktree new
+        ("launch", "--mode", "headless", "--skill", "s", "--worktree", "relative/path"),
+        ("launch", "--mode", "headless", "--skill", "s", "--worktree", "new"),  # needs --repo
+        ("launch", "--mode", "headless", "--skill", "s", "--hook", "post-park=true"),
+        ("launch", "--mode", "headless", "--skill", "s", "--max-turns", "many"),
+        ("launch", "--mode", "headless", "--skill", "s", "--prompt-file", "/nonexistent/p"),
+        (
+            "launch",
+            "--mode",
+            "headless",
+            "--skill",
+            "s",
+            "--placement",
+            "here",
+            "--wait-timeout",
+            "5s",
+        ),
+    ],
+)
+def test_usage_errors_exit_2_and_create_nothing(
+    env: Env, fakebin: Fakebin, argv: tuple[str, ...]
+) -> None:
+    done = env.run(*argv, "--json")
+    assert done.returncode == 2, (done.stdout, done.stderr)
+    assert result_json(done)["error"]["code"] == "usage"
+    assert env.agents() == [] and not non_dry(fakebin, "start")
+
+
+def test_placement_is_ignored_with_a_warning_for_headless(env: Env) -> None:
+    done = env.run(*LAUNCH, "--placement", "window", "--wait")
+    body = result_json(done)
+    assert done.returncode == 0
+    assert any("placement" in w for w in body["warnings"])
+
+
+def test_missing_claude_session_exits_12(env: Env) -> None:
+    done = env.run(*LAUNCH, extra_env={"PATH": "/usr/bin:/bin"})
+    body = result_json(done)
+    assert done.returncode == 12 and body["error"]["code"] == "tool_missing"
+    assert body["error"]["tool"] == "claude-session"
+    assert env.agents() == []
+
+
+def test_job_label_from_the_environment(env: Env, fakebin: Fakebin) -> None:
+    done = env.run(*LAUNCH, "--wait", extra_env={"JOBSCTL_JOB_ID": "job-7"})
+    assert "job=job-7" in result_json(done)["agent"]["labels"]
+    done = env.run(
+        *LAUNCH, "--wait", extra_env={"JOBSCTL_JOB_ID": "job-8", "CSESSION_ID": "cs-aaaaaaaa"}
+    )
+    assert "job=job-8" not in result_json(done)["agent"]["labels"]  # inside a session
+    done = env.run(*LAUNCH, "--wait", extra_env={"JOBSCTL_JOB_ID": "bad value!"})
+    body = result_json(done)
+    assert not [label for label in body["agent"]["labels"] if label.startswith("job=")]
+    assert any("JOBSCTL_JOB_ID" in w for w in body["warnings"])
+
+
+def test_prompt_copies_are_private_and_removed_once_a_session_exists(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    secret = tmp_path / "in.txt"
+    secret.write_text("input")
+    done = env.run(
+        *LAUNCH, "--prompt", "hello", "--input-file", str(secret), "--wait",
+    )  # fmt: skip
+    body = result_json(done)
+    start = non_dry(fakebin, "start")[0]
+    assert str(secret) not in " ".join(start)
+    assert not (env.state_dir / "prompts" / body["agent"]["agent_id"]).exists()
+    assert "hello" not in " ".join(" ".join(a) for a in fakebin.argvs("claude-session"))
+
+
+def test_result_file_gets_the_json(env: Env, tmp_path: Path) -> None:
+    target = tmp_path / "result.json"
+    done = env.run(*LAUNCH, "--wait", "--result-file", str(target))
+    assert json.loads(target.read_text()) == result_json(done)
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+
+
+def test_hooks_are_delivered_through_the_outbox(env: Env, fakebin: Fakebin, tmp_path: Path) -> None:
+    config = "hooks:\n"
+    for name in ("post-launch", "post-park", "post-state-change"):
+        config += f'  {name}:\n    - cmd: "cat >> {tmp_path}/{name}.jsonl; echo >> {tmp_path}/{name}.jsonl"\n'
+    env = Env(fakebin, env.iso, config)
+    done = env.run(*LAUNCH, "--wait")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    for name in ("post-launch", "post-park", "post-state-change"):
+        sink = tmp_path / f"{name}.jsonl"
+        env.wait_for(sink.exists, f"the {name} hook")
+        payload = json.loads(sink.read_text().splitlines()[0])
+        schema_registry.validate(payload, f"agent-spawn/hooks/{name}.json")
+        assert payload["agent"]["agent_id"] == payload["object_id"]
+    park = json.loads((tmp_path / "post-park.jsonl").read_text().splitlines()[0])
+    assert park["reason"] == "done" and park["outcome"]["outcome"] == "done"
+    launched = json.loads((tmp_path / "post-launch.jsonl").read_text().splitlines()[0])
+    assert launched["run"] == 1 and launched["resumed"] is False

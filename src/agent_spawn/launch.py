@@ -707,7 +707,14 @@ class Launch:
             self.audit(
                 "launch_escalation_override",
                 "ok",
-                {"labels": labels.texts(), "repo": row["repo"]},
+                {
+                    "labels": labels.texts(),
+                    "repo": row["repo"],
+                    "worktree": None,
+                    "csession_id": None,
+                    "merged_head": None,
+                    "force": False,
+                },
             )
         # The session (step 6) and the placement (step 7).
         started = self.start_session(row, labels, classification, cwd)
