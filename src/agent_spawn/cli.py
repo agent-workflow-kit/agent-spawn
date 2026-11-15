@@ -20,7 +20,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, NoReturn
 
-from . import __version__
+from . import __version__, gateway
 from .commands.base import Invocation
 from .commands.table import HANDLERS
 from .config import load_config
@@ -677,6 +677,7 @@ def _reconfigure_streams() -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    gateway.reset_sigchld()  # before any subprocess: an ignored SIGCHLD hides exit codes
     _reconfigure_streams()
     argv_list = list(sys.argv[1:] if argv is None else argv)
     try:
