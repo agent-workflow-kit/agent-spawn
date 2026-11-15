@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from typing import NoReturn
 
+from .. import stop as stop_module
+from ..output import Outcome
 from .base import Invocation, not_implemented
 
 
-def stop(inv: Invocation) -> NoReturn:
-    # TODO(#16): stop a run chain.
-    not_implemented("stop", 16)
+def stop(inv: Invocation) -> Outcome:
+    return stop_module.stop(inv)
 
 
 def teardown(inv: Invocation) -> NoReturn:

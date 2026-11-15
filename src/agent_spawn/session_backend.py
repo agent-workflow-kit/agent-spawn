@@ -1060,8 +1060,10 @@ class SessionBackend:
 
     # -- other commands
 
-    def stop(self, csession_id: str, *, grace: str | None = None) -> dict[str, Any]:
-        """``stop <id> [--grace D]``. Returns the stop object verbatim for exit 0, and for exit
+    def stop(
+        self, csession_id: str, *, grace: str | None = None, dry_run: bool = False
+    ) -> dict[str, Any]:
+        """``stop <id> [--grace D] [--dry-run]``. The stop object verbatim for exit 0, and for exit
         12 with ``ended: false`` (still live: the caller checks ``["ended"]``); else raises."""
         args = ["stop", _session_id(csession_id), *self.audit_flags()]
         wanted: float | None = None
@@ -1071,6 +1073,8 @@ class SessionBackend:
             except GrammarError as error:
                 raise CliError.usage(str(error)) from None
             args.append(_flag("--grace", grace))
+        if dry_run:
+            args.append("--dry-run")
         reply = self.call([*args, "--json"], timeout=wanted)
         data = reply.data
         if reply.code == 0 or (
