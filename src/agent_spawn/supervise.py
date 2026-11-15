@@ -24,6 +24,7 @@ from typing import Any
 from . import chain, lifecycle, procs
 from . import gateway as gw
 from . import hooks as hooklib
+from . import teardown as teardown_module
 from .agent_view import outcome_object, ts
 from .chain import Final, RunCtx
 from .config import Config
@@ -87,18 +88,6 @@ class Signals:
         return taken
 
 
-def unavailable_teardown(store: Store, agent_id: str) -> str | None:
-    """The ephemeral teardown (interface.md, Teardown order, from step 3).
-
-    Returns the reason it was refused, or ``None`` when it completed (it then owns the
-    tombstone and ``post-teardown``).
-
-    TODO(#18): teardown itself lands with the teardown issue; until then an ephemeral agent
-    is parked ``done`` with ``teardown_refused``.
-    """
-    return "teardown_unavailable"
-
-
 class Supervisor:
     def __init__(self, inv: Any, signals: Signals) -> None:
         self.inv = inv
@@ -112,7 +101,7 @@ class Supervisor:
         self.child: subprocess.Popen[bytes] | None = None  # the current `exec`
         self.runner: hooklib.AsyncRunner | None = None
         self.terminated = False  # SIGTERM, SIGHUP or SIGINT arrived during this run chain
-        self.teardown = unavailable_teardown
+        self.teardown = self.ephemeral_teardown
         self.relay_seen: tuple[object, ...] = ()
         self.fallback_sent: set[int] = set()
 
@@ -121,6 +110,22 @@ class Supervisor:
             append_log(self.state_dir, event, level=level, agent_id=self.agent_id, **fields)
         except (RecordsError, ValueError, OSError):
             pass  # a log that cannot be written never stops the supervisor
+
+    def ephemeral_teardown(self, store: Store, agent_id: str) -> str | None:
+        """The ephemeral teardown (interface.md, Teardown order, from step 3): the refusal
+        reason, or ``None`` when it completed or left the agent ``tearing_down`` (logged)."""
+        row = store.get_agent(agent_id)
+        if row is None:
+            return None
+        return teardown_module.ephemeral(
+            store,
+            agent_id,
+            config=self.config,
+            state_dir=self.state_dir,
+            backend=self.backend(row),
+            log=self.log,
+            gateway=self.gateway,
+        )
 
     # -- startup -----------------------------------------------------------------------------
 
