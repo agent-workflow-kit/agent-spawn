@@ -19,7 +19,10 @@ _PRIVATE = (
 def private_environment(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[None]:
-    """Every test, and every program it starts, sees a private home and config, never the user's."""
+    """Every test, and every program it starts, sees a private home and config, never the user's.
+
+    No AGENT_SPAWN_* variable leaks in either.
+    """
     base = tmp_path_factory.mktemp("env")
     for name in _PRIVATE:
         path = base / name.lower()
