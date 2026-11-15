@@ -226,7 +226,10 @@ def make_copies(state_dir: str, agent_id: str, args: Any, *, subdir: str | None 
     base = os.path.join(state_dir, "prompts")
     os.makedirs(base, mode=0o700, exist_ok=True)
     directory = os.path.join(base, agent_id)
+    parent: str | None = None  # the per-agent directory this call created (subdir mode)
     if subdir is not None:
+        if not os.path.isdir(directory):
+            parent = directory
         os.makedirs(directory, mode=0o700, exist_ok=True)
         directory = os.path.join(directory, subdir)
     try:
@@ -256,6 +259,11 @@ def make_copies(state_dir: str, agent_id: str, args: Any, *, subdir: str | None 
             copies.input_names.append(name)
     except BaseException:
         shutil.rmtree(directory, ignore_errors=True)
+        if parent is not None:
+            try:
+                os.rmdir(parent)  # only when empty
+            except OSError:
+                pass
         raise
     return copies
 

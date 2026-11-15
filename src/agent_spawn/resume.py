@@ -13,7 +13,9 @@ differs is the lifecycle entry and its undoing:
   (its id stays reserved) and drops its prompt copies.
 * an agent **without a session** re-runs its launch from the stored settings
   (``agents.settings``: ``{"settings": ..., "pass_throughs": ...}``). Its stored prompt and input
-  copies are never deleted by a failed resume; only an allocated session removes them.
+  copies are never deleted by a failed resume; only an allocated session removes them. The same
+  holds for the new ``resume-*`` copies of a plain resume of an agent with a session (D26: "a
+  failed resume never deletes them"; ``reconcile`` removes orphans older than an hour).
 
 Prompt and input text travels only in files (the private copies), never in argv or environment.
 
@@ -149,6 +151,7 @@ class Resume(Launch):
         self.run_recorded = False
         self.override_audit: list[str] = []
         self.new_copies: _Copies | None = None
+        self.unseen_session: str | None = None  # a plain resume's session whose status failed
 
     # -- step 1: usage checks ---------------------------------------------------------------
 
@@ -158,9 +161,11 @@ class Resume(Launch):
             if not self.fork:
                 raise CliError.usage("--cwd needs --fork")
             if a.cwd != third_party.SESSION_DIR and not os.path.isabs(a.cwd):
-                raise CliError.usage("--cwd needs an absolute path or session-dir")
+                a.cwd = os.path.realpath(a.cwd)  # launch resolves a relative --cwd the same way
         if a.prompt is not None and a.prompt_file is not None:
             raise CliError.usage("--prompt cannot be combined with --prompt-file")
+        if a.placement == "here" and not _tty_pair():
+            raise CliError.usage("--placement here needs a terminal on stdin and stdout")
         if a.placement == "here" and a.wait_timeout is not None:
             raise CliError.usage("--wait-timeout cannot be combined with --placement here")
         for value in a.hook or []:
@@ -257,15 +262,29 @@ class Resume(Launch):
         agent_id = row["agent_id"]
         self.source, self.source_id = row, agent_id
         settings = row.get("settings")
+        session = row.get("csession_id")
         if isinstance(settings, dict):
             raw_settings = settings.get("settings")  # pyright: ignore[reportUnknownMemberType]
             raw_pass = settings.get("pass_throughs")  # pyright: ignore[reportUnknownMemberType]
             self.stored = dict(raw_settings) if isinstance(raw_settings, dict) else {}  # pyright: ignore[reportUnknownArgumentType]
             self.stored_pass = dict(raw_pass) if isinstance(raw_pass, dict) else {}  # pyright: ignore[reportUnknownArgumentType]
-        session = row.get("csession_id")
+            damaged = not (isinstance(raw_settings, dict) and isinstance(raw_pass, dict))
+        else:
+            damaged = True
+        if damaged and session is None and not self.fork:
+            # A launch re-run needs its stored flags: dropping them silently would run
+            # something else than was asked for.
+            raise CliError(
+                "failed",
+                "the stored launch settings of the agent are unusable",
+                agent_id=agent_id,
+                details={"hint": "launch the agent again"},
+            )
         self.source_session = session if isinstance(session, str) else None
         self.args.repo = row.get("repo") or self.stored.get("repo")
         if self.source_session is None and self.fork:
+            if row["status"] == "tearing_down":
+                return  # step 3 lists tearing_down first: run() refuses it
             raise CliError("no_run", f"agent {agent_id} has no session to fork", agent_id=agent_id)
         if self.source_session is None:
             if a.reset or a.allow_tainted:
@@ -279,8 +298,6 @@ class Resume(Launch):
         stored_mode = self.stored.get("mode") if self.source_session is None else None
         mode = a.mode or stored_mode or self.last_mode(store, row) or self.stored.get("mode")
         self.mode = mode if mode in ("interactive", "headless") else "headless"
-        if a.placement == "here" and self.mode == "interactive" and not _tty_pair():
-            raise CliError.usage("--placement here needs a terminal on stdin and stdout")
         if self.mode != "headless":
             raise CliError.of(
                 "internal",
@@ -451,9 +468,9 @@ class Resume(Launch):
     def spec_cwd(self, cwd: str | None) -> str | None:
         if self.source_session is not None and not self.fork:
             return None  # a plain resume runs in the stored cwd
-        if cwd is None or cwd == third_party.SESSION_DIR:
-            return cwd
-        return cwd if os.path.isdir(cwd) else None
+        if cwd is None or cwd == third_party.SESSION_DIR or self.fork:
+            return cwd  # a fork always passes its cwd: claude-session refuses a bad one
+        return cwd if os.path.isdir(cwd) else None  # a sessionless relaunch falls back to --repo
 
     # -- prompt and input copies ------------------------------------------------------------
 
@@ -510,33 +527,57 @@ class Resume(Launch):
     def install_copies(
         self, stored: _Copies, fresh: _Copies, gave_prompt: bool, gave_inputs: bool
     ) -> _Copies:
-        """Newly given text replaces the stored copy (claude-session's carry rule): the new
-        files are moved over the stored ones only once every new file was copied."""
+        """Newly given text replaces the stored copy (claude-session's carry rule). The new
+        tree was built in ``fresh`` (same layout as the stored one); it is swapped in by renames
+        under held signals and the stored settings (``has_prompt``, ``input_names``) follow at
+        once, so the next resume sees what is on disk."""
         base = stored.directory
         result = _Copies(base, stored.prompt, list(stored.inputs), list(stored.input_names))
-        if gave_prompt and fresh.prompt is not None:
-            target = os.path.join(base, "prompt")
-            os.replace(fresh.prompt, target)
-            result.prompt = target
-        if gave_inputs:
-            inputs = os.path.join(base, "inputs")
-            old = inputs + ".old"
-            shutil.rmtree(old, ignore_errors=True)
-            if os.path.isdir(inputs):
-                os.rename(inputs, old)
-            os.makedirs(inputs, mode=0o700)
-            result.inputs, result.input_names = [], []
-            for index, (path, name) in enumerate(zip(fresh.inputs, fresh.input_names, strict=True)):
-                folder = os.path.join(inputs, str(index))
-                os.makedirs(folder, mode=0o700)
-                target = os.path.join(folder, name)
-                os.replace(path, target)
-                result.inputs.append(target)
-                result.input_names.append(name)
-            shutil.rmtree(old, ignore_errors=True)
+        inputs = os.path.join(base, "inputs")
+        old = inputs + ".old"
+        with _signals_held():
+            if gave_prompt and fresh.prompt is not None:
+                target = os.path.join(base, "prompt")
+                os.replace(fresh.prompt, target)
+                result.prompt = target
+            if gave_inputs:
+                shutil.rmtree(old, ignore_errors=True)
+                had = os.path.isdir(inputs)
+                if had:
+                    os.rename(inputs, old)
+                try:
+                    os.rename(os.path.join(fresh.directory, "inputs"), inputs)
+                except BaseException:
+                    if had:
+                        os.rename(old, inputs)
+                    raise
+                result.inputs = [
+                    os.path.join(inputs, str(index), name)
+                    for index, name in enumerate(fresh.input_names)
+                ]
+                result.input_names = list(fresh.input_names)
+                shutil.rmtree(old, ignore_errors=True)
+            self.store_copy_settings(result, gave_prompt, gave_inputs)
         shutil.rmtree(fresh.directory, ignore_errors=True)
         self.new_copies = None
         return result
+
+    def store_copy_settings(self, copies: _Copies, gave_prompt: bool, gave_inputs: bool) -> None:
+        assert self.store is not None
+        agent_id = self.source_id
+        settings = {**self.stored}
+        if gave_prompt:
+            settings["has_prompt"] = True
+        if gave_inputs:
+            settings["input_names"] = list(copies.input_names)
+        self.stored = settings
+        with self.store.lease(lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT) as lease:
+            self.store.update_agent(
+                lease,
+                agent_id,
+                {"settings": {"settings": settings, "pass_throughs": self.stored_pass}},
+                touch=False,
+            )
 
     # -- checks -----------------------------------------------------------------------------
 
@@ -552,12 +593,36 @@ class Resume(Launch):
         if cwd is not None and cwd != third_party.SESSION_DIR and self.result_file_inside([cwd]):
             raise CliError.usage("--result-file lies inside a third-party-reading run's cwd")
 
-    def check_status(self, row: Mapping[str, Any]) -> None:
-        status = row["status"]
-        if status == "tearing_down":
-            raise _refusal("tearing_down", "the agent is being torn down", row["agent_id"])
-        if status in ("launching", "live") and not self.fork:
-            raise _refusal("live", f"the agent is {status}", row["agent_id"])
+    def check_plan_cwd(self, classification: third_party.Classification, cwd: str | None) -> None:
+        """A plain resume passes no ``--cwd``: the run starts where claude-session's plan says.
+        When that differs from the recorded cwd the cwd rule applies to the plan's cwd too
+        (the session's own ``work/`` directory is the one real path a third-party run may use)."""
+        plan = classification.cwd
+        if (
+            self.fork
+            or self.source_session is None
+            or not classification.reads_third_party
+            or plan is None
+            or plan == third_party.SESSION_DIR
+            or cwd is None
+        ):
+            return
+        real = os.path.realpath(plan)
+        if cwd != third_party.SESSION_DIR and real == cwd:
+            return
+        assert self.backend is not None
+        work: str | None = None
+        try:
+            work = os.path.realpath(
+                os.path.join(self.backend.status(self.source_session).csession_dir, "work")
+            )
+        except CliError:
+            pass  # unknown: the rule below fails closed
+        try:
+            third_party.require_cwd_rule(True, real, session_work=work)
+        except CliError as error:
+            self.log("third_party_refused", level="warn", details={"reason": error.reason})
+            raise
 
     # -- the whole resume ---------------------------------------------------------------------
 
@@ -575,11 +640,11 @@ class Resume(Launch):
             decision_ids=self.inv.decision_ids,
             gateway=self.gateway,
         )
+        if row["status"] == "tearing_down" and not self.args.dry_run:
+            raise _refusal("tearing_down", "the agent is being torn down", row["agent_id"])
         self.plan_run(store, row)
         if row["status"] == "tearing_down":
-            if self.args.dry_run:
-                return self.dry_run_refused(row, "tearing_down", cs_argv)
-            raise _refusal("tearing_down", "the agent is being torn down", row["agent_id"])
+            return self.dry_run_refused(row, "tearing_down", cs_argv)
         if self.args.dry_run:
             return self.dry_run_resume(row, cs_argv)
         proposed = new_agent_id(store) if self.fork else row["agent_id"]
@@ -757,11 +822,15 @@ class Resume(Launch):
         elif cwd is None:
             cwd = classification.cwd
         self.check_cwd_rule(classification, cwd)
+        self.check_plan_cwd(classification, cwd)
         self.resume_cwd = cwd
         # The session (step 7).
         spec = self.build_spec(run_id, None, cwd, copies)
         outcome_file = new_outcome_file(self.state_dir, run_id)
         relay = relay_hook(self_path, self.state_dir, self.inv.config_file or "")
+        # The human-only flags are audited before the call that takes them (as launch does), so
+        # an interrupt during `start` still leaves a record; a failed start adds its own.
+        self.audit_overrides("ok", run_id)
         self.start_attempted = True
         try:
             result = backend.start(spec, outcome_file=outcome_file, hook=relay)
@@ -769,7 +838,6 @@ class Resume(Launch):
             self.audit_overrides("error" if error.exit_code != 20 else "refused", run_id)
             self.fail_start(error, {"agent_id": run_id})
             raise
-        self.audit_overrides("ok", run_id)
         self.csession_id = result.csession_id
         self.start_result = result
         token = os.path.basename(outcome_file).removesuffix(".json")
@@ -868,18 +936,22 @@ class Resume(Launch):
                         "hooks": self.run_hooks,
                     },
                 )
-                if not self.fork and self.label_applied:
-                    try:
-                        store.edit_labels(lease, agent_id, "add_run", list(self.label_applied))
-                    except GrammarError:
-                        self.log("warning", level="warn", message="labels not stored: over cap")
-                    else:
-                        # Passed to `start` already: nothing is left to mirror.
-                        store.mirror_done(
-                            lease, agent_id, [(pair, "add") for pair in self.label_applied]
-                        )
+                self.store_run_labels(lease, agent_id)
         self.settled = True
         self.run_recorded = True
+
+    def store_run_labels(self, lease: Any, agent_id: str) -> None:
+        """Store the labels given to this resume (they were passed to `start`: nothing is left
+        to mirror). A fork's labels were stored with its record."""
+        assert self.store is not None
+        if self.fork or not self.label_applied:
+            return
+        try:
+            self.store.edit_labels(lease, agent_id, "add_run", list(self.label_applied))
+        except GrammarError:
+            self.log("warning", level="warn", message="labels not stored: over cap")
+        else:
+            self.store.mirror_done(lease, agent_id, [(pair, "add") for pair in self.label_applied])
 
     def resumed_settings(self) -> dict[str, Any]:
         a = self.args
@@ -961,6 +1033,7 @@ class Resume(Launch):
                         "ended_at": self.gateway.wall_time(),
                     },
                 )
+                self.store_run_labels(lease, agent_id)
         self.settled = True
         self.run_recorded = True
         return recorded
@@ -994,6 +1067,8 @@ class Resume(Launch):
             self.log("status_change", level="warn", details={"to": "parked", **fields})
         elif error.exit_code == 10 and not self.fork and self.source_session is not None:
             self.session_missing(agent_id)
+        # A start exit 13 (an escalation) is treated like exit 11: pre-launch hooks run in exec,
+        # so claude-session's start never escalates and there is no override path to offer.
         error.agent_id = agent_id
         error.decision_ids = list(self.decision_ids)
         raise error
@@ -1014,7 +1089,10 @@ class Resume(Launch):
         try:
             status = backend.status(session)
         except CliError:
-            return None if self.source_session == session and not self.fork else (session, None)
+            if self.source_session == session and not self.fork:
+                self.unseen_session = session
+                return None
+            return (session, None)
         if (
             status.pending
             and status.run.run == status.current_run
@@ -1037,6 +1115,7 @@ class Resume(Launch):
             pass
         self.csession_id = session
         recorded = None
+        remove_copies(os.path.join(self.state_dir, "prompts", agent_id))  # a session exists now
         if run is not None:
             recorded = self.record_unstarted(agent_id, session, run, "canceled" if ended else None)
         else:
@@ -1086,7 +1165,7 @@ class Resume(Launch):
         self.fork_inserted = False
         self.settled = True
 
-    def undo_entry(self, *, interrupted: bool) -> None:
+    def undo_entry(self, *, interrupted: bool, search_orphan: bool = True) -> None:
         """Whatever the failure, an entry whose run does not exist is undone: the orphaned
         pending run of a ``start`` of unknown fate is canceled and recorded, else the
         pre-resume row is restored (plain) or the fork is deleted."""
@@ -1096,8 +1175,16 @@ class Resume(Launch):
         if not (self.entered or self.fork_inserted):
             return
         try:
-            if self.start_attempted and self.settle_orphan(agent_id, interrupted=interrupted):
-                return
+            # A definite refusal of `start` (search_orphan false) allocated nothing: looking for
+            # a pending run could stop another caller's.
+            if self.start_attempted and search_orphan:
+                if self.settle_orphan(agent_id, interrupted=interrupted):
+                    return
+                if self.unseen_session is not None:
+                    try:  # status failed: cancel whatever the start may have left pending
+                        self.backend.stop(self.unseen_session)  # type: ignore[union-attr]
+                    except CliError:
+                        pass
             if self.fork_inserted:
                 self.drop_fork(agent_id)
             else:
@@ -1107,7 +1194,8 @@ class Resume(Launch):
             self.log("warning", level="warn", message="could not undo the resume's entry")
 
     def cleanup_failed(self, failure: CliError) -> None:
-        self.undo_entry(interrupted=False)
+        definite = isinstance(failure, StartError) and not failure.maybe_allocated
+        self.undo_entry(interrupted=False, search_orphan=not definite)
         if self.fork and not self.agent_inserted:
             failure.agent_id = None  # no fork remains
         # Prompt and input copies of a plain or sessionless resume stay (see the module doc).
@@ -1181,7 +1269,18 @@ class Resume(Launch):
                 copies = self.stored_copies(row)
             cwd = self.run_cwd(row)
             spec = self.build_spec(run_id, None, cwd, copies)
-            classification, plan = self.backend.classify_with_plan(spec, refuse=False)
+            try:
+                classification, plan = self.backend.classify_with_plan(spec, refuse=False)
+            except CliError as error:
+                if error.tool == "claude-session" and error.exit_code == 10:
+                    raise CliError.of(
+                        "not_found",
+                        "the agent's session is missing",
+                        agent_id=row["agent_id"],
+                        details={"status": "session_missing"},
+                        decision_ids=list(self.decision_ids),
+                    ) from None
+                raise
             if cwd is None:
                 cwd = (
                     self.effective_cwd(classification)
