@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from typing import Any, NoReturn
 
 from . import __version__, gateway
+from . import launch as launch_module
 from .commands.base import Invocation
 from .commands.table import HANDLERS
 from .config import load_config
@@ -541,9 +542,10 @@ def parse_invocation(argv: Sequence[str]) -> Invocation:
     internal = key in INTERNAL_COMMANDS
     named: str | None = getattr(args, "config", None)
     try:
-        # TODO(#11): a window supervisor loads this config, including AGENT_SPAWN_* overrides,
-        # from its own environment before it adopts the launcher's handoff environment; decide
-        # which environment's AGENT_SPAWN_* applies to it.
+        # Decision (#11): the launcher's AGENT_SPAWN_* overrides apply to everything it starts.
+        # A detached supervisor inherits the launcher's environment, so this load already sees
+        # them. TODO(#27): a window supervisor loads this config from the tmux pane's environment
+        # and must re-apply the overrides after it adopts the handoff environment.
         loaded = load_config(named, must_exist=named is not None and not internal)
     except CliError as error:
         raise ConfigFailure(error, decision_ids=capped, result_file=result_file) from None
@@ -691,8 +693,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _usage_failure(exc, argv_list)
 
     outcome = _run(inv)
-    _emit(outcome, inv.as_json)
-    _write_result_file(inv.result_file, outcome)
+    try:
+        _emit(outcome, inv.as_json)
+        _write_result_file(inv.result_file, outcome)
+    finally:
+        launch_module.restore_signal_handlers()  # no-op unless `launch` kept its handlers installed
     return outcome.exit_code
 
 

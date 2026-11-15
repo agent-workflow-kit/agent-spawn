@@ -51,6 +51,10 @@ SignalHandler = Callable[[int, Any], Any] | int | signal.Handlers | None
 # Raised by ``run`` when its timeout expires (re-exported so callers need not import subprocess).
 TimeoutExpired = subprocess.TimeoutExpired
 
+# Re-exported stdio redirections for ``Gateway.spawn`` (callers never import subprocess).
+PIPE = subprocess.PIPE
+DEVNULL = subprocess.DEVNULL
+
 #: ``SystemGateway.run`` keeps at most this many bytes of each of stdout and stderr; one more
 #: byte kills the child and raises ``OutputTooLarge`` (a runaway child cannot exhaust memory).
 MAX_RUN_OUTPUT = 8 * 1024 * 1024
@@ -59,11 +63,6 @@ _READ_CHUNK = 64 * 1024
 
 class OutputTooLarge(Exception):
     """A command printed more than ``MAX_RUN_OUTPUT`` bytes on one stream; it was killed."""
-
-
-# Re-exported stdio redirections for ``Gateway.spawn`` (callers never import subprocess).
-PIPE = subprocess.PIPE
-DEVNULL = subprocess.DEVNULL
 
 
 @dataclass(frozen=True)
@@ -143,6 +142,44 @@ class Gateway(Protocol):
     def exit_now(self, code: int) -> None: ...
 
 
+_RESET_SIGNALS = tuple(
+    getattr(signal, name)
+    for name in ("SIGINT", "SIGQUIT", "SIGHUP", "SIGTERM")
+    if hasattr(signal, name)
+)
+
+
+def _reset_child_signals() -> None:
+    """Run in a spawned child before ``exec``: give it default signal dispositions and an empty
+    blocked mask, so a supervisor that ignores or blocks signals does not pass that on (an
+    ignored disposition survives ``exec``). ``subprocess`` already restores ``SIGPIPE``.
+
+    Safe despite the usual ``preexec_fn`` warning: it only calls ``signal.signal`` and
+    ``signal.pthread_sigmask`` (async-signal-safe system calls, no locks, no allocation of
+    note) and the CLI is single-threaded, so no other thread can hold a lock at fork time.
+    """
+    for sig in _RESET_SIGNALS:
+        signal.signal(sig, signal.SIG_DFL)
+    signal.pthread_sigmask(signal.SIG_SETMASK, ())
+
+
+INTERRUPT_GRACE = 5.0  # seconds a child gets to act on SIGTERM when its caller is interrupted
+
+
+def _stop_politely(proc: subprocess.Popen[bytes]) -> None:
+    """SIGTERM ``proc`` (only it), wait a bounded time, then SIGKILL it."""
+    try:
+        proc.terminate()
+        proc.wait(timeout=INTERRUPT_GRACE)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    except BaseException:  # a second interrupt while waiting: do not leave the child running
+        proc.kill()
+        proc.wait()
+        raise
+
+
 def _communicate(
     proc: subprocess.Popen[bytes],
     data: bytes | None,
@@ -207,9 +244,18 @@ def _communicate(
                 chunks[fd].append(block)
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         proc.wait(timeout=remaining)
-    except BaseException:
+    except (subprocess.TimeoutExpired, OutputTooLarge):
         proc.kill()
         proc.wait()
+        raise
+    except Exception:
+        # An ordinary failure (e.g. OSError, MemoryError): stop the child at once.
+        proc.kill()
+        proc.wait()
+        raise
+    except BaseException:
+        # An interrupt (a signal handler raised): ask the exact child to stop, then force it.
+        _stop_politely(proc)
         raise
     finally:
         selector.close()
@@ -219,27 +265,6 @@ def _communicate(
             except OSError:
                 pass
     return b"".join(chunks[out_fd]), b"".join(chunks[err_fd])
-
-
-_RESET_SIGNALS = tuple(
-    getattr(signal, name)
-    for name in ("SIGINT", "SIGQUIT", "SIGHUP", "SIGTERM")
-    if hasattr(signal, name)
-)
-
-
-def _reset_child_signals() -> None:
-    """Run in a spawned child before ``exec``: give it default signal dispositions and an empty
-    blocked mask, so a supervisor that ignores or blocks signals does not pass that on (an
-    ignored disposition survives ``exec``). ``subprocess`` already restores ``SIGPIPE``.
-
-    Safe despite the usual ``preexec_fn`` warning: it only calls ``signal.signal`` and
-    ``signal.pthread_sigmask`` (async-signal-safe system calls, no locks, no allocation of
-    note) and the CLI is single-threaded, so no other thread can hold a lock at fork time.
-    """
-    for sig in _RESET_SIGNALS:
-        signal.signal(sig, signal.SIG_DFL)
-    signal.pthread_sigmask(signal.SIG_SETMASK, ())
 
 
 class SystemGateway:

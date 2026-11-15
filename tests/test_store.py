@@ -1786,3 +1786,73 @@ def test_state_db_is_checked_before_its_sidecars(
     with Store.open(state_dir):
         pass
     assert checked == ["state.db", "state.db-wal", "state.db-shm", "state.db-journal"]
+
+
+def _with_nlink(info: os.stat_result, nlink: int) -> os.stat_result:
+    values = list(info)
+    values[stat.ST_NLINK] = nlink
+    return os.stat_result(values)
+
+
+def _patch_nlink(monkeypatch: pytest.MonkeyPatch, names: set[str], nlink: int) -> None:
+    import agent_spawn.store as store_module
+
+    real = os.lstat
+
+    def fake(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        info = real(path, *args, **kwargs)
+        if os.path.basename(str(path)) in names:
+            return _with_nlink(info, nlink)
+        return info
+
+    monkeypatch.setattr(store_module.os, "lstat", fake)
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_a_sidecar_lstat_with_no_links_counts_as_deleted(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    with Store.open(state_dir):
+        pass
+    side = state_dir / f"state.db{suffix}"
+    side.write_bytes(b"")
+    os.chmod(side, 0o600)
+    _patch_nlink(monkeypatch, {side.name}, 0)
+    with Store.open(state_dir) as opened:
+        assert opened.schema_version() == SCHEMA_VERSION
+
+
+def test_a_sidecar_with_two_links_is_refused(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with Store.open(state_dir):
+        pass
+    side = state_dir / "state.db-wal"
+    side.write_bytes(b"")
+    os.chmod(side, 0o600)
+    _patch_nlink(monkeypatch, {side.name}, 2)
+    with pytest.raises(StoreError, match="2 hard links"):
+        Store.open(state_dir)
+
+
+def test_a_main_db_lstat_with_no_links_is_refused(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with Store.open(state_dir):
+        pass
+    _patch_nlink(monkeypatch, {"state.db"}, 0)
+    with pytest.raises(StoreError, match="0 hard links"):
+        Store.open(state_dir)
+
+
+def test_lifecycle_event_after_object_carries_the_stored_updated(store: Store) -> None:
+    from agent_spawn import lifecycle
+    from agent_spawn.agent_view import ts
+
+    new_agent(store, status="launching")
+    parked = lifecycle.park(store, ID, park_reason="killed", needs_attention=None)
+    assert parked is not None
+    events = store.pending_events(ID)
+    assert events
+    for event in events:
+        assert event["payload"]["agent"]["updated"] == ts(parked["updated"])

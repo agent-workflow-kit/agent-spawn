@@ -89,3 +89,33 @@ def test_a_timeout_returns_even_when_a_grandchild_holds_the_pipes(
     if handle is not None:  # record the grandchild so the guard kills exactly it
         with handle:
             proc_tracker.record(handle.identity)
+
+
+def test_an_interrupted_run_sends_sigterm_first(tmp_path: Path) -> None:
+    import signal
+
+    seen = tmp_path / "seen"
+    ready = tmp_path / "ready"
+    code = (
+        "import signal, sys, time\n"
+        f"def term(*a):\n    open({str(seen)!r}, 'w').write('term'); sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, term)\n"
+        f"open({str(ready)!r}, 'w').write('x')\n"
+        "time.sleep(60)\n"
+    )
+
+    class Interrupt(BaseException):
+        pass
+
+    def fire(signum: int, frame: object) -> None:
+        raise Interrupt
+
+    old = signal.signal(signal.SIGALRM, fire)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 1.5)
+        with pytest.raises(Interrupt):
+            run(tmp_path, code, timeout=30)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+    assert seen.read_text() == "term"

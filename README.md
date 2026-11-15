@@ -4,7 +4,7 @@ Launch, resume, park and tear down Claude Code agents: optional worktree + optio
 
 ## Status
 
-Designed (interface 0.1.0-design); not implemented yet. The interface is [docs/interface.md](docs/interface.md) (normative) with [schemas/](schemas/); decisions and live verification are in [docs/design.md](docs/design.md); the implementation plan is [docs/plan.md](docs/plan.md).
+Designed (interface 0.1.0-design); implementation in progress: headless `launch` without a worktree (with its detached supervisor) works, the rest is not implemented yet. The interface is [docs/interface.md](docs/interface.md) (normative) with [schemas/](schemas/); decisions and live verification are in [docs/design.md](docs/design.md); the implementation plan is [docs/plan.md](docs/plan.md).
 
 ## Layer
 
