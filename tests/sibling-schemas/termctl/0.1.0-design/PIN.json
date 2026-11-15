@@ -1,0 +1,6 @@
+{
+  "tool": "termctl",
+  "interface_version": "0.1.0-design",
+  "source_repo_commit": "b9e584d22b12",
+  "source_path": "schemas/"
+}

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/cli/label-add.json",
+  "title": "termctl label add --json",
+  "description": "The pane change output; label changes never rename the window.",
+  "allOf": [
+    {
+      "$ref": "pane-change.json"
+    }
+  ],
+  "properties": {
+    "display_updated": {
+      "const": false
+    }
+  }
+}

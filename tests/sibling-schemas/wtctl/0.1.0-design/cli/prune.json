@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/prune.json",
+  "title": "wtctl prune --json",
+  "type": "object",
+  "properties": {
+    "removed": {
+      "type": "array",
+      "items": {
+        "$ref": "../defs.json#/$defs/id"
+      }
+    },
+    "skipped": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "../defs.json#/$defs/id"
+          },
+          "reason": {
+            "enum": [
+              "protected",
+              "in_use",
+              "vetoed",
+              "escalated",
+              "busy",
+              "failed"
+            ],
+            "description": "protected: a prune.protect_labels match; in_use: processes inside (listed); vetoed, escalated: a pre-remove hook; busy: the record lease is held; failed: removal failed, including a partial deletion (logged; retried on the next run)."
+          },
+          "processes": {
+            "type": "array",
+            "items": {
+              "$ref": "../defs.json#/$defs/process"
+            },
+            "description": "in_use: the processes found; else empty."
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "$ref": "../defs.json#/$defs/abs_path"
+            },
+            "maxItems": 100,
+            "description": "failed after a partial deletion: the entries that could not be deleted (at most 100); else empty."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "reason",
+          "processes",
+          "paths"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "reason": {
+                  "const": "in_use"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "processes": {
+                  "minItems": 1
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "processes": {
+                  "maxItems": 0
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "reason": {
+                  "const": "failed"
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "paths": {
+                  "maxItems": 0
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "already_running": {
+      "type": "boolean"
+    },
+    "dry_run": {
+      "type": "boolean",
+      "description": "true: what the command would do; nothing was changed and no hooks ran."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "removed",
+    "skipped",
+    "already_running",
+    "dry_run"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "already_running": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "removed": {
+            "maxItems": 0
+          },
+          "skipped": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ]
+}

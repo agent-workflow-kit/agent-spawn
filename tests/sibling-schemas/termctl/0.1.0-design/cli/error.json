@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/cli/error.json",
+  "title": "termctl error output (--json, non-zero exit)",
+  "type": "object",
+  "properties": {
+    "error": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "enum": [
+            "usage",
+            "config_invalid",
+            "not_supported",
+            "not_found",
+            "no_server",
+            "client_not_found",
+            "vetoed",
+            "escalated",
+            "tmux_missing",
+            "tmux_too_old",
+            "server_unavailable",
+            "command_not_found",
+            "tag_failed",
+            "no_client",
+            "attach_failed",
+            "locked",
+            "state_changed",
+            "refused",
+            "ambiguous",
+            "internal"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "running"
+          ],
+          "description": "Only with code refused."
+        },
+        "hook": {
+          "type": "string",
+          "description": "cmd of the hook that vetoed or escalated."
+        },
+        "hook_stderr": {
+          "type": "string",
+          "maxLength": 4096,
+          "x-untrusted": true,
+          "description": "Untrusted: that hook's stderr, cut to 4096 bytes at a UTF-8 boundary. maxLength counts code points and is an approximation."
+        },
+        "decision_ids": {
+          "$ref": "../defs.json#/$defs/decision_ids"
+        },
+        "candidates": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "$ref": "../defs.json#/$defs/id"
+              },
+              "pane_id": {
+                "$ref": "../defs.json#/$defs/pane_id"
+              },
+              "session": {
+                "$ref": "../defs.json#/$defs/session"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "pane_id",
+              "session"
+            ]
+          },
+          "description": "The managed panes the id matched."
+        },
+        "details": {
+          "type": "object",
+          "description": "Code-specific context (interface.md Errors). server_unavailable: socket_path, plus path only when a socket safety check failed; not_supported: placement and fields; tmux_missing and tmux_too_old: tmux_bin, and path once it resolved; tmux_too_old adds tmux_version. config_invalid: variable (environment) or key (config), or file (a config file, with line and column where known; when a config trust check failed, the absolute path, symlinks resolved, of the file, directory or entry that failed) and mode (permission bits as four octal digits) when a config trust check failed."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "refused"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reason"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "reason"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "vetoed",
+                  "escalated"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "hook",
+              "hook_stderr"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "hook"
+                  ]
+                },
+                {
+                  "required": [
+                    "hook_stderr"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "ambiguous"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "candidates"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "candidates"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "error"
+  ]
+}

@@ -27,6 +27,7 @@ import ctypes
 import errno
 import os
 import select
+import selectors
 import signal
 import socket
 import struct
@@ -53,6 +54,14 @@ TimeoutExpired = subprocess.TimeoutExpired
 # Re-exported stdio redirections for ``Gateway.spawn`` (callers never import subprocess).
 PIPE = subprocess.PIPE
 DEVNULL = subprocess.DEVNULL
+#: ``SystemGateway.run`` keeps at most this many bytes of each of stdout and stderr; one more
+#: byte kills the child and raises ``OutputTooLarge`` (a runaway child cannot exhaust memory).
+MAX_RUN_OUTPUT = 8 * 1024 * 1024
+_READ_CHUNK = 64 * 1024
+
+
+class OutputTooLarge(Exception):
+    """A command printed more than ``MAX_RUN_OUTPUT`` bytes on one stream; it was killed."""
 
 
 @dataclass(frozen=True)
@@ -151,6 +160,82 @@ def _reset_child_signals() -> None:
     for sig in _RESET_SIGNALS:
         signal.signal(sig, signal.SIG_DFL)
     signal.pthread_sigmask(signal.SIG_SETMASK, ())
+def _communicate(
+    proc: subprocess.Popen[bytes],
+    data: bytes | None,
+    timeout: float | None,
+    argv: Sequence[str],
+) -> tuple[bytes, bytes]:
+    """Feed ``data`` and collect stdout and stderr of ``proc`` with a per-stream byte cap.
+
+    On a timeout or an overflow only ``proc`` itself is killed (never a pattern or a group) and
+    the pipes are closed without waiting for EOF, so a grandchild holding them cannot block.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    chunks: dict[int, list[bytes]] = {}
+    sizes: dict[int, int] = {}
+    selector = selectors.DefaultSelector()
+    pending = data
+    assert proc.stdout is not None and proc.stderr is not None
+    out_fd, err_fd = proc.stdout.fileno(), proc.stderr.fileno()
+    streams = [stream for stream in (proc.stdin, proc.stdout, proc.stderr) if stream is not None]
+    try:
+        if proc.stdin is not None:
+            if not data:
+                proc.stdin.close()
+            else:
+                os.set_blocking(proc.stdin.fileno(), False)
+                selector.register(proc.stdin, selectors.EVENT_WRITE, "in")
+        for name, stream in (("out", proc.stdout), ("err", proc.stderr)):
+            assert stream is not None
+            os.set_blocking(stream.fileno(), False)
+            chunks[stream.fileno()] = []
+            sizes[stream.fileno()] = 0
+            selector.register(stream, selectors.EVENT_READ, name)
+        while selector.get_map():
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise subprocess.TimeoutExpired(list(argv), timeout or 0.0)
+            for key, _ in selector.select(remaining):
+                fd = key.fd
+                if key.data == "in":
+                    assert pending is not None and proc.stdin is not None
+                    try:
+                        written = os.write(fd, pending[:_READ_CHUNK])
+                        pending = pending[written:]
+                    except BlockingIOError:
+                        continue
+                    except OSError:  # the child closed its stdin: stop feeding it
+                        pending = b""
+                    if not pending:
+                        selector.unregister(proc.stdin)
+                        proc.stdin.close()
+                    continue
+                try:
+                    block = os.read(fd, _READ_CHUNK)
+                except BlockingIOError:
+                    continue
+                if not block:
+                    selector.unregister(key.fileobj)
+                    continue
+                sizes[fd] += len(block)
+                if sizes[fd] > MAX_RUN_OUTPUT:
+                    raise OutputTooLarge(f"a command printed more than {MAX_RUN_OUTPUT} bytes")
+                chunks[fd].append(block)
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        proc.wait(timeout=remaining)
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    finally:
+        selector.close()
+        for stream in streams:
+            try:
+                stream.close()
+            except OSError:
+                pass
+    return b"".join(chunks[out_fd]), b"".join(chunks[err_fd])
 
 
 class SystemGateway:
@@ -179,18 +264,18 @@ class SystemGateway:
         env: Mapping[str, str] | None = None,
         cwd: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        done = subprocess.run(
+        data = None if stdin is None else stdin.encode("utf-8", errors="surrogateescape")
+        # Without input the child gets /dev/null, never this process's own stdin.
+        proc = subprocess.Popen(
             list(argv),
-            input=None if stdin is None else stdin.encode("utf-8", errors="surrogateescape"),
-            capture_output=True,
-            timeout=timeout,
+            stdin=subprocess.DEVNULL if data is None else subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=None if env is None else dict(env),
             cwd=cwd,
-            check=False,
         )
-        return subprocess.CompletedProcess(
-            done.args, done.returncode, decode(done.stdout), decode(done.stderr)
-        )
+        out, err = _communicate(proc, data, timeout, argv)
+        return subprocess.CompletedProcess(list(argv), proc.returncode, decode(out), decode(err))
 
     def spawn(
         self,

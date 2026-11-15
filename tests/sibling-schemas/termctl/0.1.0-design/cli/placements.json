@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/cli/placements.json",
+  "title": "termctl placements --json",
+  "description": "Effective placements: configured fields merged over default.",
+  "type": "object",
+  "properties": {
+    "placements": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "../defs.json#/$defs/placement_name"
+      },
+      "additionalProperties": {
+        "allOf": [
+          {
+            "$ref": "../defs.json#/$defs/effective_placement"
+          }
+        ],
+        "properties": {
+          "origin": {
+            "enum": [
+              "built-in",
+              "config"
+            ],
+            "description": "config when any field comes from config, else built-in."
+          }
+        },
+        "required": [
+          "origin"
+        ],
+        "unevaluatedProperties": false
+      },
+      "required": [
+        "default"
+      ]
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "$ref": "../defs.json#/$defs/rule"
+      }
+    },
+    "match": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "labels": {
+              "$ref": "../defs.json#/$defs/labels"
+            },
+            "rule": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "description": "Index of the matching rule, or null."
+            },
+            "placement": {
+              "$ref": "../defs.json#/$defs/placement_name"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "labels",
+            "rule",
+            "placement"
+          ]
+        }
+      ],
+      "description": "Present when --label was given; otherwise null."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "placements",
+    "rules",
+    "match"
+  ]
+}

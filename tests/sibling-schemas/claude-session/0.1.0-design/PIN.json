@@ -1,0 +1,6 @@
+{
+  "tool": "claude-session",
+  "interface_version": "0.1.0-design",
+  "source_repo_commit": "50b4b252c7eb",
+  "source_path": "schemas/"
+}

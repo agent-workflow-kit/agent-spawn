@@ -1,0 +1,307 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "termctl/defs.json",
+  "title": "termctl shared definitions",
+  "description": "Definitions referenced by every other termctl schema.",
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^tc-[a-z2-7]{8}$",
+      "description": "termctl id"
+    },
+    "name": {
+      "$comment": "Lookaheads use [\\s\\S], not '.', so that U+2028 and U+2029 cannot hide text from ECMA-262 engines. The surrogate-pair alternative lets engines without the u flag accept characters outside the BMP while lone surrogates are rejected.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^(?![\\s\\S]*#\\[)(?:[^\\u0000-\\u001f\\u007f-\\u009f\\ud800-\\udfff]|[\\ud800-\\udbff][\\udc00-\\udfff])+$",
+      "description": "A name: 1-64 code points of valid Unicode text (no lone surrogates), no control characters, not containing '#['; displayed literally. Trusted input: callers never build it from third-party text."
+    },
+    "display_name": {
+      "type": "string",
+      "pattern": "^[^\\t\\n]*$",
+      "x-untrusted": true,
+      "description": "The tmux window name as tmux reports it, read through tmux's format sanitizer (tab and newline become spaces). Untrusted: anything with access to the socket can rename a window. In a dry run it is the name termctl computes, which can differ from the escaped form tmux reports after the real run."
+    },
+    "marker_name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$"
+    },
+    "marker_text": {
+      "$comment": "Lookaheads use [\\s\\S], not '.', so that U+2028 and U+2029 cannot hide text from ECMA-262 engines. The surrogate-pair alternative lets engines without the u flag accept characters outside the BMP while lone surrogates are rejected.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16,
+      "pattern": "^(?![\\s\\S]*#\\[)(?![\\s\\S]*#$)(?:[^\\u0000-\\u001f\\u007f-\\u009f\\ud800-\\udfff]|[\\ud800-\\udbff][\\udc00-\\udfff])+$",
+      "description": "1-16 code points, the name rules, and not ending in '#'."
+    },
+    "session_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}$",
+      "description": "A session name termctl creates or targets (config, open --session, pre-open payload)."
+    },
+    "session": {
+      "type": "string",
+      "minLength": 1,
+      "x-untrusted": true,
+      "description": "A session name as tmux reports it; any non-empty string (a user may have renamed the session). Untrusted: anything with access to the socket can rename a session."
+    },
+    "placement_name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "label": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}$",
+      "description": "key=value"
+    },
+    "labels": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/label"
+      },
+      "uniqueItems": true,
+      "maxItems": 32,
+      "description": "Sorted, unique pairs; at most 32."
+    },
+    "keep_on_exit": {
+      "enum": [
+        "never",
+        "failed",
+        "always"
+      ]
+    },
+    "target": {
+      "enum": [
+        "window",
+        "pane"
+      ]
+    },
+    "duration": {
+      "type": "string",
+      "pattern": "^((0|[1-9][0-9]{0,4}|[1-5][0-9]{5}|600000)ms|(0|[1-9][0-9]?|[1-5][0-9]{2}|600)s?|([0-9]|10)m)$",
+      "description": "A non-negative integer without leading zeros followed by ms, s or m (bare: seconds); at most 10m."
+    },
+    "grace_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 600000
+    },
+    "env_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "socket_path": {
+      "$comment": "Lookaheads use [\\s\\S], not '.', so that U+2028 and U+2029 cannot hide text from ECMA-262 engines. The surrogate-pair alternative lets engines without the u flag accept characters outside the BMP while lone surrogates are rejected.",
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 100,
+      "pattern": "^(?![\\s\\S]*[;/]$)(?![\\s\\S]*/\\.\\.?$)/(?:[^\\u0000-\\u001f\\u007f-\\u009f,\\ud800-\\udfff]|[\\ud800-\\udbff][\\udc00-\\udfff])*$",
+      "description": "Canonical absolute socket path: the realpath of the deepest existing ancestor of the parent directory, joined with the remaining components and the basename. Valid Unicode text with no control characters and no ','; not ending in ';' or '/'; a basename other than '.' and '..'. The limit is 100 bytes; maxLength counts code points and is an approximation."
+    },
+    "socket": {
+      "$comment": "Lookaheads use [\\s\\S], not '.', so that U+2028 and U+2029 cannot hide text from ECMA-262 engines. The surrogate-pair alternative lets engines without the u flag accept characters outside the BMP while lone surrogates are rejected.",
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^(?:(?!\\.\\.?$)[A-Za-z0-9._-]{1,64}|(?![\\s\\S]*[;/]$)(?![\\s\\S]*/\\.\\.?$)/(?:[^\\u0000-\\u001f\\u007f-\\u009f,\\ud800-\\udfff]|[\\ud800-\\udbff][\\udc00-\\udfff])*)$",
+          "maxLength": 100
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "A socket name (not '.' or '..') or an absolute socket path (the socket_path rules; '/' itself is rejected). The path limit is 100 bytes; maxLength counts code points and is an approximation."
+    },
+    "decision_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._:@/-]{1,128}$"
+      },
+      "maxItems": 32,
+      "description": "The --decision-id values, followed by the decision ids returned by pre-hooks."
+    },
+    "actor": {
+      "type": "string",
+      "pattern": "^(human|auto):[A-Za-z0-9._@-]{1,64}$",
+      "description": "human:<user> or auto:<policy>."
+    },
+    "client": {
+      "type": "string",
+      "pattern": "^/?[A-Za-z0-9_./-]{1,100}$",
+      "description": "A tmux client name (its tty path)."
+    },
+    "pane_id": {
+      "type": "string",
+      "pattern": "^%[0-9]+$"
+    },
+    "window_id": {
+      "type": "string",
+      "pattern": "^@[0-9]+$"
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "created": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$",
+      "description": "RFC 3339 UTC with millisecond precision."
+    },
+    "nullable_int": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "signals": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "SIGTERM",
+          "SIGKILL"
+        ]
+      },
+      "uniqueItems": true,
+      "if": {
+        "contains": {
+          "const": "SIGKILL"
+        }
+      },
+      "then": {
+        "contains": {
+          "const": "SIGTERM"
+        }
+      },
+      "description": "Signals termctl sends; SIGKILL only after SIGTERM. The kernel's SIGHUP on pane close is not listed."
+    },
+    "placement": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/session_name"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "max_panes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "layout": {
+          "type": "string"
+        },
+        "group_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [],
+      "description": "A configured placement; missing fields inherit from default."
+    },
+    "effective_placement": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/session_name"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "max_panes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "layout": {
+          "type": "string"
+        },
+        "group_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "session",
+        "target"
+      ]
+    },
+    "rule": {
+      "type": "object",
+      "properties": {
+        "match": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._:/#@+=,-]{0,256}$"
+          },
+          "propertyNames": {
+            "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"
+          }
+        },
+        "placement": {
+          "$ref": "#/$defs/placement_name"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "match",
+        "placement"
+      ]
+    },
+    "pre_hook_entry": {
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000]*$",
+          "description": "No NUL character: a command line cannot hold one."
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600,
+          "default": 30,
+          "description": "Seconds (at most 600). On timeout termctl kills the hook's process group; a pre-hook timeout counts as a veto."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cmd"
+      ]
+    },
+    "post_hook_entry": {
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000]*$",
+          "description": "No NUL character: a command line cannot hold one."
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600,
+          "default": 30,
+          "description": "Seconds (at most 600). On timeout termctl kills the hook's process group; a pre-hook timeout counts as a veto."
+        },
+        "async": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cmd"
+      ]
+    }
+  }
+}

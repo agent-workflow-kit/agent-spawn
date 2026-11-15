@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/locate.json",
+  "title": "wtctl locate --json",
+  "type": "object",
+  "properties": {
+    "repo": {
+      "$ref": "../defs.json#/$defs/repo_id"
+    },
+    "clone_path": {
+      "$ref": "../defs.json#/$defs/abs_path"
+    },
+    "common_dir": {
+      "$ref": "../defs.json#/$defs/abs_path"
+    },
+    "source": {
+      "enum": [
+        "config",
+        "discovered",
+        "cloned"
+      ]
+    },
+    "fetch_url": {
+      "type": "string",
+      "description": "The clone fetch URL (interface: Clone resolution): the URL of repos.<id>.remote, userinfo stripped, normalized to the repo id, unchanged by ls-remote --get-url; stored with the clone and verified on every resolution. Push target of the clean checkout."
+    },
+    "default_branch": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The remote's default branch, read from the mirror's HEAD as set by its last refresh (never from the clone); null if the mirror was never refreshed."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "repo",
+    "clone_path",
+    "common_dir",
+    "source",
+    "fetch_url",
+    "default_branch"
+  ]
+}

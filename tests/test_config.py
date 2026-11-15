@@ -538,8 +538,7 @@ def test_duration_forms(tmp_path: Path, value: Any, seconds: float) -> None:
 # Duration bounds: text over 32 characters and anything over 36500d (3153600000 s) are refused,
 # both inclusive at the limit, compared in Decimal (default 28-digit context, as #4 does) rather
 # than float, so a hair over 36500d that float would round down is still refused.
-# TODO(#4): these must keep matching validate.parse_duration (and the schema duration defs) when
-# config.py's private duration copy is replaced by it in the #9 wiring.
+# These must keep matching validate.parse_duration (and the schema duration defs).
 _MAX_TEXT_AT_LIMIT = "36500." + "0" * 25 + "d"  # 32 characters, exactly 36500d
 _JUST_OVER = "36500.0000000000000001d"  # 1e-16 d over: float rounds it to 36500d, Decimal does not
 
