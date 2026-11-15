@@ -127,6 +127,7 @@ Notes from review pass 1: the handoff now also checks the peer's start time and 
 | `ids`, `labels` | id allocation and prefix resolution; label grammar and multiset operations |
 | `gateway` | every subprocess call (claude-session, termctl, wtctl, `crontab`) |
 | `session_backend` | the agent session role over claude-session, including the dry-run classification and the post-start check (D39) |
+| `third_party` | the dry-run plan parser (classification), the session-dir cwd rule and the pure post-start decision; `session_backend` makes the calls and the launch code applies the verdict (D39, D49) |
 | `term` | termctl calls (open and its preflight, mark, focus, close, labels) |
 | `worktrees` | wtctl calls, the records of a cwd, the holder rule and the third-party cwd checks (D6, D49) |
 | `procs` | spawn, double fork with the PID pipe and acknowledgement, process identity (PID, start time, boot id, zombie), pidfd with `ctypes` fallback (kqueue on macOS), signal forwarding |
