@@ -30,15 +30,21 @@ SESSION = "cs-abcdefgh"
 AUDIT_ARGS = ("--actor", "auto:tester", "--decision-id", "d-1")
 
 CHILD = """
-import signal, sys, time
-marker, ready, exits = sys.argv[1], sys.argv[2], sys.argv[3] == "exit"
+import os, signal, sys, time
+marker, ready, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+release = os.path.join(os.path.dirname(marker), "release")
+termed = False
 def on_term(signum, frame):
+    global termed
     open(marker, "w").write("term")
-    if exits:
+    termed = True
+    if mode == "exit":
         sys.exit(0)
 signal.signal(signal.SIGTERM, on_term)
 open(ready, "w").write("ready")
 for _ in range(1200):
+    if termed and mode == "release" and os.path.exists(release):
+        sys.exit(0)
     time.sleep(0.05)
 """
 
@@ -62,17 +68,18 @@ def seed(env: Env, fakebin: Fakebin, **fields: Any) -> None:
 
 
 def stand_in(
-    env: Env, proc_tracker: ProcTracker, tmp_path: Path, *, exits: bool = True
+    env: Env, proc_tracker: ProcTracker, tmp_path: Path, *, on_term: str = "exit"
 ) -> tuple[ProcessIdentity, Path]:
-    """A process that records a SIGTERM in a marker file (and exits unless ``exits`` is false);
-    ready once it has a handler."""
+    """A process that records a SIGTERM in a marker file, ready once it has a handler. After the
+    SIGTERM it exits (``exit``), stays (``stay``), or stays until ``release`` is called
+    (``release``: a supervisor that parks the agent before it exits)."""
     where = tmp_path / f"proc{len(list(tmp_path.glob('proc*')))}"
     where.mkdir()
     script = where / "stand_in.py"
     script.write_text(CHILD)
     marker, ready = where / "marker", where / "ready"
     child = proc_tracker.popen(
-        [sys.executable, str(script), str(marker), str(ready), "exit" if exits else "stay"],
+        [sys.executable, str(script), str(marker), str(ready), on_term],
         stdin=subprocess.DEVNULL,
     )
     env.wait_for(ready.exists, "the stand-in process")
@@ -100,6 +107,11 @@ def park(env: Env, **fields: Any) -> None:
     with Store.open(env.state_dir, create=False) as store:
         values: dict[str, Any] = {"park_reason": "killed", "needs_attention": None, **fields}
         assert lifecycle.park(store, AGENT, **values) is not None
+
+
+def release(marker: Path) -> None:
+    """Let a ``release`` stand-in exit (it has done its bookkeeping)."""
+    (marker.parent / "release").write_text("release")
 
 
 def delete_record(env: Env) -> None:
@@ -355,11 +367,13 @@ def test_a_supervisor_between_runs_gets_sigterm(
     env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
 ) -> None:
     fakebin.seed_session(SESSION)  # the current run is final: nothing for claude-session to stop
-    supervisor, marker = stand_in(env, proc_tracker, tmp_path)
+    # It parks before it exits: an exited supervisor with a final run would be an orphan.
+    supervisor, marker = stand_in(env, proc_tracker, tmp_path, on_term="release")
     seed(env, fakebin, csession_id=SESSION, supervisor=supervisor)
     proc = start_stop(env, proc_tracker)
     env.wait_for(marker.exists, "the supervisor to get SIGTERM")
     park(env)
+    release(marker)
     code, body = finish(proc)
     assert code == 0
     check_stop(body)
@@ -424,7 +438,7 @@ def test_the_wait_ends_with_exit_12_when_the_agent_stays_live(
     env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
 ) -> None:
     fakebin.seed_session(SESSION)
-    supervisor, marker = stand_in(env, proc_tracker, tmp_path, exits=False)
+    supervisor, marker = stand_in(env, proc_tracker, tmp_path, on_term="stay")
     seed(env, fakebin, csession_id=SESSION, supervisor=supervisor)
     # The grace is what bounds the wait (plus a fixed margin); shrink it through the module.
     done = subprocess.run(
@@ -517,11 +531,12 @@ def test_stop_during_a_resume_acts_on_the_state_it_finds(
     launcher is signaled, never the old supervisor recorded earlier."""
     fakebin.seed_session(SESSION)
     old, old_marker = stand_in(env, proc_tracker, tmp_path)  # an earlier, unrelated process
-    launcher, launcher_marker = stand_in(env, proc_tracker, tmp_path)
+    launcher, launcher_marker = stand_in(env, proc_tracker, tmp_path, on_term="release")
     seed(env, fakebin, status="launching", csession_id=SESSION, launcher=launcher)
     proc = start_stop(env, proc_tracker)
     env.wait_for(launcher_marker.exists, "the launcher to get SIGTERM")
     park(env)
+    release(launcher_marker)
     code, body = finish(proc)
     assert code == 0 and body["action"] == "signal_launcher"
     assert not old_marker.exists() and procs.is_alive(old)
@@ -698,11 +713,13 @@ def test_a_stop_reply_already_final_replans_and_signals_the_supervisor(
     fakebin.seed_session(SESSION, adopted=True, final=False)
     script_live_run(fakebin, times=1)  # live at the first look, final afterwards
     fakebin.script("claude-session", "stop", merge={"already_final": True, "signals": []})
-    supervisor, marker = stand_in(env, proc_tracker, tmp_path)
+    # It parks before it exits: an exited supervisor with a final run would be an orphan.
+    supervisor, marker = stand_in(env, proc_tracker, tmp_path, on_term="release")
     seed(env, fakebin, csession_id=SESSION, supervisor=supervisor)
     proc = start_stop(env, proc_tracker)
     env.wait_for(marker.exists, "the supervisor to get SIGTERM")
     park(env)
+    release(marker)
     code, body = finish(proc)
     assert code == 0
     check_stop(body)
@@ -714,7 +731,7 @@ def test_a_wait_that_sees_tearing_down_ends_when_the_run_is_final(
     env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
 ) -> None:
     fakebin.seed_session(SESSION)
-    supervisor, marker = stand_in(env, proc_tracker, tmp_path, exits=False)
+    supervisor, marker = stand_in(env, proc_tracker, tmp_path, on_term="stay")
     seed(env, fakebin, csession_id=SESSION, supervisor=supervisor)
     proc = start_stop(env, proc_tracker)
     env.wait_for(marker.exists, "the supervisor to get SIGTERM")
