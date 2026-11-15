@@ -1,3 +1,4 @@
+import os
 from collections.abc import Iterator
 
 import pytest
@@ -18,11 +19,16 @@ _PRIVATE = (
 def private_environment(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[None]:
-    """Every test, and every program it starts, sees a private home and config, never the user's."""
+    """Every test, and every program it starts, sees a private home and config, never the user's.
+
+    No AGENT_SPAWN_* variable leaks in either.
+    """
     base = tmp_path_factory.mktemp("env")
     for name in _PRIVATE:
         path = base / name.lower()
         path.mkdir()
         monkeypatch.setenv(name, str(path))
     monkeypatch.setenv("SHELL", "/bin/sh")
+    for name in [n for n in os.environ if n.startswith("AGENT_SPAWN_")]:
+        monkeypatch.delenv(name)
     yield

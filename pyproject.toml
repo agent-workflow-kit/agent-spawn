@@ -1,11 +1,14 @@
 [project]
 name = "agent-spawn"
-version = "0.0.1"
+version = "0.5.0"
 description = "Launch, resume, park and tear down Claude agents: worktree + terminal + Claude session."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-dependencies = []
+dependencies = [
+    "pyyaml>=6",
+    "pydantic>=2.7",
+]
 
 [project.scripts]
 agent-spawn = "agent_spawn.cli:main"
