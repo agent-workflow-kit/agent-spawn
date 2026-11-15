@@ -34,6 +34,7 @@ from pydantic import (
     field_validator,
 )
 
+from . import labels, validate
 from .output import CliError
 
 MAX_FILE_BYTES = 1024 * 1024
@@ -41,25 +42,11 @@ MAX_DROPINS = 256
 DROPIN_DIR = "config.d"
 
 # --- grammars (shape only) ------------------------------------------------------------------
-# TODO(#4): the duration, kind, label and repo-id grammars are owned by validate.py/labels.py;
-# these private copies mirror schemas/defs.json until those modules land. The duration copy must
-# accept exactly what validate.parse_duration does: strings of at most 32 characters, values up
-# to and including 36500d (3153600000 seconds, also the number form's cap), compared exactly.
+# The duration and label grammars are owned by validate.py and labels.py. The kind and repo-id
+# grammars have no shared home yet, so config keeps private copies mirroring schemas/defs.json.
+# TODO(#4): move the kind and repo-id grammars into validate.py when a second user needs them.
 
-_DURATION = re.compile(r"(?P<n>[0-9]+(?:\.[0-9]+)?)(?P<unit>ms|s|m|h|d)?")
-_UNIT_SECONDS = {
-    None: Decimal(1),
-    "ms": Decimal("0.001"),
-    "s": Decimal(1),
-    "m": Decimal(60),
-    "h": Decimal(3600),
-    "d": Decimal(86400),
-}
-_MAX_DURATION_TEXT = 32
-_MAX_DURATION_SECONDS = 36500 * 86400
 _KIND = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
-_LABEL_KEY = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
-_LABEL = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _ME_NAME = re.compile(r"[A-Za-z0-9._@-]{1,64}")
 _REPO_ID = re.compile(
@@ -80,22 +67,25 @@ def _pattern(regex: re.Pattern[str], what: str) -> Any:
 def parse_duration(value: object) -> float:
     """Seconds from a positive number, ``<number><unit>`` or a bare number string.
 
-    Zero, text over 32 characters and anything over 36500d are refused.
+    Zero, text over 32 characters and anything over 36500d are refused. Strings follow
+    ``validate.parse_duration``; numbers are checked against the same bounds.
     """
     if isinstance(value, bool) or not isinstance(value, int | float | str):
         raise ValueError("a duration is a number of seconds or a string like 30s, 10m or 90")
     if isinstance(value, str):
-        match = _DURATION.fullmatch(value) if len(value) <= _MAX_DURATION_TEXT else None
-        if match is None:
-            raise ValueError("a duration is a number of seconds or a string like 30s, 10m or 90")
-        seconds = Decimal(match["n"]) * _UNIT_SECONDS[match["unit"]]
-    elif isinstance(value, float) and not math.isfinite(value):
+        try:
+            return validate.parse_duration(value)
+        except validate.GrammarError:
+            raise ValueError(
+                "a duration is a positive number of seconds or a string like 30s, 10m or 90 "
+                "(at most 36500d)"
+            ) from None
+    if isinstance(value, float) and not math.isfinite(value):
         raise ValueError("a duration must be positive and finite (zero is refused)")
-    else:
-        seconds = Decimal(value)  # exact for every int and float
+    seconds = Decimal(value)  # exact for every int and float
     if seconds <= 0:
         raise ValueError("a duration must be positive and finite (zero is refused)")
-    if seconds > _MAX_DURATION_SECONDS:
+    if seconds > validate.MAX_DURATION_SECONDS:
         raise ValueError("a duration must be at most 36500d")
     return float(seconds)
 
@@ -103,14 +93,33 @@ def parse_duration(value: object) -> float:
 Duration = Annotated[float, BeforeValidator(parse_duration)]
 Kind = Annotated[str, _pattern(_KIND, "kind name")]
 RepoId = Annotated[str, _pattern(_REPO_ID, "repo id")]
-LabelKey = Annotated[str, _pattern(_LABEL_KEY, "label key")]
-Label = Annotated[str, _pattern(_LABEL, "label (key=value)")]
+
+
+def _label_key(value: str) -> str:
+    if labels.KEY.fullmatch(value) is None:
+        raise ValueError("not a valid label key")
+    return value
+
+
+def _label(value: str) -> str:
+    try:
+        labels.parse_label(value)
+    except validate.GrammarError:
+        raise ValueError("not a valid label (key=value)") from None
+    return value
 
 
 def _label_key_or_label(value: str) -> str:
-    if not (_LABEL_KEY.fullmatch(value) or _LABEL.fullmatch(value)):
-        raise ValueError("not a valid label key or label")
+    if labels.KEY.fullmatch(value) is None:
+        try:
+            labels.parse_label(value)
+        except validate.GrammarError:
+            raise ValueError("not a valid label key or label") from None
     return value
+
+
+LabelKey = Annotated[str, AfterValidator(_label_key)]
+Label = Annotated[str, AfterValidator(_label)]
 
 
 LabelKeyOrLabel = Annotated[str, AfterValidator(_label_key_or_label)]

@@ -216,9 +216,9 @@ def test_the_result_file_check_is_not_run_for_an_actual_trusted_run() -> None:
     def never() -> bool:
         raise AssertionError("not for a trusted run")
 
-    assert decide_check(True, False, rule_allows=allows(True), result_file_allows=never).verdict == (
-        "warn"
-    )
+    assert decide_check(
+        True, False, rule_allows=allows(True), result_file_allows=never
+    ).verdict == ("warn")
 
 
 def test_an_unreadable_status_is_cancelled_as_unknown() -> None:
@@ -228,7 +228,9 @@ def test_an_unreadable_status_is_cancelled_as_unknown() -> None:
 
 def test_the_error_of_a_cancelled_check_is_launch_failed_with_its_cause() -> None:
     for cause, actual in (("classification_mismatch", True), ("classification_unknown", None)):
-        error = check_error(decide_check(False, actual, rule_allows=allows(False)), agent_id="ag-aaaaaaaa")
+        error = check_error(
+            decide_check(False, actual, rule_allows=allows(False)), agent_id="ag-aaaaaaaa"
+        )
         assert (error.exit_code, error.code, error.tool, error.agent_id) == (
             12,
             "launch_failed",

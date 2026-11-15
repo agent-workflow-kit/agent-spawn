@@ -15,7 +15,7 @@ import pytest
 from agent_spawn import session_backend as sb
 from agent_spawn.gateway import SystemGateway
 from agent_spawn.output import CliError
-from agent_spawn.session_backend import RunSpec, SessionBackend, StartError
+from agent_spawn.session_backend import SessionBackend, StartError
 from tests import sibling_schemas
 from tests.fakebin.fakelib.claude_session import outcome_object
 from tests.fakebin.harness import Fakebin
@@ -154,7 +154,9 @@ def test_prompt_and_inputs_travel_as_files_never_as_text(fakebin: Fakebin, tmp_p
     prompt, note, outcome = files(tmp_path)
     prompt.write_text("SECRET-PROMPT-TEXT")
     fake_backend(fakebin).start(
-        spec(prompt_file=str(prompt), input_files=(str(note),)), outcome_file=str(outcome), hook=RELAY
+        spec(prompt_file=str(prompt), input_files=(str(note),)),
+        outcome_file=str(outcome),
+        hook=RELAY,
     )
     call = fakebin.invocations("claude-session")[-1]
     assert not any("SECRET-PROMPT-TEXT" in a for a in call.argv)
@@ -200,7 +202,14 @@ def test_the_relay_hook_survives_sh_c(agent: str, state: str, config: str) -> No
         config,
         "_session-event",
     ]
-    assert shlex.split(command) == [agent, "--state-dir", state, "--config", config, "_session-event"]
+    assert shlex.split(command) == [
+        agent,
+        "--state-dir",
+        state,
+        "--config",
+        config,
+        "_session-event",
+    ]
 
 
 def test_the_relay_hook_needs_absolute_paths() -> None:
@@ -449,9 +458,7 @@ def test_a_trusted_actual_run_in_a_forbidden_place_is_cancelled(
 ) -> None:
     backend = fake_backend(fakebin)
     run = started(fakebin, tmp_path, backend)
-    check = backend.check_classification(
-        run, expected(True), rule_allows=lambda actual: actual
-    )
+    check = backend.check_classification(run, expected(True), rule_allows=lambda actual: actual)
     assert check.verdict == "cancel" and check.decision.cause == "classification_mismatch"
 
 
@@ -544,7 +551,7 @@ def test_a_failing_cancel_is_reported_not_raised(fakebin: Fakebin, tmp_path: Pat
 # --- the outcome file ---------------------------------------------------------------------------
 
 
-def done_outcome(session: str = SESSION, run: int = 1, **changes: Any) -> dict[str, Any]:
+def done_outcome(session: str = SESSION, run: Any = 1, **changes: Any) -> dict[str, Any]:
     return outcome_object("done", session, run, **changes)
 
 

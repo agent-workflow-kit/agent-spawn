@@ -34,7 +34,7 @@ __all__ = [
 MAX_LABELS = 64
 RESERVED_KEYS = frozenset({"agent", "kind"})
 JOB_KEY = "job"
-_KEY = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
+KEY = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 _VALUE = re.compile(r"[A-Za-z0-9._:/#@+=,-]{0,256}")
 _MAX_TEXT = 64 + 1 + 256
 
@@ -54,7 +54,7 @@ def parse_label(text: str) -> Label:
     key, separator, value = text.partition("=")
     if not separator:
         raise GrammarError(f"invalid label {shown(text)}: expected key=value")
-    if _KEY.fullmatch(key) is None:
+    if KEY.fullmatch(key) is None:
         raise GrammarError(
             f"invalid label key in {shown(text)}: expected 1 to 64 of a-z, 0-9 and . _ -, "
             "starting with a letter or digit"

@@ -11,7 +11,9 @@ from tests.fakebin.harness import Fakebin
 
 AGENT = "ag-abcdefgh"
 SESSION = "cs-abcdefgh"
-RELAY = "post-state-change=/opt/as/agent-spawn --state-dir /state --config /cfg/c.yaml _session-event"
+RELAY = (
+    "post-state-change=/opt/as/agent-spawn --state-dir /state --config /cfg/c.yaml _session-event"
+)
 
 
 class FakebinGateway(SystemGateway):
@@ -46,7 +48,9 @@ def spec(**changes: object) -> RunSpec:
     return RunSpec(**{**base, **changes})  # type: ignore[arg-type]
 
 
-def completed(stdout: str, code: int = 0, stderr: str = "") -> Callable[..., object]:
+def completed(
+    stdout: str, code: int = 0, stderr: str = ""
+) -> Callable[[Sequence[str]], subprocess.CompletedProcess[str]]:
     """A canned ``FakeGateway.run_results`` entry."""
 
     def run(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
