@@ -144,3 +144,37 @@ def test_result_file_inside_the_third_party_cwd_is_a_usage_error(
     # before the result-file check and neither creates anything.
     assert done.returncode in (2, 20)
     assert env.agents() == []
+
+
+def test_a_refused_result_file_is_forgotten_so_no_error_envelope_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from agent_spawn import output, third_party
+    from agent_spawn.output import CliError
+
+    work = tmp_path / "work"
+    work.mkdir()
+    inv = SimpleNamespace(
+        result_file=output.resolve_result_file(str(work / "r.json")),
+        args=SimpleNamespace(cwd=str(work)),
+        warnings=[],
+        decision_ids=[],
+        state_dir=str(tmp_path / "state"),
+        config=None,
+    )
+    run = launch.Launch(inv, launch.SignalState())
+    monkeypatch.setattr(third_party, "require_cwd_rule", lambda *_a, **_k: None)
+    plan = third_party.Classification(
+        reads_third_party=True,
+        run_kind="implement",
+        repo=None,
+        cwd=str(work),
+        would_refuse=None,
+        would_fail=None,
+    )
+    with pytest.raises(CliError) as excinfo:
+        run.pre_start_checks(plan)
+    assert excinfo.value.exit_code == 2
+    assert inv.result_file is None  # cli.main then writes nothing, not even the error

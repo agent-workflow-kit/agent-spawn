@@ -21,6 +21,16 @@ def lease_key(agent_id: str) -> str:
     return f"agent:{agent_id}"
 
 
+def run_settled(row: Mapping[str, Any], *, supervisor_alive: bool) -> bool:
+    """The end condition of a waiting command: the agent is not `launching` or `live`, no
+    promotion is pending and its supervisor has exited (interface.md, `wait`)."""
+    return (
+        row["status"] not in ("launching", "live")
+        and not row.get("promotion_pending")
+        and not supervisor_alive
+    )
+
+
 def reads_third_party_of(store: Store, row: Mapping[str, Any]) -> bool | None:
     """The classification of the agent's current run; ``None`` before a run."""
     run = row.get("run")
