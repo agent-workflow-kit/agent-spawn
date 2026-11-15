@@ -550,7 +550,11 @@ def test_a_unique_prefix_resolves(env: Env, fakebin: Fakebin) -> None:
 
 
 def run_patched(
-    env: Env, prelude: str, *args: str, timeout: float = 60.0
+    env: Env,
+    prelude: str,
+    *args: str,
+    timeout: float = 60.0,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run the CLI in a child that first executes ``prelude`` (patches of the stop module)."""
     return subprocess.run(
@@ -564,7 +568,7 @@ def run_patched(
         ],
         capture_output=True,
         text=True,
-        env=env.env(),
+        env={**env.env(), **(extra_env or {})},
         stdin=subprocess.DEVNULL,
         timeout=timeout,
         check=False,
@@ -625,45 +629,67 @@ def test_the_wait_loop_parks_a_final_run_whose_supervisor_died(
     assert body["action"] == "signal_supervisor" and body["agent"]["status"] == "parked"
 
 
-def test_a_replanned_third_attempt_is_acted_on(env: Env, fakebin: Fakebin) -> None:
+def drive_act(
+    env: Env, fakebin: Fakebin, plans_to_make: list[str], send_results: list[bool]
+) -> tuple[Any, list[int], list[int]]:
+    """Run ``act`` with scripted plans (``signal`` or ``none``) and send results; return the
+    outcome (or the raised error) with the plan and send counts."""
     seed(env, fakebin)
     stop = make_stop(env, fakebin)
+    made: list[int] = []
+    sends: list[int] = []
     try:
         row = stop.store.get_agent(AGENT)  # type: ignore[union-attr]
         assert row is not None
-        signal_plan = Plan("signal_supervisor", row, target=None, field="supervisor")
-        plans = iter([signal_plan, signal_plan, Plan("none", row)])
-        sends: list[int] = []
+        plan_queue = iter(plans_to_make)
+
+        def next_plan(_row: object) -> Plan:
+            made.append(1)
+            if next(plan_queue) == "none":
+                return Plan("none", row)
+            return Plan("signal_supervisor", row, target=None, field="supervisor")
+
+        results = iter(send_results)
+
+        def fake_send(_plan: object) -> bool:
+            sends.append(1)
+            return next(results)
+
         stop.backend = object()  # type: ignore[assignment]
-        stop.plan = lambda _row: next(plans)  # type: ignore[method-assign]
-        stop.send = lambda _plan: sends.append(1) or False  # type: ignore[method-assign]
-        outcome = stop.act(row)
+        stop.plan = next_plan  # type: ignore[method-assign]
+        stop.send = fake_send  # type: ignore[method-assign]
+        stop.wait = lambda _plan, _budget: row  # type: ignore[method-assign]
+        try:
+            result: Any = stop.act(row)
+        except Exception as error:
+            result = error
     finally:
         assert stop.store is not None
         stop.store.close()
-    assert (
-        len(sends) == 2
-        and isinstance(outcome.payload, dict)
-        and outcome.payload["action"] == "none"
+    return result, made, sends
+
+
+def test_a_replanned_final_attempt_is_acted_on(env: Env, fakebin: Fakebin) -> None:
+    # Three sends fail; the plan made after the third failure is signaled and succeeds.
+    result, made, sends = drive_act(env, fakebin, ["signal"] * 4, [False, False, False, True])
+    assert not isinstance(result, Exception), result
+    assert len(sends) == 4 and len(made) == 4
+    assert result.payload["action"] == "signal_supervisor"
+
+
+def test_a_final_plan_of_none_after_failed_sends_settles(env: Env, fakebin: Fakebin) -> None:
+    result, made, sends = drive_act(
+        env, fakebin, ["signal", "signal", "signal", "none"], [False, False, False]
     )
+    assert not isinstance(result, Exception), result
+    assert len(sends) == 3 and result.payload["action"] == "none"
 
 
 def test_exhausted_attempts_with_a_signal_still_failing_exit_12(env: Env, fakebin: Fakebin) -> None:
-    seed(env, fakebin)
-    stop = make_stop(env, fakebin)
-    try:
-        row = stop.store.get_agent(AGENT)  # type: ignore[union-attr]
-        assert row is not None
-        signal_plan = Plan("signal_supervisor", row, target=None, field="supervisor")
-        stop.backend = object()  # type: ignore[assignment]
-        stop.plan = lambda _row: signal_plan  # type: ignore[method-assign]
-        stop.send = lambda _plan: False  # type: ignore[method-assign]
-        with pytest.raises(Exception) as caught:
-            stop.act(row)
-    finally:
-        assert stop.store is not None
-        stop.store.close()
-    assert getattr(caught.value, "exit_code", None) == 12
+    # The final plan gets its own attempt (4 sends) and only its failure raises; no more plans.
+    result, made, sends = drive_act(env, fakebin, ["signal"] * 4, [False] * 4)
+    assert getattr(result, "exit_code", None) == 12
+    assert len(sends) == 4 and len(made) == 4
 
 
 def test_a_stop_reply_already_final_replans_and_signals_the_supervisor(
@@ -688,7 +714,7 @@ def test_a_wait_that_sees_tearing_down_ends_when_the_run_is_final(
     env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
 ) -> None:
     fakebin.seed_session(SESSION)
-    supervisor, marker = stand_in(env, proc_tracker, tmp_path)
+    supervisor, marker = stand_in(env, proc_tracker, tmp_path, exits=False)
     seed(env, fakebin, csession_id=SESSION, supervisor=supervisor)
     proc = start_stop(env, proc_tracker)
     env.wait_for(marker.exists, "the supervisor to get SIGTERM")
@@ -731,8 +757,27 @@ def test_a_missing_tool_is_audited(env: Env, fakebin: Fakebin) -> None:
         *AUDIT_ARGS,
         extra_env={"PATH": "/nonexistent-dir"},
     )
-    assert done.returncode != 0
-    assert audits(env)[-1]["result"] in ("error", "refused")
+    body = json.loads(done.stdout)
+    check_error(body)
+    assert done.returncode == 12 and body["error"]["code"] == "tool_missing"
+    records = audits(env)
+    assert len(records) == 1 and records[0]["result"] == "error"
+
+
+def test_an_audit_failure_never_masks_the_original_error(env: Env, fakebin: Fakebin) -> None:
+    seed(env, fakebin, csession_id=SESSION, claude_session_path=None)
+    prelude = (
+        "s.append_audit = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('audit broke'));"
+        "orig = s.Store.get_agent; calls = [];"
+        "s.Store.get_agent = lambda self, *a, **k: ("
+        "calls.append(1), (_ for _ in ()).throw(RuntimeError('store broke')) "
+        "if len(calls) > 1 else orig(self, *a, **k))[1]"
+    )
+    done = run_patched(
+        env, prelude, "stop", AGENT, "--json", *AUDIT_ARGS, extra_env={"PATH": "/nonexistent-dir"}
+    )
+    body = json.loads(done.stdout)
+    assert body["error"]["code"] == "tool_missing"
 
 
 def test_a_signal_target_that_died_after_the_plan_is_not_signaled(

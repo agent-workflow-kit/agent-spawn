@@ -146,7 +146,14 @@ class Stop:
             # Whatever ends the command after this point (also a signal or an unexpected error)
             # leaves one audit record with the action that was planned.
             if not self.audited and not self.dry_run:
-                self.audit(store.get_agent(self.agent_id) or row, self.result, self.action)
+                try:
+                    latest = store.get_agent(self.agent_id) or row
+                except Exception:
+                    latest = row
+                try:
+                    self.audit(latest, self.result, self.action)
+                except Exception as error:  # never mask the exception that ended the command
+                    self.warnings.append(f"could not write the audit log ({type(error).__name__})")
 
     def make_backend(self, row: dict[str, Any]) -> SessionBackend:
         stored = row.get("claude_session_path")
@@ -170,7 +177,9 @@ class Stop:
         self.action = plan.action
         session_stop: dict[str, Any] | None = None
         settled = False
-        for _attempt in range(ATTEMPTS):
+        # ATTEMPTS plans are acted on after a state change, plus the one made after the last
+        # failed attempt, so the final plan is never discarded unseen.
+        for attempt in range(ATTEMPTS + 1):
             if self.dry_run or plan.action == "none":
                 settled = True
                 break
@@ -192,6 +201,8 @@ class Stop:
             elif self.send(plan):
                 settled = True
                 break
+            if attempt == ATTEMPTS:
+                break  # the final plan had its attempt
             fresh = self.store.get_agent(self.agent_id)
             if fresh is None:
                 return self.finish(plan, None, None, removed=True)
