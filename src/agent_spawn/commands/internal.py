@@ -10,7 +10,6 @@ from .base import Invocation, not_implemented
 
 
 def supervise(inv: Invocation) -> Outcome:
-    # TODO(#12): the full supervisor (see supervise.py for what #11 provides).
     return supervise_module.supervise(inv)
 
 

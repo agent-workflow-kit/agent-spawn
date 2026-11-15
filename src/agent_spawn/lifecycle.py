@@ -187,9 +187,7 @@ def enter_ephemeral_teardown(
         }
         before = agent_object(store, row)
         after = agent_object(store, {**row, **all_changes})
-        events = lifecycle_events(
-            before, after, reads_third_party=reads_third_party_of(store, row)
-        )
+        events = lifecycle_events(before, after, reads_third_party=reads_third_party_of(store, row))
         try:
             return store.compare_and_set(
                 lease,
