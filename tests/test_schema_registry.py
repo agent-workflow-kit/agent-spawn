@@ -53,3 +53,28 @@ def _minimal_error() -> dict[str, dict[str, object]]:
             "decision_ids": [],
         }
     }
+
+
+@pytest.mark.parametrize("schema_id", ["agent-spawn/config.json", "agent-spawn/defs.json"])
+@pytest.mark.parametrize("value", ["36500d", 3153600000, "1." + "0" * 30])
+def test_duration_schema_accepts_the_grammar_bounds(schema_id: str, value: int | str) -> None:
+    assert not _duration_errors(value, schema_id)
+
+
+@pytest.mark.parametrize("schema_id", ["agent-spawn/config.json", "agent-spawn/defs.json"])
+@pytest.mark.parametrize("value", ["1." + "0" * 31, "1." + "0" * 30 + "s", 3153600001])
+def test_duration_schema_rejects_over_32_characters_or_over_36500_days(
+    schema_id: str, value: int | str
+) -> None:
+    assert _duration_errors(value, schema_id)
+
+
+def _duration_errors(value: int | str, schema_id: str) -> list[str]:
+    if schema_id == "agent-spawn/config.json":
+        return list(schema_registry.errors({"handoff_timeout": value}, schema_id))
+    from jsonschema import Draft202012Validator
+
+    ref = Draft202012Validator(
+        {"$ref": f"{schema_id}#/$defs/duration"}, registry=schema_registry.registry()
+    )
+    return [error.message for error in ref.iter_errors(value)]
