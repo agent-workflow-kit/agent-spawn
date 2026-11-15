@@ -50,6 +50,10 @@ SignalHandler = Callable[[int, Any], Any] | int | signal.Handlers | None
 # Raised by ``run`` when its timeout expires (re-exported so callers need not import subprocess).
 TimeoutExpired = subprocess.TimeoutExpired
 
+# Re-exported stdio redirections for ``Gateway.spawn`` (callers never import subprocess).
+PIPE = subprocess.PIPE
+DEVNULL = subprocess.DEVNULL
+
 
 @dataclass(frozen=True)
 class PeerCredentials:
@@ -104,6 +108,8 @@ class Gateway(Protocol):
     def pidfd_open(self, pid: int) -> int: ...
     def pidfd_send_signal(self, pidfd: int, sig: int) -> None: ...
     def kill(self, pid: int, sig: int) -> None: ...
+    def getpgid(self, pid: int) -> int: ...
+    def killpg(self, pgid: int, sig: int) -> None: ...
     def close(self, fd: int) -> None: ...
     def poll_readable(self, fd: int, timeout: float) -> bool: ...
     def wait_pid_exit(self, pid: int, timeout: float) -> bool: ...
@@ -124,6 +130,27 @@ class Gateway(Protocol):
     def setsid(self) -> None: ...
     def waitpid(self, pid: int, flags: int = 0) -> tuple[int, int]: ...
     def exit_now(self, code: int) -> None: ...
+
+
+_RESET_SIGNALS = tuple(
+    getattr(signal, name)
+    for name in ("SIGINT", "SIGQUIT", "SIGHUP", "SIGTERM")
+    if hasattr(signal, name)
+)
+
+
+def _reset_child_signals() -> None:
+    """Run in a spawned child before ``exec``: give it default signal dispositions and an empty
+    blocked mask, so a supervisor that ignores or blocks signals does not pass that on (an
+    ignored disposition survives ``exec``). ``subprocess`` already restores ``SIGPIPE``.
+
+    Safe despite the usual ``preexec_fn`` warning: it only calls ``signal.signal`` and
+    ``signal.pthread_sigmask`` (async-signal-safe system calls, no locks, no allocation of
+    note) and the CLI is single-threaded, so no other thread can hold a lock at fork time.
+    """
+    for sig in _RESET_SIGNALS:
+        signal.signal(sig, signal.SIG_DFL)
+    signal.pthread_sigmask(signal.SIG_SETMASK, ())
 
 
 class SystemGateway:
@@ -184,6 +211,7 @@ class SystemGateway:
             env=None if env is None else dict(env),
             cwd=cwd,
             start_new_session=start_new_session,
+            preexec_fn=_reset_child_signals,
         )
 
     # files, clocks, platform
@@ -238,6 +266,13 @@ class SystemGateway:
 
     def kill(self, pid: int, sig: int) -> None:
         os.kill(pid, sig)
+
+    def getpgid(self, pid: int) -> int:
+        return os.getpgid(pid)
+
+    def killpg(self, pgid: int, sig: int) -> None:
+        """Signal a process group this tool created (hooks); callers verify it first."""
+        os.killpg(pgid, sig)
 
     def close(self, fd: int) -> None:
         os.close(fd)
