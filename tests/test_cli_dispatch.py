@@ -51,6 +51,7 @@ IMPLEMENTED = {
     "list",
     "resume",
     "show",
+    "stop",
     "supervise",
 }
 
