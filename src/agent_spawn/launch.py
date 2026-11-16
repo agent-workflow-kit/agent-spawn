@@ -1649,7 +1649,9 @@ class Launch:
                 raise  # unreachable
         finally:
             listener.close()
-        assert identity is not None  # a served handoff always had a readable pane process
+        if identity is None:  # the pane process could not be read when it was recorded
+            self.placement_failed(result, self.handoff_error(HandoffFailed("pane_unreadable")))
+            raise  # unreachable
         self.forwarder = procs.SignalForwarder(identity, gateway=self.gateway)
         self.sig.raising = False  # from here a signal is forwarded, not a reason to cancel
         self.supervised = True
