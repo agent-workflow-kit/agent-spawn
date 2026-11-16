@@ -864,6 +864,8 @@ class Launch:
             self.backend.decision_ids = list(self.decision_ids)
             if self.wt is not None:
                 self.wt.decision_ids = list(self.decision_ids)
+            if self.term is not None:
+                self.term.decision_ids = list(self.decision_ids)
         except BaseException:
             remove_copies(self.copies.directory)
             raise

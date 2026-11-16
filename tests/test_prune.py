@@ -306,21 +306,30 @@ def test_live_and_launching_and_torn_down_agents_are_not_candidates(
     assert [status_of(env, i) for i in ids] == ["live", "launching"]
 
 
-def test_an_agent_with_a_window_is_skipped_with_a_reason_not_a_crash(
+def test_an_agent_with_a_window_is_torn_down_with_its_dead_panes_closed(
     env: Env, fakebin: Fakebin
 ) -> None:
     agent_id = old(env, fakebin)
     with env.store() as store:
         with store.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
-            store.put_run(lease, agent_id, 1, {"term_id": "t1", "socket_path": "/tmp/s"})
-    other = old(env, fakebin)
+            store.put_run(lease, agent_id, 1, {"term_id": "tc-aaaaaaaa", "socket_path": "/tmp/s"})
     body = prune(env, "--older-than", "7d")
-    results = by_id(body)
-    assert results[agent_id]["result"] == "skipped"
-    assert results[agent_id]["reason"] == "teardown_unsupported"
-    assert results[other]["result"] == "torn_down"
-    assert any("not implemented yet" in w for w in body["warnings"])
-    assert status_of(env, agent_id) == "parked"
+    assert by_id(body)[agent_id]["result"] == "torn_down"
+    assert status_of(env, agent_id) == "torn_down"
+    listing = [a for a in fakebin.argvs("termctl") if a[0] == "list"]
+    assert len(listing) == 1 and "--dead" in listing[0]  # step 5 ran
+
+
+def test_a_configured_pre_teardown_hook_still_skips_every_agent(
+    fakebin: Fakebin, isolation_env: Isolation
+) -> None:
+    # TODO(#32): the hook runs instead of skipping.
+    hooked = Env(fakebin, isolation_env, 'hooks:\n  pre-teardown:\n    - cmd: "true"\n')
+    agent_id = old(hooked, fakebin)
+    body = prune(hooked, "--older-than", "7d")
+    assert by_id(body)[agent_id]["reason"] == "teardown_unsupported"
+    assert any("#32" in w and "#27" not in w for w in body["warnings"])
+    assert status_of(hooked, agent_id) == "parked"
 
 
 def test_one_agents_refusal_does_not_stop_the_others(env: Env, fakebin: Fakebin) -> None:

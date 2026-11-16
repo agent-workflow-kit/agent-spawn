@@ -240,7 +240,7 @@ class TermBackend:
         args = self.open_args(
             name=name, labels=labels, placement=placement, cwd=cwd, argv=argv, keep_on_exit=True
         )
-        reply = self.call(["open", "--dry-run", *args, "--", *argv])
+        reply = self.call(["open", "--dry-run", *args, *self.audit_flags(), "--", *argv])
         if reply.code == 0 and reply.data is not None:
             return reply.data
         if reply.code == 0:

@@ -894,3 +894,102 @@ def test_stop_ends_a_window_agent(
     assert body["agent"]["park_reason"] == "killed" and body["agent"]["needs_attention"] is None
     wenv.wait_for(lambda: not procs.is_alive(supervisor), "the supervisor to exit")
     wenv.wait_for(lambda: wenv.panes() == [], "the pane to close")  # exit 0: nothing stays dead
+
+
+# --- launch: signals and the handoff peer check --------------------------------------------------
+
+
+def test_a_launcher_interrupted_while_the_window_opens_parks_killed_once(
+    wenv: WindowEnv, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    fakebin.script("termctl", "open", times=1)  # the preflight
+    fakebin.script("termctl", "open", sleep=30)
+    launcher = proc_tracker.popen(
+        wenv.argv(*LAUNCH), env=wenv.env(), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )  # fmt: skip
+    wenv.wait_for(lambda: bool(open_calls(fakebin, dry_run=False)), "the real open")
+    launcher.send_signal(signal.SIGTERM)
+    out, _err = launcher.communicate(timeout=30)
+    body = json.loads(out)
+    assert launcher.returncode == 143
+    assert body["error"]["details"] == {"cause": "interrupted"}
+    (row,) = wenv.agents()
+    assert row["status"] == "parked" and row["park_reason"] == "killed"
+    assert row["needs_attention"] is None and row["supervisor"] is None
+    assert len([a for a in fakebin.argvs("claude-session") if a[0] == "stop"]) == 1
+    assert not (wenv.state_dir / "handoff").exists() or not list(
+        (wenv.state_dir / "handoff").iterdir()
+    )
+
+
+def test_a_connection_from_another_process_is_rejected_and_the_launch_fails(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    """termctl reports a PID that is not the window process: the window's own connection is a
+    thief (wrong peer PID) and gets nothing; the launch fails by timeout (spike A6/A8)."""
+    other = int(wenv.tmux.run("display-message", "-p", "#{pane_pid}").stdout.strip())
+    fakebin.script("termctl", "open", times=1)
+    fakebin.script("termctl", "open", merge={"pid": other})
+    done = wenv.run(*LAUNCH, extra_env={"AGENT_SPAWN_HANDOFF_TIMEOUT": "1.5"})
+    error = result_json(done)["error"]
+    assert done.returncode == 12
+    assert (error["code"], error["details"]["cause"]) == ("handoff_failed", "timeout")
+    events = log_events(wenv)
+    rejected = [e for e in events if e["event"] == "handoff_rejected"]
+    assert rejected and rejected[0]["details"]["cause"] == "wrong_pid"
+    assert [e for e in events if e["event"] == "handoff_failed"]
+    (agent,) = wenv.agents()
+    assert agent["status"] == "parked" and agent["park_reason"] == "launch_failed"
+    assert not [i for i in fakebin.invocations("claude-session") if "exec" in i.argv]
+    # the window process was refused: it gets no environment, exits 1 and leaves a dead pane
+    wenv.wait_for(lambda: any(p["state"] == "dead" for p in wenv.panes()), "dead pane")
+
+
+def test_a_resume_whose_window_fails_to_open_parks_launch_failed(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    agent_id = launched_window(wenv)
+    fail_real_open(fakebin, 12, "tmux_missing")
+    done = wenv.run("resume", agent_id, "--json")
+    assert done.returncode == 12 and result_json(done)["error"]["tool"] == "termctl"
+    row = wenv.agent(agent_id)
+    assert row["status"] == "parked" and row["park_reason"] == "launch_failed"
+    assert row["needs_attention"] == "launch_failed" and row["supervisor"] is None
+    stops = [a for a in fakebin.argvs("claude-session") if a[0] == "stop"]
+    assert len(stops) == 1  # the pending run of this resume, once
+
+
+def test_hook_decision_ids_reach_termctl_open(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    done = wenv.run(
+        *LAUNCH, "--wait", "--decision-id", "d-1",
+        "--hook", """pre-launch=echo '{"decision_id": "d-77"}'""",
+    )  # fmt: skip
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    (real,) = open_calls(fakebin, dry_run=False)
+    assert "--decision-id=d-1" in real and "--decision-id=d-77" in real
+    (dry,) = open_calls(fakebin, dry_run=True)
+    # the preflight carries the command's own ids; the hook's came later
+    assert "--decision-id=d-1" in dry and "--decision-id=d-77" not in dry
+    assert any(a.startswith("--actor=") for a in dry)
+
+
+def test_a_waiting_launcher_forwards_sigterm_to_the_window_supervisor(
+    wenv: WindowEnv, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    script_hung_exec(fakebin)
+    script_live_run(fakebin)
+    launcher = proc_tracker.popen(
+        wenv.argv(*LAUNCH, "--wait"), env=wenv.env(), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )  # fmt: skip
+    wenv.wait_for(lambda: any(a["status"] == "live" for a in wenv.agents()), "the agent to be live")
+    (row,) = wenv.agents()
+    track_agent(wenv, proc_tracker, row["agent_id"])
+    launcher.send_signal(signal.SIGTERM)
+    out, _err = launcher.communicate(timeout=60)
+    body = json.loads(out)
+    # the launcher forwarded SIGTERM to the supervisor (cancellation chain) and kept waiting
+    assert body["agent"]["status"] == "parked" and body["agent"]["park_reason"] == "killed"
+    assert launcher.returncode != 143
+    assert int(signal.SIGTERM) in exec_signals(fakebin)
