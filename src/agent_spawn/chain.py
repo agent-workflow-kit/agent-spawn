@@ -1,16 +1,19 @@
 """Supervisor-initiated runs of a run chain (interface.md, Supervision and Third-party runs).
 
-Today that is the automatic report resume: after a headless run ended ``exited-unreported`` the
-supervisor starts one more run of the same session with a fixed prompt. The run goes through the
-pre-start checks and the classification check like any other ``start``. A refusal or failure at
+The automatic report resume (after a headless run ended ``exited-unreported``, one more headless
+run of the same session with a fixed prompt) and the promotion (after a headless run ended with a
+session-phase exit 13, one interactive run of the same session, hosted in a window by
+``promotion.py``) share every step here. The run goes through the pre-start checks and the
+classification check like any other ``start``. A refusal or failure at
 or before ``start`` raises ``ChainFailure``; the supervisor then parks the agent per the run that
 triggered the chain (the chain rule), with the failure in ``post-park``.
 
 All five pre-start checks run here, before ``start``: the classification dry run, the records of
 the cwd (one ``wtctl list``), the cwd rule of a third-party-reading run or the throwaway check of
 a trusted one, and the holding of the worktree records of the cwd. A refusal or a failure of
-wtctl is a chain failure (``tool`` and ``reason`` of the refusal).
-TODO(#29): promotion is the other supervisor-initiated run; it will reuse this module.
+wtctl is a chain failure (``tool`` and ``reason`` of the refusal). A promotion runs the same
+checks (it fails closed alike), then the window preflight (``preflight``), before any hold or
+``start``.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import os
 import re
 import secrets
 import shlex
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -26,6 +30,7 @@ from . import lifecycle, third_party
 from .agent_view import outcome_object
 from .outcome_table import DELIBERATE_END_REASONS
 from .output import CliError
+from .procs import ProcessIdentity
 from .session_backend import (
     RunOutcome,
     RunSpec,
@@ -59,6 +64,10 @@ class RunCtx:
     outcome_file: str
     auto_resumed: bool = False
     started: bool = False
+    promoted: bool = False
+    #: The host pane process of a promoted run, once its window is open (the supervisor waits for
+    #: it and forwards signals to it).
+    host: ProcessIdentity | None = None
 
 
 @dataclass
@@ -205,6 +214,7 @@ def record_unstarted(
     hooks: object,
     token: str | None,
     actual: RunOutcome | None = None,
+    promoted: bool = False,
 ) -> None:
     """Record a chain run that was canceled before it started, with its ``not-started`` outcome.
 
@@ -215,8 +225,9 @@ def record_unstarted(
     """
     assert sup.store is not None
     fields: dict[str, object] = {
-        "mode": "headless",
-        "auto_resumed": True,
+        "mode": "interactive" if promoted else "headless",
+        "auto_resumed": not promoted,
+        "promoted": promoted,
         "hooks": hooks,
         "outcome": None,
         "end_reason": None,
@@ -225,7 +236,9 @@ def record_unstarted(
     }
     if actual is not None and actual.final:
         fields.update(
-            outcome=outcome_object(sup.agent_id, actual, auto_resumed=True),
+            outcome=outcome_object(
+                sup.agent_id, actual, auto_resumed=not promoted, promoted=promoted
+            ),
             end_reason=actual.end_reason,
             exit_code=actual.exit_code,
         )
@@ -234,7 +247,9 @@ def record_unstarted(
             session, run, "launch", "not-started", end_reason, 12, "not-started", None, "status"
         )
         fields.update(
-            outcome=outcome_object(sup.agent_id, result, auto_resumed=True),
+            outcome=outcome_object(
+                sup.agent_id, result, auto_resumed=not promoted, promoted=promoted
+            ),
             end_reason=end_reason,
             exit_code=12,
         )
@@ -261,11 +276,20 @@ def cancel_pending(
     *,
     hooks: object,
     token: str | None,
+    promoted: bool = False,
 ) -> None:
     """Cancel the chain run (no process can adopt it yet) and record it; a run that ``stop``
     did not end is recorded without an outcome."""
     ended = stop_pending(sup, backend, session)
-    record_unstarted(sup, session, run, "canceled" if ended else None, hooks=hooks, token=token)
+    record_unstarted(
+        sup,
+        session,
+        run,
+        "canceled" if ended else None,
+        hooks=hooks,
+        token=token,
+        promoted=promoted,
+    )
 
 
 def stop_pending(sup: Supervisor, backend: SessionBackend, session: str) -> bool:
@@ -308,6 +332,35 @@ def start_report_resume(
         return _start(sup, backend, row, session, trigger, prompt, cwd, hooks)
     finally:
         remove_prompt(prompt)
+
+
+def start_promotion(
+    sup: Supervisor,
+    backend: SessionBackend,
+    row: dict[str, Any],
+    session: str,
+    trigger: Final,
+    preflight: Callable[[third_party.Classification], None],
+) -> RunCtx:
+    """Start the promoted run (``start --resume --mode interactive``) after the pre-start checks
+    and ``preflight`` (the window preflight; it raises ``ChainFailure``): the pending run is
+    adopted by the ``exec`` of the host window. Raises ``ChainFailure`` (parks per ``trigger``)
+    or ``ChainCanceled`` (a signal arrived)."""
+    assert sup.store is not None
+    if sup.terminated or sup.collect_signals():
+        raise ChainCanceled
+    trigger_row = sup.store.get_run(sup.agent_id, trigger.ctx.run) or {}
+    return _start(
+        sup,
+        backend,
+        row,
+        session,
+        trigger,
+        None,
+        trigger_row.get("cwd"),
+        trigger_row.get("hooks"),
+        preflight=preflight,
+    )
 
 
 class _Wtctl:
@@ -484,14 +537,24 @@ def _start(
     row: dict[str, Any],
     session: str,
     trigger: Final,
-    prompt: str,
+    prompt: str | None,
     cwd: object,
     hooks: object,
+    *,
+    preflight: Callable[[third_party.Classification], None] | None = None,
 ) -> RunCtx:
     assert sup.store is not None
     agent_id = sup.agent_id
-    spec = RunSpec(agent_id=agent_id, mode="headless", resume=session, prompt_file=prompt)
+    promoted = preflight is not None
+    spec = RunSpec(
+        agent_id=agent_id,
+        mode="interactive" if promoted else "headless",
+        resume=session,
+        prompt_file=prompt,
+    )
     classification, hold_cwds, wt = _pre_start_checks(sup, backend, spec, row, session, cwd)
+    if preflight is not None:
+        preflight(classification)  # before any hold or run: a failure creates nothing
     if sup.collect_signals():
         raise ChainCanceled  # no run exists yet
     _take_holds(sup, wt, hold_cwds)
@@ -503,21 +566,35 @@ def _start(
     try:
         started = backend.start(spec, outcome_file=outcome_file, hook=relay)
     except StartError as error:
-        run, end_reason = _recover_run(sup, backend, session, trigger, error, hooks, token)
+        run, end_reason = _recover_run(
+            sup, backend, session, trigger, error, hooks, token, promoted
+        )
         failure = failure_of(error, run=run)
         if run is not None:
             failure.end_reason = end_reason  # the run row and the failure agree
         raise failure from None
     try:
         return _after_start(
-            sup, backend, session, started, classification, cwd, hooks, token, outcome_file, wt
+            sup,
+            backend,
+            session,
+            started,
+            classification,
+            cwd,
+            hooks,
+            token,
+            outcome_file,
+            wt,
+            promoted,
         )
     except (ChainFailure, ChainCanceled):
         raise
     except Exception as error:  # noqa: BLE001 - a started run must never be left unrecorded
         sup.log("warning", level="error", message=f"chain run {started.run} failed: {error}")
         try:
-            cancel_pending(sup, backend, session, started.run, hooks=hooks, token=token)
+            cancel_pending(
+                sup, backend, session, started.run, hooks=hooks, token=token, promoted=promoted
+            )
         except Exception as problem:  # noqa: BLE001 - best effort
             sup.log("warning", level="warn", message=f"could not cancel the run: {problem}")
         raise ChainFailure("agent-spawn", "failed", run=started.run) from None
@@ -534,6 +611,7 @@ def _after_start(
     token: str,
     outcome_file: str,
     wt: _Wtctl,
+    promoted: bool = False,
 ) -> RunCtx:
     assert sup.store is not None
     store, agent_id = sup.store, sup.agent_id
@@ -549,21 +627,24 @@ def _after_start(
                 started.run,
                 {
                     "plan_run_kind": classification.run_kind,
-                    "mode": "headless",
-                    "placement": None,
+                    "mode": "interactive" if promoted else "headless",
+                    "placement": None,  # a promotion records "window" once it is open
                     "cwd": cwd if isinstance(cwd, str) else None,
                     "reads_third_party": classification.reads_third_party,
                     "outcome_token": token,
                     "hooks": hooks,
-                    "auto_resumed": True,
+                    "auto_resumed": not promoted,
+                    "promoted": promoted,
                 },
             )
-    _classification_check(sup, backend, started, classification, work, hooks, token, wt)
+    _classification_check(sup, backend, started, classification, work, hooks, token, wt, promoted)
     if sup.collect_signals():
         # No `exec` child: cancel our own pending run, skip everything else, park.
-        cancel_pending(sup, backend, session, started.run, hooks=hooks, token=token)
+        cancel_pending(
+            sup, backend, session, started.run, hooks=hooks, token=token, promoted=promoted
+        )
         raise ChainCanceled
-    return RunCtx(started.run, outcome_file, auto_resumed=True)
+    return RunCtx(started.run, outcome_file, auto_resumed=not promoted, promoted=promoted)
 
 
 def _recover_run(
@@ -574,6 +655,7 @@ def _recover_run(
     error: StartError,
     hooks: object,
     token: str,
+    promoted: bool = False,
 ) -> tuple[int | None, str | None]:
     """The run a failed ``start`` allocated, if any, and its recorded end reason.
 
@@ -600,7 +682,16 @@ def _recover_run(
     if error.run is None or error.csession_id != session:
         ended_reason = "canceled" if stop_pending(sup, backend, session) else None
     try:
-        record_unstarted(sup, session, run, ended_reason, hooks=hooks, token=token, actual=actual)
+        record_unstarted(
+            sup,
+            session,
+            run,
+            ended_reason,
+            hooks=hooks,
+            token=token,
+            actual=actual,
+            promoted=promoted,
+        )
     except StoreError as problem:
         sup.log("warning", level="warn", message=f"could not record the run: {problem}")
     return run, ended_reason
@@ -653,6 +744,7 @@ def _classification_check(
     hooks: object,
     token: str,
     wt: _Wtctl,
+    promoted: bool = False,
 ) -> None:
     assert sup.store is not None
     looked_up: list[list[WtRecord]] = []
@@ -722,6 +814,7 @@ def _classification_check(
             "canceled" if check.cancel_error is None else None,
             hooks=hooks,
             token=token,
+            promoted=promoted,
         )
     except StoreError as problem:
         sup.log("warning", level="warn", message=f"could not record the run: {problem}")

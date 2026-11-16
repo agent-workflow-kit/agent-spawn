@@ -194,6 +194,7 @@ def lifecycle_events(
     resumed: bool = False,
     fork: bool = False,
     auto_resumed: bool = False,
+    promoted: bool = False,
     teardown_refused: bool = False,
 ) -> list[OutboxEvent]:
     """The outbox events of a status or attention change from ``before`` to ``after`` (agent
@@ -211,7 +212,7 @@ def lifecycle_events(
                     "run": started_run,
                     "resumed": resumed,
                     "fork": fork,
-                    "promoted": False,
+                    "promoted": promoted,
                     "auto_resumed": auto_resumed,
                 },
             )

@@ -96,7 +96,8 @@ class Fakebin:
         ``error`` (``{"code", "message", ...}`` printed as the error envelope), ``stderr``,
         ``sleep`` (seconds), ``hang`` (block until a signal), ``on_signal``
         (``{"SIGTERM": {"exit": 143}}`` or ``"ignore"``), ``outcome`` (claude-session: the
-        outcome name of ``exec``/``resume``/``wait``/``status``) and ``secret``
+        outcome name of ``exec``/``resume``/``wait``/``status``), ``end_reason`` (claude-session
+        ``exec`` only: replaces the outcome's end reason) and ``secret``
         (claude-session ``verify-secret``). Rules match in the order added; ``times`` limits
         how many calls a rule answers.
         """

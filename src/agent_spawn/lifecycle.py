@@ -154,6 +154,7 @@ def run_started(
     *,
     run: int,
     auto_resumed: bool = False,
+    promoted: bool = False,
     changes: Mapping[str, object] | None = None,
 ) -> dict[str, Any] | None:
     """A later run of the chain started (status stays ``live``): clears ``needs_attention`` and
@@ -175,6 +176,7 @@ def run_started(
             reads_third_party=reads_third_party_of(store, {**row, "run": run}),
             started_run=run,
             auto_resumed=auto_resumed,
+            promoted=promoted,
         )
         try:
             return store.compare_and_set(

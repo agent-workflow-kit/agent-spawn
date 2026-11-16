@@ -820,6 +820,8 @@ def run_session(
             for number in numbers:
                 signal.signal(number, drop_signal)
     obj = outcome_object(name, session_id, run)
+    if isinstance(response.get("end_reason"), str):  # e.g. a `not-started` ended never_adopted
+        obj["end_reason"] = response["end_reason"]
     obj["forked_from"] = forked_from
     write_outcome_file(outcome_file, obj)
     end_run(session_id, name)
