@@ -232,9 +232,7 @@ def test_a_tearing_down_agent_with_a_dead_process_is_continued(env: Env, fakebin
     assert status_of(env, agent_id) == "torn_down"
 
 
-def test_a_tearing_down_agent_with_a_live_process_is_left_alone(
-    env: Env, fakebin: Fakebin
-) -> None:
+def test_a_tearing_down_agent_with_a_live_process_is_left_alone(env: Env, fakebin: Fakebin) -> None:
     agent_id = old(env, fakebin, status="tearing_down", teardown_step="started", teardown_proc=me())
     entry = by_id(prune(env, "--older-than", "7d"))[agent_id]
     assert (entry["result"], entry["reason"]) == ("skipped", "tearing_down")

@@ -148,9 +148,7 @@ def prune_command(inv: Any) -> Outcome:
     older = args.older_than if args.older_than is not None else config.prune.older_than
     dry_run = bool(args.dry_run)
     if older is None:
-        warnings.append(
-            "nothing pruned: give --older-than or set prune.older_than in the config"
-        )
+        warnings.append("nothing pruned: give --older-than or set prune.older_than in the config")
         return _outcome([], warnings, dry_run)
     threshold = parse_duration(older) if isinstance(older, str) else float(older)
     state_dir = inv.state_dir or str(default_state_dir())
@@ -225,7 +223,8 @@ def _one(
     except CasLost:
         entry = _result(agent_id, "skipped", "changed", "agent-spawn")
     except Exception as error:  # noqa: BLE001 - bulk command: one agent never stops the others
-        entry = _result(agent_id, "failed", "internal", "agent-spawn", {"error": type(error).__name__})
+        name = type(error).__name__
+        entry = _result(agent_id, "failed", "internal", "agent-spawn", {"error": name})
     if td is not None:
         for problem in td.warnings:
             warnings.append(f"{agent_id}: {problem}")
