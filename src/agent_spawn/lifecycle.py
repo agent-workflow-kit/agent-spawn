@@ -21,6 +21,16 @@ def lease_key(agent_id: str) -> str:
     return f"agent:{agent_id}"
 
 
+def run_settled(row: Mapping[str, Any], *, supervisor_alive: bool) -> bool:
+    """The end condition of a waiting command: the agent is not `launching` or `live`, no
+    promotion is pending and its supervisor has exited (interface.md, `wait`)."""
+    return (
+        row["status"] not in ("launching", "live")
+        and not row.get("promotion_pending")
+        and not supervisor_alive
+    )
+
+
 def reads_third_party_of(store: Store, row: Mapping[str, Any]) -> bool | None:
     """The classification of the agent's current run; ``None`` before a run."""
     run = row.get("run")
@@ -221,7 +231,14 @@ def refuse_ephemeral_teardown(
         row = store.get_agent(agent_id)
         if row is None or row["status"] != "tearing_down":
             return None
-        if row.get("teardown_step") == "worktree_partial":
+        # Only the supervisor that entered the teardown may refuse it, and only before the
+        # worktree step began: marker ``started``, or ``hooks_done`` (the worktree step runs
+        # later). ``worktree_partial`` and beyond are never refused.
+        step = row.get("teardown_step")
+        if row.get("teardown_proc") != store.holder_identity() or step not in (
+            "started",
+            "hooks_done",
+        ):
             return None
         all_changes: dict[str, object] = {
             "updated": store.gateway.wall_time(),
@@ -245,7 +262,12 @@ def refuse_ephemeral_teardown(
         )
         try:
             return store.compare_and_set(
-                lease, agent_id, expect_status="tearing_down", changes=all_changes, events=events
+                lease,
+                agent_id,
+                expect_status="tearing_down",
+                expect={"teardown_proc": store.holder_identity(), "teardown_step": step},
+                changes=all_changes,
+                events=events,
             )
         except CasLost:
             return None

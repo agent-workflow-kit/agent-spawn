@@ -83,9 +83,13 @@ class Fakebin:
         *,
         argv_contains: Sequence[str] = (),
         times: int | None = None,
+        until_called: str | None = None,
         **respond: Any,
     ) -> None:
         """Script the next matching calls of ``tool``'s ``command``.
+
+        ``until_called`` (a subcommand name) ends the rule once a call of that subcommand of
+        ``tool`` is in the log, so a reply can depend on what happened rather than on a count.
 
         Keyword arguments are the response: ``exit`` (code), ``stdout`` (replaces the canned
         output: an object is printed as JSON), ``merge`` (deep-merged into the canned output),
@@ -103,6 +107,8 @@ class Fakebin:
             rule["argv_contains"] = list(argv_contains)
         if times is not None:
             rule["times"] = times
+        if until_called is not None:
+            rule["until_called"] = until_called
         self._rules.append(rule)
         self._write_script()
 
@@ -216,6 +222,25 @@ class Fakebin:
                         return
             time.sleep(0.02)
         raise AssertionError(f"the fake (pid {pid}) never reached its hang")
+
+    def clear_script(self, tool: str, command: str | None = None) -> None:
+        """Disable the rules added so far for ``tool`` (and ``command``).
+
+        A disabled rule keeps its place, because the fakes count answered calls by rule index.
+        """
+        for rule in self._rules:
+            if rule["tool"] == tool and (command is None or rule.get("command") == command):
+                rule["tool"] = "__cleared__"
+        self._write_script()
+
+    def wait_for_gate(self, gate: Path, timeout: float = 20) -> None:
+        """Block until a call scripted with ``gate=<gate>`` is waiting at that gate."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if any(r["path"] == str(gate) for r in self.records("gate_ready")):
+                return
+            time.sleep(0.02)
+        raise AssertionError(f"no call reached the gate {gate}")
 
     def argvs(self, tool: str) -> list[list[str]]:
         return [call.argv for call in self.invocations(tool)]

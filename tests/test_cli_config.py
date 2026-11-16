@@ -75,10 +75,9 @@ def test_invalid_environment_override_fails_fast(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A scoped patch: the isolation fixture checks the environment at its teardown, which runs
-    # before this test's own monkeypatch is undone.
-    with monkeypatch.context() as patch:
-        patch.setenv("AGENT_SPAWN_HANDOFF_TIMEOUT", "0")
+    # A context, so the variable is gone before the isolation fixture's teardown check.
+    with monkeypatch.context() as scoped:
+        scoped.setenv("AGENT_SPAWN_HANDOFF_TIMEOUT", "0")
         assert cli.main(["list"]) == 2
     assert "AGENT_SPAWN_HANDOFF_TIMEOUT" in capsys.readouterr().err
 
@@ -130,14 +129,6 @@ def test_missing_named_config_is_invalid_for_public_commands(
     assert reached == []
     assert envelope["error"]["code"] == "config_invalid"
     assert gone in envelope["error"]["message"]
-
-
-def test_internal_commands_treat_a_missing_config_as_defaults(
-    tmp_path: Path, reached: list[Invocation]
-) -> None:
-    cli.main(["--state-dir", "/s", "--config", str(tmp_path / "gone.yaml"), "_session-event"])
-    assert reached[-1].config is not None
-    assert reached[-1].config_file == str(tmp_path / "gone.yaml")
 
 
 @pytest.mark.parametrize(

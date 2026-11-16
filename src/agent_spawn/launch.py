@@ -34,7 +34,7 @@ from . import gateway as gw
 from . import hooks as hooklib
 from . import lifecycle, procs, third_party
 from . import worktrees as wtlib
-from .agent_view import agent_object, outcome_object, ts
+from .agent_view import agent_object, chain_first_working_at, outcome_object
 from .config import Config
 from .ids import IdEntry, new_agent_id
 from .labels import LabelSet, job_label, parse_run_labels
@@ -159,9 +159,7 @@ def resolve_self() -> str:
     raise CliError("tool_missing", "agent-spawn cannot find its own executable path")
 
 
-def _inside(path: str, directory: str) -> bool:
-    """Whether ``path`` equals ``directory`` or lies below it (both realpaths)."""
-    return path == directory or path.startswith(directory.rstrip("/") + "/")
+_inside = third_party.inside
 
 
 def _same_real_path(a: str, b: str) -> bool:
@@ -645,6 +643,7 @@ class Launch:
             and cwd != third_party.SESSION_DIR
             and self.result_file_inside([cwd])
         ):
+            third_party.drop_result_file(self.inv)
             raise CliError.usage("--result-file lies inside a third-party-reading run's cwd")
         return cwd
 
@@ -1315,7 +1314,10 @@ class Launch:
             )
 
         def result_file_allows() -> bool:
-            return not self.result_file_inside([result.csession_dir, *([cwd] if cwd else [])])
+            if self.result_file_inside([result.csession_dir, *([cwd] if cwd else [])]):
+                third_party.drop_result_file(self.inv)  # never write into the run's directories
+                return False
+            return True
 
         check = self.backend.check_classification(
             result,
@@ -1337,6 +1339,10 @@ class Launch:
         if check.verdict == "accept":
             return
         cause = check.decision.cause or "classification_unknown"
+        # The run is third-party-reading or unknown: fail closed, so the error envelope is never
+        # written into its session directory or cwd (only the stdout copy remains).
+        if self.result_file_inside([result.csession_dir, *([cwd] if cwd else [])]):
+            third_party.drop_result_file(self.inv)
         self.log(
             "classification_unknown"
             if cause == "classification_unknown"
@@ -1495,7 +1501,7 @@ class Launch:
                     return self.result(row, final=False)
                 if ended and not alive:  # the run ended before this launcher saw it started
                     return self.result(row, final=True)
-            elif ended and not row["promotion_pending"] and not alive:
+            elif lifecycle.run_settled(row, supervisor_alive=alive):
                 return self.result(row, final=True)
             if not alive and status in ("launching", "live"):
                 dead_looks += 1
@@ -1554,17 +1560,7 @@ class Launch:
 
     def first_working_at(self, row: dict[str, Any], run: int | None = None) -> str | None:
         assert self.store is not None
-        number = run if run is not None else row.get("run")
-        if not isinstance(number, int) or number < 1:
-            return None
-        # The run chain's first run: an automatic report resume belongs to the run before it.
-        run_row = self.store.get_run(row["agent_id"], number)
-        while run_row is not None and run_row.get("auto_resumed") and number > 1:
-            earlier = self.store.get_run(row["agent_id"], number - 1)
-            if earlier is None:
-                break
-            number, run_row = number - 1, earlier
-        return ts(run_row.get("first_working_at")) if run_row else None
+        return chain_first_working_at(self.store, row, run)
 
     def forward_signal(self, received: int) -> Outcome | None:
         """Handle a flagged signal: forward SIGTERM to the supervisor and keep waiting, or (a
@@ -1763,6 +1759,12 @@ def _tty_pair() -> bool:
 
 
 _pending_restore: Callable[[], None] | None = None
+
+
+def defer_restore(restore: Callable[[], None]) -> None:
+    """Keep handlers installed until ``restore_signal_handlers`` (see ``launch``)."""
+    global _pending_restore
+    _pending_restore = restore
 
 
 def restore_signal_handlers() -> None:

@@ -16,7 +16,7 @@ order of calls, the parking and the logging; it uses these functions for the cal
 * ``status``, ``stop``, ``forget``, ``label_add``/``label_remove``, ``verify_secret``,
   ``list_by_label`` and ``reconcile``.
 
-TODO(#11): launch order, TODO(#13): resume and fork, TODO(#14): supervision use these calls.
+TODO(#11): launch order, TODO(#13): resume and fork; supervision (#12) uses these calls.
 """
 
 from __future__ import annotations
@@ -174,6 +174,12 @@ def _clean(value: object) -> str | None:
     if isinstance(value, str) and "\0" not in value and _LONE_SURROGATE.search(value) is None:
         return value
     return None
+
+
+def _absolute(value: object) -> bool:
+    """Whether ``value`` is an absolute path string: a relative or empty session directory would
+    be resolved against agent-spawn's own cwd by the result-file checks, so it is unusable."""
+    return isinstance(value, str) and value.startswith("/")
 
 
 def _session_id(value: object) -> str:
@@ -543,6 +549,7 @@ def parse_status(data: Mapping[str, Any]) -> SessionStatus | None:
         not isinstance(session_id, str)
         or SESSION_ID.fullmatch(session_id) is None
         or not isinstance(directory, str)
+        or not _absolute(directory)
         or not _is_int(current)
         or current < 1
         or not isinstance(tainted, bool)
@@ -684,6 +691,7 @@ def parse_start(data: Mapping[str, Any]) -> StartResult | None:
         not isinstance(session, str)
         or SESSION_ID.fullmatch(session) is None
         or not isinstance(directory, str)
+        or not _absolute(directory)
         or not _is_int(run)
         or run < 1
         or argv is None
@@ -1060,8 +1068,10 @@ class SessionBackend:
 
     # -- other commands
 
-    def stop(self, csession_id: str, *, grace: str | None = None) -> dict[str, Any]:
-        """``stop <id> [--grace D]``. Returns the stop object verbatim for exit 0, and for exit
+    def stop(
+        self, csession_id: str, *, grace: str | None = None, dry_run: bool = False
+    ) -> dict[str, Any]:
+        """``stop <id> [--grace D] [--dry-run]``. The stop object verbatim for exit 0, and for exit
         12 with ``ended: false`` (still live: the caller checks ``["ended"]``); else raises."""
         args = ["stop", _session_id(csession_id), *self.audit_flags()]
         wanted: float | None = None
@@ -1071,6 +1081,8 @@ class SessionBackend:
             except GrammarError as error:
                 raise CliError.usage(str(error)) from None
             args.append(_flag("--grace", grace))
+        if dry_run:
+            args.append("--dry-run")
         reply = self.call([*args, "--json"], timeout=wanted)
         data = reply.data
         if reply.code == 0 or (
