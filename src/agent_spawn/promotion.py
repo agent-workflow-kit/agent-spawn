@@ -363,19 +363,29 @@ def _abandon(
     except Exception as problem:  # noqa: BLE001 - best effort
         sup.log("warning", level="warn", message=f"could not cancel the run: {problem}")
     if term is not None:
-        close_dead(sup, term, ctx)
+        close_dead(sup, term, ctx, wait=HOST_STOP_WAIT if opened.pane is not None else 0.0)
 
 
-def close_dead(sup: Supervisor, term: TermBackend, ctx: RunCtx) -> None:
+def close_dead(sup: Supervisor, term: TermBackend, ctx: RunCtx, *, wait: float = 0.0) -> None:
     """Close the promoted run's pane when it is dead (``--keep-on-exit failed`` keeps a pane
-    whose host failed). A running pane is never closed. Best effort."""
+    whose host failed). A running pane is never closed. ``wait`` gives a host that is about to
+    exit (it was refused its environment) that many seconds to become a dead pane. Best
+    effort."""
     assert sup.store is not None
     try:
         run_row = sup.store.get_run(sup.agent_id, ctx.run) or {}
         term_id, socket_path = run_row.get("term_id"), run_row.get("socket_path")
         if not isinstance(term_id, str) or not isinstance(socket_path, str):
             return
-        if term_id in term.list_dead(sup.agent_id, socket_path):
-            term.close(term_id, socket_path)
+        deadline = sup.gateway.monotonic() + wait
+        while True:
+            if term_id in term.list_dead(sup.agent_id, socket_path):
+                term.close(term_id, socket_path)
+                return
+            if sup.gateway.monotonic() >= deadline:
+                return
+            if (term_id, socket_path) not in term.find_panes(sup.agent_id, socket_path):
+                return  # the pane is gone (a clean exit closes it): nothing to wait for
+            sup.gateway.sleep(HOST_TICK)
     except (CliError, StoreError) as problem:
         sup.log("warning", level="warn", message=f"could not close the dead pane: {problem}")

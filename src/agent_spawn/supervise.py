@@ -518,7 +518,7 @@ class Supervisor:
         ):
             chain.stop_pending(self, backend, session)
         if self.term is not None:
-            promotion.close_dead(self, self.term, ctx)
+            promotion.close_dead(self, self.term, ctx, wait=promotion.HOST_STOP_WAIT)
 
     def watch_until(
         self,

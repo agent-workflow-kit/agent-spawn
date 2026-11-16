@@ -102,9 +102,10 @@ class Capture:
             "from agent_spawn.cli import main\n"
             "code = main(args)\n"
             "if supervisor:\n"
-            f"    with open({str(self.rc)!r} + '.tmp', 'w') as handle:\n"
+            f"    rc = {str(self.rc)!r} + ('.host' if '--host' in args else '')\n"
+            "    with open(rc + '.tmp', 'w') as handle:\n"
             "        handle.write(str(code))\n"
-            f"    os.replace({str(self.rc)!r} + '.tmp', {str(self.rc)!r})\n"
+            "    os.replace(rc + '.tmp', rc)\n"
             "raise SystemExit(code)\n"
         )
         script.write_text(head + textwrap.indent(launcher_prologue or "pass\n", "    ") + tail)
@@ -113,6 +114,10 @@ class Capture:
 
     def exit_code(self) -> int:
         return int(self.rc.read_text())
+
+    def host_exit_code(self) -> int:
+        """The exit code of the ``supervise --host`` process of a promotion."""
+        return int(Path(str(self.rc) + ".host").read_text())
 
 
 def tmux_text(done: subprocess.CompletedProcess[str]) -> str:
