@@ -7,7 +7,6 @@ warning, never a guess.
 
 from __future__ import annotations
 
-import shlex
 from collections.abc import Mapping
 from typing import Any
 
@@ -16,7 +15,7 @@ from . import procs
 from .agent_lookup import backend_for, open_existing, resolve_existing, store_failed
 from .agent_view import CORRUPT_ROW, agent_object, ts, unusable_row
 from .commands.base import Invocation
-from .launch import resolve_tool
+from .launch import resolve_wtctl
 from .output import CliError, Outcome, PayloadKind, safe_text
 from .session_backend import STATES, SessionStatus
 from .store import Store, StoreError
@@ -28,6 +27,7 @@ _REPORT_STATUSES = frozenset({"done", "blocked", "needs-input", "failed"})
 _ACTIVITIES = frozenset({"working", "idle"})
 _NEEDS_INPUT = frozenset({"permission", "question", "elicitation"})
 _MODES = frozenset({"interactive", "headless"})
+SHOW_TIMEOUT = 15.0  # seconds per read-only wtctl call: show must stay quick
 
 
 def session_summary(status: SessionStatus) -> dict[str, Any] | None:
@@ -132,16 +132,8 @@ def _wtctl(inv: Invocation, row: Mapping[str, Any]) -> WtctlBackend | None:
     command = inv.config.wtctl_cmd
     if command is None:
         return None
-    try:
-        argv = resolve_tool(command, "wtctl")
-    except CliError:
-        stored = row.get("wtctl_path")
-        if not isinstance(stored, str) or not stored:
-            raise
-        try:
-            argv = resolve_tool(shlex.split(stored), "wtctl")
-        except ValueError:
-            raise CliError("tool_missing", "wtctl is not installed", tool="wtctl") from None
+    stored = row.get("wtctl_path")
+    argv = resolve_wtctl(command, stored if isinstance(stored, str) else None)
     return WtctlBackend(argv)
 
 
@@ -154,7 +146,7 @@ def third_party_run(inv: Invocation, row: Mapping[str, Any], warnings: list[str]
         backend = _wtctl(inv, row)
         if backend is None:
             return False  # no wtctl on this machine: the records of every cwd are empty
-        return inside_throwaway(backend.list_records(), cwd)
+        return inside_throwaway(backend.list_records(timeout=SHOW_TIMEOUT), cwd)
     except CliError as error:
         warnings.append(
             f"the throwaway records of the cwd were not looked up ({safe_text(error.code)})"
@@ -172,8 +164,9 @@ def repo_config_changed(
     try:
         backend = _wtctl(inv, row)
         if backend is None:
+            warnings.append("the repo config baseline was not checked (no wtctl)")
             return None
-        return backend.baseline_check(record_id)
+        return backend.baseline_check(record_id, timeout=SHOW_TIMEOUT)
     except CliError as error:
         warnings.append(f"the repo config baseline was not checked ({safe_text(error.code)})")
         return None

@@ -467,12 +467,14 @@ class WtctlBackend:
             raise self._unusable("a record")
         return record
 
-    def list_records(self, *, repo: str | None = None) -> list[WtRecord]:
+    def list_records(
+        self, *, repo: str | None = None, timeout: float = CALL_TIMEOUT
+    ) -> list[WtRecord]:
         """``list [--repo <id>] --json``: the live records (tombstones, if listed, are dropped)."""
         argv = ["list"]
         if repo is not None:
             argv.append(_flag("--repo", repo))
-        reply = self.call([*argv, "--json"])
+        reply = self.call([*argv, "--json"], timeout=timeout)
         if reply.code != 0:
             raise self._fail(reply, "list")
         raw = reply.data.get("records") if reply.data is not None else None
@@ -487,13 +489,17 @@ class WtctlBackend:
                 found.append(record)
         return found
 
-    def baseline_check(self, record_id: str) -> dict[str, Any]:
-        """``baseline check <id> --json`` as ``{"changed", "changed_classes", "items"}`` (exit 0:
-        unchanged; exit 20 ``repo_config_changed``: changed). Any other result raises."""
+    def baseline_check(self, record_id: str, *, timeout: float = CALL_TIMEOUT) -> dict[str, Any]:
+        """``baseline check <id> --json`` as ``{"changed", "changed_classes", "items"}`` (exit 0
+        with an object: unchanged; exit 20 ``repo_config_changed``: changed, where
+        ``error.items`` and ``error.details.changed_classes`` may be absent, meaning none).
+        Any other result raises."""
         if RECORD_ID.fullmatch(record_id) is None:
             raise CliError.usage("not a wtctl record id")
-        reply = self.call(["baseline", "check", record_id, "--json"])
+        reply = self.call(["baseline", "check", record_id, "--json"], timeout=timeout)
         if reply.code == 0:
+            if reply.data is None:
+                raise self._unusable("a baseline check")
             return {"changed": False, "changed_classes": [], "items": []}
         error = reply.data.get("error") if reply.data is not None else None
         if (
@@ -502,8 +508,10 @@ class WtctlBackend:
             and error.get("reason") == "repo_config_changed"  # pyright: ignore[reportUnknownMemberType]
         ):
             details = error.get("details")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-            classes = details.get("changed_classes") if isinstance(details, dict) else None  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-            items = error.get("items")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+            classes = details.get("changed_classes", []) if isinstance(details, dict) else []  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+            items = error.get("items", [])  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+            if details is not None and not isinstance(details, dict):
+                raise self._unusable("a baseline check")
             if (
                 isinstance(classes, list)
                 and all(c in ("git", "claude") for c in classes)  # pyright: ignore[reportUnknownVariableType]
@@ -590,12 +598,16 @@ def _details(reply: _Reply) -> dict[str, Any]:
     return details if isinstance(details, dict) else {}  # pyright: ignore[reportUnknownVariableType]
 
 
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"non-finite JSON constant {name}")
+
+
 def _loads(text: str) -> dict[str, Any] | None:
     if len(text) > 8 * 1024 * 1024:
         return None
     try:
-        data = json.loads(text)
-    except ValueError:
+        data = json.loads(text, parse_constant=_reject_constant)
+    except (ValueError, RecursionError):  # malformed, NaN/Infinity, or nested too deeply
         return None
     return data if isinstance(data, dict) else None  # pyright: ignore[reportUnknownVariableType]
 

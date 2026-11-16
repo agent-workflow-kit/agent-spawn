@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from agent_spawn.lifecycle import LEASE_WAIT, lease_key
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
 from tests.flow_support import Flow, schema
@@ -203,7 +204,9 @@ def test_crashed_worktree_launch_is_retried_by_resume_without_a_second_worktree(
     assert flow.agent(agent_id)["status"] == "parked"
     assert flow.agent(agent_id)["park_reason"] == "done"
 
-    flow.cli(schema("teardown"), "teardown", agent_id, "--json")
+    final = flow.cli(schema("teardown"), "teardown", agent_id, "--json")
+    assert final.code == 0, (final.stdout, final.stderr)
+    assert final.body["agent"]["status"] == "torn_down"
     assert records(flow.fakebin)[left["id"]]["state"] == "removed"
     flow.validate_everything(expect_hooks=["post-launch", "post-teardown"], expect_audit=1)
 
@@ -216,8 +219,10 @@ def test_prune_tears_down_an_old_parked_worktree_agent_and_leaves_the_rest(flow:
     recent = flow.cli(schema("launch"), *LAUNCH).body["agent"]["agent_id"]
     owned = flow.cli(schema("launch"), *LAUNCH, "--label", "owner=me").body["agent"]["agent_id"]
     escalated = flow.cli(schema("launch"), *LAUNCH).body["agent"]["agent_id"]
-    flow.cli(schema("label-add"), "label", "add", escalated, "k=v", "--json")
-    for agent_id in (old, owned):
+    with flow.env.store() as store:  # escalated: needs_attention set, as the supervisor would
+        with store.lease(lease_key(escalated), wait=LEASE_WAIT) as lease:
+            store.update_agent(lease, escalated, {"needs_attention": "failed"})
+    for agent_id in (old, owned, escalated):
         backdate(flow, agent_id)
     (record,) = records(flow.fakebin).values()
 
@@ -229,9 +234,14 @@ def test_prune_tears_down_an_old_parked_worktree_agent_and_leaves_the_rest(flow:
     results = {r["agent_id"]: r for r in pruned.body["results"]}
     assert results[old]["result"] == "torn_down"
     assert (results[owned]["result"], results[owned]["reason"]) == ("skipped", "protected")
-    assert recent not in results and escalated not in results  # too young: not candidates
+    assert recent not in results  # too young: not a candidate
+    assert (results[escalated]["result"], results[escalated]["reason"]) == (
+        "skipped",
+        "needs_attention",
+    )
     assert flow.agent(old)["status"] == "torn_down"
-    assert flow.agent(owned)["status"] == "parked" and flow.agent(recent)["status"] == "parked"
+    for kept in (owned, recent, escalated):
+        assert flow.agent(kept)["status"] == "parked"
     assert not os.path.exists(record["path"])
     assert records(flow.fakebin)[record["id"]]["state"] == "removed"
     # prune acts as the automation actor and its removal is audited
@@ -266,6 +276,11 @@ def test_prune_refuses_the_source_of_a_young_fork_until_the_fork_is_old_too(flow
     assert {r["agent_id"]: r["result"] for r in third.body["results"]} == {source: "torn_down"}
     assert not os.path.exists(record["path"])
     assert records(flow.fakebin)[record["id"]]["state"] == "removed"
+    audit = flow.cli(schema("export"), "export", "--action", "teardown", "--json").body
+    # only a teardown that removed a worktree is audited: the fork only released its hold
+    assert flow.agent(fork_id)["status"] == "torn_down"
+    assert flow.agent(source)["status"] == "torn_down"
+    assert [(r["target"], r["actor"]) for r in audit] == [(source, "auto:agent-spawn")]
     flow.validate_everything(expect_hooks=["post-teardown"], expect_audit=1)
 
 

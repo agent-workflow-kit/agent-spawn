@@ -143,6 +143,24 @@ def resolve_tool(argv: Sequence[str], name: str) -> list[str]:
     return [path, *argv[1:]]
 
 
+def resolve_wtctl(command: Sequence[str], stored: str | None) -> list[str]:
+    """wtctl as configured, else as stored with the agent (an absolute path, possibly with
+    arguments); exit 12 ``tool_missing`` when neither resolves. A blank stored value counts as
+    none."""
+    try:
+        return resolve_tool(command, "wtctl")
+    except CliError as missing:
+        if not stored:
+            raise
+        try:
+            argv = shlex.split(stored)
+            if not argv:
+                raise missing from None
+            return resolve_tool(argv, "wtctl")
+        except (CliError, ValueError):
+            raise missing from None
+
+
 def resolve_self() -> str:
     """The absolute path of this agent-spawn, which must exec it in place (a console script)."""
     candidates: list[str] = []
@@ -578,15 +596,7 @@ class Launch:
         if command is None:
             return None
         stored = stored or self.stored_wtctl
-        try:
-            argv = resolve_tool(command, "wtctl")
-        except CliError as missing:
-            if not stored:
-                raise
-            try:
-                argv = resolve_tool(shlex.split(stored), "wtctl")
-            except (CliError, ValueError):
-                raise missing from None
+        argv = resolve_wtctl(command, stored)
         self.wt_argv = argv
         self.wt = WtctlBackend(
             argv, actor=self.inv.actor, decision_ids=self.decision_ids, gateway=self.gateway
