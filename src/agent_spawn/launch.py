@@ -999,9 +999,9 @@ class Launch:
                 backend = self.wtctl_backend()
                 assert backend is not None
                 record, _ = backend.adopt(mode, agent_id, repo=self.args.repo)
-                self.store_worktree(
-                    agent_id, record.id, path=record.path, owned=record.owned is True
-                )
+                # `adopt` never creates a record: the agent releases it at teardown (forget),
+                # whatever wtctl's own `owned` says of a record it adopted.
+                self.store_worktree(agent_id, record.id, path=record.path, owned=False)
                 cwd = self.cwd_in_worktree(mode)
             if mode != "none":
                 self.update_cwd(agent_id, cwd)
@@ -1113,7 +1113,9 @@ class Launch:
             with _signals_held():  # the hold wtctl took must reach the local row
                 adopted, _ = backend.adopt(record.path, agent_id)
                 self.wt_records = None
-                self.store_hold(agent_id, adopted.id, adopted.path, owned=adopted.owned is True)
+                # a hold taken by `adopt` is released at teardown, never removed: the agent did not
+                # create the record (wtctl's `owned` is about whoever created it)
+                self.store_hold(agent_id, adopted.id, adopted.path, owned=False)
         row = self.store.get_agent(agent_id)
         assert row is not None
         if row.get("wt_record_id") is None:

@@ -638,16 +638,30 @@ def do_show(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
     return 0, resolve(ctx, p.positionals[0], tombstones=True), "show"
 
 
+def content_refusal(record: dict[str, Any]) -> tuple[str, str] | None:
+    """The content refusal a test planted on a record (``fake_dirty`` / ``fake_unpushed``) as
+    ``(reason, failing check)``; real wtctl reports the check names in ``force_overrides``."""
+    if record.get("fake_dirty"):
+        return "dirty", "tracked"
+    if record.get("fake_unpushed"):
+        return "unpushed", "unpushed_head"
+    return None
+
+
 def status_object(record: dict[str, Any], *, dry_run: bool | None = None) -> dict[str, Any]:
     held = bool(record["holders"])
+    content = content_refusal(record)
+    reason = "held" if held else (content[0] if content else None)
+    overrides = (["held"] if held else []) + ([content[1]] if content else [])
     out: dict[str, Any] = {
         "id": record["id"],
         "object_type": record["object_type"],
-        "would_remove": not held,
-        "reason": "held" if held else None,
-        "human_required": False,
+        "would_remove": reason is None,
+        "reason": reason,
+        # an adopted worktree is removed by a human only
+        "human_required": record["object_type"] == "worktree" and record.get("owned") is False,
         "checks": checks_object(),
-        "force_overrides": ["held"] if held else [],
+        "force_overrides": overrides,
         "head": record["head_at_create"],
         "current_branch": record["branch"],
         "warnings": [],
@@ -700,6 +714,15 @@ def do_remove(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
             checks={**checks_object(), "held": held_check(others)},
             details={"holders": record["holders"]},
         )
+    content = content_refusal(record)
+    if content is not None and not forced:
+        ctx.fail(
+            20,
+            "refused",
+            f"the worktree is {content[0]}",
+            reason=content[0],
+            checks=checks_object(),
+        )
     if p.has("--dry-run"):
         return 0, status_object({**record, "holders": others}, dry_run=True), "remove"
     if record["object_type"] == "worktree" and not p.has("--yes") and not ctx.stdin_is_tty():
@@ -719,7 +742,8 @@ def do_remove(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
     out = {
         "record": removed,
         "checks": checks_object(),
-        "overridden": ["held"] if others and forced else [],
+        "overridden": (["held"] if others and forced else [])
+        + ([content[1]] if content is not None and forced else []),
         "branch_deleted": False,
         "branch_kept_reason": kept if removed["object_type"] == "worktree" else None,
         "warnings": [],
