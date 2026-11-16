@@ -933,6 +933,7 @@ class Resume(Launch):
                 cwd,
                 self_path,
                 name=self.args.name or source_row["name"],
+                term_placement=source_row.get("term_placement"),
             )
         self.take_holds(run_id, cwd)  # step 6
         # The session (step 7).
@@ -1660,6 +1661,7 @@ class Resume(Launch):
                     cwd,
                     resolve_self(),
                     name=self.args.name or row["name"],
+                    term_placement=row.get("term_placement"),
                 )
                 term_plan = self.termctl_backend().placements(window)
             return self.dry_plan(

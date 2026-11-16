@@ -8,6 +8,10 @@ Without ``FAKEBIN_TMUX`` no tmux is involved. With ``FAKEBIN_TMUX=<tmux binary>`
 test's private server, chosen with ``TERMCTL_SOCKET=<socket path>``) ``open`` really starts its
 argv in a new tmux session, ``list`` and ``show`` take the pane's state from tmux and ``close``
 kills the pane. See ``tests/fakebin/FIDELITY.md``.
+
+``open --placement`` must name a defined placement: ``default`` and the names in the environment
+variable ``FAKEBIN_PLACEMENTS`` (comma separated); anything else is a usage error, exit 2, as in
+termctl. A scripted ``open`` response with ``after_create: true`` applies after the pane exists.
 """
 
 from __future__ import annotations
@@ -408,6 +412,9 @@ def do_open(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         env_names.append(var)
     if (placement := p.get("--placement")) is not None:
         require_pattern(placement, g.PLACEMENT, "--placement")
+        defined = {"default", *filter(None, os.environ.get("FAKEBIN_PLACEMENTS", "").split(","))}
+        if placement not in defined:
+            ctx.usage(f"--placement {placement!r} is not defined in config (placements)")
     if (session := p.get("--session")) is not None:
         require_pattern(session, g.SESSION_NAME, "--session")
     target = p.get("--target")
@@ -466,7 +473,8 @@ def do_open(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
             "tmux_commands": [],
         }
         return 0, out, "open"
-    ctx.check_scripted_error("open")
+    if not ctx.response("open").get("after_create"):
+        ctx.check_scripted_error("open")  # a refusal creates nothing
     number = counter("tc")
     pane_id = base32_id("tc-", number)
     real_pane, real_pid = (
@@ -494,6 +502,8 @@ def do_open(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         "keep_on_exit": keep,
     }
     update_panes(lambda data: data.setdefault(sock, {}).__setitem__(pane_id, pane))
+    # `after_create` in a scripted response: the call fails (or hangs) once the pane exists, as
+    # when termctl is killed or fails after creating it; `apply_rule` applies the script.
     out = {**pane_view(pane), "focused": False, "decision_ids": p.multi("--decision-id")}
     return 0, out, "open"
 

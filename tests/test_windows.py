@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 from pathlib import Path
@@ -18,7 +19,13 @@ from agent_spawn import procs
 from tests import schema_registry
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
-from tests.launch_support import result_json, script_hung_exec, script_live_run, track_agent
+from tests.launch_support import (
+    result_json,
+    script_done_run,
+    script_hung_exec,
+    script_live_run,
+    track_agent,
+)
 from tests.private_tmux import PrivateTmux
 from tests.procguard import ProcTracker
 from tests.window_support import WindowEnv, send_signal
@@ -39,6 +46,15 @@ def log_events(env: WindowEnv) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
+def parked_records(env: WindowEnv) -> list[dict[str, Any]]:
+    """The log's status changes to ``parked``."""
+    return [
+        e
+        for e in log_events(env)
+        if e["event"] == "status_change" and (e.get("details") or {}).get("to") == "parked"
+    ]
+
+
 def open_calls(fakebin: Fakebin, *, dry_run: bool) -> list[list[str]]:
     return [
         argv
@@ -51,6 +67,7 @@ def open_calls(fakebin: Fakebin, *, dry_run: bool) -> list[list[str]]:
 
 
 def test_launch_in_a_window_and_the_golden_output(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    script_done_run(wenv.fakebin)
     done = wenv.run(*LAUNCH, "--wait", "--label", "ticket=T-1", "--name", "my window")
     body = result_json(done)
     assert done.returncode == 0, (done.stdout, done.stderr)
@@ -96,6 +113,7 @@ def test_launch_in_a_window_and_the_golden_output(wenv: WindowEnv, fakebin: Fake
 
 
 def test_a_clean_exit_leaves_no_dead_pane(wenv: WindowEnv) -> None:
+    script_done_run(wenv.fakebin)
     body = result_json(wenv.run(*LAUNCH, "--wait"))
     assert body["outcome"] == "done"
     # supervise exits 0 after its bookkeeping: tmux closes the pane, none stays dead (spike B6)
@@ -105,6 +123,7 @@ def test_a_clean_exit_leaves_no_dead_pane(wenv: WindowEnv) -> None:
 def test_the_window_cwd_of_a_session_dir_run_is_its_work_directory(
     wenv: WindowEnv, fakebin: Fakebin
 ) -> None:
+    script_done_run(wenv.fakebin)
     body = result_json(wenv.run(*LAUNCH, "--wait", "--cwd", "session-dir"))
     agent_id = body["agent"]["agent_id"]
     (dry,), (real,) = open_calls(fakebin, dry_run=True), open_calls(fakebin, dry_run=False)
@@ -112,12 +131,16 @@ def test_the_window_cwd_of_a_session_dir_run_is_its_work_directory(
     cwd = [a for a in real if a.startswith("--cwd=")]
     assert len(cwd) == 1 and cwd[0].endswith("/work")
     assert os.path.isabs(cwd[0][len("--cwd=") :])
-    assert agent_id
+    session = wenv.agent(agent_id)["csession_id"]
+    status = fakebin.run("claude-session", "status", session, "--json", env=wenv.env())
+    directory = json.loads(status.stdout)["csession_dir"]
+    assert cwd[0] == f"--cwd={os.path.realpath(directory)}/work"
 
 
 def test_an_existing_cwd_goes_to_the_preflight_and_the_open(
     wenv: WindowEnv, fakebin: Fakebin, tmp_path: Path
 ) -> None:
+    script_done_run(wenv.fakebin)
     work = tmp_path / "real"
     work.mkdir()
     link = tmp_path / "link"
@@ -130,6 +153,7 @@ def test_an_existing_cwd_goes_to_the_preflight_and_the_open(
 
 
 def test_term_placement_is_passed_and_stored(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    script_done_run(wenv.fakebin)
     body = result_json(wenv.run(*LAUNCH, "--wait", "--term-placement", "default"))
     assert body["agent"]["term_placement"] == "default"
     for argv in (*open_calls(fakebin, dry_run=True), *open_calls(fakebin, dry_run=False)):
@@ -139,6 +163,7 @@ def test_term_placement_is_passed_and_stored(wenv: WindowEnv, fakebin: Fakebin) 
 def test_labels_beyond_the_first_thirty_are_dropped_with_a_warning(
     wenv: WindowEnv, fakebin: Fakebin
 ) -> None:
+    script_done_run(wenv.fakebin)
     labels = [arg for i in range(34) for arg in ("--label", f"k{i:02d}=v")]
     body = result_json(wenv.run(*LAUNCH, "--wait", *labels))
     (real,) = open_calls(fakebin, dry_run=False)
@@ -149,6 +174,7 @@ def test_labels_beyond_the_first_thirty_are_dropped_with_a_warning(
 
 
 def test_the_launchers_environment_reaches_the_run(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    script_done_run(wenv.fakebin)
     result_json(wenv.run(*LAUNCH, "--wait", extra_env={"AGENT_SPAWN_HANDED_OVER": "yes"}))
     (exec_call,) = [i for i in fakebin.invocations("claude-session") if "exec" in i.argv]
     assert exec_call.env.get("AGENT_SPAWN_HANDED_OVER") == "yes"  # not in the tmux server's
@@ -209,6 +235,7 @@ def test_termctl_missing_exits_12_before_anything_changes(wenv: WindowEnv) -> No
 
 
 def test_a_headless_launch_needs_no_termctl(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    script_done_run(wenv.fakebin)
     result_json(wenv.run("launch", "--mode", "headless", "--skill", "do-it", "--json", "--wait"))
     fakebin.assert_not_called("termctl")
 
@@ -225,6 +252,7 @@ def fail_real_open(fakebin: Fakebin, exit_code: int, code: str = "x") -> None:
         (11, "vetoed", None, None, "vetoed"),
         (13, "escalated", "escalated", "termctl", "escalated"),
         (12, "launch_failed", "launch_failed", None, "failed"),
+        (2, "launch_failed", "launch_failed", None, "failed"),  # the preflight passed: not usage
     ],
 )
 def test_a_failed_open_stops_the_pending_run_and_parks_once(
@@ -239,7 +267,7 @@ def test_a_failed_open_stops_the_pending_run_and_parks_once(
     fail_real_open(fakebin, exit_code)
     done = wenv.run(*LAUNCH)
     error = result_json(done)["error"]
-    assert done.returncode == exit_code
+    assert done.returncode == (12 if exit_code == 2 else exit_code)
     assert (error["code"], error["tool"]) == (code, "termctl")
     (agent,) = wenv.agents()
     assert error["agent_id"] == agent["agent_id"]
@@ -249,6 +277,7 @@ def test_a_failed_open_stops_the_pending_run_and_parks_once(
     # no supervisor exists: the launcher canceled the pending run, exactly once
     stops = [a for a in fakebin.argvs("claude-session") if "stop" in a]
     assert len(stops) == 1 and agent["csession_id"] in stops[0]
+    assert len(parked_records(wenv)) == 1  # one process parked it, once
     assert not (wenv.state_dir / "handoff").exists() or not list(
         (wenv.state_dir / "handoff").iterdir()
     )
@@ -277,18 +306,6 @@ def test_a_pane_without_a_pid_fails_the_handoff_and_keeps_a_dead_pane(
     assert wenv.panes()[0]["exit_status"] == 1
     # nothing ran: no exec, and the agent was not made live by that process
     assert not [i for i in fakebin.invocations("claude-session") if "exec" in i.argv]
-    log = wenv.state_dir / "supervise" / f"{agent['agent_id']}.log"
-    assert not log.exists() or "Traceback" not in log.read_text()
-
-
-def test_a_dead_pane_is_closed_by_its_label_and_never_a_running_one(
-    wenv: WindowEnv, fakebin: Fakebin
-) -> None:
-    fakebin.script("termctl", "open", times=1)
-    fakebin.script("termctl", "open", merge={"pid": None})
-    wenv.run(*LAUNCH)
-    wenv.wait_for(lambda: bool(wenv.panes()) and wenv.panes()[0]["state"] == "dead", "dead pane")
-    assert [p["labels"] for p in wenv.panes()][0][0].startswith("agent=")
 
 
 # --- the window-hosted supervisor ---------------------------------------------------------------
@@ -329,9 +346,8 @@ def test_closing_the_window_parks_killed_without_attention(
     assert exec_signals(fakebin).count(int(signal.SIGHUP)) == 1
     sent = [e for e in log_events(wenv) if e["event"] == "signal_sent"]
     assert [e["signal"] for e in sent] == ["SIGHUP"]
-    # B2: the supervisor wrote nothing after the hangup and finished its bookkeeping
-    log = wenv.state_dir / "supervise" / f"{agent_id}.log"
-    assert not log.exists() or "Traceback" not in log.read_text()
+    # B2: the supervisor finished its bookkeeping after the hangup (that it wrote nothing and
+    # exited 0 is asserted by test_a_supervisor_whose_terminal_hangs_up_exits_0_...)
 
 
 def test_sigint_and_sigquit_are_ignored_by_a_window_supervisor(
@@ -345,11 +361,11 @@ def test_sigint_and_sigquit_are_ignored_by_a_window_supervisor(
     (pane,) = wenv.panes()
     # still the supervisor, still live: the ignored signals did nothing and reached nobody
     assert procs.is_alive(supervisor) and wenv.agent(agent_id)["status"] == "live"
-    assert exec_signals(fakebin) == []
     wenv.tmux.run("kill-pane", "-t", pane["pane_id"])
     wenv.wait_for(lambda: wenv.agent(agent_id)["status"] == "parked", "the agent to park")
-    assert exec_signals(fakebin).count(int(signal.SIGINT)) == 0
-    assert exec_signals(fakebin).count(int(signal.SIGQUIT)) == 0
+    wenv.wait_for(lambda: not procs.is_alive(supervisor), "the supervisor to exit")
+    # the call's signals are complete once it ended: only the hangup was ever forwarded
+    assert exec_signals(fakebin) == [int(signal.SIGHUP)]
 
 
 def test_sigterm_of_a_window_supervisor_is_forwarded_to_exec(
@@ -379,25 +395,41 @@ def test_a_sigkilled_window_supervisor_leaves_a_live_agent_for_liveness(
 
 
 def test_a_window_supervisor_that_fails_writes_nothing_to_its_terminal(
-    wenv: WindowEnv,
+    wenv: WindowEnv, tmp_path: Path
 ) -> None:
-    """A failed handoff (exit 1) shows nothing in the pane: no message, no usage text."""
+    """A failed handoff (exit 1) writes nothing: no message, no usage text, on either stream."""
     from tests.launch_support import agent_spawn_path
 
     state = wenv.state_dir
     state.mkdir(parents=True, exist_ok=True)
-    marker = state.parent / "rc"
-    done = wenv.tmux.run(
-        "new-window", "-d", "-P", "-F", "#{pane_id}", "--", "sh", "-c",
-        f"{agent_spawn_path()} supervise ag-aaaaaaaa --handoff {state}/nothing "
-        f"--handoff-timeout 1 --state-dir {state} --config {wenv.config}; "
-        f"echo rc=$? > {marker}; sleep 30",
-    )  # fmt: skip
-    pane = done.stdout.strip()
+    out, err, marker = tmp_path / "out", tmp_path / "err", tmp_path / "rc"
+    script = (
+        f"{shlex.quote(agent_spawn_path())} supervise ag-aaaaaaaa "
+        f"--handoff {shlex.quote(str(state))}/nothing --handoff-timeout 1 "
+        f"--state-dir {shlex.quote(str(state))} --config {shlex.quote(str(wenv.config))} "
+        f">{shlex.quote(str(out))} 2>{shlex.quote(str(err))}; "
+        f"echo $? > {shlex.quote(str(marker))}.tmp; "
+        f"mv {shlex.quote(str(marker))}.tmp {shlex.quote(str(marker))}"
+    )  # the exit code lands in the marker atomically, after the supervisor has finished
+    done = wenv.tmux.run("new-window", "-d", "--", "sh", "-c", script)
+    assert done.returncode == 0, done.stderr
     wenv.wait_for(marker.exists, "the supervisor to exit")
-    assert marker.read_text().strip() == "rc=1"
-    assert wenv.tmux.run("capture-pane", "-p", "-t", pane).stdout.strip() == ""
+    assert marker.read_text().strip() == "1"
+    assert out.read_text() == "" and err.read_text() == ""
     assert any(e["event"] == "handoff_failed" for e in log_events(wenv))
+
+
+def test_a_supervisor_whose_terminal_hangs_up_exits_0_having_written_nothing(
+    wenv: WindowEnv, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
+) -> None:
+    capture = wenv.capture_supervisor(tmp_path / "capture")
+    agent = launch_live(wenv, fakebin, proc_tracker)
+    (pane,) = wenv.panes()
+    assert wenv.tmux.run("kill-pane", "-t", pane["pane_id"]).returncode == 0
+    wenv.wait_for(lambda: wenv.agent(agent["agent_id"])["status"] == "parked", "the agent to park")
+    wenv.wait_for(capture.rc.exists, "the supervisor to finish")
+    assert capture.exit_code() == 0  # it did not crash on the hung-up terminal
+    assert capture.out.read_text() == "" and capture.err.read_text() == ""
 
 
 def test_a_refused_window_supervisor_exits_2_and_prints_nothing(
@@ -478,6 +510,7 @@ def launched_window(wenv: WindowEnv, *extra: str) -> str:
 def test_resume_opens_a_new_window_and_records_it_on_the_new_run(
     wenv: WindowEnv, fakebin: Fakebin
 ) -> None:
+    script_done_run(wenv.fakebin)
     agent_id = launched_window(wenv)
     done = wenv.run("resume", agent_id, "--json", "--wait")
     body = result_json(done)
@@ -498,6 +531,7 @@ def test_resume_opens_a_new_window_and_records_it_on_the_new_run(
 def test_resume_name_and_term_placement_replace_the_stored_values(
     wenv: WindowEnv, fakebin: Fakebin
 ) -> None:
+    script_done_run(wenv.fakebin)
     agent_id = launched_window(wenv, "--name", "first")
     result_json(wenv.run("resume", agent_id, "--json", "--wait", "--name", "second",
                          "--term-placement", "default"))  # fmt: skip
@@ -510,6 +544,7 @@ def test_resume_name_and_term_placement_replace_the_stored_values(
 def test_a_headless_agent_resumed_interactively_gets_a_window(
     wenv: WindowEnv, fakebin: Fakebin
 ) -> None:
+    script_done_run(wenv.fakebin)
     body = result_json(
         wenv.run("launch", "--mode", "headless", "--skill", "do-it", "--json", "--wait")
     )
@@ -524,6 +559,7 @@ def test_a_headless_agent_resumed_interactively_gets_a_window(
 def test_a_resume_preflight_failure_restores_the_pre_resume_row(
     wenv: WindowEnv, fakebin: Fakebin
 ) -> None:
+    script_done_run(wenv.fakebin)
     agent_id = launched_window(wenv)
     before = wenv.agent(agent_id)
     preflight_error(fakebin, "tmux_too_old", 12)
@@ -538,6 +574,7 @@ def test_a_resume_preflight_failure_restores_the_pre_resume_row(
 def test_resume_override_escalation_goes_to_termctl_open_only(
     wenv: WindowEnv, fakebin: Fakebin
 ) -> None:
+    script_done_run(wenv.fakebin)
     fail_real_open(fakebin, 13, "escalated")
     done = wenv.run(*LAUNCH)
     assert done.returncode == 13
@@ -566,6 +603,7 @@ def test_resume_override_escalation_goes_to_termctl_open_only(
 
 
 def test_a_fork_passes_the_override_to_termctl_open_only(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    script_done_run(wenv.fakebin)
     agent_id = launched_window(wenv)
     done = wenv.run("resume", agent_id, "--fork", "--json", "--wait", "--override-escalation",
                     "--actor", "human:tester")  # fmt: skip
@@ -576,6 +614,7 @@ def test_a_fork_passes_the_override_to_termctl_open_only(wenv: WindowEnv, fakebi
 
 
 def test_override_without_a_target_still_exits_2(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    script_done_run(wenv.fakebin)
     agent_id = launched_window(wenv)
     done = wenv.run(
         "resume", agent_id, "--json", "--override-escalation", "--actor", "human:tester"
@@ -585,6 +624,7 @@ def test_override_without_a_target_still_exits_2(wenv: WindowEnv, fakebin: Fakeb
 
 
 def test_dry_runs_report_the_window_plan(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    script_done_run(wenv.fakebin)
     done = wenv.run(*LAUNCH, "--dry-run")
     plan = result_json(done)
     assert done.returncode == 0, (done.stdout, done.stderr)
@@ -661,6 +701,7 @@ def test_teardown_closes_the_dead_panes_of_the_agent_only(
 
 def test_a_running_pane_is_never_closed_by_teardown(wenv: WindowEnv, fakebin: Fakebin) -> None:
     agent_id = dead_pane_agent(wenv, fakebin)
+    (dead,) = [p["id"] for p in wenv.panes() if p["state"] == "dead"]
     running = wenv.fakebin.run(
         "termctl", "open", "--name=live", f"--label=agent={agent_id}", "--json", "--",
         "sleep", "300", env=wenv.env(),
@@ -668,13 +709,15 @@ def test_a_running_pane_is_never_closed_by_teardown(wenv: WindowEnv, fakebin: Fa
     assert running.returncode == 0
     done = wenv.run("teardown", agent_id, "--json")
     body = result_json(done)
-    assert done.returncode == 0 and len(body["windows_closed"]) == 1
+    assert done.returncode == 0 and body["windows_closed"] == [dead]
     left = wenv.panes()
     assert [p["state"] for p in left] == ["running"]
-    assert not term_calls(fakebin, "close") or len(term_calls(fakebin, "close")) == 1
+    (close,) = term_calls(fakebin, "close")  # one close: the dead pane, never forced
+    assert close[1] == dead and not any(a.startswith("--force") for a in close)
 
 
 def test_no_window_no_termctl_call(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    script_done_run(wenv.fakebin)
     body = result_json(
         wenv.run("launch", "--mode", "headless", "--skill", "do-it", "--json", "--wait")
     )
@@ -841,6 +884,7 @@ def test_a_pane_that_is_gone_counts_as_mirrored(
 
 
 def test_no_pane_call_for_a_parked_agent(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    script_done_run(wenv.fakebin)
     agent_id = launched_window(wenv)
     done = wenv.run("label", "add", agent_id, "pr=7", "--json")
     assert done.returncode == 0
@@ -924,23 +968,36 @@ def test_a_launcher_interrupted_while_the_window_opens_parks_killed_once(
 
 
 def test_a_connection_from_another_process_is_rejected_and_the_launch_fails(
-    wenv: WindowEnv, fakebin: Fakebin
+    wenv: WindowEnv, fakebin: Fakebin, proc_tracker: ProcTracker
 ) -> None:
     """termctl reports a PID that is not the window process: the window's own connection is a
-    thief (wrong peer PID) and gets nothing; the launch fails by timeout (spike A6/A8)."""
+    thief (wrong peer PID) and gets nothing; the launch fails by timeout (spike A6/A8). The
+    handoff deadline is generous: the test waits for the rejection record, not for the clock."""
     other = int(wenv.tmux.run("display-message", "-p", "#{pane_pid}").stdout.strip())
     fakebin.script("termctl", "open", times=1)
     fakebin.script("termctl", "open", merge={"pid": other})
-    done = wenv.run(*LAUNCH, extra_env={"AGENT_SPAWN_HANDOFF_TIMEOUT": "1.5"})
-    error = result_json(done)["error"]
-    assert done.returncode == 12
+    launcher = proc_tracker.popen(
+        wenv.argv(*LAUNCH), env=wenv.env({"AGENT_SPAWN_HANDOFF_TIMEOUT": "20"}),
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )  # fmt: skip
+    wenv.wait_for(
+        lambda: any(e["event"] == "handoff_rejected" for e in log_events(wenv)),
+        "the thief's connection to be rejected",
+        timeout=60,
+    )
+    assert launcher.poll() is None  # rejected, and the launcher is still waiting for its window
+    out, _err = launcher.communicate(timeout=60)
+    body = json.loads(out)
+    error = body["error"]
+    assert launcher.returncode == 12
     assert (error["code"], error["details"]["cause"]) == ("handoff_failed", "timeout")
     events = log_events(wenv)
     rejected = [e for e in events if e["event"] == "handoff_rejected"]
-    assert rejected and rejected[0]["details"]["cause"] == "wrong_pid"
+    assert rejected[0]["details"]["cause"] == "wrong_pid"
     assert [e for e in events if e["event"] == "handoff_failed"]
     (agent,) = wenv.agents()
     assert agent["status"] == "parked" and agent["park_reason"] == "launch_failed"
+    assert agent["supervisor"] is None  # no supervisor exists after a failed handoff
     assert not [i for i in fakebin.invocations("claude-session") if "exec" in i.argv]
     # the window process was refused: it gets no environment, exits 1 and leaves a dead pane
     wenv.wait_for(lambda: any(p["state"] == "dead" for p in wenv.panes()), "dead pane")
@@ -949,6 +1006,7 @@ def test_a_connection_from_another_process_is_rejected_and_the_launch_fails(
 def test_a_resume_whose_window_fails_to_open_parks_launch_failed(
     wenv: WindowEnv, fakebin: Fakebin
 ) -> None:
+    script_done_run(wenv.fakebin)
     agent_id = launched_window(wenv)
     fail_real_open(fakebin, 12, "tmux_missing")
     done = wenv.run("resume", agent_id, "--json")
@@ -961,6 +1019,7 @@ def test_a_resume_whose_window_fails_to_open_parks_launch_failed(
 
 
 def test_hook_decision_ids_reach_termctl_open(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    script_done_run(wenv.fakebin)
     done = wenv.run(
         *LAUNCH, "--wait", "--decision-id", "d-1",
         "--hook", """pre-launch=echo '{"decision_id": "d-77"}'""",
@@ -996,6 +1055,7 @@ def test_a_waiting_launcher_forwards_sigterm_to_the_window_supervisor(
 
 
 def test_show_and_list_report_the_window(wenv: WindowEnv) -> None:
+    script_done_run(wenv.fakebin)
     agent_id = launched_window(wenv, "--name", "my window")
     shown = result_json(wenv.run("show", agent_id, "--json"))
     schema_registry.validate(shown, "agent-spawn/cli/show.json")
@@ -1004,3 +1064,330 @@ def test_show_and_list_report_the_window(wenv: WindowEnv) -> None:
     listed = result_json(wenv.run("list", "--json"))
     schema_registry.validate(listed, "agent-spawn/cli/list.json")
     assert listed["agents"][0]["window"] == shown["agent"]["window"]
+
+
+# --- review round 1 -----------------------------------------------------------------------------
+
+
+def test_a_bad_config_in_the_panes_environment_does_not_stop_the_handoff(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    """The window supervisor starts with the tmux server's environment; an invalid
+    AGENT_SPAWN_* value there must not stop it before the handoff (the launcher's environment,
+    which it adopts, is the authoritative one)."""
+    script_done_run(fakebin)
+    done = wenv.tmux.run("set-environment", "-g", "AGENT_SPAWN_TOMBSTONE_DAYS", "not-a-number")
+    assert done.returncode == 0, done.stderr
+    launched = wenv.run(*LAUNCH, "--wait")
+    assert launched.returncode == 0, (launched.stdout, launched.stderr)
+    assert result_json(launched)["outcome"] == "done"
+
+
+def test_a_window_supervisor_with_a_bad_config_loads_defaults_until_the_handoff(
+    wenv: WindowEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent_spawn import cli
+
+    tail = ["--state-dir", str(wenv.state_dir), "--config", str(wenv.config)]
+    window = ["supervise", "ag-aaaaaaaa", "--handoff", "/x", "--handoff-timeout", "1", *tail]
+    host = [
+        "supervise",
+        "ag-aaaaaaaa",
+        "--host",
+        "--handoff",
+        "/x",
+        "--handoff-timeout",
+        "1",
+        *tail,
+    ]
+    detached = ["supervise", "ag-aaaaaaaa", *tail]
+    with monkeypatch.context() as scoped:
+        scoped.setenv("AGENT_SPAWN_TOMBSTONE_DAYS", "not-a-number")
+        for argv in (window, host):
+            inv = cli.parse_invocation(argv)
+            assert inv.config is not None and inv.config_file == str(wenv.config)
+        with pytest.raises(cli.ConfigFailure):  # a detached supervisor still refuses
+            cli.parse_invocation(detached)
+
+
+def test_a_terminal_that_hung_up_never_makes_a_write_fail() -> None:
+    import errno
+
+    from agent_spawn import cli
+
+    class Hung:
+        def write(self, text: str) -> int:
+            raise OSError(errno.EIO, "Input/output error")
+
+        def flush(self) -> None:
+            raise OSError(errno.EIO, "Input/output error")
+
+        def fileno(self) -> int:
+            raise ValueError("not a real descriptor")
+
+    cli._write(Hung(), "text")  # pyright: ignore[reportPrivateUsage]
+
+
+def script_two_opens(fakebin: Fakebin, **real: Any) -> None:
+    """The preflight succeeds; the real open is answered as ``real`` says."""
+    fakebin.script("termctl", "open", times=1)
+    fakebin.script("termctl", "open", **real)
+
+
+def run_teardown_of_the_parked_agent(wenv: WindowEnv) -> dict[str, Any]:
+    (agent,) = wenv.agents()
+    done = wenv.run("teardown", agent["agent_id"], "--json")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    body: dict[str, Any] = result_json(done)
+    return body
+
+
+@pytest.mark.parametrize(
+    "real",
+    [
+        pytest.param(
+            {"after_create": True, "exit": 12, "error": {"code": "locked", "message": "m"}},
+            id="fails-after-creating-the-pane",
+        ),
+        pytest.param({"merge": {"id": "not-an-id"}}, id="unparseable-reply"),
+    ],
+)
+def test_a_pane_whose_open_did_not_report_back_is_found_and_closed_by_teardown(
+    wenv: WindowEnv, fakebin: Fakebin, real: dict[str, Any]
+) -> None:
+    script_two_opens(fakebin, **real)
+    done = wenv.run(*LAUNCH, extra_env={"AGENT_SPAWN_HANDOFF_TIMEOUT": "2"})
+    assert done.returncode == 12, (done.stdout, done.stderr)
+    (agent,) = wenv.agents()
+    assert agent["status"] == "parked" and agent["park_reason"] == "launch_failed"
+    # the pane exists but the launcher never heard of it: it was found by its label and recorded
+    (pane,) = wenv.panes()
+    with wenv.store() as store:
+        run = store.get_run(agent["agent_id"], agent["run"])
+    assert run is not None
+    assert (run["term_id"], run["socket_path"]) == (pane["id"], str(wenv.tmux.socket))
+    # the window process never got an environment: it fails and tmux keeps the dead pane
+    wenv.wait_for(lambda: all(p["state"] == "dead" for p in wenv.panes()), "dead pane")
+    body = run_teardown_of_the_parked_agent(wenv)
+    assert body["windows_closed"] == [pane["id"]]
+    assert wenv.panes() == []
+
+
+def test_a_pre_creation_failure_records_no_window(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    script_two_opens(fakebin, exit=12, error={"code": "tmux_missing", "message": "m"})
+    assert wenv.run(*LAUNCH).returncode == 12
+    (agent,) = wenv.agents()
+    with wenv.store() as store:
+        run = store.get_run(agent["agent_id"], agent["run"])
+    assert run is not None and run["term_id"] is None and run["socket_path"] is None
+    assert wenv.panes() == []
+
+
+def test_a_launcher_killed_while_termctl_opens_leaves_a_pane_teardown_closes(
+    wenv: WindowEnv, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
+) -> None:
+    gate = tmp_path / "open-gate"
+    script_two_opens(fakebin, after_create=True, gate=str(gate))  # the pane exists, then hangs
+    launcher = proc_tracker.popen(
+        wenv.argv(*LAUNCH), env=wenv.env({"AGENT_SPAWN_HANDOFF_TIMEOUT": "2"}),
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )  # fmt: skip
+    try:
+        fakebin.wait_for_gate(gate)
+        launcher.send_signal(signal.SIGTERM)
+        out, _err = launcher.communicate(timeout=60)
+    finally:
+        gate.touch()  # let the hung termctl go
+    assert launcher.returncode == 143 and json.loads(out)["error"]["details"] == {
+        "cause": "interrupted"
+    }
+    (agent,) = wenv.agents()
+    assert agent["status"] == "parked" and agent["park_reason"] == "killed"
+    (pane,) = wenv.panes()
+    with wenv.store() as store:
+        run = store.get_run(agent["agent_id"], agent["run"])
+    assert run is not None and run["term_id"] == pane["id"]
+    wenv.wait_for(lambda: all(p["state"] == "dead" for p in wenv.panes()), "dead pane")
+    assert run_teardown_of_the_parked_agent(wenv)["windows_closed"] == [pane["id"]]
+
+
+def test_a_signal_after_the_handoff_is_forwarded_even_before_the_listener_closes(
+    wenv: WindowEnv, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
+) -> None:
+    """SIGTERM after the handoff completed (the launcher's own close of the listener) reaches the
+    supervisor, which now owns the run: the launcher is not interrupted and parks nothing."""
+    script_hung_exec(fakebin)
+    script_live_run(fakebin)
+    wenv.capture_supervisor(
+        tmp_path / "capture",
+        launcher_prologue=(
+            "import signal\n"
+            "from agent_spawn import handoff\n"
+            "_close, calls = handoff.HandoffListener.close, []\n"
+            "def close(self):\n"
+            "    calls.append(1)\n"
+            "    if len(calls) == 2:  # serve() closed it once: this is the launcher's own close\n"
+            "        os.kill(os.getpid(), signal.SIGTERM)\n"
+            "    _close(self)\n"
+            "handoff.HandoffListener.close = close\n"
+        ),
+    )
+    launcher = proc_tracker.popen(
+        wenv.argv(*LAUNCH, "--wait"), env=wenv.env(), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )  # fmt: skip
+    out, err = launcher.communicate(timeout=120)
+    (row,) = wenv.agents()
+    track_agent(wenv, proc_tracker, row["agent_id"])
+    # not the launcher's own interrupt (exit 143, "interrupted"): the supervisor was signaled
+    assert launcher.returncode != 143 and "interrupted" not in out.decode(), (out, err)
+    supervisor = wenv.agent(row["agent_id"])["supervisor"]
+    assert supervisor is not None  # still recorded: the launcher did not clear it
+    wenv.wait_for(lambda: wenv.agent(row["agent_id"])["status"] == "parked", "the agent to park")
+    assert wenv.agent(row["agent_id"])["park_reason"] == "killed"
+    wenv.wait_for(lambda: not procs.is_alive(supervisor), "the supervisor to exit")
+    assert not [e for e in log_events(wenv) if e["event"] == "interrupted"]
+
+
+def test_an_interrupt_during_the_handoff_parks_killed_and_clears_the_supervisor(
+    wenv: WindowEnv, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    other = int(wenv.tmux.run("display-message", "-p", "#{pane_pid}").stdout.strip())
+    script_two_opens(fakebin, merge={"pid": other})  # the handoff never completes
+    launcher = proc_tracker.popen(
+        wenv.argv(*LAUNCH), env=wenv.env({"AGENT_SPAWN_HANDOFF_TIMEOUT": "60"}),
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )  # fmt: skip
+    wenv.wait_for(
+        lambda: any(e["event"] == "handoff_rejected" for e in log_events(wenv)),
+        "the handoff to be under way",
+        timeout=60,
+    )
+    launcher.send_signal(signal.SIGTERM)
+    out, _err = launcher.communicate(timeout=60)
+    assert launcher.returncode == 143
+    assert json.loads(out)["error"]["details"] == {"cause": "interrupted"}
+    (agent,) = wenv.agents()
+    assert agent["status"] == "parked" and agent["park_reason"] == "killed"
+    assert agent["needs_attention"] is None and agent["supervisor"] is None
+
+
+def test_an_undefined_term_placement_is_a_preflight_usage_error(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    done = wenv.run(*LAUNCH, "--term-placement", "nowhere")
+    error = result_json(done)["error"]
+    assert done.returncode == 2
+    assert (error["code"], error["tool"], error["lower_code"]) == ("usage", "termctl", "usage")
+    assert wenv.agents() == [] and open_calls(fakebin, dry_run=False) == []
+
+
+@pytest.mark.parametrize("fork", [False, True], ids=["resume", "fork"])
+def test_a_resume_preflights_the_placement_its_open_uses(
+    wenv: WindowEnv, fakebin: Fakebin, fork: bool
+) -> None:
+    script_done_run(fakebin)
+    extra = {"FAKEBIN_PLACEMENTS": "side"}
+    launched = result_json(wenv.run(*LAUNCH, "--wait", "--term-placement", "side", extra_env=extra))
+    agent_id = launched["agent"]["agent_id"]
+    done = wenv.run("resume", agent_id, *(["--fork"] if fork else []), "--json", "--wait",
+                    extra_env=extra)  # fmt: skip
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    dry, real = open_calls(fakebin, dry_run=True)[-1], open_calls(fakebin, dry_run=False)[-1]
+    assert "--placement=side" in dry and "--placement=side" in real  # stored, not termctl's rule
+    assert [a for a in dry if a.startswith("--placement")] == [
+        a for a in real if a.startswith("--placement")
+    ]
+
+
+def test_a_label_added_while_the_window_opens_reaches_the_pane(
+    wenv: WindowEnv, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
+) -> None:
+    script_hung_exec(fakebin)
+    script_live_run(fakebin)
+    gate = tmp_path / "open-gate"
+    script_two_opens(fakebin, gate=str(gate))
+    launcher = proc_tracker.popen(
+        wenv.argv(*LAUNCH, "--label", "a=1"), env=wenv.env(), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )  # fmt: skip
+    try:
+        fakebin.wait_for_gate(gate)  # termctl is opening; the labels were read before it
+        (agent,) = wenv.agents()
+        added = wenv.run("label", "add", agent["agent_id"], "late=1", "--json")
+        assert added.returncode == 0, (added.stdout, added.stderr)
+        removed = wenv.run("label", "remove", agent["agent_id"], "a=1", "--json")
+        assert removed.returncode == 0, (removed.stdout, removed.stderr)
+    finally:
+        gate.touch()
+    out, err = launcher.communicate(timeout=120)
+    assert launcher.returncode == 0, (out, err)
+    track_agent(wenv, proc_tracker, agent["agent_id"])
+    labels = pane_labels(wenv)
+    assert "late=1" in labels and "a=1" not in labels
+    assert f"agent={agent['agent_id']}" in labels
+
+
+def test_a_partial_batch_keeps_only_the_failed_pair_queued(
+    wenv: WindowEnv, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    script_hung_exec(fakebin)
+    script_live_run(fakebin)
+    labels = [arg for i in range(29) for arg in ("--label", f"k{i:02d}=v")]
+    agent = result_json(wenv.run(*LAUNCH, *labels))["agent"]
+    track_agent(wenv, proc_tracker, agent["agent_id"])
+    agent_id = agent["agent_id"]
+    # `a=1` becomes the 30th label (pushed, and scripted to fail); `extra=1` the 31st (never)
+    fakebin.script(
+        "termctl", "label add", times=1, exit=12, error={"code": "locked", "message": "m"}
+    )
+    done = wenv.run("label", "add", agent_id, "a=1", "extra=1", "--json")
+    body = result_json(done)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert any("beyond the first 30" in w for w in body["warnings"])
+    assert any("queued for reconcile" in w for w in body["warnings"])
+    with wenv.store() as store:
+        assert [(str(p), op) for p, op in store.mirror_pending(agent_id)] == [("a=1", "add")]
+    (call,) = label_calls(fakebin, "add")
+    assert call[3:4] == ["a=1"] and "extra=1" not in call
+
+
+def test_a_termctl_that_cannot_be_found_does_not_complete_the_window_step(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    from agent_spawn.lifecycle import lease_key
+
+    agent_id = dead_pane_agent(wenv, fakebin)
+    with wenv.store() as store:
+        with store.lease(lease_key(agent_id)) as lease:
+            store.update_agent(lease, agent_id, {"termctl_path": "/nonexistent/termctl"})
+    fakebin.script("claude-session", "forget", times=1, exit=20,
+                   error={"code": "refused", "message": "live", "reason": "live"})  # fmt: skip
+    first = wenv.run("teardown", agent_id, "--json", extra_env={"PATH": "/usr/bin:/bin"})
+    body = result_json(first)
+    assert first.returncode == 20, (first.stdout, first.stderr)
+    assert wenv.agent(agent_id)["status"] == "tearing_down"
+    assert wenv.agent(agent_id)["teardown_step"] != "windows_done"
+    assert wenv.panes()[0]["state"] == "dead"
+    assert body["error"]["code"] == "refused"
+    second = wenv.run("teardown", agent_id, "--json")  # termctl is found now: the pane is closed
+    assert second.returncode == 0, (second.stdout, second.stderr)
+    assert len(result_json(second)["windows_closed"]) == 1
+    assert wenv.panes() == []
+
+
+def test_a_failed_list_does_not_complete_the_window_step_and_a_retry_closes_the_pane(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    agent_id = dead_pane_agent(wenv, fakebin)
+    fakebin.script("termctl", "list", times=1, exit=12,
+                   error={"code": "tmux_missing", "message": "x"})  # fmt: skip
+    fakebin.script("claude-session", "forget", times=1, exit=20,
+                   error={"code": "refused", "message": "live", "reason": "live"})  # fmt: skip
+    first = wenv.run("teardown", agent_id, "--json")
+    assert first.returncode == 20, (first.stdout, first.stderr)
+    assert wenv.agent(agent_id)["teardown_step"] != "windows_done"
+    second = wenv.run("teardown", agent_id, "--json")
+    assert second.returncode == 0, (second.stdout, second.stderr)
+    assert len(result_json(second)["windows_closed"]) == 1
+    assert wenv.panes() == []

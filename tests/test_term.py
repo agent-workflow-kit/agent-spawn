@@ -12,8 +12,15 @@ from agent_spawn import cli
 from agent_spawn.ids import new_agent_id
 from agent_spawn.output import CliError
 from agent_spawn.store import Store
-from agent_spawn.supervise import RunCtx, Signals, Supervisor
-from agent_spawn.term import MAX_AGENT_LABELS, TermBackend, window_labels
+from agent_spawn.supervise import MARKER_BACKOFF, RunCtx, Signals, Supervisor
+from agent_spawn.term import (
+    CALL_TIMEOUT,
+    MAX_AGENT_LABELS,
+    OPEN_TIMEOUT,
+    QUICK_TIMEOUT,
+    TermBackend,
+    window_labels,
+)
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
 from tests.session_backend_support import FakebinGateway
@@ -108,6 +115,19 @@ def test_open_exit_codes_map_through_the_envelope(term: TermBackend, fakebin: Fa
         assert caught.value.lower_error == {"code": "x", "message": "m"}
 
 
+def test_a_real_open_that_exits_2_is_a_placement_failure_not_internal(
+    term: TermBackend, fakebin: Fakebin
+) -> None:
+    """The preflight accepted the request, so a later exit 2 (a directory that vanished, an
+    argv over the preflight's size) is exit 12 `failed`, never the caller's usage error nor
+    `internal`."""
+    fakebin.script("termctl", "open", exit=2, error={"code": "usage", "message": "m"})
+    with pytest.raises(CliError) as caught:
+        open_pane(term)
+    assert (caught.value.code, caught.value.exit_code) == ("failed", 12)
+    assert caught.value.lower_code == "usage"
+
+
 def test_the_preflight_maps_2_to_usage_and_everything_else_to_12(
     term: TermBackend, fakebin: Fakebin
 ) -> None:
@@ -169,6 +189,51 @@ def test_a_nul_in_a_value_is_a_usage_error_before_the_call(
         term.mark("tc-aaaaaaaa", "/tmp/a\0b")
     assert caught.value.code == "usage"
     fakebin.assert_not_called("termctl")
+
+
+class TimeoutSpy(FakebinGateway):
+    """The fakebin gateway that records each call's timeout by termctl command."""
+
+    def __init__(self, fakebin: Fakebin) -> None:
+        super().__init__(fakebin)
+        self.timeouts: dict[str, float | None] = {}
+
+    def run(self, argv: Any, **kwargs: Any) -> Any:
+        command = next(a for a in argv[1:] if not a.startswith("-"))
+        self.timeouts[command] = kwargs.get("timeout")
+        return super().run(argv, **kwargs)
+
+
+def test_only_open_and_close_may_take_long_the_rest_are_quick(fakebin: Fakebin) -> None:
+    spy = TimeoutSpy(fakebin)
+    backend = TermBackend([str(fakebin.bin_dir / "termctl")], gateway=spy)
+    pane = backend.open(
+        name="w", labels=["agent=ag-aaaaaaaa"], placement=None, cwd="/tmp", argv=["/bin/true"]
+    )
+    backend.mark(pane.term_id, pane.socket_path)
+    backend.unmark(pane.term_id, pane.socket_path)
+    backend.label_add(pane.term_id, pane.socket_path, ["a=1"])
+    backend.label_remove(pane.term_id, pane.socket_path, ["a=1"])
+    backend.list_dead("ag-aaaaaaaa", pane.socket_path)
+    backend.find_panes("ag-aaaaaaaa", pane.socket_path)
+    assert spy.timeouts["open"] == OPEN_TIMEOUT
+    for command in ("mark", "unmark", "label", "list"):
+        assert spy.timeouts[command] == QUICK_TIMEOUT, command
+    backend.list_dead("ag-aaaaaaaa", pane.socket_path)
+    with pytest.raises(CliError):  # the pane is running: refused, but the call was made
+        backend.close(pane.term_id, pane.socket_path)  # may run hooks: the long timeout
+    assert spy.timeouts["close"] == CALL_TIMEOUT
+    assert QUICK_TIMEOUT <= 5.0
+
+
+def test_find_panes_lists_by_label_on_the_given_server(term: TermBackend, fakebin: Fakebin) -> None:
+    mine = open_pane(term, agent="ag-aaaaaaaa")
+    open_pane(term, agent="ag-bbbbbbbb")
+    found = term.find_panes("ag-aaaaaaaa", None)
+    assert [term_id for term_id, _ in found] == [mine]
+    assert term.find_panes("ag-aaaaaaaa", found[0][1]) == found
+    argv = fakebin.argvs("termctl")[-1]
+    assert "--label=agent=ag-aaaaaaaa" in argv and "--dead" not in argv
 
 
 # --- the supervisor's markers --------------------------------------------------------------------
@@ -253,8 +318,20 @@ def test_needs_input_and_idle_mark_and_working_clears(rig: MarkerRig) -> None:
     assert rig.marker(rig.second) == "attention"
 
 
-def test_repeats_are_not_sent_and_a_failure_is_retried(rig: MarkerRig) -> None:
+class Clock:
+    """A settable clock for the supervisor's marker backoff (no sleeping in a test)."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_repeats_are_not_sent_and_a_failure_is_retried_after_the_backoff(rig: MarkerRig) -> None:
     ctx = RunCtx(2, "/x")
+    clock = Clock()
+    rig.supervisor.clock = clock
     rig.relay(2, "needs-input", None)
     rig.fakebin.script(
         "termctl", "mark", times=1, exit=12, error={"code": "locked", "message": "m"}
@@ -262,11 +339,51 @@ def test_repeats_are_not_sent_and_a_failure_is_retried(rig: MarkerRig) -> None:
     rig.supervisor.apply_marker(ctx)
     assert rig.marker(rig.second) is None  # a warning, not a crash
     rig.supervisor.apply_marker(ctx)
+    assert rig.calls("mark") == 1  # backing off: no call on the next look
+    clock.now += MARKER_BACKOFF + 1
+    rig.supervisor.apply_marker(ctx)
     assert rig.marker(rig.second) == "attention"
     before = rig.calls("mark")
     rig.supervisor.apply_marker(ctx)
     rig.supervisor.apply_marker(ctx)
     assert rig.calls("mark") == before  # nothing changed: nothing sent
+
+
+def test_a_failing_termctl_is_called_at_a_bounded_rate_and_logged_once(rig: MarkerRig) -> None:
+    ctx = RunCtx(2, "/x")
+    clock = Clock()
+    rig.supervisor.clock = clock
+    rig.relay(2, "needs-input", None)
+    rig.fakebin.script("termctl", "mark", exit=12, error={"code": "locked", "message": "m"})
+    for _ in range(50):  # fifty looks within one backoff period
+        rig.supervisor.apply_marker(ctx)
+        clock.now += 0.5
+    assert rig.calls("mark") == 1
+    for _ in range(3):  # the same failure after each backoff: still one warning
+        clock.now += MARKER_BACKOFF + 1
+        rig.supervisor.apply_marker(ctx)
+    assert rig.calls("mark") == 4
+    log = (Path(rig.supervisor.state_dir) / "log.jsonl").read_text()
+    assert log.count("window marker failed") == 1
+
+
+def test_a_pane_that_is_gone_is_marked_once_and_then_left_alone(rig: MarkerRig) -> None:
+    ctx = RunCtx(2, "/x")
+    rig.supervisor.clock = Clock()
+    rig.relay(2, "needs-input", None)
+    rig.fakebin.script("termctl", "mark", exit=10, error={"code": "not_found", "message": "m"})
+    for _ in range(5):
+        rig.supervisor.apply_marker(ctx)
+    rig.relay(2, "working", "working")
+    rig.supervisor.apply_marker(ctx)
+    assert rig.calls("mark") == 1 and rig.calls("unmark") == 0
+
+
+def test_no_marker_call_once_a_termination_signal_was_forwarded(rig: MarkerRig) -> None:
+    rig.relay(2, "needs-input", None)
+    rig.supervisor.terminated = True
+    rig.supervisor.apply_marker(RunCtx(2, "/x"))
+    assert rig.calls("mark") == 0
 
 
 def test_a_state_that_means_nothing_changes_nothing(rig: MarkerRig) -> None:

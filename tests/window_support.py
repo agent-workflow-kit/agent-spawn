@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+import textwrap
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,18 @@ class WindowEnv(Env):
     ) -> None:
         super().__init__(fakebin, iso, config_text)
         self.tmux = tmux
+        self.spawn: str | None = None  # a wrapper that stands in for the agent-spawn executable
+
+    def argv(self, *args: str) -> list[str]:
+        return [self.spawn, *args] if self.spawn is not None else super().argv(*args)
+
+    def capture_supervisor(self, directory: Path, launcher_prologue: str = "") -> Capture:
+        """Run every window supervisor under a wrapper named ``agent-spawn`` (the launcher puts
+        its own path in the pane's command) that is the pane process itself: it sends the
+        supervisor's stdout and stderr to files and records its exit code atomically."""
+        capture = Capture(directory)
+        self.spawn = str(capture.write(launcher_prologue))
+        return capture
 
     def env(self, extra: Mapping[str, str] | None = None) -> dict[str, str]:
         assert REAL_TMUX is not None
@@ -58,6 +72,47 @@ class WindowEnv(Env):
 
     def alive(self, identity: procs.ProcessIdentity) -> bool:
         return procs.is_alive(identity)
+
+
+class Capture:
+    """Where the wrapper of ``WindowEnv.capture_supervisor`` leaves what the supervisor wrote."""
+
+    def __init__(self, directory: Path) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        self.directory = directory
+        self.out = directory / "stdout"
+        self.err = directory / "stderr"
+        self.rc = directory / "rc"
+
+    def write(self, launcher_prologue: str = "") -> Path:
+        """The wrapper script; ``launcher_prologue`` (Python) runs first in every process that is
+        not a supervisor, to patch the launcher under test."""
+        script = self.directory / "agent-spawn"
+        head = (
+            f"#!{sys.executable}\n"
+            "import os, sys\n"
+            "args = sys.argv[1:]\n"
+            "supervisor = args[:1] == ['supervise']\n"
+            "if supervisor:\n"
+            f"    for fd, path in ((1, {str(self.out)!r}), (2, {str(self.err)!r})):\n"
+            "        os.dup2(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), fd)\n"
+            "if not supervisor:\n"
+        )
+        tail = (
+            "from agent_spawn.cli import main\n"
+            "code = main(args)\n"
+            "if supervisor:\n"
+            f"    with open({str(self.rc)!r} + '.tmp', 'w') as handle:\n"
+            "        handle.write(str(code))\n"
+            f"    os.replace({str(self.rc)!r} + '.tmp', {str(self.rc)!r})\n"
+            "raise SystemExit(code)\n"
+        )
+        script.write_text(head + textwrap.indent(launcher_prologue or "pass\n", "    ") + tail)
+        script.chmod(0o755)
+        return script
+
+    def exit_code(self) -> int:
+        return int(self.rc.read_text())
 
 
 def tmux_text(done: subprocess.CompletedProcess[str]) -> str:

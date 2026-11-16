@@ -845,7 +845,8 @@ class Teardown:
         """Step 5 (skipped, False, when no run of the agent had a window): for each distinct
         socket path ``termctl list --label agent=<id> --dead``, then ``termctl close`` for each
         dead pane listed. Exit 10 and 20 ``running`` are no-ops; any other failure is a warning
-        (a window left behind never blocks a teardown)."""
+        (a window left behind never blocks a teardown). Returns whether the step is done: it is
+        not when termctl could not be found or a ``list`` failed, so a retry looks again."""
         agent_id = row["agent_id"]
         sockets = self.window_sockets(agent_id)
         if not sockets:
@@ -853,13 +854,15 @@ class Teardown:
         term = self.termctl(row)
         if term is None:
             self.warnings.append("termctl could not be found: the agent's dead windows stay open")
-            return True
+            return False
+        complete = True
         for socket_path in sockets:
             try:
                 dead = term.list_dead(agent_id, socket_path)
             except CliError as error:
                 if error.exit_code != 10:
                     self.warnings.append(f"termctl list failed (exit {error.exit_code})")
+                    complete = False
                 continue
             for term_id in dead:
                 try:
@@ -872,7 +875,7 @@ class Teardown:
                     self.warnings.append(f"termctl close failed (exit {error.exit_code})")
                     continue
                 self.windows_closed.append(term_id)
-        return True
+        return complete
 
     def step_session(self, row: Mapping[str, Any]) -> None:
         """Step 6: ``claude-session forget``; exit 10 counts as done, any other failure stops

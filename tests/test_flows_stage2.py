@@ -375,8 +375,10 @@ def test_review_respond_reads_third_party_content_in_a_throwaway_and_acts_in_the
 def test_ticket_work_in_a_window_closes_its_dead_window_in_the_order_of_the_teardown(
     flow: Flow, fakebin: Fakebin, isolation_env: Isolation, private_tmux: Any
 ) -> None:
+    from tests.launch_support import script_done_run
     from tests.window_support import WindowEnv
 
+    script_done_run(fakebin)  # the run ends `done`, scripted rather than the fake's default
     private_tmux.start()
     flow.env = WindowEnv(fakebin, isolation_env, private_tmux)  # same state dir and hook config
     done = flow.cli(

@@ -285,6 +285,33 @@ def test_placements_reports_the_built_in_placement(fakebin: Fakebin) -> None:
     assert matched["match"] == {"labels": ["agent=ag-1"], "rule": None, "placement": "default"}
 
 
+def test_open_rejects_a_placement_that_is_not_defined(fakebin: Fakebin) -> None:
+    sock = ["--socket", "nosuch"]
+    for flag in ("--dry-run", "--json"):
+        code, error = error_of(
+            fakebin, "termctl", "open", *sock, "--placement", "side", flag, "--", "sleep", "1"
+        )
+        assert (code, error["code"]) == (2, "usage")
+    done = fakebin.run(
+        "termctl", "open", *sock, "--placement=side", "--json", "--", "sleep", "1",
+        env={**fakebin.env(), "FAKEBIN_PLACEMENTS": "side"},
+    )  # fmt: skip
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout)["placement"] == "side"
+
+
+def test_a_scripted_error_after_create_leaves_the_pane(fakebin: Fakebin) -> None:
+    sock = ["--socket", "nosuch"]
+    fakebin.script("termctl", "open", after_create=True, exit=12,
+                   error={"code": "locked", "message": "m"})  # fmt: skip
+    code, error = error_of(
+        fakebin, "termctl", "open", *sock, "--label=agent=ag-1", "--", "sleep", "1"
+    )
+    assert (code, error["code"]) == (12, "locked")
+    _, listed = run_json(fakebin, "termctl", "list", *sock, "--label=agent=ag-1")
+    assert len(listed["panes"]) == 1
+
+
 # --- global flags with a separate value before a nested command (R2) --------------------------
 
 

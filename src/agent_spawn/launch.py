@@ -351,6 +351,7 @@ class Launch:
         self.stored_wtctl: str | None = None  # the absolute wtctl path stored with the agent
         self.mode = args_mode(self.args)  # interactive or headless
         self.term: TermBackend | None = None  # resolved when a window will be opened
+        self.window_socket: str | None = None  # the tmux server the preflight named
         self.term_argv: list[str] | None = None
         self.stored_termctl: str | None = None  # the absolute termctl path stored with the agent
         self.term_override = False  # --override-escalation goes to `termctl open` (resume)
@@ -509,9 +510,6 @@ class Launch:
     def window_name(self, agent_id: str) -> str:
         return _name_of(agent_id, self.args)
 
-    def window_term_placement(self) -> str | None:
-        return self.args.term_placement
-
     def window_preflight(
         self,
         agent_id: str,
@@ -520,22 +518,29 @@ class Launch:
         cwd: str | None,
         self_path: str,
         name: str | None = None,
+        term_placement: str | None = None,
     ) -> list[str]:
         """Launch step 1, window preflight: ``termctl open --dry-run`` with the real open's
-        name, labels and placement, ``--cwd`` only for a directory that exists (never
-        ``session-dir``). Returns the window labels (with their warnings noted)."""
+        name, labels and placement (``term_placement`` is the value the real open will use: a
+        resume passes the stored one when ``--term-placement`` is not given), ``--cwd`` only for
+        a directory that exists (never ``session-dir``). Returns the window labels (with their
+        warnings noted)."""
         labels, notes = window_labels(run_kind, agent_id, label_texts)
         self.warnings.extend(w for w in notes if w not in self.warnings)
         directory = None
         if cwd is not None and cwd != third_party.SESSION_DIR and os.path.isdir(cwd):
             directory = os.path.realpath(cwd)
-        self.termctl_backend().preflight(
+        placement = self.args.term_placement or term_placement
+        reply = self.termctl_backend().preflight(
             name=name or self.window_name(agent_id),
             labels=labels,
-            placement=self.window_term_placement(),
+            placement=placement,
             cwd=directory,
             argv=[self_path, "supervise"],
         )
+        socket = reply.get("socket_path")
+        if isinstance(socket, str) and socket.startswith("/") and "\0" not in socket:
+            self.window_socket = socket  # where a pane of this launch would be created
         return labels
 
     def labels(self) -> LabelSet:
@@ -1627,7 +1632,12 @@ class Launch:
                     argv=self.supervise_argv(row, listener),
                     override_escalation=self.term_override,
                 )
+            except LaunchInterrupted:
+                self.recover_window(result, term_backend)  # the pane may exist unrecorded
+                raise
             except CliError as error:
+                if error.exit_code not in (11, 13):  # a veto or escalation created no pane
+                    self.recover_window(result, term_backend)
                 if self.term_override:
                     self.term_override_audit(
                         "refused" if error.exit_code == 20 else "error", agent_id
@@ -1636,7 +1646,11 @@ class Launch:
                 raise  # unreachable
             if self.term_override:
                 self.term_override_audit("ok", agent_id)
-            identity = self.record_window(result, pane)
+            try:
+                identity = self.record_window(result, pane)
+            except BaseException:
+                self.recover_window(result, term_backend)
+                raise
             try:
                 listener.serve(
                     pane_pid=pane.pid,
@@ -1647,16 +1661,62 @@ class Launch:
             except HandoffFailed as failure:
                 self.placement_failed(result, self.handoff_error(failure))
                 raise  # unreachable
+            # The handoff is done: a signal from here is forwarded (below), never raised.
+            self.sig.raising = False
         finally:
             listener.close()
         if identity is None:  # the pane process could not be read when it was recorded
             self.placement_failed(result, self.handoff_error(HandoffFailed("pane_unreadable")))
             raise  # unreachable
+        self.sync_window_labels(term_backend, pane, run_kind, labels)
         self.forwarder = procs.SignalForwarder(identity, gateway=self.gateway)
         self.sig.raising = False  # from here a signal is forwarded, not a reason to cancel
         self.supervised = True
         self.log("launch", message="window supervisor started", pid=identity.pid)
         return self.wait()
+
+    def sync_window_labels(
+        self, term_backend: TermBackend, pane: Pane, run_kind: object, opened: Sequence[str]
+    ) -> None:
+        """Labels were read before ``open`` (which can take long) and a ``label add`` or
+        ``remove`` in that gap found no window to mirror to: push the difference between the
+        labels now stored and the ones the window was opened with. Best effort."""
+        assert self.store is not None and self.agent_id is not None
+        try:
+            wanted, _ = window_labels(
+                run_kind if isinstance(run_kind, str) else None,
+                self.agent_id,
+                self.store.get_labels(self.agent_id).texts(),
+            )
+            add = [label for label in wanted if label not in opened]
+            remove = [label for label in opened if label not in wanted]
+            if add:
+                term_backend.label_add(pane.term_id, pane.socket_path, add)
+            if remove:
+                term_backend.label_remove(pane.term_id, pane.socket_path, remove)
+        except (CliError, StoreError):
+            self.log("warning", level="warn", message="the window's labels could not be synced")
+
+    def recover_window(self, result: StartResult, term_backend: TermBackend) -> None:
+        """A ``termctl open`` that failed or was interrupted may have created its pane without
+        reporting it: find it by its ``agent=`` label (on the server the preflight named) and
+        record it on the run, so that teardown closes it. Best effort, never raises."""
+        assert self.store is not None and self.agent_id is not None
+        self.sig.raising = False  # a signal during this cleanup is recorded, never aborts it
+        agent_id = self.agent_id
+        try:
+            found = term_backend.find_panes(agent_id, self.window_socket)
+            if not found:
+                return
+            term_id, socket_path = found[0]
+            with self.store.lease(
+                lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT
+            ) as lease:
+                self.store.put_run(
+                    lease, agent_id, result.run, {"term_id": term_id, "socket_path": socket_path}
+                )
+        except (CliError, StoreError, OSError):
+            self.log("warning", level="warn", message="a window that failed to open was not found")
 
     def term_override_audit(self, result: str, agent_id: str) -> None:
         """``--override-escalation`` went to ``termctl open`` (resume only)."""

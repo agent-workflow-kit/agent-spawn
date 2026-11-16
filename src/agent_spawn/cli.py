@@ -25,7 +25,7 @@ from . import __version__, gateway, relay
 from . import launch as launch_module
 from .commands.base import Invocation
 from .commands.table import HANDLERS
-from .config import load_config
+from .config import Config, LoadedConfig, default_config_path, load_config
 from .ids import agent_id_arg, check_agent_id_text
 from .labels import label_arg, parse_run_labels, parse_user_label, parse_user_labels, selector_arg
 from .output import (
@@ -541,12 +541,17 @@ def parse_invocation(argv: Sequence[str]) -> Invocation:
     try:
         # Decision (#11): the launcher's AGENT_SPAWN_* overrides apply to everything it starts.
         # A detached supervisor inherits the launcher's environment, so this load already sees
-        # them. A window supervisor loads this config from the tmux pane's environment and
-        # loads it again from the launcher's environment after the handoff
-        # (supervise.Supervisor.adopt_handoff).
+        # them. A window supervisor has only the tmux pane's environment until the handoff: its
+        # authoritative config is the one loaded again from the launcher's environment
+        # (supervise.Supervisor.adopt_handoff), so a config that fails to load here must not stop
+        # it before the handoff (the launcher would only see a handoff timeout).
         loaded = load_config(named, must_exist=named is not None and not internal)
     except CliError as error:
-        raise ConfigFailure(error, decision_ids=capped, result_file=result_file) from None
+        if not (key == "supervise" and (args.handoff is not None or args.host)):
+            raise ConfigFailure(error, decision_ids=capped, result_file=result_file) from None
+        loaded = LoadedConfig(
+            Config(), os.path.abspath(named or default_config_path(os.environ)), ()
+        )
     try:
         tty = stdin_is_tty()
         explicit = args.actor is not None
@@ -677,7 +682,7 @@ def _write(stream: Any, text: str) -> None:
     try:
         stream.write(text)
         stream.flush()
-    except BrokenPipeError:
+    except OSError:  # a broken pipe, or EIO after the terminal hung up
         _silence(stream)
 
 

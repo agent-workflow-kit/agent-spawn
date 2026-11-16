@@ -25,6 +25,7 @@ import shlex
 import signal
 import subprocess
 import time
+from collections.abc import Callable
 from types import FrameType
 from typing import Any
 
@@ -44,6 +45,7 @@ from .term import ATTENTION_MARKER, TermBackend
 
 STATUS_EVERY = 1.0  # seconds between looks at `claude-session status` and the outbox
 STATUS_TIMEOUT = 5.0  # seconds the watch loop's own `status` poll may take
+MARKER_BACKOFF = 30.0  # seconds between window marker attempts after a termctl failure
 RELAY_EVERY = 0.25  # seconds between looks at the relay's records (an early wake-up)
 TICK = 0.05  # seconds between looks at `exec`
 SUPERVISOR_ACTOR = "auto:agent-spawn"
@@ -118,6 +120,10 @@ class Supervisor:
         self.fallback_sent: set[int] = set()
         self.term: TermBackend | None = None  # window markers: only a window-hosted supervisor
         self.marked: dict[int, bool] = {}  # run -> the marker state last applied (attention on)
+        self.marker_settled: set[int] = set()  # runs whose pane is gone: no more marker calls
+        self.marker_retry_at: dict[int, float] = {}  # run -> earliest next attempt after a failure
+        self.marker_warned: dict[int, str] = {}  # run -> the failure last logged (once per change)
+        self.clock: Callable[[], float] = time.monotonic
 
     def log(self, event: str, *, level: str = "info", **fields: Any) -> None:
         try:
@@ -388,6 +394,10 @@ class Supervisor:
         term = self.term
         if term is None or self.store is None:
             return
+        if self.terminated or ctx.run in self.marker_settled:
+            return  # a hangup or stop is under way, or the pane is gone: leave the window alone
+        if self.clock() < self.marker_retry_at.get(ctx.run, 0.0):
+            return
         try:
             run_row = self.store.get_run(self.agent_id, ctx.run) or {}
         except StoreError:
@@ -410,8 +420,18 @@ class Supervisor:
             else:
                 term.unmark(term_id, socket_path)
         except CliError as error:
-            self.log("warning", level="warn", message=f"window marker failed: {error.code}")
+            if error.tool == "termctl" and error.exit_code == 10:
+                self.marker_settled.add(ctx.run)  # the pane is gone: nothing to mark
+                self.log("warning", message="the window is gone: no more markers")
+                return
+            self.marker_retry_at[ctx.run] = self.clock() + MARKER_BACKOFF
+            reason = f"window marker failed: {error.code}"
+            if self.marker_warned.get(ctx.run) != reason:
+                self.marker_warned[ctx.run] = reason
+                self.log("warning", level="warn", message=reason)
             return
+        self.marker_warned.pop(ctx.run, None)
+        self.marker_retry_at.pop(ctx.run, None)
         self.marked[ctx.run] = wanted
 
     def relay_changed(self) -> bool:
