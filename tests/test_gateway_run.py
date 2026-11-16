@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -110,13 +111,27 @@ def test_an_interrupted_run_sends_sigterm_first(tmp_path: Path) -> None:
     def fire(signum: int, frame: object) -> None:
         raise Interrupt
 
+    main_ident = threading.get_ident()
+    stop = threading.Event()
+
+    def deliver_once_ready() -> None:
+        # Interrupt only once the child exists and traps SIGTERM, never earlier.
+        deadline = time.monotonic() + 30
+        while not stop.is_set() and time.monotonic() < deadline:
+            if ready.exists():
+                signal.pthread_kill(main_ident, signal.SIGALRM)
+                return
+            time.sleep(0.01)
+
+    helper = threading.Thread(target=deliver_once_ready, daemon=True)
     old = signal.signal(signal.SIGALRM, fire)
     try:
-        signal.setitimer(signal.ITIMER_REAL, 1.5)
+        helper.start()
         with pytest.raises(Interrupt):
-            run(tmp_path, code, timeout=30)
+            gw.SystemGateway().run_on_terminal([sys.executable, "-I", "-c", code], timeout=60)
     finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
+        stop.set()
+        helper.join(timeout=5)
         signal.signal(signal.SIGALRM, old)
     assert seen.read_text() == "term"
 
