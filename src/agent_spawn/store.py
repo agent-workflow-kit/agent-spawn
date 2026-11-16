@@ -1317,6 +1317,38 @@ class Store:
             )
             return cursor.rowcount == 1
 
+    def reacquire_hold(
+        self, lease: Lease, agent_id: str, record_id: str, path: str, *, owned: bool
+    ) -> None:
+        """The agent holds ``record_id`` again: a released row for the same record or the same
+        path (a re-adoption of a forgotten record makes a new id) is reopened with the new id
+        and path, else a new row is added. ``wt_record_id`` follows a replaced id."""
+        with self.transaction():
+            self._require_lease(lease, f"agent:{agent_id}")
+            self._require_agent(agent_id)
+            rows = self._conn.execute(
+                "SELECT record_id, path FROM agent_holds WHERE agent_id = ? AND released = 1 "
+                "ORDER BY pos",
+                (agent_id,),
+            ).fetchall()
+            match = next(
+                (r for r in rows if r["record_id"] == record_id or r["path"] == path), None
+            )
+            if match is None:
+                self.put_hold(lease, agent_id, record_id, path, owned=owned)
+                return
+            self._conn.execute(
+                "UPDATE agent_holds SET record_id = ?, path = ?, released = 0 "
+                "WHERE agent_id = ? AND record_id = ?",
+                (record_id, path, agent_id, match["record_id"]),
+            )
+            if match["record_id"] != record_id:
+                self._conn.execute(
+                    "UPDATE agents SET wt_record_id = ?, wt_path = ? "
+                    "WHERE agent_id = ? AND wt_record_id = ?",
+                    (record_id, path, agent_id, match["record_id"]),
+                )
+
     def release_hold(self, lease: Lease, agent_id: str, record_id: str) -> None:
         with self.transaction():
             self._require_lease(lease, f"agent:{agent_id}")

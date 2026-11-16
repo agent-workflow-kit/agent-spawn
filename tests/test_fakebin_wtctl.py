@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -44,10 +45,11 @@ def test_create_throwaway_validates(fakebin: Fakebin) -> None:
 
 
 def test_names_are_made_unique_per_repo(fakebin: Fakebin) -> None:
-    first = create(fakebin, "--name", "same")["record"]
-    second = create(fakebin, "--name", "same")["record"]
+    # A derived name that collides gets a suffix (an explicit --name is refused instead).
+    first = create(fakebin, "--branch", "a/x")["record"]
+    second = create(fakebin, "--branch", "a-x")["record"]
     assert isinstance(first, dict) and isinstance(second, dict)
-    assert (first["name"], second["name"]) == ("same", "same-2")
+    assert (first["name"], second["name"]) == ("a-x", "a-x-2")
 
 
 def test_retry_after_a_crash_returns_the_record_unchanged_for_a_holder(fakebin: Fakebin) -> None:
@@ -228,7 +230,7 @@ def test_merge_overrides_canned_fields_and_stays_schema_valid(fakebin: Fakebin) 
 
 def test_version_and_unsupported(fakebin: Fakebin) -> None:
     assert fakebin.run("wtctl", "--version").stdout == "wtctl 0.1.0\n"
-    done = fakebin.run("wtctl", "adopt", "/x", "--json")
+    done = fakebin.run("wtctl", "bootstrap", "wt-aaaaaaaa", "--json")
     assert done.returncode == 1 and json.loads(done.stdout)["error"]["code"] == "fake_unsupported"
 
 
@@ -337,3 +339,170 @@ def test_a_dry_run_create_takes_no_record_id(fakebin: Fakebin) -> None:
     assert not os.path.exists(dry["record"]["path"])  # type: ignore[index]
     real = create(fakebin, "--branch", "b")["record"]
     assert dry["record"]["id"] == real["id"]  # type: ignore[index]
+
+
+# --- adopt (added for worktrees at launch) ---------------------------------------------------
+
+
+def test_adopt_records_an_unowned_worktree_and_a_second_adopt_adds_the_holder(
+    fakebin: Fakebin, tmp_path: Path
+) -> None:
+    target = tmp_path / "tree"
+    target.mkdir()
+    first = json.loads(
+        fakebin.run("wtctl", "adopt", str(target), "--holder", "ag-aaaaaaaa", "--json").stdout
+    )
+    assert first["existing"] is False and first["record"]["owned"] is False
+    assert first["record"]["holders"] == ["ag-aaaaaaaa"]
+    sibling_schemas.validate(first, "wtctl", "cli/adopt.json")
+    second = json.loads(
+        fakebin.run("wtctl", "adopt", str(target), "--holder", "ag-bbbbbbbb", "--json").stdout
+    )
+    assert second["existing"] is True and second["record"]["id"] == first["record"]["id"]
+    assert second["record"]["holders"] == ["ag-aaaaaaaa", "ag-bbbbbbbb"]
+
+
+def test_adopt_refusals(fakebin: Fakebin, tmp_path: Path) -> None:
+    assert fakebin.run("wtctl", "adopt", "relative", "--json").returncode == 2
+    missing = fakebin.run("wtctl", "adopt", str(tmp_path / "nope"), "--json")
+    assert missing.returncode == 10
+    throwaway = json.loads(
+        fakebin.run(
+            "wtctl",
+            "create",
+            "--throwaway",
+            "--repo",
+            "example.org/o/r",
+            "--ref",
+            "a" * 40,
+            "--json",
+        ).stdout
+    )["record"]
+    inside = fakebin.run("wtctl", "adopt", throwaway["path"], "--json")
+    assert inside.returncode == 2
+
+
+def test_create_can_script_a_bootstrap_failure_that_keeps_the_record(fakebin: Fakebin) -> None:
+    fakebin.script("wtctl", "create", bootstrap_failed="install")
+    done = fakebin.run("wtctl", "create", "--repo", "example.org/o/r", "--branch", "m", "--json")
+    body = json.loads(done.stdout)
+    sibling_schemas.validate(body, "wtctl", "cli/error.json")  # details.record is a full record
+    error = body["error"]
+    assert done.returncode == 12 and error["code"] == "bootstrap_failed"
+    assert error["details"]["step"]["argv"] == ["install"]
+    record = error["details"]["record"]
+    assert isinstance(record, dict) and record["state"] == "active"
+    shown = fakebin.run("wtctl", "show", record["id"], "--json")
+    assert json.loads(shown.stdout)["state"] == "active"
+
+
+def test_an_explicit_name_collision_is_refused_not_suffixed(fakebin: Fakebin) -> None:
+    args = ("wtctl", "create", "--repo", "example.org/o/r", "--detach", "--name", "same", "--json")
+    first = json.loads(fakebin.run(*args).stdout)["record"]
+    second = fakebin.run(*args)
+    error = json.loads(second.stdout)["error"]
+    assert second.returncode == 20 and error["reason"] == "path_exists"
+    assert error["holder_id"] == first["id"]
+
+
+def test_an_explicit_name_collision_of_the_same_holder_is_reused_for_detach(
+    fakebin: Fakebin,
+) -> None:
+    args = ("--detach", "--name", "same", "--holder", "ag-aaaaaaaa")
+    first = create(fakebin, *args)
+    again = create(fakebin, *args)
+    assert again["reused"] is True and again["record"] == first["record"]
+    assert again["branch_action"] is None and again["bootstrap"] is None
+    code, error = error_of(
+        fakebin, "wtctl", "create", "--repo", REPO, "--detach", "--name", "same",
+        "--holder", "ag-bbbbbbbb",
+    )  # fmt: skip
+    assert (code, error["reason"]) == (20, "path_exists")
+
+
+def test_an_explicit_name_with_an_explicit_branch_is_reused_by_its_holder(
+    fakebin: Fakebin,
+) -> None:
+    args = ("--branch", "feat/q", "--name", "same", "--holder", "ag-aaaaaaaa")
+    first = create(fakebin, *args)
+    again = create(fakebin, *args)
+    assert again["reused"] is True and again["record"] == first["record"]
+
+
+def test_a_template_branch_collision_with_an_explicit_name_is_branch_exists(
+    fakebin: Fakebin,
+) -> None:
+    args = ("--name", "same", "--holder", "ag-aaaaaaaa")  # no --branch, no --detach: template
+    create(fakebin, *args)
+    code, error = error_of(fakebin, "wtctl", "create", "--repo", REPO, *args)
+    assert (code, error["reason"]) == (20, "branch_exists")
+    assert "tip" in error["details"]
+
+
+def test_a_dry_run_applies_the_refusals_and_never_reuses(fakebin: Fakebin) -> None:
+    args = ("--detach", "--name", "same", "--holder", "ag-aaaaaaaa")
+    create(fakebin, *args)
+    code, error = error_of(fakebin, "wtctl", "create", "--repo", REPO, *args, "--dry-run")
+    assert (code, error["reason"]) == (20, "path_exists")
+    create(fakebin, "--branch", "b9", "--holder", "ag-aaaaaaaa")
+    code, error = error_of(
+        fakebin, "wtctl", "create", "--repo", REPO, "--branch", "b9",
+        "--holder", "ag-aaaaaaaa", "--dry-run",
+    )  # fmt: skip
+    assert (code, error["reason"]) == (20, "branch_in_use")
+
+
+def _set_state(fakebin: Fakebin, record_id: str, state: str) -> None:
+    path = Path(str(fakebin.log) + ".records.json")
+    data = json.loads(path.read_text())
+    data[record_id]["state"] = state
+    path.write_text(json.dumps(data))
+
+
+@pytest.mark.parametrize(
+    ("state", "code", "reason"),
+    [
+        ("missing", 10, None),
+        ("clone_missing", 20, "unlinked"),
+        ("partial", 20, "unlinked"),
+        ("unlinked", 20, "unlinked"),
+        ("creating", 20, "path_exists"),
+    ],
+)
+def test_adopt_of_a_recorded_path_in_a_state_follows_the_state_table(
+    fakebin: Fakebin, tmp_path: Path, state: str, code: int, reason: str | None
+) -> None:
+    target = tmp_path / "tree"
+    target.mkdir()
+    adopted = json.loads(fakebin.run("wtctl", "adopt", str(target), "--json").stdout)["record"]
+    _set_state(fakebin, adopted["id"], state)
+    done = fakebin.run("wtctl", "adopt", str(target), "--holder", "ag-aaaaaaaa", "--json")
+    body = json.loads(done.stdout)
+    sibling_schemas.validate(body, "wtctl", "cli/error.json")
+    assert done.returncode == code
+    assert body["error"].get("reason") == reason
+    if state == "creating":
+        assert body["error"]["holder_id"] == adopted["id"]
+
+
+def test_forgetting_the_last_holder_forgets_an_adopted_record_only(
+    fakebin: Fakebin, tmp_path: Path
+) -> None:
+    target = tmp_path / "tree"
+    target.mkdir()
+    adopted = json.loads(
+        fakebin.run("wtctl", "adopt", str(target), "--holder", "ag-aaaaaaaa", "--json").stdout
+    )["record"]
+    done = json.loads(
+        fakebin.run("wtctl", "forget", adopted["id"], "--holder", "ag-aaaaaaaa", "--json").stdout
+    )
+    assert done["record"]["state"] == "forgotten"
+    again = fakebin.run("wtctl", "forget", adopted["id"], "--holder", "ag-aaaaaaaa", "--json")
+    assert again.returncode == 10
+    assert json.loads(again.stdout)["error"]["details"]["state"] == "forgotten"
+    owned = create(fakebin, "--branch", "keep", "--holder", "ag-aaaaaaaa")["record"]
+    assert isinstance(owned, dict)
+    kept = json.loads(
+        fakebin.run("wtctl", "forget", owned["id"], "--holder", "ag-aaaaaaaa", "--json").stdout
+    )
+    assert kept["record"]["state"] == "active" and kept["record"]["holders"] == []

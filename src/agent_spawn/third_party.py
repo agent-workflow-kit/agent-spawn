@@ -12,12 +12,13 @@ type is an unusable plan (fail closed), never a guess.
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from .output import CliError
 from .validate import KIND
+from .worktrees import WtRecord, inside_throwaway, is_throwaway_root
 
 SESSION_DIR = "session-dir"
 
@@ -83,8 +84,8 @@ def parse_plan(plan: object, *, requested_cwd: str | None = None) -> Classificat
     plan's cwd, mapped to ``session-dir`` only when that is exactly the new-session placeholder
     the dry run emits (see ``_is_new_session_placeholder``). The plan carries no
     ``csession_dir`` (only ``csession_id``), so the work directory of a resumed session cannot
-    be recognized here: it keeps its real path and the cwd rule falls back to the caller's
-    records (TODO(#20)); it fails closed. Any other path, including a repo path that looks
+    be recognized here: it keeps its real path, and the cwd rule recognizes it through the
+    caller's ``session_work`` (or fails closed). Any other path, including a repo path that looks
     like ``.../cs-xxxxxxxx/work``, stays the real path.
     """
     if not isinstance(plan, dict):
@@ -151,26 +152,33 @@ def cwd_rule_allows(
     cwd: str | None,
     *,
     session_work: str | None = None,
+    records: Sequence[WtRecord] | None = None,
 ) -> bool:
     """Whether ``cwd`` satisfies the third-party rule for a run of this class.
 
-    wtctl's records are not consulted here (no throwaways or worktrees exist yet): a
-    third-party-reading run must run in its own session dir (``session-dir``, or the realpath
-    of its ``<csession_dir>/work``), and a trusted run is refused only inside a throwaway, of
-    which there is none without wtctl.
-    TODO(#20): the records of the cwd (throwaway roots, worktree containment) join this rule.
+    ``records`` are the live wtctl records (one ``wtctl list``; ``[]`` when config
+    ``wtctl_cmd`` is null). A third-party-reading run must run in its own session dir
+    (``session-dir``, or the realpath of its ``<csession_dir>/work``) or at the root of a live
+    throwaway record that lies inside no worktree record; a trusted run must not run inside any
+    throwaway. Without ``records`` (a caller that has not looked them up) a trusted run is not
+    judged and a third-party-reading run outside its session dir fails closed.
     """
     if not reads_third_party:
-        return True
+        if records is None or cwd is None or cwd == SESSION_DIR:
+            return True
+        try:
+            return not inside_throwaway(records, cwd)
+        except (ValueError, OSError):  # a NUL or another path the OS refuses
+            return False
     if cwd is None:
         return False
     if cwd == SESSION_DIR:
         return True
-    if session_work is None:
-        return False
     try:
-        return _real(cwd) == _real(session_work)
-    except (ValueError, OSError):  # a NUL or another path the OS refuses
+        if session_work is not None and _real(cwd) == _real(session_work):
+            return True
+        return records is not None and is_throwaway_root(records, cwd)
+    except (ValueError, OSError):
         return False
 
 
@@ -179,10 +187,18 @@ def require_cwd_rule(
     cwd: str | None,
     *,
     session_work: str | None = None,
+    records: Sequence[WtRecord] | None = None,
 ) -> None:
-    """Raise the exit-20 ``third_party_cwd`` refusal when the rule forbids the cwd."""
-    if cwd_rule_allows(reads_third_party, cwd, session_work=session_work):
+    """Raise the exit-20 refusal when the rule forbids the cwd: ``third_party_cwd`` for a
+    third-party-reading run, ``third_party_run`` for a trusted run inside a throwaway."""
+    if cwd_rule_allows(reads_third_party, cwd, session_work=session_work, records=records):
         return
+    if not reads_third_party:
+        raise CliError(
+            "refused",
+            "throwaways are for third-party-reading runs only",
+            reason="third_party_run",
+        )
     raise CliError(
         "refused",
         "third-party-reading runs run only in their session dir or at a throwaway's root",

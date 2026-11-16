@@ -158,7 +158,7 @@ def test_a_refused_result_file_is_forgotten_so_no_error_envelope_is_written(
     work.mkdir()
     inv = SimpleNamespace(
         result_file=output.resolve_result_file(str(work / "r.json")),
-        args=SimpleNamespace(cwd=str(work)),
+        args=SimpleNamespace(cwd=str(work), worktree=None),
         warnings=[],
         decision_ids=[],
         state_dir=str(tmp_path / "state"),
@@ -166,6 +166,7 @@ def test_a_refused_result_file_is_forgotten_so_no_error_envelope_is_written(
     )
     run = launch.Launch(inv, launch.SignalState())
     monkeypatch.setattr(third_party, "require_cwd_rule", lambda *_a, **_k: None)
+    monkeypatch.setattr(run, "records_for", lambda _cwd: [])  # no wtctl in this stand-in
     plan = third_party.Classification(
         reads_third_party=True,
         run_kind="implement",

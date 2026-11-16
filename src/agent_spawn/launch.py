@@ -1,8 +1,9 @@
-"""``launch`` for headless agents without a worktree (interface.md, Launch order, steps 1 to 9).
+"""``launch`` for headless agents (interface.md, Launch order, steps 1 to 9).
 
 The order: usage checks and preflight (tool resolution, prompt copies, classification, pre-start
-checks), ``pre-launch`` hooks, allocation, the session (``claude-session start`` and the
-post-start classification check), the detached supervisor, and the return.
+checks), ``pre-launch`` hooks, allocation, the worktree (``wtctl create`` or ``adopt``, step 4)
+and the holds (step 5), the session (``claude-session start`` and the post-start classification
+check), the detached supervisor, and the return.
 
 Signals (interface.md, Signals). Until a supervisor is recorded the handlers raise
 ``LaunchInterrupted`` in the main thread, which stops the in-flight lower-tool call (the gateway
@@ -32,6 +33,7 @@ from typing import Any
 from . import gateway as gw
 from . import hooks as hooklib
 from . import lifecycle, procs, third_party
+from . import worktrees as wtlib
 from .agent_view import agent_object, chain_first_working_at, outcome_object
 from .config import Config
 from .ids import IdEntry, new_agent_id
@@ -59,6 +61,7 @@ from .session_backend import (
 )
 from .store import Store, StoreError, default_state_dir
 from .validate import GrammarError, default_name, parse_duration
+from .worktrees import CreatePlan, WtctlBackend, WtctlError, WtRecord
 
 POLL = 0.1  # seconds between looks at the state while waiting
 PRE_LAUNCH_BODY_LABEL_CAP = 64
@@ -157,6 +160,13 @@ def resolve_self() -> str:
 
 
 _inside = third_party.inside
+
+
+def _same_real_path(a: str, b: str) -> bool:
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except (ValueError, OSError):
+        return False
 
 
 def _same_file(info: os.stat_result, fd_info: os.stat_result) -> bool:
@@ -299,6 +309,11 @@ class Launch:
         self.started = False
         self.supervised = False  # a supervisor is recorded and acknowledged
         self.label_set: LabelSet | None = None
+        self.wt: WtctlBackend | None = None  # resolved on first use; None under wtctl_cmd: null
+        self.wt_argv: list[str] | None = None
+        self.wt_records: list[WtRecord] | None = None  # the last `wtctl list`
+        self.holds_started = False  # `take_holds` may have adopted a record
+        self.stored_wtctl: str | None = None  # the absolute wtctl path stored with the agent
 
     # -- logging ------------------------------------------------------------------------------
 
@@ -346,7 +361,10 @@ class Launch:
         worktree = args.worktree or "none"
         if worktree not in ("new", "none") and not os.path.isabs(worktree):
             raise CliError.usage("--worktree needs new, none or an absolute path")
-        has_flags = any(getattr(args, name) for name in (*WORKTREE_FLAGS, *WORKTREE_SWITCHES))
+        # a value flag counts when given at all (an empty value is still a worktree flag)
+        has_flags = any(getattr(args, name) is not None for name in WORKTREE_FLAGS) or any(
+            getattr(args, name) for name in WORKTREE_SWITCHES
+        )
         if worktree == "new":
             if not args.repo:
                 raise CliError.usage("--worktree new needs --repo")
@@ -361,6 +379,8 @@ class Launch:
             raise CliError.usage("--cwd session-dir cannot be combined with a worktree")
         if (worktree != "none" or has_flags) and self.config.wtctl_cmd is None:
             raise CliError.usage("worktree flags need wtctl, but wtctl_cmd is null in the config")
+        if worktree != "none":
+            self.worktree_usage(worktree)
         mode = args.mode or "interactive"
         if args.placement == "here" and args.wait_timeout is not None:
             raise CliError.usage("--wait-timeout cannot be combined with --placement here")
@@ -376,10 +396,6 @@ class Launch:
         input_names(args)
         self.label_set = self.labels()  # a reserved label key is exit 2, before any tool lookup
         # Seams owned by later issues; the usage checks above already ran.
-        if worktree != "none":
-            raise CliError.of(
-                "internal", "`launch --worktree` is not implemented yet (tracked in issue #20)"
-            )  # TODO(#20): worktrees, holds and the records of a cwd.
         if mode != "headless":
             raise CliError.of(
                 "internal",
@@ -387,6 +403,34 @@ class Launch:
             )  # TODO(#27): windows; TODO(#30): --placement here.
         if args.placement is not None:
             self.warnings.append("--placement is ignored for a headless launch")
+
+    def worktree_usage(self, worktree: str) -> None:
+        """Grammars and containment of the worktree flags (exit 2, nothing created)."""
+        args = self.args
+        if args.repo:
+            wtlib.check_repo(args.repo)
+        if args.branch is not None:
+            wtlib.check_branch(args.branch, "--branch")
+        if args.base is not None:
+            wtlib.check_branch(args.base, "--base")
+        if args.ref is not None:
+            wtlib.check_sha(args.ref)
+        if args.worktree_name is not None:
+            wtlib.check_worktree_name(args.worktree_name)
+        if args.branch is not None and args.detach:
+            raise CliError.usage("--branch cannot be combined with --detach")
+        if worktree == "new":
+            if args.cwd is not None:
+                # Lexical only: a symlink inside the worktree is checked once it exists.
+                normal = os.path.normpath(args.cwd)
+                if normal == ".." or normal.startswith("../"):
+                    raise CliError.usage("--cwd must stay inside the new worktree")
+            return
+        wtlib.check_abs_path(worktree, "--worktree")
+        if args.cwd is not None:
+            root = os.path.realpath(worktree)
+            if not _inside(wtlib.resolve_in(root, args.cwd), root):
+                raise CliError.usage("--cwd lies outside the worktree")
 
     def max_turns(self) -> int | None:
         value = self.args.max_turns
@@ -450,13 +494,16 @@ class Launch:
         self, labels: LabelSet, input_names: Sequence[str], repo: str | None
     ) -> dict[str, Any]:
         a = self.args
+        worktree = a.worktree or "none"
         return {
             "kind": a.kind,
             "mode": "headless",
             "placement": None,
             "term_placement": a.term_placement,
             "name": a.name or a.worktree_name,
-            "repo": repo,
+            # `--worktree <path>` stores the literal --repo (or null): a retry of its `adopt`
+            # at resume passes exactly what the user gave, not the repo the plan derived.
+            "repo": a.repo if worktree not in ("new", "none") else repo,
             "worktree": a.worktree or "none",
             "branch": a.branch,
             "base": a.base,
@@ -485,8 +532,17 @@ class Launch:
                 found[name] = value
         return found
 
+    def worktree_mode(self) -> str:
+        return self.args.worktree or "none"
+
     def effective_cwd(self, classification: third_party.Classification) -> str | None:
-        """The run's cwd: ``--cwd``, else the plan's (the kind's default, possibly session-dir)."""
+        """The run's cwd: inside an adopted worktree, else ``--cwd``, else the plan's (the
+        kind's default, possibly session-dir). ``None`` for ``--worktree new`` (step 4)."""
+        mode = self.worktree_mode()
+        if mode == "new":
+            return None
+        if mode != "none":
+            return wtlib.resolve_in(mode, self.args.cwd)
         given = self.args.cwd
         if given == third_party.SESSION_DIR:
             return given
@@ -504,23 +560,91 @@ class Launch:
             return False
         return any(_inside(target.parent, os.path.realpath(d)) for d in directories)
 
-    def pre_start_checks(self, classification: third_party.Classification) -> str | None:
-        """Pre-start checks 3 and 4 (the records of the cwd belong to #20); returns the cwd."""
-        cwd = self.effective_cwd(classification)
-        if classification.reads_third_party:
-            try:
-                third_party.require_cwd_rule(True, cwd)
-            except CliError as error:
-                self.log("third_party_refused", level="warn", details={"reason": error.reason})
+    # -- wtctl: resolution, the records of a cwd, the rules, the holds -----------------------------
+
+    def wtctl_backend(self, stored: str | None = None) -> WtctlBackend | None:
+        """wtctl, resolved once: ``None`` under config ``wtctl_cmd: null`` (no wtctl on this
+        machine); else config's command, else the absolute path stored with the agent; exit 12
+        ``tool_missing`` when neither resolves."""
+        if self.wt is not None:
+            return self.wt
+        command = self.config.wtctl_cmd
+        if command is None:
+            return None
+        stored = stored or self.stored_wtctl
+        try:
+            argv = resolve_tool(command, "wtctl")
+        except CliError as missing:
+            if not stored:
                 raise
-            if (
-                cwd is not None
-                and cwd != third_party.SESSION_DIR
-                and self.result_file_inside([cwd])
-            ):
-                third_party.drop_result_file(self.inv)
-                raise CliError.usage("--result-file lies inside a third-party-reading run's cwd")
-        # TODO(#20): the records of the cwd (throwaway and worktree containment, third_party_run).
+            try:
+                argv = resolve_tool(shlex.split(stored), "wtctl")
+            except (CliError, ValueError):
+                raise missing from None
+        self.wt_argv = argv
+        self.wt = WtctlBackend(
+            argv, actor=self.inv.actor, decision_ids=self.decision_ids, gateway=self.gateway
+        )
+        return self.wt
+
+    def live_records(self, *, fresh: bool = False) -> list[WtRecord]:
+        """The live wtctl records (one ``wtctl list``, cached until ``fresh``); ``[]`` when there
+        is no wtctl on this machine. A lookup error fails the command (wtctl's code)."""
+        backend = self.wtctl_backend()
+        if backend is None:
+            return []
+        if fresh or self.wt_records is None:
+            self.wt_records = backend.list_records()
+        return self.wt_records
+
+    @staticmethod
+    def needs_records(cwd: str | None) -> bool:
+        """The records of a cwd are looked up for a real path (``session-dir`` lies in no
+        record: it is under claude-session's own directory)."""
+        return cwd is not None and cwd != third_party.SESSION_DIR
+
+    def records_for(self, cwd: str | None) -> list[WtRecord]:
+        return self.live_records(fresh=True) if self.needs_records(cwd) else []
+
+    def enforce_rules(
+        self,
+        reads_third_party: bool,
+        cwd: str | None,
+        records: Sequence[WtRecord],
+        *,
+        session_work: str | None = None,
+    ) -> None:
+        """Pre-start checks 3 and 4: the cwd rule of a third-party-reading run and the throwaway
+        check of a trusted one (exit 20, logged ``third_party_refused``)."""
+        try:
+            third_party.require_cwd_rule(
+                reads_third_party, cwd, session_work=session_work, records=records
+            )
+        except CliError as error:
+            self.log("third_party_refused", level="warn", details={"reason": error.reason})
+            raise
+
+    def pre_start_checks(self, classification: third_party.Classification) -> str | None:
+        """Pre-start checks 2 to 4; returns the cwd (``None`` for ``--worktree new``: step 4)."""
+        reads = classification.reads_third_party
+        mode = self.worktree_mode()
+        if mode == "new":
+            if reads:  # the cwd will be a worktree: a third-party-reading run is always refused
+                self.enforce_rules(True, None, [])
+            return None  # a trusted run's checks 2 and 4 run at step 4, once the cwd exists
+        cwd = self.effective_cwd(classification)
+        records = self.records_for(cwd)
+        if mode != "none" and cwd is not None and wtlib.inside_throwaway(records, cwd):
+            raise CliError.usage("--worktree lies inside a wtctl throwaway")
+        self.enforce_rules(reads, cwd, records)
+        if (
+            reads
+            and cwd is not None
+            and cwd != third_party.SESSION_DIR
+            and self.result_file_inside([cwd])
+        ):
+            third_party.drop_result_file(self.inv)
+            raise CliError.usage("--result-file lies inside a third-party-reading run's cwd")
         return cwd
 
     # -- hooks --------------------------------------------------------------------------------
@@ -598,6 +722,8 @@ class Launch:
         self.usage_checks()
         config = self.config
         cs_argv = self.tool_argv("claude-session", config.claude_session_cmd)
+        if self.worktree_mode() != "none":
+            self.wtctl_backend()  # tool resolution: exit 12 tool_missing before anything changes
         self_path = resolve_self()
         if self.args.dry_run:
             return self.dry_run_launch(cs_argv)
@@ -626,12 +752,20 @@ class Launch:
             self.run_pre_launch(labels, classification, cwd, self.copies)
             # The hooks' decision ids join every later call of the launcher.
             self.backend.decision_ids = list(self.decision_ids)
+            if self.wt is not None:
+                self.wt.decision_ids = list(self.decision_ids)
         except BaseException:
             remove_copies(self.copies.directory)
             raise
         return self.after_hooks(proposed, labels, classification, cwd, cs_argv, self_path)
 
     def _classification_cwd(self) -> str | None:
+        mode = self.worktree_mode()
+        if mode == "new":
+            return None  # the worktree does not exist yet: `--repo` is passed instead
+        if mode != "none":
+            real = wtlib.resolve_in(mode, self.args.cwd)
+            return real if os.path.isdir(real) else None
         given = self.args.cwd
         if given is None:
             return None
@@ -682,9 +816,9 @@ class Launch:
         would_refuse = classification.would_refuse
         if would_refuse is not None and would_refuse not in third_party.WOULD_REFUSE_REASONS:
             would_refuse = "unknown"
-        if would_refuse is None and classification.reads_third_party:
-            if not third_party.cwd_rule_allows(True, cwd):
-                would_refuse = "third_party_cwd"
+        worktree_plan: dict[str, Any] | None = None
+        if would_refuse is None:
+            would_refuse, worktree_plan = self.dry_run_worktree(classification, cwd, agent_id)
         outcome_path = os.path.join(self.state_dir, "outcomes", agent_id, "TOKEN.json")
         relay = relay_hook(resolve_self(), self.state_dir, self.inv.config_file or "")
         argv = [
@@ -705,14 +839,34 @@ class Launch:
             "reads_third_party": classification.reads_third_party,
             "session_plan": session_plan,
             "would_refuse": would_refuse,
-            "tools": {"claude-session": list(cs_argv), "termctl": None, "wtctl": None},
-            "worktree_plan": None,
+            "tools": {"claude-session": list(cs_argv), "termctl": None, "wtctl": self.wt_argv},
+            "worktree_plan": worktree_plan,
             "term_plan": None,
             "session_start_argv": argv,
             "hooks": self.hook_listing(),
             "warnings": self.warnings,
         }
         return Outcome(20 if would_refuse else 0, plan, PayloadKind.DRY_RUN)
+
+    def dry_run_worktree(
+        self, classification: third_party.Classification, cwd: str | None, agent_id: str
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """Pre-start checks 2 to 4, read-only, and ``wtctl create --dry-run`` for a new
+        worktree: the refusal a real run would give and the worktree plan."""
+        reads = classification.reads_third_party
+        mode = self.worktree_mode()
+        if mode == "new":
+            if reads:
+                return "third_party_cwd", None
+            backend = self.wtctl_backend()
+            assert backend is not None
+            return None, backend.create_dry_run(self.create_plan(agent_id))
+        records = self.records_for(cwd)
+        if mode != "none" and cwd is not None and wtlib.inside_throwaway(records, cwd):
+            raise CliError.usage("--worktree lies inside a wtctl throwaway")
+        if third_party.cwd_rule_allows(reads, cwd, records=records):
+            return None, None
+        return ("third_party_cwd" if reads else "third_party_run"), None
 
     def hook_listing(self) -> list[dict[str, str]]:
         listing: list[dict[str, str]] = []
@@ -769,6 +923,8 @@ class Launch:
             "promote": args.promote,
             "ephemeral": bool(args.ephemeral),
         }
+        if self.wt_argv is not None:
+            fields["wtctl_path"] = shlex.join(self.wt_argv)
         # A signal is held back until the record and the flag agree: an interrupt must never
         # find a record the launcher does not know about.
         with _signals_held():
@@ -792,9 +948,206 @@ class Launch:
                     "force": False,
                 },
             )
-        # The session (step 6) and the placement (step 7).
+        # The worktree (step 4), the holds (step 5), the session (step 6), the placement (step 7).
+        cwd = self.prepare_worktree(row, classification, cwd)
         started = self.start_session(row, labels, classification, cwd)
         return self.place_and_wait(started)
+
+    # -- steps 4 and 5: the worktree and the holds ------------------------------------------------
+
+    def create_plan(self, agent_id: str) -> CreatePlan:
+        a = self.args
+        return CreatePlan(
+            agent_id=agent_id,
+            repo=a.repo,
+            name=wtlib.planned_name(agent_id, a.worktree_name),
+            branch=a.branch,
+            base=a.base,
+            ref=a.ref,
+            detach=bool(a.detach),
+            no_bootstrap=bool(a.no_bootstrap),
+            copy_env=bool(a.copy_env),
+        )
+
+    def prepare_worktree(
+        self, row: dict[str, Any], classification: third_party.Classification, cwd: str | None
+    ) -> str | None:
+        """Launch steps 4 and 5: create or adopt the worktree, resolve the cwd inside it, run a
+        trusted run's checks 2 and 4 now, and hold every worktree record of the cwd. A failure
+        parks the agent (``park_worktree_failure``) and raises."""
+        agent_id = row["agent_id"]
+        mode = self.worktree_mode()
+        try:
+            if mode == "new":
+                record = self.run_create(agent_id, self.create_plan(agent_id))
+                cwd = self.cwd_in_worktree(record.path)
+            elif mode != "none":
+                backend = self.wtctl_backend()
+                assert backend is not None
+                record, _ = backend.adopt(mode, agent_id, repo=self.args.repo)
+                self.store_worktree(
+                    agent_id, record.id, path=record.path, owned=record.owned is True
+                )
+                cwd = self.cwd_in_worktree(mode)
+            if mode != "none":
+                self.update_cwd(agent_id, cwd)
+            if mode == "new":
+                self.enforce_rules(False, cwd, self.records_for(cwd))
+            self.take_holds(agent_id, cwd)
+        except CliError as error:
+            self.park_worktree_failure(agent_id, error)
+        return cwd
+
+    def cwd_in_worktree(self, root: str) -> str:
+        """The run's cwd: the worktree root, or ``--cwd`` resolved inside it."""
+        real_root = os.path.realpath(root)
+        cwd = wtlib.resolve_in(real_root, self.worktree_cwd_arg())
+        if not _inside(cwd, real_root):
+            raise CliError(
+                "launch_failed", "--cwd resolves outside the worktree", details={"retryable": False}
+            )
+        return cwd
+
+    def worktree_cwd_arg(self) -> str | None:
+        return self.args.cwd
+
+    def run_create(
+        self, agent_id: str, plan: CreatePlan, *, override_escalation: bool = False
+    ) -> WtRecord:
+        """``wtctl create``; the record is stored from every result that names it: success (a
+        reused record included; ``owned`` is wtctl's) and ``bootstrap_failed`` (when it is this
+        agent's own record), before anything else can fail."""
+        backend = self.wtctl_backend()
+        assert backend is not None
+        try:
+            record, _ = backend.create(plan, override_escalation=override_escalation)
+        except WtctlError as error:
+            self.remember_named_record(agent_id, error, plan.name, backend)
+            raise
+        self.store_worktree(agent_id, record.id, path=record.path, owned=record.owned is True)
+        return record
+
+    def remember_named_record(
+        self, agent_id: str, error: WtctlError, name: str, backend: WtctlBackend
+    ) -> None:
+        """A ``create`` that exited 12 ``bootstrap_failed`` named the record it kept
+        (``details.record``): store it at once (a retry finds it by id). Anything wtctl names is
+        untrusted: the record must be a live worktree of the planned name that this agent holds,
+        else the failure is plain and nothing is stored."""
+        record = error.record
+        if record is None and error.record_id is not None:  # only an id: verify it with `show`
+            try:
+                record = backend.show(error.record_id)
+            except CliError:
+                return
+        if (
+            record is None
+            or not record.live
+            or record.object_type != "worktree"
+            or record.name != name
+            or agent_id not in record.holders
+        ):
+            return
+        self.store_worktree(agent_id, record.id, path=record.path, owned=record.owned is True)
+
+    def store_worktree(
+        self, agent_id: str, record_id: str, *, path: str | None, owned: bool
+    ) -> None:
+        """Store the record the agent created or adopted (``wt_record_id`` and friends) and its
+        hold row, in one transaction with signals held back."""
+        assert self.store is not None
+        changes: dict[str, object] = {"wt_record_id": record_id, "wt_owned": owned}
+        if path is not None:
+            changes["wt_path"] = path
+        with _signals_held():
+            with self.store.lease(
+                lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT
+            ) as lease:
+                with self.store.transaction():
+                    self.store.update_agent(lease, agent_id, changes)
+                    if path is not None:
+                        self.store.put_hold(lease, agent_id, record_id, path, owned=owned)
+
+    def update_cwd(self, agent_id: str, cwd: str | None) -> None:
+        assert self.store is not None
+        with self.store.lease(lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT) as lease:
+            self.store.update_agent(lease, agent_id, {"cwd": cwd}, touch=False)
+
+    def take_holds(self, agent_id: str, cwd: str | None) -> None:
+        """Pre-start check 5: hold every worktree record of the cwd the agent does not hold
+        yet (``wtctl adopt --holder``); throwaways are never held. The records are looked up
+        again, so a record created since the checks is not missed."""
+        assert self.store is not None
+        if not self.needs_records(cwd):
+            return
+        assert cwd is not None
+        backend = self.wtctl_backend()
+        if backend is None:
+            return
+        around = wtlib.worktrees_containing(self.live_records(fresh=True), cwd)
+        if not around:
+            return
+        self.holds_started = True
+        row = self.store.get_agent(agent_id)
+        assert row is not None
+        held = {hold["record_id"] for hold in self.store.get_holds(agent_id)}
+        for record in around:
+            if record.id in held and agent_id in record.holders:
+                continue  # both sides agree that the agent holds it
+            # A missing local row or a hold wtctl lost (holders emptied externally): `adopt` is
+            # idempotent, so it re-adds the holder; the local row is reopened or put.
+            with _signals_held():  # the hold wtctl took must reach the local row
+                adopted, _ = backend.adopt(record.path, agent_id)
+                self.wt_records = None
+                self.store_hold(agent_id, adopted.id, adopted.path, owned=adopted.owned is True)
+        row = self.store.get_agent(agent_id)
+        assert row is not None
+        if row.get("wt_record_id") is None:
+            nearest = max(around, key=lambda r: len(os.path.realpath(r.path)))
+            self.store_nearest(agent_id, nearest)
+
+    def store_hold(self, agent_id: str, record_id: str, path: str, *, owned: bool) -> None:
+        assert self.store is not None
+        with _signals_held():
+            with self.store.lease(
+                lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT
+            ) as lease:
+                self.store.reacquire_hold(lease, agent_id, record_id, path, owned=owned)
+
+    def store_nearest(self, agent_id: str, record: WtRecord) -> None:
+        """No worktree was created or adopted at launch: the agent's ``worktree`` is the nearest
+        record it holds for its cwd."""
+        assert self.store is not None
+        with self.store.lease(lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT) as lease:
+            self.store.update_agent(
+                lease,
+                agent_id,
+                {"wt_record_id": record.id, "wt_path": record.path, "wt_owned": False},
+                touch=False,
+            )
+
+    def park_worktree_failure(self, agent_id: str, error: CliError) -> None:
+        """Park after a failed worktree step or hold and raise the pass-through error
+        (interface.md, Launch order step 4)."""
+        assert self.store is not None
+        if isinstance(error, WtctlError):
+            fields = wtlib.park_fields(wtlib.failure_kind(error))
+        elif error.code == "refused":
+            fields = wtlib.park_fields("busy")  # a refusal: launch_failed without attention
+        else:
+            fields = wtlib.park_fields("other")
+        lifecycle.park(
+            self.store,
+            agent_id,
+            from_status="launching",
+            park_reason=str(fields["park_reason"]),
+            needs_attention=fields["needs_attention"],
+            escalated_by=fields["escalated_by"],
+        )
+        self.log("status_change", level="warn", details={"to": "parked", **fields})
+        error.agent_id = agent_id
+        error.decision_ids = list(self.decision_ids)
+        raise error
 
     def start_session(
         self,
@@ -946,8 +1299,19 @@ class Launch:
         agent_id = row["agent_id"]
         work = os.path.join(result.csession_dir, "work")
 
+        looked_up: list[list[WtRecord]] = []
+
         def rule_allows(actual: bool, run_cwd: str | None) -> bool:
-            return third_party.cwd_rule_allows(actual, run_cwd, session_work=work)
+            # The run's actual cwd is judged by the records as they are now (one `wtctl list`
+            # for the whole check); a lookup error raises and cancels the run as unknown.
+            # The session dir and its `work/` lie in no record: no lookup (as in step 1).
+            if not looked_up:
+                in_work = run_cwd is not None and _same_real_path(run_cwd, work)
+                needs = self.needs_records(run_cwd) and not in_work
+                looked_up.append(self.live_records(fresh=True) if needs else [])
+            return third_party.cwd_rule_allows(
+                actual, run_cwd, session_work=work, records=looked_up[0]
+            )
 
         def result_file_allows() -> bool:
             if self.result_file_inside([result.csession_dir, *([cwd] if cwd else [])]):
@@ -1280,12 +1644,14 @@ class Launch:
         )
         return error_outcome(error, self.inv.decision_ids)
 
-    def cleanup_failed(self, failure: CliError) -> None:
+    def cleanup_failed(self, failure: CliError) -> CliError:
         """Undo what a failed command left that its error path did not (called once, with
-        signals recorded rather than raised). A launch before its record exists drops its
-        prompt copies; once the record exists they stay for the next resume."""
+        signals recorded rather than raised); returns the failure to report. A launch before its
+        record exists drops its prompt copies; once the record exists they stay for the next
+        resume."""
         if self.copies is not None and not self.agent_inserted:
             remove_copies(self.copies.directory)
+        return failure
 
     def store_failed(self, error: StoreError) -> CliError:
         """The state database failed mid-launch: end what is pending and report, never escape.
@@ -1445,7 +1811,7 @@ def run_command(
         except CliError as error:
             sig.raising = False
             failure = error
-        launch_run.cleanup_failed(failure)
+        failure = launch_run.cleanup_failed(failure)
         if failure.agent_id is None and launch_run.agent_inserted:
             failure.agent_id = launch_run.agent_id
         launch_run.deliver()
