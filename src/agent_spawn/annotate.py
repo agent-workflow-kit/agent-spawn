@@ -1,8 +1,10 @@
 """``ack``, ``label add`` and ``label remove``: edits of one agent under its lease.
 
 Every write is a read-modify-write under ``agent:<id>``; no lower-tool call and no hook runs
-while the lease is held. Label changes are mirrored to the session afterwards; a failed mirror is
-a warning and the change stays in the pending-mirror queue for ``reconcile``.
+while the lease is held. Label changes are mirrored afterwards to the session and, for a live
+window, to the pane (the first 30 stored labels only); a failed mirror is a warning and the
+change stays in the pending-mirror queue for ``reconcile``. An entry leaves the queue only when
+every target that applies to it took the push.
 """
 
 from __future__ import annotations
@@ -29,9 +31,10 @@ from .lifecycle import LEASE_WAIT, lease_key, reads_third_party_of
 from .output import CliError, Outcome, PayloadKind, safe_text
 from .records import RecordsError, append_log
 from .store import AgentMissing, Lease, LeaseHeld, LeaseLost, Store, StoreError
+from .term import MAX_AGENT_LABELS, TermBackend
 from .validate import GrammarError
 
-__all__ = ["ack", "label_edit", "mirror_session", "print_warnings"]
+__all__ = ["ack", "label_edit", "mirror_labels", "print_warnings"]
 
 
 @contextmanager
@@ -165,7 +168,104 @@ def _deliver(inv: Invocation, store: Store, agent_id: str) -> None:
 Direction = Literal["add", "remove"]
 
 
-def mirror_session(
+def push_session(
+    inv: Invocation,
+    row: dict[str, Any],
+    direction: Direction,
+    pairs: Sequence[Label],
+    warnings: list[str],
+) -> bool:
+    """Push the pairs to the agent's session; a failure is a warning (and stays queued)."""
+    session = row.get("csession_id")
+    texts = [str(pair) for pair in pairs]
+    try:
+        backend = backend_for(inv, row)
+        if direction == "add":
+            backend.label_add(str(session), texts)
+        else:
+            backend.label_remove(str(session), texts)
+    except CliError as error:
+        warnings.append(
+            f"claude-session label {direction} failed (exit {error.exit_code}); "
+            "queued for reconcile"
+        )
+        return False
+    return True
+
+
+def live_window(store: Store, row: dict[str, Any]) -> tuple[str, str] | None:
+    """``(term_id, socket_path)`` of the window of the agent's current run while it lives (the
+    agent is launching or live); ``None`` when there is none to mirror to."""
+    run = row.get("run")
+    if row.get("status") not in ("launching", "live") or not isinstance(run, int):
+        return None
+    run_row = store.get_run(row["agent_id"], run) or {}
+    term_id, socket_path = run_row.get("term_id"), run_row.get("socket_path")
+    if isinstance(term_id, str) and isinstance(socket_path, str) and term_id and socket_path:
+        return term_id, socket_path
+    return None
+
+
+def termctl_for(inv: Invocation, row: dict[str, Any]) -> TermBackend:
+    """termctl as the agent recorded it, else as the config names it."""
+    from .launch import resolve_stored_tool
+
+    assert inv.config is not None
+    stored = row.get("termctl_path")
+    argv = resolve_stored_tool(
+        inv.config.termctl_cmd, "termctl", stored if isinstance(stored, str) else None
+    )
+    return TermBackend(argv, gateway=gw.get_gateway())
+
+
+def push_pane(
+    inv: Invocation,
+    store: Store,
+    row: dict[str, Any],
+    window: tuple[str, str],
+    direction: Direction,
+    pairs: Sequence[Label],
+    warnings: list[str],
+) -> set[Label]:
+    """Mirror the pairs to the pane. Returns the pairs that are settled for the pane: pushed, or
+    not mirrored by design (an added pair beyond the first 30 stored labels is a warning, never
+    queued). A removal is always pushed (termctl treats an absent pair as a no-op)."""
+    settled: set[Label] = set()
+    wanted = list(pairs)
+    if direction == "add":
+        stored = store.get_labels(row["agent_id"]).texts()
+        within = {str(pair) for pair in stored[:MAX_AGENT_LABELS]}
+        beyond = [pair for pair in wanted if str(pair) not in within]
+        if beyond:
+            warnings.append(
+                f"{len(beyond)} label(s) are beyond the first {MAX_AGENT_LABELS} and are not "
+                "mirrored to the window"
+            )
+        settled.update(beyond)
+        wanted = [pair for pair in wanted if str(pair) in within]
+    if not wanted:
+        return settled
+    term_id, socket_path = window
+    try:
+        backend = termctl_for(inv, row)
+        texts = [str(pair) for pair in wanted]
+        if direction == "add":
+            backend.label_add(term_id, socket_path, texts)
+        else:
+            backend.label_remove(term_id, socket_path, texts)
+    except CliError as error:
+        if error.exit_code == 10 and error.tool == "termctl":
+            settled.update(wanted)  # the pane is gone: nothing to mirror to
+            return settled
+        warnings.append(
+            f"termctl label {direction} failed (exit {error.exit_code}); queued for reconcile"
+        )
+        return settled
+    settled.update(wanted)
+    return settled
+
+
+def mirror_labels(
     inv: Invocation,
     store: Store,
     row: dict[str, Any],
@@ -173,26 +273,24 @@ def mirror_session(
     pairs: Sequence[Label],
     warnings: list[str],
 ) -> None:
-    """Push the pairs to the agent's session; a failure is a warning and stays queued."""
+    """Push the pairs to the agent's session and to its live window's pane. An entry of the
+    pending-mirror queue is dropped only when every target that applies took it."""
     session = row.get("csession_id")
     if not pairs or not isinstance(session, str):
         return  # nothing to push, or no session yet: the queue keeps the change
-    texts = [str(pair) for pair in pairs]
-    try:
-        backend = backend_for(inv, row)
-        if direction == "add":
-            backend.label_add(session, texts)
-        else:
-            backend.label_remove(session, texts)
-    except CliError as error:
-        warnings.append(
-            f"claude-session label {direction} failed (exit {error.exit_code}); "
-            "queued for reconcile"
-        )
+    session_ok = push_session(inv, row, direction, pairs, warnings)
+    window = live_window(store, row)
+    pane_done = (
+        set(pairs)
+        if window is None
+        else push_pane(inv, store, row, window, direction, pairs, warnings)
+    )
+    done = pane_done if session_ok else set()
+    if not done:
         return
     try:
         with agent_lease(store, row["agent_id"]) as lease:
-            store.mirror_done(lease, row["agent_id"], [(pair, direction) for pair in pairs])
+            store.mirror_done(lease, row["agent_id"], [(pair, direction) for pair in done])
     except (CliError, StoreError):
         warnings.append("the label mirror could not be recorded; reconcile re-syncs")
 
@@ -235,9 +333,7 @@ def label_edit(inv: Invocation, direction: Direction) -> Outcome:
                         agent_id=agent_id,
                         details={"op": direction, "labels": [str(p) for p in applied]},
                     )
-                    mirror_session(inv, store, row, direction, applied, warnings)
-                    # TODO(#27): mirror to the live pane (termctl label add|remove) for the first
-                    # 30 stored labels; a change beyond them is a warning, never queued.
+                    mirror_labels(inv, store, row, direction, applied, warnings)
                 # a mutating command delivers what earlier commands queued (label queues nothing)
                 _deliver(inv, store, agent_id)
     except StoreError as error:

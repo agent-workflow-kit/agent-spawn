@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -749,3 +750,147 @@ def test_a_retry_after_the_session_step_does_not_close_windows_again(
     second = wenv.run("teardown", agent_id, "--json")
     assert second.returncode == 0
     assert len(term_calls(fakebin, "list")) == lists  # step 5 was done
+
+
+# --- label mirroring to the pane ---------------------------------------------------------------
+
+
+def pane_labels(wenv: WindowEnv) -> list[str]:
+    (pane,) = wenv.panes()
+    return pane["labels"]
+
+
+def label_calls(fakebin: Fakebin, action: str) -> list[list[str]]:
+    return [a for a in fakebin.argvs("termctl") if a[:2] == ["label", action]]
+
+
+def test_label_changes_are_mirrored_to_a_live_window(
+    wenv: WindowEnv, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    agent = launch_live(wenv, fakebin, proc_tracker)
+    agent_id = agent["agent_id"]
+    done = wenv.run("label", "add", agent_id, "pr=7", "ticket=T-1", "--json")
+    assert done.returncode == 0 and result_json(done)["warnings"] == []
+    (call,) = label_calls(fakebin, "add")
+    assert call[2].startswith("tc-") and call[3:5] == ["pr=7", "ticket=T-1"]
+    assert f"--socket={wenv.tmux.socket}" in call
+    assert {"pr=7", "ticket=T-1"} <= set(pane_labels(wenv))
+    with wenv.store() as store:
+        assert store.mirror_pending(agent_id) == []  # session and pane both took it
+    done = wenv.run("label", "remove", agent_id, "pr=7", "--json")
+    assert done.returncode == 0
+    assert "pr=7" not in pane_labels(wenv) and "ticket=T-1" in pane_labels(wenv)
+    assert {"agent=" + agent_id} <= set(pane_labels(wenv))  # never touched
+    with wenv.store() as store:
+        assert store.mirror_pending(agent_id) == []
+
+
+def test_labels_beyond_the_first_thirty_are_not_mirrored_to_the_pane(
+    wenv: WindowEnv, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    script_hung_exec(fakebin)
+    script_live_run(fakebin)
+    labels = [arg for i in range(30) for arg in ("--label", f"k{i:02d}=v")]
+    agent = result_json(wenv.run(*LAUNCH, *labels))["agent"]
+    track_agent(wenv, proc_tracker, agent["agent_id"])
+    agent_id = agent["agent_id"]
+    done = wenv.run("label", "add", agent_id, "extra=1", "--json")
+    body = result_json(done)
+    assert done.returncode == 0 and "extra=1" in body["labels"]
+    assert any("beyond the first 30" in w for w in body["warnings"])
+    assert label_calls(fakebin, "add") == []  # nothing was pushed
+    assert "extra=1" not in pane_labels(wenv)
+    with wenv.store() as store:
+        assert store.mirror_pending(agent_id) == []  # not queued: it never will be mirrored
+    # a removal is pushed whatever its position, and so is a pair within the first 30
+    result_json(wenv.run("label", "remove", agent_id, "k00=v", "--json"))
+    assert label_calls(fakebin, "remove")
+    assert "k00=v" not in pane_labels(wenv)
+
+
+def test_a_failed_pane_mirror_stays_queued(
+    wenv: WindowEnv, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    agent = launch_live(wenv, fakebin, proc_tracker)
+    agent_id = agent["agent_id"]
+    fakebin.script(
+        "termctl", "label add", times=1, exit=12, error={"code": "locked", "message": "m"}
+    )
+    done = wenv.run("label", "add", agent_id, "pr=7", "--json")
+    body = result_json(done)
+    assert done.returncode == 0 and len(body["warnings"]) == 1
+    with wenv.store() as store:
+        assert [(str(p), op) for p, op in store.mirror_pending(agent_id)] == [("pr=7", "add")]
+    # the session took it (claude-session label add ran), the pane did not
+    assert any(a[:2] == ["label", "add"] for a in fakebin.argvs("claude-session"))
+    assert "pr=7" not in pane_labels(wenv)
+
+
+def test_a_pane_that_is_gone_counts_as_mirrored(
+    wenv: WindowEnv, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    agent = launch_live(wenv, fakebin, proc_tracker)
+    agent_id = agent["agent_id"]
+    fakebin.script(
+        "termctl", "label add", times=1, exit=10, error={"code": "not_found", "message": "m"}
+    )
+    done = wenv.run("label", "add", agent_id, "pr=7", "--json")
+    assert done.returncode == 0 and result_json(done)["warnings"] == []
+    with wenv.store() as store:
+        assert store.mirror_pending(agent_id) == []
+
+
+def test_no_pane_call_for_a_parked_agent(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    agent_id = launched_window(wenv)
+    done = wenv.run("label", "add", agent_id, "pr=7", "--json")
+    assert done.returncode == 0
+    assert label_calls(fakebin, "add") == []
+
+
+def test_self_labeling_mirrors_to_the_live_pane_too(
+    wenv: WindowEnv, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    agent = launch_live(wenv, fakebin, proc_tracker)
+    agent_id = agent["agent_id"]
+    session = wenv.agent(agent_id)["csession_id"]
+    directory = wenv.iso.state / "claude-session" / "sessions" / session
+    directory.mkdir(parents=True, exist_ok=True)
+    secret = directory / "secret"
+    secret.write_text("s3cr3t\n")
+    secret.chmod(0o600)
+    fakebin.script("claude-session", "verify-secret", secret="s3cr3t")
+    done = wenv.run(
+        "label", "add", "--session", session, "pr=h/o/r#7", "--json",
+        extra_env={"CSESSION_ID": session, "CSESSION_DIR": str(directory)},
+    )  # fmt: skip
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert "pr=h/o/r#7" in pane_labels(wenv)
+
+
+# --- stop --------------------------------------------------------------------------------------
+
+
+def test_stop_ends_a_window_agent(
+    wenv: WindowEnv, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    agent = launch_live(wenv, fakebin, proc_tracker)
+    agent_id = agent["agent_id"]
+    supervisor = wenv.agent(agent_id)["supervisor"]
+    exec_proc = wenv.agent(agent_id)["exec_proc"]
+    stopper = proc_tracker.popen(
+        wenv.argv("stop", agent_id, "--json", "--grace", "1s"),
+        env=wenv.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )  # fmt: skip
+    # claude-session's `stop` signals `exec` in the real tool; the fake only records the request
+    wenv.wait_for(
+        lambda: any(a[0] == "stop" for a in fakebin.argvs("claude-session")), "claude-session stop"
+    )
+    send_signal(exec_proc, signal.SIGTERM)
+    out, err = stopper.communicate(timeout=60)
+    body = json.loads(out)
+    assert stopper.returncode == 0, (out, err)
+    schema_registry.validate(body, "agent-spawn/cli/stop.json")
+    assert body["action"] == "session_stop" and body["agent"]["status"] == "parked"
+    assert body["agent"]["park_reason"] == "killed" and body["agent"]["needs_attention"] is None
+    wenv.wait_for(lambda: not procs.is_alive(supervisor), "the supervisor to exit")
+    wenv.wait_for(lambda: wenv.panes() == [], "the pane to close")  # exit 0: nothing stays dead

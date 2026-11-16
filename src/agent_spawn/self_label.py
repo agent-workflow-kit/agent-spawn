@@ -24,7 +24,7 @@ from typing import Any
 
 from . import gateway as gw
 from .agent_lookup import backend_for, open_existing, store_failed
-from .annotate import agent_lease, log_quietly, mirror_session, print_warnings
+from .annotate import agent_lease, log_quietly, mirror_labels, print_warnings
 from .commands.base import Invocation
 from .labels import Label, parse_user_label
 from .output import CliError, Outcome, PayloadKind
@@ -216,8 +216,7 @@ def self_label(inv: Invocation) -> Outcome:
                     csession_id=session_id,
                     details={"op": "add", "labels": [str(p) for p in change.applied]},
                 )
-                mirror_session(inv, store, row, "add", change.applied, warnings)
-                # TODO(#27): mirror to the live pane as `label add` does.
+                mirror_labels(inv, store, row, "add", change.applied, warnings)
     except StoreError as error:
         raise store_failed(error) from None
     print_warnings(inv, warnings)
