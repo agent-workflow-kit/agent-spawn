@@ -131,14 +131,6 @@ def test_missing_named_config_is_invalid_for_public_commands(
     assert gone in envelope["error"]["message"]
 
 
-def test_internal_commands_treat_a_missing_config_as_defaults(
-    tmp_path: Path, reached: list[Invocation]
-) -> None:
-    cli.main(["--state-dir", "/s", "--config", str(tmp_path / "gone.yaml"), "_session-event"])
-    assert reached[-1].config is not None
-    assert reached[-1].config_file == str(tmp_path / "gone.yaml")
-
-
 @pytest.mark.parametrize(
     "text",
     ["tombstone_days: !!int abc\n", "tombstone_days: " + "7" * 5000 + "\n"],

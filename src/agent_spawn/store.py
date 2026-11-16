@@ -59,6 +59,7 @@ __all__ = [
     "LeaseHeld",
     "LeaseLost",
     "OutboxEvent",
+    "SchemaNewer",
     "SchemaOlder",
     "Store",
     "StoreBusy",
@@ -143,6 +144,15 @@ class SchemaOlder(StoreError):
 
     def __init__(self, found: int, expected: int) -> None:
         super().__init__(f"state.db has schema {found}, this agent-spawn needs {expected}")
+        self.found = found
+        self.expected = expected
+
+
+class SchemaNewer(CliError):
+    """The database schema is newer than this agent-spawn understands (``schema_newer``)."""
+
+    def __init__(self, found: int, expected: int, message: str) -> None:
+        super().__init__("schema_newer", message)
         self.found = found
         self.expected = expected
 
@@ -282,8 +292,9 @@ def _read_version(conn: sqlite3.Connection, path: Path) -> int | None:
 def _check_version(version: int | None, wanted: int, *, migrate: bool) -> None:
     """Refuse a newer schema (exit 12) and, without ``migrate``, an older or empty one."""
     if version is not None and version > wanted:
-        raise CliError.of(
-            "schema_newer",
+        raise SchemaNewer(
+            version,
+            wanted,
             f"state.db has schema {version}; this agent-spawn understands up to "
             f"{wanted}: upgrade agent-spawn",
         )
@@ -300,8 +311,13 @@ def _hold_checkpoints(conn: sqlite3.Connection, *, hold: bool) -> None:
 
 def _peek_version(path: Path, file_id: tuple[int, int], busy_timeout: float) -> int | None:
     """Read the schema version on a read-only connection, which can never write the database
-    or checkpoint its WAL (a newer database stays exactly as the newer agent-spawn left it)."""
-    conn = _connect(f"file:{urllib.parse.quote(str(path))}?mode=ro", busy_timeout, uri=True)
+    or checkpoint its WAL (a newer database stays exactly as the newer agent-spawn left it).
+    With no ``-wal`` file next to it the database is opened ``immutable``, which also creates no
+    empty ``-wal``/``-shm`` sidecars."""
+    quoted = urllib.parse.quote(str(path))
+    wal = Path(f"{path}-wal")
+    immutable = "" if wal.exists() or wal.is_symlink() else "&immutable=1"
+    conn = _connect(f"file:{quoted}?mode=ro{immutable}", busy_timeout, uri=True)
     try:
         with _mapped():
             version = _read_version(conn, path)
@@ -449,8 +465,9 @@ class Store:
             # Re-read under the write lock: another process may have migrated meanwhile.
             version = _read_version(self._conn, self.path) or 0
             if version > wanted:
-                raise CliError.of(
-                    "schema_newer",
+                raise SchemaNewer(
+                    version,
+                    wanted,
                     f"state.db has schema {version}; this agent-spawn needs {wanted}",
                 )
             for step in range(version, wanted):
@@ -1364,6 +1381,47 @@ class Store:
             return self._conn.execute(
                 "DELETE FROM relay_events WHERE received < ?", (cutoff,)
             ).rowcount
+
+    def relay_set_agent(
+        self,
+        agent_id: str,
+        *,
+        run: int,
+        session_state: str,
+        activity: str | None,
+        needs_input_reason: str | None,
+    ) -> bool:
+        """The relay's write of the agent's session fields; it holds no lease, so it can touch
+        only these columns (and ``updated``). False when the agent is gone."""
+        with self.transaction():
+            cursor = self._conn.execute(
+                "UPDATE agents SET run = ?, session_state = ?, activity = ?, "
+                "needs_input_reason = ?, updated = ? WHERE agent_id = ?",
+                (run, session_state, activity, needs_input_reason, self._now(), agent_id),
+            )
+            return cursor.rowcount == 1
+
+    def relay_record_run(
+        self,
+        agent_id: str,
+        run: int,
+        *,
+        session_state: str,
+        activity: str | None,
+        needs_input_reason: str | None,
+        first_working_at: float | None,
+    ) -> None:
+        """The relay's write of one run's last state, activity and reason (the row is created
+        when the launcher has not yet written it). ``first_working_at`` is kept once set."""
+        with self.transaction():
+            self._conn.execute(
+                "INSERT OR IGNORE INTO agent_runs (agent_id, run) VALUES (?, ?)", (agent_id, run)
+            )
+            self._conn.execute(
+                "UPDATE agent_runs SET session_state = ?, activity = ?, needs_input_reason = ?, "
+                "first_working_at = COALESCE(first_working_at, ?) WHERE agent_id = ? AND run = ?",
+                (session_state, activity, needs_input_reason, first_working_at, agent_id, run),
+            )
 
     def add_events(self, agent_id: str, events: Sequence[OutboxEvent]) -> None:
         """Queue events alone (the relay, which holds no lease); use the ``events`` argument of
