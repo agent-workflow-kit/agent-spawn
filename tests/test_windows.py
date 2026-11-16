@@ -971,13 +971,14 @@ def test_a_connection_from_another_process_is_rejected_and_the_launch_fails(
     wenv: WindowEnv, fakebin: Fakebin, proc_tracker: ProcTracker
 ) -> None:
     """termctl reports a PID that is not the window process: the window's own connection is a
-    thief (wrong peer PID) and gets nothing; the launch fails by timeout (spike A6/A8). The
-    handoff deadline is generous: the test waits for the rejection record, not for the clock."""
+    thief (wrong peer PID) and gets nothing (spike A6/A8). The handoff deadline is far away; the
+    test waits for the rejection record, then ends the launch with SIGTERM (its own recorded
+    launcher): the launch fails, no supervisor exists, no clock is involved."""
     other = int(wenv.tmux.run("display-message", "-p", "#{pane_pid}").stdout.strip())
     fakebin.script("termctl", "open", times=1)
     fakebin.script("termctl", "open", merge={"pid": other})
     launcher = proc_tracker.popen(
-        wenv.argv(*LAUNCH), env=wenv.env({"AGENT_SPAWN_HANDOFF_TIMEOUT": "20"}),
+        wenv.argv(*LAUNCH), env=wenv.env({"AGENT_SPAWN_HANDOFF_TIMEOUT": "60"}),
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )  # fmt: skip
     wenv.wait_for(
@@ -985,18 +986,15 @@ def test_a_connection_from_another_process_is_rejected_and_the_launch_fails(
         "the thief's connection to be rejected",
         timeout=60,
     )
-    assert launcher.poll() is None  # rejected, and the launcher is still waiting for its window
+    launcher.send_signal(signal.SIGTERM)
     out, _err = launcher.communicate(timeout=60)
     body = json.loads(out)
-    error = body["error"]
-    assert launcher.returncode == 12
-    assert (error["code"], error["details"]["cause"]) == ("handoff_failed", "timeout")
-    events = log_events(wenv)
-    rejected = [e for e in events if e["event"] == "handoff_rejected"]
+    assert launcher.returncode == 143
+    assert body["error"]["details"] == {"cause": "interrupted"}
+    rejected = [e for e in log_events(wenv) if e["event"] == "handoff_rejected"]
     assert rejected[0]["details"]["cause"] == "wrong_pid"
-    assert [e for e in events if e["event"] == "handoff_failed"]
     (agent,) = wenv.agents()
-    assert agent["status"] == "parked" and agent["park_reason"] == "launch_failed"
+    assert agent["status"] == "parked" and agent["park_reason"] == "killed"
     assert agent["supervisor"] is None  # no supervisor exists after a failed handoff
     assert not [i for i in fakebin.invocations("claude-session") if "exec" in i.argv]
     # the window process was refused: it gets no environment, exits 1 and leaves a dead pane
@@ -1181,6 +1179,43 @@ def test_a_pre_creation_failure_records_no_window(wenv: WindowEnv, fakebin: Fake
         run = store.get_run(agent["agent_id"], agent["run"])
     assert run is not None and run["term_id"] is None and run["socket_path"] is None
     assert wenv.panes() == []
+
+
+@pytest.mark.parametrize("creates_a_pane", [True, False], ids=["pane-created", "no-pane-created"])
+def test_a_resume_whose_open_fails_records_only_its_own_pane(
+    wenv: WindowEnv, fakebin: Fakebin, creates_a_pane: bool
+) -> None:
+    """An older run's dead pane carries the same agent label: recovery must not stamp it on the
+    new run (the resume's pane if it created one, no pane id otherwise)."""
+    agent_id = dead_pane_agent(wenv, fakebin)
+    (old,) = wenv.panes()
+    script_two_opens(
+        fakebin, exit=12, error={"code": "locked", "message": "m"}, after_create=creates_a_pane
+    )
+    done = wenv.run("resume", agent_id, "--json", extra_env={"AGENT_SPAWN_HANDOFF_TIMEOUT": "2"})
+    assert done.returncode == 12, (done.stdout, done.stderr)
+    row = wenv.agent(agent_id)
+    with wenv.store() as store:
+        run = store.get_run(agent_id, row["run"])
+    assert run is not None and row["run"] == 2
+    created = [p["id"] for p in wenv.panes() if p["id"] != old["id"]]
+    assert len(created) == (1 if creates_a_pane else 0)
+    assert run["term_id"] == (created[0] if creates_a_pane else None)
+
+
+def test_recovery_without_a_before_list_records_only_the_socket_when_panes_are_ambiguous(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    agent_id = dead_pane_agent(wenv, fakebin)
+    script_two_opens(fakebin, exit=12, error={"code": "locked", "message": "m"}, after_create=True)
+    fakebin.script("termctl", "list", times=1, exit=12, error={"code": "x", "message": "m"})
+    done = wenv.run("resume", agent_id, "--json", extra_env={"AGENT_SPAWN_HANDOFF_TIMEOUT": "2"})
+    assert done.returncode == 12, (done.stdout, done.stderr)
+    assert len(wenv.panes()) == 2  # the older dead pane and the new one: which is which is unknown
+    with wenv.store() as store:
+        run = store.get_run(agent_id, 2)
+    assert run is not None
+    assert (run["term_id"], run["socket_path"]) == (None, str(wenv.tmux.socket))
 
 
 def test_a_launcher_killed_while_termctl_opens_leaves_a_pane_teardown_closes(

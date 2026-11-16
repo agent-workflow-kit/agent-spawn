@@ -1623,6 +1623,7 @@ class Launch:
                 store.get_labels(agent_id).texts(),
             )
             self.warnings.extend(w for w in notes if w not in self.warnings)
+            before = self.panes_before_open(term_backend)
             try:
                 pane = term_backend.open(
                     name=row["name"],
@@ -1633,11 +1634,11 @@ class Launch:
                     override_escalation=self.term_override,
                 )
             except LaunchInterrupted:
-                self.recover_window(result, term_backend)  # the pane may exist unrecorded
+                self.recover_window(result, term_backend, before)  # the pane may exist unrecorded
                 raise
             except CliError as error:
                 if error.exit_code not in (11, 13):  # a veto or escalation created no pane
-                    self.recover_window(result, term_backend)
+                    self.recover_window(result, term_backend, before)
                 if self.term_override:
                     self.term_override_audit(
                         "refused" if error.exit_code == 20 else "error", agent_id
@@ -1649,7 +1650,7 @@ class Launch:
             try:
                 identity = self.record_window(result, pane)
             except BaseException:
-                self.recover_window(result, term_backend)
+                self.recover_window(result, term_backend, before)
                 raise
             try:
                 listener.serve(
@@ -1697,24 +1698,47 @@ class Launch:
         except (CliError, StoreError):
             self.log("warning", level="warn", message="the window's labels could not be synced")
 
-    def recover_window(self, result: StartResult, term_backend: TermBackend) -> None:
+    def panes_before_open(self, term_backend: TermBackend) -> set[tuple[str, str]] | None:
+        """The agent's labeled panes (an older run's dead pane among them) before the real
+        ``open``, so that recovery tells the new pane from them; None when unknown. Best effort."""
+        assert self.agent_id is not None
+        try:
+            return set(term_backend.find_panes(self.agent_id, self.window_socket))
+        except CliError:
+            return None
+
+    def recover_window(
+        self,
+        result: StartResult,
+        term_backend: TermBackend,
+        before: set[tuple[str, str]] | None,
+    ) -> None:
         """A ``termctl open`` that failed or was interrupted may have created its pane without
-        reporting it: find it by its ``agent=`` label (on the server the preflight named) and
-        record it on the run, so that teardown closes it. Best effort, never raises."""
+        reporting it: find it by its ``agent=`` label (on the server the preflight named), among
+        the panes that were not there before the open, and record it on the run, so that teardown
+        closes it. When ``before`` is unknown and several panes match, only their socket path is
+        recorded (no pane id is guessed). Best effort, never raises."""
         assert self.store is not None and self.agent_id is not None
         self.sig.raising = False  # a signal during this cleanup is recorded, never aborts it
         agent_id = self.agent_id
         try:
             found = term_backend.find_panes(agent_id, self.window_socket)
+            if before is not None:
+                found = [pane for pane in found if pane not in before]
             if not found:
                 return
-            term_id, socket_path = found[0]
+            fields: dict[str, Any]
+            if before is None and len(found) > 1:
+                sockets = {socket_path for _, socket_path in found}
+                if len(sockets) != 1:
+                    return
+                fields = {"socket_path": sockets.pop()}
+            else:
+                fields = {"term_id": found[0][0], "socket_path": found[0][1]}
             with self.store.lease(
                 lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT
             ) as lease:
-                self.store.put_run(
-                    lease, agent_id, result.run, {"term_id": term_id, "socket_path": socket_path}
-                )
+                self.store.put_run(lease, agent_id, result.run, fields)
         except (CliError, StoreError, OSError):
             self.log("warning", level="warn", message="a window that failed to open was not found")
 
