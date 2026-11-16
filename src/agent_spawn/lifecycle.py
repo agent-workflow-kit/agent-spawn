@@ -64,6 +64,7 @@ def park(
         all_changes: dict[str, object] = {
             **(changes or {}),
             "updated": now,  # the stored value is this one: the events' `after` matches it
+            "pre_resume": None,  # the run exists (or the launch failed): never restored again
             "status": "parked",
             "park_reason": park_reason,
             "needs_attention": needs_attention,
@@ -86,7 +87,7 @@ def park(
                 needs_attention=needs_attention,
                 escalated_by=escalated_by,
                 from_status=wanted,
-                changes={**(changes or {}), "updated": now},
+                changes={**(changes or {}), "updated": now, "pre_resume": None},
                 events=events,
             )
         except CasLost:
@@ -109,11 +110,21 @@ def go_live(
             "needs_attention": None,
             "park_reason": None,
             "escalated_by": None,
+            "pre_resume": None,
         }
         before = agent_object(store, row)
         after = agent_object(store, {**row, **all_changes})
+        # A plain resume still carries its pre-resume row here; a fork's first run is the one
+        # run of a record with `forked_from` and no pre-resume row (a fork is also a resume).
+        resumed = row.get("pre_resume") is not None
+        fork = row.get("forked_from") is not None and not resumed
         events = lifecycle_events(
-            before, after, reads_third_party=reads_third_party_of(store, row), started_run=run
+            before,
+            after,
+            reads_third_party=reads_third_party_of(store, row),
+            started_run=run,
+            resumed=resumed or fork,
+            fork=fork,
         )
         try:
             return store.compare_and_set(
