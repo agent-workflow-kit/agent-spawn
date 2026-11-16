@@ -105,6 +105,12 @@ class Gateway(Protocol):
         start_new_session: bool = False,
     ) -> subprocess.Popen[bytes]: ...
 
+    def run_on_terminal(
+        self, argv: Sequence[str], *, timeout: float | None = None
+    ) -> subprocess.CompletedProcess[str]: ...
+
+    def exec_replace(self, argv: Sequence[str]) -> None: ...
+
     # files, clocks, platform
     def read_file(self, path: str) -> str: ...
     def monotonic(self) -> float: ...
@@ -327,6 +333,38 @@ class SystemGateway:
             start_new_session=start_new_session,
             preexec_fn=_reset_child_signals,
         )
+
+    def run_on_terminal(
+        self, argv: Sequence[str], *, timeout: float | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a command that must see this process's own stdin and stderr (a command that
+        decides by ``isatty`` whether the user is at a terminal). Only stdout is captured; the
+        output is bounded like ``run``'s. On a timeout the child itself is killed."""
+        proc = subprocess.Popen(
+            list(argv),
+            stdin=None,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            preexec_fn=_reset_child_signals,
+        )
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
+        if len(out) > MAX_RUN_OUTPUT:
+            raise OutputTooLarge(f"a command printed more than {MAX_RUN_OUTPUT} bytes")
+        return subprocess.CompletedProcess(list(argv), proc.returncode, decode(out), "")
+
+    def exec_replace(self, argv: Sequence[str]) -> None:
+        """Replace this process with ``argv`` (the user's own terminal and environment pass
+        through). Returns only by raising ``OSError``; nothing of this process's signal state
+        survives into the new program."""
+        sys.stdout.flush()
+        sys.stderr.flush()
+        _reset_child_signals()
+        os.execv(argv[0], list(argv))
 
     # files, clocks, platform
     def read_file(self, path: str) -> str:

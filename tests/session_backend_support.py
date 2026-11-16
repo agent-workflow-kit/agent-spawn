@@ -34,6 +34,11 @@ class FakebinGateway(SystemGateway):
     ) -> subprocess.CompletedProcess[str]:
         return super().run(argv, stdin=stdin, timeout=timeout, env=self._fakebin.env(), cwd=cwd)
 
+    def run_on_terminal(
+        self, argv: Sequence[str], *, timeout: float | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        return super().run(argv, timeout=timeout, env=self._fakebin.env())
+
 
 def fake_backend(fakebin: Fakebin, **kwargs: object) -> SessionBackend:
     return SessionBackend(

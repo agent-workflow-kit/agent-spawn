@@ -119,3 +119,31 @@ def test_an_interrupted_run_sends_sigterm_first(tmp_path: Path) -> None:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, old)
     assert seen.read_text() == "term"
+
+
+def test_run_on_terminal_captures_stdout_and_bounds_a_hung_child() -> None:
+    import subprocess
+
+    from agent_spawn.gateway import SystemGateway
+
+    gateway = SystemGateway()
+    done = gateway.run_on_terminal(["/bin/sh", "-c", "echo hi"], timeout=30)
+    assert (done.returncode, done.stdout) == (0, "hi\n")
+    with pytest.raises(subprocess.TimeoutExpired):
+        gateway.run_on_terminal(["/bin/sleep", "30"], timeout=0.3)
+
+
+def test_exec_replace_replaces_the_process_and_fails_with_oserror() -> None:
+    import subprocess
+    import sys
+
+    code = (
+        "from agent_spawn.gateway import SystemGateway;"
+        "SystemGateway().exec_replace(['/bin/echo', 'replaced'])"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
+    assert (done.returncode, done.stdout) == (0, "replaced\n")
+    from agent_spawn.gateway import SystemGateway
+
+    with pytest.raises(OSError):
+        SystemGateway().exec_replace(["/nonexistent/tmux"])

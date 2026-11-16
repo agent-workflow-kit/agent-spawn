@@ -50,6 +50,10 @@ QUICK_TIMEOUT = 5.0
 #: `open` runs termctl's `pre-open` and `post-open` hooks.
 OPEN_TIMEOUT = 300.0
 _MAX_OUTPUT_ERROR = 8 * 1024 * 1024
+CLIENT = re.compile(r"/?[A-Za-z0-9_./-]{1,100}")
+_ATTACH_TARGET = re.compile(r"=\$[0-9]+:@[0-9]+\.%[0-9]+")
+#: ``focus`` may wait for tmux, never for long.
+FOCUS_TIMEOUT = 30.0
 _VALUE = re.compile(r"[A-Za-z0-9._:/#@+=,-]{0,256}")
 
 
@@ -108,6 +112,21 @@ def window_labels(
             f"at most 32 per pane (kind=, agent= and {MAX_AGENT_LABELS} more)"
         )
     return result, warnings
+
+
+def _attach_argv_ok(argv: object, socket_path: str) -> bool:
+    """termctl's documented ``attach`` command: ``<tmux> -S <socket> attach -E -t =$N:@N.%N``."""
+    if not isinstance(argv, list) or len(argv) != 7 or not all(isinstance(a, str) for a in argv):  # pyright: ignore[reportUnknownArgumentType]
+        return False
+    tmux, flag, sock, verb, e, t, target = argv  # pyright: ignore[reportUnknownVariableType]
+    return (
+        isinstance(tmux, str)
+        and tmux.startswith("/")
+        and "\0" not in tmux
+        and (flag, sock, verb, e, t) == ("-S", socket_path, "attach", "-E", "-t")
+        and isinstance(target, str)
+        and _ATTACH_TARGET.fullmatch(target) is not None
+    )
 
 
 @dataclass(frozen=True)
@@ -295,6 +314,66 @@ class TermBackend:
 
     def unmark(self, term_id: str, socket_path: str) -> None:
         self._change(["unmark", term_id], term_id, socket_path)
+
+    def focus(
+        self,
+        term_id: str,
+        socket_path: str,
+        *,
+        client: str | None = None,
+        no_attach: bool = False,
+    ) -> dict[str, Any]:
+        """``termctl focus <id> --json`` (``attach``), run with the caller's own stdin and
+        stderr so termctl can tell whether the user is at a terminal. The answer is validated
+        against the pane asked for: the same id, this socket, and for ``attach`` exactly the
+        command termctl documents (an absolute tmux, ``-S`` this socket, ``attach -E -t`` one
+        pane target). Anything else is refused, never executed."""
+        self._check_id(term_id)
+        if client is not None and CLIENT.fullmatch(client) is None:
+            raise CliError.usage("invalid --client: expected a tmux client name such as /dev/pts/3")
+        args = ["focus", term_id, _flag("--socket", socket_path)]
+        if client is not None:
+            args.append(_flag("--client", client))
+        if no_attach:
+            args.append("--no-attach")
+        try:
+            done = self.gateway.run_on_terminal([*self.command, *args, "--json"], timeout=FOCUS_TIMEOUT)
+        except (FileNotFoundError, PermissionError):
+            raise CliError(
+                "tool_missing",
+                "termctl is not installed or not executable",
+                tool=TOOL,
+                details={"hint": "install termctl"},
+            ) from None
+        except subprocess.TimeoutExpired:
+            raise CliError("failed", "termctl did not answer in time", tool=TOOL) from None
+        except gw.OutputTooLarge:
+            raise CliError("failed", "termctl printed too much output", tool=TOOL) from None
+        except OSError as error:
+            raise CliError(
+                "failed", f"termctl could not run ({error.strerror})", tool=TOOL
+            ) from None
+        reply = _Reply(done.returncode, _loads(done.stdout))
+        if reply.code != 0:
+            raise self.fail(reply)
+        data = reply.data
+        unusable = CliError("failed", "termctl printed unusable output", tool=TOOL)
+        if data is None or data.get("id") != term_id or data.get("socket_path") != socket_path:
+            raise unusable
+        action, answered, argv = data.get("action"), data.get("client"), data.get("argv")
+        if action == "switched":
+            if (
+                not isinstance(answered, str)
+                or CLIENT.fullmatch(answered) is None
+                or argv is not None
+            ):
+                raise unusable
+            return {"action": "switched", "client": answered, "argv": None}
+        if action == "attach" and not no_attach and client is None and answered is None:
+            if not _attach_argv_ok(argv, socket_path):
+                raise unusable
+            return {"action": "attach", "client": None, "argv": list(argv)}
+        raise unusable
 
     def label_add(self, term_id: str, socket_path: str, pairs: Sequence[str]) -> None:
         self._change(["label", "add", term_id, *pairs], term_id, socket_path)
