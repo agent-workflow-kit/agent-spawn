@@ -51,6 +51,7 @@ QUICK_TIMEOUT = 5.0
 OPEN_TIMEOUT = 300.0
 _MAX_OUTPUT_ERROR = 8 * 1024 * 1024
 CLIENT = re.compile(r"/?[A-Za-z0-9_./-]{1,100}")
+BAD_CLIENT = "invalid --client: expected a tmux client name such as /dev/pts/3"
 _ATTACH_TARGET = re.compile(r"=\$[0-9]+:@[0-9]+\.%[0-9]+")
 #: ``focus`` may wait for tmux, never for long.
 FOCUS_TIMEOUT = 30.0
@@ -112,6 +113,10 @@ def window_labels(
             f"at most 32 per pane (kind=, agent= and {MAX_AGENT_LABELS} more)"
         )
     return result, warnings
+
+
+_WINDOW_ID = re.compile(r"@[0-9]+")
+_PANE_ID = re.compile(r"%[0-9]+")
 
 
 def _attach_argv_ok(argv: object, socket_path: str) -> bool:
@@ -330,7 +335,7 @@ class TermBackend:
         pane target). Anything else is refused, never executed."""
         self._check_id(term_id)
         if client is not None and CLIENT.fullmatch(client) is None:
-            raise CliError.usage("invalid --client: expected a tmux client name such as /dev/pts/3")
+            raise CliError.usage(BAD_CLIENT)
         args = ["focus", term_id, _flag("--socket", socket_path)]
         if client is not None:
             args.append(_flag("--client", client))
@@ -363,16 +368,27 @@ class TermBackend:
         if data is None or data.get("id") != term_id or data.get("socket_path") != socket_path:
             raise unusable
         action, answered, argv = data.get("action"), data.get("client"), data.get("argv")
+        if data.get("dry_run") is not False:  # --dry-run was never passed
+            raise unusable
         if action == "switched":
             if (
                 not isinstance(answered, str)
                 or CLIENT.fullmatch(answered) is None
-                or argv is not None
+                or "argv" in data
             ):
                 raise unusable
             return {"action": "switched", "client": answered, "argv": None}
         if action == "attach" and not no_attach and client is None and answered is None:
-            if not isinstance(argv, list) or not _attach_argv_ok(argv, socket_path):
+            window, pane = data.get("window_id"), data.get("pane_id")
+            if (
+                not isinstance(argv, list)
+                or not _attach_argv_ok(argv, socket_path)
+                or not isinstance(window, str)
+                or not isinstance(pane, str)
+                or _WINDOW_ID.fullmatch(window) is None
+                or _PANE_ID.fullmatch(pane) is None
+                or not str(argv[6]).endswith(f":{window}.{pane}")  # pyright: ignore[reportUnknownArgumentType]
+            ):
                 raise unusable
             return {"action": "attach", "client": None, "argv": [str(a) for a in argv]}
         raise unusable

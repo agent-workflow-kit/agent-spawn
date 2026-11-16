@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from . import gateway as gw
+from . import term
 from .agent_lookup import open_existing, resolve_existing, store_failed
 from .annotate import termctl_for
 from .commands.base import Invocation
@@ -27,6 +28,8 @@ NO_WINDOW_HINT = (
 
 def attach(inv: Invocation) -> Outcome:
     args = inv.args
+    if args.client is not None and term.CLIENT.fullmatch(args.client) is None:
+        raise CliError.usage(term.BAD_CLIENT)  # before any agent lookup: termctl is not called
     store = open_existing(inv)
     try:
         try:
