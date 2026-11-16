@@ -332,20 +332,18 @@ def test_run_at_the_trust_dialog_goes_live_by_polling_alone(
 # --- ephemeral --------------------------------------------------------------------------------
 
 
-def test_ephemeral_done_hands_over_and_refusal_parks_done(env: Env, fakebin: Fakebin) -> None:
+def test_ephemeral_done_hands_over_and_is_torn_down(env: Env, fakebin: Fakebin) -> None:
     done = env.run(*LAUNCH, "--ephemeral", "--wait")
     body = result_json(done)
     assert done.returncode == 0, (done.stdout, done.stderr)
     agent_id = body["agent"]["agent_id"]
     row = env.agent(agent_id)
-    # TODO(#18): teardown itself is not implemented yet: the hand-over is refused and logged.
-    assert row["status"] == "parked" and row["park_reason"] == "done"
-    assert row["teardown_step"] is None and row["teardown_proc"] is None
+    assert row["status"] == "torn_down" and row["teardown_step"] is None
     names = [n for n, _ in events(env, agent_id)]
-    assert names.count("post-park") == 1
-    park = next(p for n, p in events(env, agent_id) if n == "post-park")
-    assert park["teardown_refused"] is True
-    validate_event("post-park", park, agent_id)
+    assert names.count("post-teardown") == 1 and "post-park" not in names
+    for name, payload in events(env, agent_id):
+        if name == "post-teardown":
+            validate_event(name, payload, agent_id)
     log = (env.state_dir / "supervise" / f"{agent_id}.log").read_text()
     assert "Traceback" not in log
 

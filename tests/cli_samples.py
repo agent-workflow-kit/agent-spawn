@@ -120,7 +120,6 @@ FLAGS: dict[str, dict[str, str | None]] = {
     "export": {"--since": "1d", "--action": "stop"},
     "browse": {"--focus": "ag-abcdefgh", "--result-file": "/tmp/r.json"},
     "supervise": {"--host": None, "--handoff": "/tmp/s", "--handoff-timeout": "30"},
-    "_session-event": {},
 }
 
 # The smallest valid argv of each command (positionals only; internal commands carry their
@@ -145,7 +144,6 @@ MIN_ARGV: dict[str, list[str]] = {
     "export": ["export"],
     "browse": ["browse"],
     "supervise": [*INTERNAL_GLOBALS, "supervise", "ag-abcdefgh"],
-    "_session-event": [*INTERNAL_GLOBALS, "_session-event"],
 }
 
 GLOBAL_OPTIONS = {

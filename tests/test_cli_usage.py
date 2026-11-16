@@ -46,10 +46,7 @@ BAD_ARGV = {
     "label add --session without pairs": ["label", "add", "--session", "cs-abcdefgh"],
     "label add without agent": ["label", "add", "pr=1"],
     "state-dir on a user command": ["--state-dir", "/state", "list"],
-    "relative state-dir": ["--state-dir", "state", "--config", "/c", "_session-event"],
-    "relative internal config": ["--state-dir", "/s", "--config", "c", "_session-event"],
     "supervise without state-dir": ["--config", "/c", "supervise", "ag-abcdefgh"],
-    "session-event without config": ["--state-dir", "/s", "_session-event"],
     "empty argv": [],
 }
 
