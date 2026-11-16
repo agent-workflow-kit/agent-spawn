@@ -16,7 +16,7 @@ order of calls, the parking and the logging; it uses these functions for the cal
 * ``status``, ``stop``, ``forget``, ``label_add``/``label_remove``, ``verify_secret``,
   ``list_by_label`` and ``reconcile``.
 
-TODO(#11): launch order, TODO(#13): resume and fork, TODO(#14): supervision use these calls.
+TODO(#11): launch order, TODO(#13): resume and fork; supervision (#12) uses these calls.
 """
 
 from __future__ import annotations

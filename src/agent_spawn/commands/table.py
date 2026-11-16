@@ -28,5 +28,4 @@ HANDLERS: dict[str, Handler] = {
     "export": maintenance.export,
     "browse": maintenance.browse,
     "supervise": internal.supervise,
-    "_session-event": internal.session_event,
 }
