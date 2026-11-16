@@ -442,6 +442,7 @@ def do_open(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         os.path.basename(program) if valid_name(os.path.basename(program)) else "command"
     )
     if p.has("--dry-run"):
+        ctx.check_scripted_error("open")  # a dry run exits as a real run would (tmux checks)
         out = {
             "dry_run": True,
             "id": "tc-aaaaaaaa",

@@ -533,6 +533,8 @@ def do_start(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         return run
 
     run = update_sessions(record)
+    # the real tool creates the session directory and its `work/` at `start`
+    os.makedirs(os.path.join(state_dir(), "sessions", new_id, "work"), exist_ok=True)
     out = {
         "csession_id": new_id,
         "csession_dir": os.path.join(state_dir(), "sessions", new_id),
