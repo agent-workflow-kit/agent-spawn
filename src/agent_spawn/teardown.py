@@ -1,14 +1,14 @@
 """``teardown`` (interface.md, Teardown order).
 
 The steps this module owns: 1 (resolve and usage checks), 2 (the live checks and the lifecycle
-entry), 4 (worktrees), 6 (forget the session) and 7 (the tombstone). The named markers
+entry), 4 (worktrees), 5 (windows), 6 (forget the session) and 7 (the tombstone). The named markers
 (``teardown_step``) make a retry continue where a dead teardown process stopped. The supervisor of
 an ephemeral agent runs the same steps from step 3 (``ephemeral``).
 
 TODO(#32): the ``pre-teardown`` hooks (step 3); until then an agent that has any configured or
 given ``pre-teardown`` hook is refused before anything changes (a veto must never be skipped).
-TODO(#27): windows (step 5); until then an agent with a run that had a window is refused before
-anything changes (a worktree must not be removed under a window that is still open).
+Step 5 closes the dead panes labeled ``agent=<agent_id>`` of every server the agent's runs used;
+a failure there is a warning, never a refusal.
 
 Every lifecycle write is a compare-and-set under the agent's lease; no lower tool and no hook
 runs while the lease is held.
@@ -36,6 +36,7 @@ from .output import CliError, Outcome, PayloadKind
 from .records import RecordsError, append_audit, append_log
 from .session_backend import SessionBackend, SessionStatus
 from .store import CasLost, Store, StoreError, StoreMissing, default_state_dir
+from .term import TermBackend
 from .worktrees import WtctlBackend, WtctlError
 
 TOOL = "claude-session"
@@ -200,6 +201,7 @@ class Teardown:
         self.hooks_written = False
         self.wt_backend: WtctlBackend | None = None
         self.worktrees: list[dict[str, Any]] = []  # step 4's output entries, in processing order
+        self.windows_closed: list[str] = []  # step 5: the dead panes it closed
         self.removed: WtItem | None = None  # the owned record this run removed
         self.audited = False
         self.sticky = False  # a remove with a possibly partial outcome: never back to parked
@@ -338,17 +340,13 @@ class Teardown:
         """The pieces of teardown not implemented yet, refused before any change."""
         agent_id = row["agent_id"]
         what: str | None = None
-        if not reached(row, "windows_done") and any(
-            run.get("term_id") or run.get("socket_path") for run in self.store.get_runs(agent_id)
-        ):
-            what = "windows"  # TODO(#27): step 5 of the teardown order
-        elif not reached(row, "hooks_done") and self.pre_hook_entries():
+        if not reached(row, "hooks_done") and self.pre_hook_entries():
             what = "pre-teardown hooks"  # TODO(#32)
         if what is None:
             return None
         return CliError(
             "internal",
-            f"teardown with {what} is not implemented yet (tracked in issues #27 and #32)",
+            f"teardown with {what} is not implemented yet (tracked in issue #32)",
             agent_id=agent_id,
         )
 
@@ -568,6 +566,9 @@ class Teardown:
             row = self.store.get_agent(agent_id) or row
         else:
             self.worktrees = [self.entry(i, "none", None) for i in self.finished_items(row)]
+        if not reached(row, "windows_done"):
+            if self.step_windows(row):
+                self.set_step(agent_id, "windows_done")
         if not reached(row, "session_done"):
             self.step_session(row)
             self.set_step(agent_id, "session_done")
@@ -814,6 +815,64 @@ class Teardown:
         )
         if not result.already or result.state == "removed":  # forgotten/gone: not a removal
             self.audit_removal(row, item)
+
+    # -- step 5: windows --------------------------------------------------------------------
+
+    def window_sockets(self, agent_id: str) -> list[str]:
+        """The distinct socket paths of the agent's runs' windows, in run order."""
+        found: list[str] = []
+        for run in self.store.get_runs(agent_id):
+            socket_path = run.get("socket_path")
+            if isinstance(socket_path, str) and socket_path and socket_path not in found:
+                found.append(socket_path)
+        return found
+
+    def termctl(self, row: Mapping[str, Any]) -> TermBackend | None:
+        from .launch import resolve_stored_tool  # the tool resolution launch uses
+
+        stored = row.get("termctl_path")
+        try:
+            argv = resolve_stored_tool(
+                self.config.termctl_cmd, "termctl", stored if isinstance(stored, str) else None
+            )
+        except CliError:
+            return None
+        return TermBackend(
+            argv, actor=self.actor, decision_ids=self.decision_ids, gateway=self.gateway
+        )
+
+    def step_windows(self, row: Mapping[str, Any]) -> bool:
+        """Step 5 (skipped, False, when no run of the agent had a window): for each distinct
+        socket path ``termctl list --label agent=<id> --dead``, then ``termctl close`` for each
+        dead pane listed. Exit 10 and 20 ``running`` are no-ops; any other failure is a warning
+        (a window left behind never blocks a teardown)."""
+        agent_id = row["agent_id"]
+        sockets = self.window_sockets(agent_id)
+        if not sockets:
+            return False
+        term = self.termctl(row)
+        if term is None:
+            self.warnings.append("termctl could not be found: the agent's dead windows stay open")
+            return True
+        for socket_path in sockets:
+            try:
+                dead = term.list_dead(agent_id, socket_path)
+            except CliError as error:
+                if error.exit_code != 10:
+                    self.warnings.append(f"termctl list failed (exit {error.exit_code})")
+                continue
+            for term_id in dead:
+                try:
+                    term.close(term_id, socket_path)
+                except CliError as error:
+                    if error.exit_code == 10 or (
+                        error.exit_code == 20 and error.reason == "running"
+                    ):
+                        continue
+                    self.warnings.append(f"termctl close failed (exit {error.exit_code})")
+                    continue
+                self.windows_closed.append(term_id)
+        return True
 
     def step_session(self, row: Mapping[str, Any]) -> None:
         """Step 6: ``claude-session forget``; exit 10 counts as done, any other failure stops
@@ -1075,7 +1134,7 @@ def _run(td: Teardown, agent_id: str) -> Outcome:
         "agent": agent_object(td.store, done, warnings=td.warnings),
         "worktrees": td.worktrees,
         "session_forgotten": td.session_forgotten,
-        "windows_closed": [],
+        "windows_closed": td.windows_closed,
         "warnings": list(td.warnings),
     }
     return Outcome(0, payload, PayloadKind.COMMAND, f"torn down {agent_id}")

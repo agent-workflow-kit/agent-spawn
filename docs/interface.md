@@ -528,7 +528,7 @@ With `--dry-run`, `torn_down` means "would be torn down"; nothing is changed and
 | `skipped` | `too_new` | `agent-spawn` | the age is not over the threshold on fresh state |
 | `skipped` | `tearing_down` | `agent-spawn` | a teardown process of the agent is alive |
 | `skipped` | `worktree_partial` | `wtctl` | the marker is set and its record is missing or not a tombstone; decided before the agent is entered, so its row is untouched |
-| `skipped` | `teardown_unsupported` | `agent-spawn` | the agent has a window or pre-teardown hooks, which teardown does not handle yet (temporary, until #27 and #32) |
+| `skipped` | `teardown_unsupported` | `agent-spawn` | a `pre-teardown` hook is configured or given, which teardown does not run yet (temporary, until #32) |
 | `skipped` | `gone` | `agent-spawn` | the agent disappeared or was torn down meanwhile |
 | `skipped` | `changed` | `agent-spawn` | the agent changed status between the listing and the entry |
 | `skipped` | `lease_held` | `agent-spawn` | another process holds the agent's lease; tried again next run |

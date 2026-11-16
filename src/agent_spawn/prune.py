@@ -186,8 +186,8 @@ def prune_command(inv: Any) -> Outcome:
     unsupported = sum(1 for r in results if r["reason"] == UNSUPPORTED)
     if unsupported:
         warnings.append(
-            f"{unsupported} agent(s) skipped: teardown of agents with windows or pre-teardown "
-            "hooks is not implemented yet (tracked in issues #27 and #32)"
+            f"{unsupported} agent(s) skipped: teardown with pre-teardown hooks is not "
+            "implemented yet (tracked in issue #32)"
         )
     return _outcome(results, warnings, dry_run)
 

@@ -215,7 +215,7 @@ def test_a_headless_launch_needs_no_termctl(wenv: WindowEnv, fakebin: Fakebin) -
 def fail_real_open(fakebin: Fakebin, exit_code: int, code: str = "x") -> None:
     """Let the preflight (the first `open`) pass and fail the real open."""
     fakebin.script("termctl", "open", times=1)
-    fakebin.script("termctl", "open", error={"code": code, "message": "m"}, exit=exit_code)
+    fakebin.script("termctl", "open", times=1, error={"code": code, "message": "m"}, exit=exit_code)
 
 
 @pytest.mark.parametrize(
@@ -435,11 +435,14 @@ def test_the_handed_environment_replaces_the_panes_and_the_launchers_overrides_a
     with monkeypatch.context() as scoped:
         scoped.setattr(os, "environ", {"AGENT_SPAWN_TOMBSTONE_DAYS": "99", "PANE_ONLY": "1"})
         inv = cli.parse_invocation(argv)
-        assert inv.config.tombstone_days == 99  # loaded from the pane's environment
+        assert (
+            inv.config is not None and inv.config.tombstone_days == 99
+        )  # loaded from the pane's environment
         supervisor = Supervisor(inv, Signals(interactive=True))
         assert supervisor.adopt_handoff() is None
         assert dict(os.environ) == handed  # the pane's own variables are gone
-        assert supervisor.config.tombstone_days == 7 and inv.config.tombstone_days == 7
+        assert supervisor.config.tombstone_days == 7
+        assert inv.config is not None and inv.config.tombstone_days == 7
 
 
 def test_a_failed_handoff_exits_1_and_starts_nothing(
@@ -461,3 +464,288 @@ def test_a_failed_handoff_exits_1_and_starts_nothing(
     outcome = Supervisor(inv, Signals(interactive=True)).adopt_handoff()
     assert outcome is not None and outcome.exit_code == 1 and outcome.quiet
     fakebin.assert_not_called("claude-session")
+
+
+# --- resume ------------------------------------------------------------------------------------
+
+
+def launched_window(wenv: WindowEnv, *extra: str) -> str:
+    body = result_json(wenv.run(*LAUNCH, "--wait", *extra))
+    return body["agent"]["agent_id"]
+
+
+def test_resume_opens_a_new_window_and_records_it_on_the_new_run(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    agent_id = launched_window(wenv)
+    done = wenv.run("resume", agent_id, "--json", "--wait")
+    body = result_json(done)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    schema_registry.validate(body, "agent-spawn/cli/launch.json")
+    assert body["agent"]["mode"] == "interactive" and body["agent"]["placement"] == "window"
+    assert body["agent"]["run"] == 2 and body["agent"]["window"] is not None
+    assert (
+        len(open_calls(fakebin, dry_run=False)) == 2 and len(open_calls(fakebin, dry_run=True)) == 2
+    )
+    with wenv.store() as store:
+        first, second = store.get_run(agent_id, 1), store.get_run(agent_id, 2)
+    assert first is not None and second is not None
+    assert first["term_id"] != second["term_id"] and second["mode"] == "interactive"
+    assert second["placement"] == "window" and second["pane_proc"] is not None
+
+
+def test_resume_name_and_term_placement_replace_the_stored_values(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    agent_id = launched_window(wenv, "--name", "first")
+    result_json(wenv.run("resume", agent_id, "--json", "--wait", "--name", "second",
+                         "--term-placement", "default"))  # fmt: skip
+    last = open_calls(fakebin, dry_run=False)[-1]
+    assert "--name=second" in last and "--placement=default" in last
+    row = wenv.agent(agent_id)
+    assert row["name"] == "second" and row["term_placement"] == "default"
+
+
+def test_a_headless_agent_resumed_interactively_gets_a_window(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    body = result_json(
+        wenv.run("launch", "--mode", "headless", "--skill", "do-it", "--json", "--wait")
+    )
+    agent_id = body["agent"]["agent_id"]
+    fakebin.assert_not_called("termctl")
+    done = wenv.run("resume", agent_id, "--mode", "interactive", "--json", "--wait")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert result_json(done)["agent"]["window"] is not None
+    assert len(open_calls(fakebin, dry_run=False)) == 1
+
+
+def test_a_resume_preflight_failure_restores_the_pre_resume_row(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    agent_id = launched_window(wenv)
+    before = wenv.agent(agent_id)
+    preflight_error(fakebin, "tmux_too_old", 12)
+    done = wenv.run("resume", agent_id, "--json")
+    error = result_json(done)["error"]
+    assert done.returncode == 12 and error["lower_code"] == "tmux_too_old"
+    after = wenv.agent(agent_id)
+    assert after["status"] == "parked" and after["updated"] == before["updated"]
+    assert len(open_calls(fakebin, dry_run=False)) == 1  # only the launch's
+
+
+def test_resume_override_escalation_goes_to_termctl_open_only(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    fail_real_open(fakebin, 13, "escalated")
+    done = wenv.run(*LAUNCH)
+    assert done.returncode == 13
+    (agent,) = wenv.agents()
+    assert agent["escalated_by"] == "termctl"
+    result_json(
+        wenv.run(
+            "resume",
+            agent["agent_id"],
+            "--json",
+            "--wait",
+            "--override-escalation",
+            "--actor",
+            "human:tester",
+        )  # fmt: skip
+    )
+    real = open_calls(fakebin, dry_run=False)
+    assert "--override-escalation" not in real[0] and "--override-escalation" in real[-1]
+    assert not [a for a in open_calls(fakebin, dry_run=True) if "--override-escalation" in a]
+    starts = [
+        a for a in fakebin.argvs("claude-session") if "start" in a and "--resume" in " ".join(a)
+    ]
+    assert starts and all("--override-escalation" not in a for a in starts)
+    audit = (wenv.state_dir / "audit.jsonl").read_text()
+    assert "resume_escalation_override" in audit
+
+
+def test_a_fork_passes_the_override_to_termctl_open_only(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    agent_id = launched_window(wenv)
+    done = wenv.run("resume", agent_id, "--fork", "--json", "--wait", "--override-escalation",
+                    "--actor", "human:tester")  # fmt: skip
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert "--override-escalation" in open_calls(fakebin, dry_run=False)[-1]
+    forks = [a for a in fakebin.argvs("claude-session") if "--fork" in a]
+    assert forks and all("--override-escalation" not in a for a in forks)
+
+
+def test_override_without_a_target_still_exits_2(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    agent_id = launched_window(wenv)
+    done = wenv.run(
+        "resume", agent_id, "--json", "--override-escalation", "--actor", "human:tester"
+    )
+    assert done.returncode == 2
+    assert wenv.agent(agent_id)["status"] == "parked"
+
+
+def test_dry_runs_report_the_window_plan(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    done = wenv.run(*LAUNCH, "--dry-run")
+    plan = result_json(done)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    schema_registry.validate(plan, "agent-spawn/cli/launch-dry-run.json")
+    assert plan["tools"]["termctl"] is not None and plan["term_plan"]["match"]["rule"] is None
+    assert plan["term_plan"]["match"]["labels"][0].startswith("agent=")
+    assert plan["agent_settings"]["mode"] == "interactive"
+    assert plan["agent_settings"]["placement"] == "window"
+    assert open_calls(fakebin, dry_run=False) == [] and wenv.agents() == []
+    agent_id = launched_window(wenv)
+    done = wenv.run("resume", agent_id, "--dry-run", "--json")
+    plan = result_json(done)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    schema_registry.validate(plan, "agent-spawn/cli/launch-dry-run.json")
+    assert plan["term_plan"] is not None and plan["tools"]["termctl"] is not None
+
+
+def test_a_dry_run_fails_like_the_real_run_when_the_preflight_does(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    preflight_error(fakebin, "tmux_missing", 12)
+    done = wenv.run(*LAUNCH, "--dry-run")
+    assert done.returncode == 12 and result_json(done)["error"]["lower_code"] == "tmux_missing"
+
+
+# --- teardown: the window step -----------------------------------------------------------------
+
+
+def dead_pane_agent(wenv: WindowEnv, fakebin: Fakebin) -> str:
+    """A parked agent whose window process failed at the handoff: a dead pane stays (B6)."""
+    fakebin.script("termctl", "open", times=1)
+    fakebin.script("termctl", "open", times=1, merge={"pid": None})
+    done = wenv.run(*LAUNCH)
+    assert done.returncode == 12
+    (agent,) = wenv.agents()
+    wenv.wait_for(lambda: any(p["state"] == "dead" for p in wenv.panes()), "dead pane")
+    return agent["agent_id"]
+
+
+def term_calls(fakebin: Fakebin, command: str) -> list[list[str]]:
+    """The calls of one command (the tests' own `list` views, without `--dead`, do not count)."""
+    return [
+        a
+        for a in fakebin.argvs("termctl")
+        if a and a[0] == command and (command != "list" or "--dead" in a)
+    ]
+
+
+def test_teardown_closes_the_dead_panes_of_the_agent_only(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    agent_id = dead_pane_agent(wenv, fakebin)
+    other = wenv.fakebin.run(
+        "termctl", "open", "--name=other", "--label=agent=ag-zzzzzzzz", "--keep-on-exit=failed",
+        "--json", "--", "sh", "-c", "exit 3", env=wenv.env(),
+    )  # fmt: skip
+    assert other.returncode == 0, other.stderr
+    wenv.wait_for(
+        lambda: len(wenv.panes()) == 2 and all(p["state"] == "dead" for p in wenv.panes()), "panes"
+    )
+    done = wenv.run("teardown", agent_id, "--json")
+    body = result_json(done)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    schema_registry.validate(body, "agent-spawn/cli/teardown.json")
+    (term_id,) = body["windows_closed"]
+    assert [p["id"] for p in wenv.panes()] == [p["id"] for p in wenv.panes() if p["id"] != term_id]
+    remaining = wenv.panes()
+    assert len(remaining) == 1 and "agent=ag-zzzzzzzz" in remaining[0]["labels"]
+    (listing,) = term_calls(fakebin, "list")
+    assert f"--label=agent={agent_id}" in listing and "--dead" in listing
+    assert f"--socket={wenv.tmux.socket}" in listing
+    assert wenv.agent(agent_id)["status"] == "torn_down"
+
+
+def test_a_running_pane_is_never_closed_by_teardown(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    agent_id = dead_pane_agent(wenv, fakebin)
+    running = wenv.fakebin.run(
+        "termctl", "open", "--name=live", f"--label=agent={agent_id}", "--json", "--",
+        "sleep", "300", env=wenv.env(),
+    )  # fmt: skip
+    assert running.returncode == 0
+    done = wenv.run("teardown", agent_id, "--json")
+    body = result_json(done)
+    assert done.returncode == 0 and len(body["windows_closed"]) == 1
+    left = wenv.panes()
+    assert [p["state"] for p in left] == ["running"]
+    assert not term_calls(fakebin, "close") or len(term_calls(fakebin, "close")) == 1
+
+
+def test_no_window_no_termctl_call(wenv: WindowEnv, fakebin: Fakebin) -> None:
+    body = result_json(
+        wenv.run("launch", "--mode", "headless", "--skill", "do-it", "--json", "--wait")
+    )
+    fakebin.assert_not_called("termctl")
+    done = wenv.run("teardown", body["agent"]["agent_id"], "--json")
+    assert done.returncode == 0 and result_json(done)["windows_closed"] == []
+    fakebin.assert_not_called("termctl")
+
+
+@pytest.mark.parametrize(
+    ("error", "exit_code", "warned"),
+    [
+        ({"code": "not_found", "message": "gone"}, 10, False),
+        ({"code": "refused", "message": "running", "reason": "running"}, 20, False),
+        ({"code": "locked", "message": "busy"}, 12, True),
+    ],
+)
+def test_close_exits_10_and_running_are_no_ops_and_other_failures_warn(
+    wenv: WindowEnv, fakebin: Fakebin, error: dict[str, Any], exit_code: int, warned: bool
+) -> None:
+    agent_id = dead_pane_agent(wenv, fakebin)
+    fakebin.script("termctl", "close", error=error, exit=exit_code)
+    done = wenv.run("teardown", agent_id, "--json")
+    body = result_json(done)
+    assert done.returncode == 0 and body["windows_closed"] == []
+    assert bool(body["warnings"]) is warned
+    assert wenv.agent(agent_id)["status"] == "torn_down"  # never a refusal
+
+
+def test_a_failing_list_is_a_warning_and_teardown_goes_on(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    agent_id = dead_pane_agent(wenv, fakebin)
+    fakebin.script("termctl", "list", error={"code": "tmux_missing", "message": "x"}, exit=12)
+    done = wenv.run("teardown", agent_id, "--json")
+    body = result_json(done)
+    assert done.returncode == 0 and body["warnings"]
+    assert wenv.agent(agent_id)["status"] == "torn_down"
+
+
+def test_every_distinct_socket_of_the_runs_is_listed_once(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    agent_id = dead_pane_agent(wenv, fakebin)
+    from agent_spawn.lifecycle import lease_key
+
+    with wenv.store() as store:
+        with store.lease(lease_key(agent_id)) as lease:
+            store.put_run(
+                lease, agent_id, 2, {"term_id": "tc-bbbbbbbb", "socket_path": "/tmp/other-sock"}
+            )
+            store.put_run(
+                lease, agent_id, 3, {"term_id": "tc-cccccccc", "socket_path": str(wenv.tmux.socket)}
+            )
+    result_json(wenv.run("teardown", agent_id, "--json"))
+    sockets = [
+        next(a for a in call if a.startswith("--socket=")) for call in term_calls(fakebin, "list")
+    ]
+    assert sockets == [f"--socket={wenv.tmux.socket}", "--socket=/tmp/other-sock"]
+
+
+def test_a_retry_after_the_session_step_does_not_close_windows_again(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    agent_id = dead_pane_agent(wenv, fakebin)
+    fakebin.script("claude-session", "forget", times=1, exit=20,
+                   error={"code": "refused", "message": "live", "reason": "live"})  # fmt: skip
+    first = wenv.run("teardown", agent_id, "--json")
+    assert first.returncode == 20
+    assert wenv.agent(agent_id)["status"] == "tearing_down"
+    assert wenv.agent(agent_id)["teardown_step"] == "windows_done"
+    lists = len(term_calls(fakebin, "list"))
+    second = wenv.run("teardown", agent_id, "--json")
+    assert second.returncode == 0
+    assert len(term_calls(fakebin, "list")) == lists  # step 5 was done

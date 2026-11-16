@@ -912,20 +912,23 @@ def test_an_ephemeral_teardown_refused_by_wtctl_parks_done_with_teardown_refused
 # --- windows -----------------------------------------------------------------------------------
 
 
-def test_a_run_with_a_window_is_still_refused_before_the_worktree_is_touched(
+def test_a_run_with_a_window_is_torn_down_after_the_worktree_step(
     env: Env, fakebin: Fakebin
 ) -> None:
-    # TODO(#27): the windows step replaces this refusal.
     agent_id = launched_in_worktree(env)
     with env.store() as store:
         from agent_spawn.lifecycle import lease_key
 
         with store.lease(lease_key(agent_id)) as lease:
-            store.put_run(lease, agent_id, 1, {"term_id": "t1", "socket_path": "/tmp/s"})
+            store.put_run(lease, agent_id, 1, {"term_id": "tc-aaaaaaaa", "socket_path": "/tmp/s"})
     done = td(env, agent_id)
-    assert done.returncode == 1
-    assert wtctl_calls(fakebin, "remove") == []
-    assert env.agent(agent_id)["status"] == "parked"
+    body = result_json(done)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert body["windows_closed"] == []  # the fake has no such pane: nothing to close
+    assert len(wtctl_calls(fakebin, "remove")) == 1
+    termctl = fakebin.argvs("termctl")
+    assert termctl and termctl[0][0] == "list" and "--dead" in termctl[0]  # step 5 ran
+    assert env.agent(agent_id)["status"] == "torn_down"
 
 
 def test_a_record_without_a_wtctl_on_the_machine_is_refused_and_nothing_changes(
