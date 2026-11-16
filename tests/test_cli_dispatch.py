@@ -26,6 +26,7 @@ OWNERS = {
     "list": 15,
     "show": 15,
     "ack": 15,
+    "attach": 28,
     "label add": 15,
     "label remove": 15,
     "stop": 16,
