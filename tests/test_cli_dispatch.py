@@ -38,15 +38,17 @@ OWNERS = {
     "export": 7,
     "browse": 38,
     "supervise": 12,
-    "_session-event": 14,
 }
 
 
 IMPLEMENTED = {
     "export",
     "launch",
+    "stop",
+    "resume",
     "supervise",
     "teardown",
+    "wait",
 }  # commands whose issue has landed (no longer stubs)
 
 
@@ -368,3 +370,8 @@ def test_the_checked_target_is_handed_to_the_handler(
     assert seen[0].result_file is not None
     assert seen[0].result_file.parent == str(real)
     assert os.path.exists(real / "r.json")
+
+
+def test_the_relay_command_name_list_equals_the_parsers_commands() -> None:
+    parsed = {key.split()[0] for key in cli.build_parser().command_parsers}
+    assert set(cli._COMMAND_NAMES) == parsed  # pyright: ignore[reportPrivateUsage]
