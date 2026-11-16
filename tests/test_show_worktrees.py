@@ -196,6 +196,23 @@ def test_non_finite_numbers_in_a_reply_are_malformed_not_a_crash(
     assert len(body["warnings"]) == 2
 
 
+@pytest.mark.parametrize("literal", ["1e999", "-1e999"])
+def test_overflowing_numbers_in_a_reply_are_malformed_not_a_crash(
+    env: Env, fakebin: Fakebin, literal: str
+) -> None:
+    agent_id = launched_in_worktree(env)
+    fakebin.script(
+        "wtctl",
+        "baseline check",
+        exit=20,
+        stdout='{"error": {"reason": "repo_config_changed", "items": [{"n": ' + literal + "}]}}",
+    )
+    fakebin.script("wtctl", "list", exit=0, stdout='{"records": [{"n": ' + literal + "}]}")
+    body = show(env, agent_id)
+    assert body["repo_config_changed"] is None and body["third_party_run"] is None
+    assert len(body["warnings"]) == 2
+
+
 def test_show_bounds_each_wtctl_read_with_its_own_timeout(
     env: Env, fakebin: Fakebin, monkeypatch: pytest.MonkeyPatch
 ) -> None:

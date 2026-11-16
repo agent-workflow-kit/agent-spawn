@@ -24,6 +24,7 @@ this was written) is listed in docs/design.md, "Live verification".
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -602,11 +603,18 @@ def _reject_constant(name: str) -> Any:
     raise ValueError(f"non-finite JSON constant {name}")
 
 
+def _parse_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite JSON number {text}")
+    return value
+
+
 def _loads(text: str) -> dict[str, Any] | None:
     if len(text) > 8 * 1024 * 1024:
         return None
     try:
-        data = json.loads(text, parse_constant=_reject_constant)
+        data = json.loads(text, parse_constant=_reject_constant, parse_float=_parse_float)
     except (ValueError, RecursionError):  # malformed, NaN/Infinity, or nested too deeply
         return None
     return data if isinstance(data, dict) else None  # pyright: ignore[reportUnknownVariableType]
