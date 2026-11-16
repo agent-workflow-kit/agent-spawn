@@ -275,6 +275,42 @@ CASES: dict[str, list[Case]] = {
             True,
         ),
         (["show", "--json", "tc-aaaaaaa1"], 2, "usage", True),
+        # the argv shapes `term.py` sends (values as `--flag=value`); from termctl's interface,
+        # not yet compared with the real tool (`live` re-checks these once they are verified)
+        (
+            ["open", "--json", "--dry-run", "--placement=nope", "--", "sleep", "1"],
+            2,
+            "usage",
+            False,
+        ),
+        (["placements", "--placement=default", "--json"], 2, "usage", False),
+        (["mark", "tc-aaaaaaaa", "attention", "--socket=nosuch", "--json"], 10, "no_server", False),
+        (["unmark", "tc-aaaaaaaa", "--socket=nosuch", "--json"], 10, "no_server", False),
+        (
+            ["label", "add", "tc-aaaaaaaa", "a=1", "b=2", "--socket=nosuch", "--json"],
+            10,
+            "no_server",
+            False,
+        ),
+        (
+            ["label", "remove", "tc-aaaaaaaa", "a=1", "--socket=nosuch", "--json"],
+            10,
+            "no_server",
+            False,
+        ),
+        (
+            [
+                "close",
+                "tc-aaaaaaaa",
+                "--socket=nosuch",
+                "--actor=auto:x",
+                "--decision-id=d-1",
+                "--json",
+            ],
+            10,
+            "no_server",
+            False,
+        ),
     ],
     "wtctl": [
         (["create", "--json"], 2, "usage", False),
@@ -344,7 +380,27 @@ ACCEPTED: dict[str, list[list[str]]] = {
         ["forget", "--json", "--older-than", "0"],
         ["forget", "--json", "--older-than", "1.5h"],
     ],
-    "termctl": [],
+    "termctl": [
+        [
+            "open",
+            "--dry-run",
+            "--name=w",
+            "--cwd=/tmp",
+            "--label=kind=implement",
+            "--label=agent=ag-aaaaaaaa",
+            "--placement=default",
+            "--keep-on-exit=failed",
+            "--actor=auto:x",
+            "--decision-id=d-1",
+            "--socket=nosuch",
+            "--json",
+            "--",
+            "sleep",
+            "1",
+        ],
+        ["list", "--label=agent=ag-aaaaaaaa", "--dead", "--socket=nosuch", "--json"],
+        ["placements", "--label=agent=ag-aaaaaaaa", "--json"],
+    ],
 }
 
 #: Known differences, kept on purpose: ``(tool, argv, real exit, fake exit)``. The live test pins

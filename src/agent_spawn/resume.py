@@ -25,8 +25,10 @@ Worktrees: an agent without a session re-runs launch step 4 as resume step 5 (``
 or any failure that left the agent's state unchanged, restores the pre-resume row; a wtctl veto
 or escalation of ``create``, a ``creating`` record and a record in another state park it.
 
-TODO(#27): interactive resumes with a window; TODO(#30): ``--placement here``. TODO(#31): the
-liveness check that precedes the lifecycle entry.
+An interactive resume with placement ``window`` runs launch step 7 for its window
+(``Launch.place_window``): the window preflight follows the pre-start checks, the termctl
+``--override-escalation`` goes to the real ``open`` only. TODO(#30): ``--placement here``.
+TODO(#31): the liveness check that precedes the lifecycle entry.
 """
 
 from __future__ import annotations
@@ -306,13 +308,18 @@ class Resume(Launch):
         stored_mode = self.stored.get("mode") if self.source_session is None else None
         mode = a.mode or stored_mode or self.last_mode(store, row) or self.stored.get("mode")
         self.mode = mode if mode in ("interactive", "headless") else "headless"
-        if self.mode != "headless":
+        self.stored_termctl = (
+            row.get("termctl_path") if isinstance(row.get("termctl_path"), str) else None
+        )
+        if self.mode == "headless":
+            if a.placement is not None:
+                self.warnings.append("--placement is ignored for a headless resume")
+        elif a.placement == "here":
             raise CliError.of(
-                "internal",
-                "interactive resumes are not implemented yet (windows: #27, here: #30)",
-            )  # TODO(#27): windows; TODO(#30): --placement here.
-        if a.placement is not None:
-            self.warnings.append("--placement is ignored for a headless resume")
+                "internal", "--placement here is not implemented yet (issue #30)"
+            )  # TODO(#30): --placement here.
+        if self.windowed:
+            self.termctl_backend()  # tool resolution: exit 12 tool_missing before any change
         self.plan_override(row)
         self.plan_skill(store, row)
         self.plan_flags()
@@ -324,8 +331,11 @@ class Resume(Launch):
         if not a.override_escalation:
             return
         if self.fork:
-            # Only a window's `termctl open` could take it for a fork; never claude-session.
-            self.warnings.append("--override-escalation has no effect on a headless fork")
+            # Only a window's `termctl open` takes it for a fork; never claude-session.
+            if self.windowed:
+                self.term_override = True
+            else:
+                self.warnings.append("--override-escalation has no effect on a headless fork")
             return
         by = row.get("escalated_by")
         last = row.get("last_outcome")
@@ -336,10 +346,13 @@ class Resume(Launch):
         if by == "wtctl" and self.source_session is None and self.worktree_mode() == "new":
             self.wt_override = True  # goes to `wtctl create` at step 5, and to nothing else
             return
+        if by == "termctl" and self.windowed:
+            self.term_override = True  # goes to `termctl open`, and to nothing else
+            return
         raise CliError.usage(
             "--override-escalation has no target: the agent was not escalated by a tool this "
             "resume calls"
-        )  # TODO(#27): the termctl override
+        )
 
     def plan_skill(self, store: Store, row: Mapping[str, Any]) -> None:
         a = self.args
@@ -808,7 +821,7 @@ class Resume(Launch):
             {
                 "kind": a.kind if a.kind is not None else settings["kind"],
                 "mode": self.mode,
-                "placement": None,
+                "placement": self.placement_value(),
                 "term_placement": a.term_placement or row.get("term_placement"),
                 "name": a.name or row["name"],
                 "repo": row.get("repo"),
@@ -843,7 +856,7 @@ class Resume(Launch):
             "forked_from": row["agent_id"],
             "launch_kind": a.kind if a.kind is not None else row.get("launch_kind"),
             "mode": self.mode,
-            "placement": None,
+            "placement": self.placement_value(),
             "term_placement": a.term_placement or row.get("term_placement"),
             "name": a.name or row["name"],
             "repo": row.get("repo"),
@@ -912,6 +925,16 @@ class Resume(Launch):
         ):  # the cwd rule is first (interface.md, Third-party runs)
             self.check_session_dir_for_result_file()
         self.resume_cwd = cwd
+        if self.windowed:
+            self.window_preflight(
+                run_id,
+                classification.run_kind,
+                self.preflight_labels(run_id),
+                cwd,
+                self_path,
+                name=self.args.name or source_row["name"],
+                term_placement=source_row.get("term_placement"),
+            )
         self.take_holds(run_id, cwd)  # step 6
         # The session (step 7).
         spec = self.build_spec(run_id, None, cwd, copies)
@@ -1146,7 +1169,7 @@ class Resume(Launch):
             "run": result.run,
             "run_kind": classification.run_kind,
             "mode": self.mode,
-            "placement": None,
+            "placement": self.placement_value(),
             "agent_spawn_path": self_path,
             "state_dir": self.state_dir,
             "config_path": self.inv.config_file,
@@ -1162,6 +1185,8 @@ class Resume(Launch):
             changes["cwd"] = cwd
         if self.wt_argv is not None:
             changes["wtctl_path"] = shlex.join(self.wt_argv)
+        if self.windowed and self.term_argv is not None:
+            changes["termctl_path"] = shlex.join(self.term_argv)
         if self.source_session is None and not self.fork:
             changes["settings"] = {
                 "settings": self.resumed_settings(),
@@ -1177,7 +1202,7 @@ class Resume(Launch):
                     {
                         "plan_run_kind": classification.run_kind,
                         "mode": self.mode,
-                        "placement": None,
+                        "placement": self.run_placement(),
                         "cwd": cwd,
                         "reads_third_party": classification.reads_third_party,
                         "outcome_token": token,
@@ -1627,11 +1652,41 @@ class Resume(Launch):
                 *self.backend.audit_flags(),
                 "--json",
             ]
+            term_plan: dict[str, Any] | None = None
+            if self.windowed and refuse is None:
+                window = self.window_preflight(
+                    run_id,
+                    classification.run_kind,
+                    self.preflight_labels(run_id),
+                    cwd,
+                    resolve_self(),
+                    name=self.args.name or row["name"],
+                    term_placement=row.get("term_placement"),
+                )
+                term_plan = self.termctl_backend().placements(window)
             return self.dry_plan(
-                row, cs_argv, plan, classification.reads_third_party, refuse, argv, names
+                row,
+                cs_argv,
+                plan,
+                classification.reads_third_party,
+                refuse,
+                argv,
+                names,
+                term_plan,
             )
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
+
+    def preflight_labels(self, run_id: str) -> list[str]:
+        """The labels the window will carry (the agent's, plus the ones given now)."""
+        assert self.store is not None
+        stored = (
+            [] if self.fork and not self.agent_inserted else self.store.get_labels(run_id).texts()
+        )
+        return [*stored, *(t for t in self.new_labels.texts() if t not in stored)]
+
+    def term_override_audit(self, result: str, agent_id: str) -> None:
+        self.audit_one("resume_escalation_override", result, agent_id)
 
     def dry_run_rules(
         self, classification: third_party.Classification, cwd: str | None
@@ -1657,6 +1712,7 @@ class Resume(Launch):
         would_refuse: str | None,
         argv: list[str] | None,
         names: Sequence[str] = (),
+        term_plan: dict[str, Any] | None = None,
     ) -> Outcome:
         a = self.args
         settings = {
@@ -1667,7 +1723,7 @@ class Resume(Launch):
             {
                 "kind": self.kind_flag,
                 "mode": self.mode,
-                "placement": None,
+                "placement": self.placement_value(),
                 "term_placement": a.term_placement or row.get("term_placement"),
                 "name": a.name or row.get("name"),
                 "repo": row.get("repo"),
@@ -1693,9 +1749,13 @@ class Resume(Launch):
             "reads_third_party": reads,
             "session_plan": session_plan,
             "would_refuse": would_refuse,
-            "tools": {"claude-session": list(cs_argv), "termctl": None, "wtctl": self.wt_argv},
+            "tools": {
+                "claude-session": list(cs_argv),
+                "termctl": self.term_argv if self.windowed else None,
+                "wtctl": self.wt_argv,
+            },
             "worktree_plan": None,
-            "term_plan": None,
+            "term_plan": term_plan,
             "session_start_argv": argv or [],
             "hooks": [
                 {"hook": h["hook"], "cmd": h["cmd"], "source": "flag"} for h in self.run_hooks

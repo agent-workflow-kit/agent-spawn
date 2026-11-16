@@ -1,10 +1,17 @@
 """Fake ``termctl`` (interface 0.1.0-design).
 
 Implemented commands: ``open`` (also ``--dry-run``), ``show``, ``exists``, ``list``, ``rename``,
-``mark``, ``unmark``, ``focus``, ``close`` and ``label add|remove``. ``placements`` exits 1 with
-``fake_unsupported``. Panes opened by ``open`` live in ``<FAKEBIN_LOG>.panes.json`` (keyed by
-socket path), so ``show``, ``list``, ``close`` and ``exists`` see them and an unknown id exits
-10. No tmux is involved. See ``tests/fakebin/FIDELITY.md``.
+``mark``, ``unmark``, ``focus``, ``close``, ``label add|remove`` and ``placements`` (the built-in
+placement only). Panes opened by ``open`` live in ``<FAKEBIN_LOG>.panes.json`` (keyed by socket
+path), so ``show``, ``list``, ``close`` and ``exists`` see them and an unknown id exits 10.
+Without ``FAKEBIN_TMUX`` no tmux is involved. With ``FAKEBIN_TMUX=<tmux binary>`` (a process
+test's private server, chosen with ``TERMCTL_SOCKET=<socket path>``) ``open`` really starts its
+argv in a new tmux session, ``list`` and ``show`` take the pane's state from tmux and ``close``
+kills the pane. See ``tests/fakebin/FIDELITY.md``.
+
+``open --placement`` must name a defined placement: ``default`` and the names in the environment
+variable ``FAKEBIN_PLACEMENTS`` (comma separated); anything else is a usage error, exit 2, as in
+termctl. A scripted ``open`` response with ``after_create: true`` applies after the pane exists.
 """
 
 from __future__ import annotations
@@ -12,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -131,6 +139,96 @@ def canonical_socket(path: str) -> str:
     return os.path.join(os.path.realpath(head), tail)
 
 
+def tmux_bin() -> str | None:
+    return os.environ.get("FAKEBIN_TMUX") or None
+
+
+def tmux(sock: str, *args: str) -> subprocess.CompletedProcess[str]:
+    """One call of the process test's private tmux server (``-f /dev/null -S <socket>``)."""
+    env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
+    env.setdefault("TERM", "xterm")
+    binary = tmux_bin()
+    assert binary is not None
+    return subprocess.run(
+        [binary, "-f", "/dev/null", "-S", sock, *args],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        env=env,
+        timeout=30,
+        check=False,
+    )
+
+
+def sync_from_tmux(sock: str) -> None:
+    """Take every pane's state from the private tmux server: a pane tmux no longer lists is
+    gone, a dead one carries its exit status."""
+    if tmux_bin() is None:
+        return
+    done = tmux(sock, "list-panes", "-a", "-F", "#{pane_id} #{pane_dead} #{pane_dead_status}")
+    seen: dict[str, tuple[bool, int | None]] = {}
+    if done.returncode == 0:
+        for line in done.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                status = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+                seen[parts[0]] = (parts[1] == "1", status)
+
+    def change(data: dict[str, dict[str, dict[str, Any]]]) -> None:
+        panes = data.get(sock, {})
+        for pane_id in list(panes):
+            info = seen.get(panes[pane_id]["pane_id"])
+            if info is None:
+                del panes[pane_id]
+            elif info[0]:
+                panes[pane_id]["state"] = "dead"
+                panes[pane_id]["exit_status"] = info[1]
+
+    update_panes(change)
+
+
+def start_in_tmux(
+    sock: str, number: int, name: str, cwd: str, argv: list[str], keep: str
+) -> tuple[str, int]:
+    """A new tmux session whose only pane runs ``argv`` directly; returns tmux's pane id and
+    the pane's PID."""
+    remain = {"never": "off", "failed": "failed", "always": "on"}[keep]
+    tmux(
+        sock,
+        "start-server",
+        ";",
+        "set-option",
+        "-g",
+        "exit-empty",
+        "off",
+        ";",
+        "set-option",
+        "-g",
+        "remain-on-exit",
+        remain,
+    )
+    done = tmux(
+        sock,
+        "new-session",
+        "-d",
+        "-s",
+        f"s{number}",
+        "-n",
+        name,
+        "-c",
+        cwd,
+        "-P",
+        "-F",
+        "#{pane_id} #{pane_pid}",
+        "--",
+        *argv,
+    )
+    fields = done.stdout.split()
+    if done.returncode != 0 or len(fields) != 2 or not fields[1].isdigit():
+        raise Exit(1, f"fakebin: tmux new-session failed: {done.stderr.strip()}\n")
+    return fields[0], int(fields[1])
+
+
 def pane_view(pane: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "id name display_name marker marker_text labels placement session pane_id window_id "
@@ -146,6 +244,7 @@ def resolve(ctx: Context, p: Parsed, raw: str, *, missing_ok: bool = False) -> t
     if not re.fullmatch(r"[a-z2-7]{4,8}", body):
         ctx.usage(f"invalid pane id: {raw!r}")
     sock = socket_path(ctx, p)
+    sync_from_tmux(sock)
     panes = load_panes().get(sock, {})
     matches = sorted(i for i in panes if i.startswith(f"tc-{body}"))
     if len(body) == 8:
@@ -203,8 +302,6 @@ def dispatch(ctx: Context) -> tuple[int, Any, str]:
     command, rest = find_command(ctx, argv)
     if command not in SPECS:
         ctx.usage(f"unknown command: {command!r}")
-    if command == "placements":
-        ctx.fail(1, "fake_unsupported", "the fake does not implement 'placements'")
     if command == "label":
         # The action is the first positional once the global value flags are skipped, so
         # `--socket PATH label add ...` and `label add --socket PATH ...` are the same call.
@@ -315,6 +412,9 @@ def do_open(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         env_names.append(var)
     if (placement := p.get("--placement")) is not None:
         require_pattern(placement, g.PLACEMENT, "--placement")
+        defined = {"default", *filter(None, os.environ.get("FAKEBIN_PLACEMENTS", "").split(","))}
+        if placement not in defined:
+            ctx.usage(f"--placement {placement!r} is not defined in config (placements)")
     if (session := p.get("--session")) is not None:
         require_pattern(session, g.SESSION_NAME, "--session")
     target = p.get("--target")
@@ -349,6 +449,7 @@ def do_open(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         os.path.basename(program) if valid_name(os.path.basename(program)) else "command"
     )
     if p.has("--dry-run"):
+        ctx.check_scripted_error("open")  # a dry run exits as a real run would (tmux checks)
         out = {
             "dry_run": True,
             "id": "tc-aaaaaaaa",
@@ -372,9 +473,15 @@ def do_open(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
             "tmux_commands": [],
         }
         return 0, out, "open"
-    ctx.check_scripted_error("open")
+    if not ctx.response("open").get("after_create"):
+        ctx.check_scripted_error("open")  # a refusal creates nothing
     number = counter("tc")
     pane_id = base32_id("tc-", number)
+    real_pane, real_pid = (
+        start_in_tmux(sock, number, pane_name, cwd, argv, keep)
+        if tmux_bin() is not None
+        else (None, None)
+    )
     pane: dict[str, Any] = {
         "id": pane_id,
         "name": pane_name,
@@ -384,17 +491,19 @@ def do_open(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         "labels": sorted(set(labels)),
         "placement": placement or "default",
         "session": session or "termctl",
-        "pane_id": f"%{number}",
+        "pane_id": real_pane if real_pane is not None else f"%{number}",
         "window_id": f"@{number}",
         "socket_path": sock,
         "created": CREATED,
-        "pid": 40000 + number,
+        "pid": real_pid if real_pid is not None else 40000 + number,
         "state": "running",
         "exit_status": None,
         "exit_signal": None,
         "keep_on_exit": keep,
     }
     update_panes(lambda data: data.setdefault(sock, {}).__setitem__(pane_id, pane))
+    # `after_create` in a scripted response: the call fails (or hangs) once the pane exists, as
+    # when termctl is killed or fails after creating it; `apply_rule` applies the script.
     out = {**pane_view(pane), "focused": False, "decision_ids": p.multi("--decision-id")}
     return 0, out, "open"
 
@@ -425,6 +534,7 @@ def do_list(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
     for label in p.multi("--label"):
         require_pattern(label, g.LABEL, "label")
     sock = socket_path(ctx, p)
+    sync_from_tmux(sock)
     wanted = set(p.multi("--label"))
     panes = [
         pane_view(pane)
@@ -566,6 +676,8 @@ def do_close(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         return 0, out, "close"
     ctx.check_scripted_error("close")
     ctx.behave("close")
+    if tmux_bin() is not None:
+        tmux(sock, "kill-pane", "-t", pane["pane_id"])
     update_panes(lambda data: data[sock].pop(pane_id, None))
     out = {
         "id": pane_id,
@@ -584,7 +696,35 @@ def do_close(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
     return 0, out, "close"
 
 
+def do_placements(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
+    if p.positionals:
+        ctx.usage("placements takes no positional arguments")
+    labels = p.multi("--label")
+    for label in labels:
+        require_pattern(label, g.LABEL, "label")
+    if len(labels) > 32:
+        ctx.usage("at most 32 --label values")
+    out: dict[str, Any] = {
+        "placements": {
+            "default": {
+                "session": "termctl",
+                "target": "window",
+                "max_panes": 1,
+                "layout": "tiled",
+                "group_by": None,
+                "origin": "built-in",
+            }
+        },
+        "rules": [],
+        "match": None,
+    }
+    if labels:
+        out["match"] = {"labels": sorted(set(labels)), "rule": None, "placement": "default"}
+    return 0, out, "placements"
+
+
 HANDLERS: dict[str, Callable[[Context, Parsed], tuple[int, Any, str]]] = {
+    "placements": do_placements,
     "open": do_open,
     "show": do_show,
     "exists": do_exists,

@@ -108,6 +108,13 @@ def script_live_run(fakebin: Fakebin, *, times: int | None = None) -> None:
     )
 
 
+def script_done_run(fakebin: Fakebin) -> None:
+    """The run ends `done`: `exec` finishes with that outcome and `status` reports it, so a test
+    that depends on a finished run does not rely on the fake's default."""
+    fakebin.script("claude-session", "exec", outcome="done")
+    fakebin.script("claude-session", "status", outcome="done")
+
+
 def script_hung_exec(fakebin: Fakebin) -> None:
     """`claude-session exec` runs until it is signaled (then it ends `killed`)."""
     fakebin.script("claude-session", "exec", hang=True)

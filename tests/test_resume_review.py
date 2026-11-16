@@ -420,8 +420,16 @@ def test_the_mode_follows_the_last_unpromoted_run(env: Env, fakebin: Fakebin) ->
     with env.store() as store:
         with store.lease(lease_key(agent_id)) as lease:
             store.put_run(lease, agent_id, 2, {"mode": "interactive"})
+    # interactive: the start is interactive and a window is wanted. The fake termctl has no tmux
+    # here; it is scripted to report no pane PID, so the handoff fails whatever processes the
+    # host has (tests/test_windows.py has the real windows).
+    fakebin.script("termctl", "open", times=1)  # the preflight
+    fakebin.script("termctl", "open", merge={"pid": None})
     done = env.run("resume", agent_id, "--json")
-    assert done.returncode == 1, (done.stdout, done.stderr)  # interactive: not implemented yet
+    assert "--mode=interactive" in starts(fakebin)[-1]
+    assert done.returncode == 12, (done.stdout, done.stderr)
+    error = json.loads(done.stdout)["error"]
+    assert (error["code"], error["details"]["cause"]) == ("handoff_failed", "no_pane_pid")
     assert env.agent(agent_id)["status"] == "parked"
 
 

@@ -7,35 +7,45 @@ started (by polling ``status``; the relay is only an early wake-up), reads the o
 that cannot start, or ends in its launch phase, parks the agent per the run that triggered it
 (the chain rule). An ephemeral agent whose run ended ``done`` hands over to teardown.
 
-TODO(#27): windows, markers and the handoff (``--handoff``, interactive hosting).
+Window hosting (interactive, ``--handoff``): the pane's session leader is this process, so a
+closed window hangs up only it. It adopts the launcher's environment over the handoff, ignores
+SIGINT (the terminal delivers it to ``claude``) and SIGQUIT, forwards SIGHUP and SIGTERM to
+``exec``, applies the window markers from the recorded state and never writes to its terminal
+(a write after a hangup fails with EIO): errors are logged, never printed.
+
 TODO(#29): promotion and host mode (``--host``).
 """
 
 from __future__ import annotations
 
+import dataclasses
+import math
 import os
 import shlex
 import signal
 import subprocess
 import time
+from collections.abc import Callable
 from types import FrameType
 from typing import Any
 
-from . import chain, lifecycle, procs
+from . import chain, handoff, lifecycle, procs
 from . import gateway as gw
 from . import hooks as hooklib
 from . import teardown as teardown_module
 from .agent_view import outcome_object, ts
 from .chain import Final, RunCtx
-from .config import Config
+from .config import Config, load_config
 from .outcome_table import CANCEL_END_REASONS, park_row
-from .output import CliError, Outcome, PayloadKind
+from .output import CliError, Outcome, PayloadKind, error_outcome
 from .records import RecordsError, append_log, parse_record_ts
 from .session_backend import RunOutcome, SessionBackend
 from .store import Store, StoreError, StoreMissing
+from .term import ATTENTION_MARKER, TermBackend
 
 STATUS_EVERY = 1.0  # seconds between looks at `claude-session status` and the outbox
 STATUS_TIMEOUT = 5.0  # seconds the watch loop's own `status` poll may take
+MARKER_BACKOFF = 30.0  # seconds between window marker attempts after a termctl failure
 RELAY_EVERY = 0.25  # seconds between looks at the relay's records (an early wake-up)
 TICK = 0.05  # seconds between looks at `exec`
 SUPERVISOR_ACTOR = "auto:agent-spawn"
@@ -44,9 +54,12 @@ DONE = Outcome(0, {}, PayloadKind.COMMAND, quiet=True)
 OUTCOME_TRIES = 3  # reads of the final outcome before giving up
 OUTCOME_RETRY = 0.2  # seconds between them
 EXEC_GRACE = 30.0  # seconds `exec` gets after SIGTERM when this supervisor fails
-# TODO(#27): an interactive run ignores SIGINT (the terminal delivers it to `claude`); until
-# interactive hosting lands every supervisor is headless, so SIGINT is forwarded.
+# A headless run forwards SIGINT; an interactive (window-hosted) run ignores it: the terminal
+# delivers it to `claude` itself (interface.md, Signals).
 FORWARDED = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+FORWARDED_INTERACTIVE = (signal.SIGTERM, signal.SIGHUP)
+#: The relay states that make a window ask for attention.
+ATTENTION_STATES = frozenset({"needs-input", "idle"})
 #: Outcomes a run can end with in its launch phase (a supervisor-initiated run that does so
 #: stops the chain early).
 LAUNCH_PHASE_OUTCOMES = frozenset({"not-started", "vetoed", "escalated"})
@@ -62,7 +75,8 @@ class Signals:
     in progress); the loop logs what ``take_sent`` returns.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, interactive: bool = False) -> None:
+        self.forwarded = FORWARDED_INTERACTIVE if interactive else FORWARDED
         self.received: list[int] = []
         self.forwarder: procs.SignalForwarder | None = None
         self.sent: list[procs.SignalOutcome] = []
@@ -70,7 +84,7 @@ class Signals:
     def handle(self, signum: int, frame: FrameType | None) -> None:
         self.received.append(signum)
         forwarder = self.forwarder
-        if forwarder is None or signum not in FORWARDED:
+        if forwarder is None or signum not in self.forwarded:
             return
         try:
             outcome = forwarder.forward(signum)
@@ -104,6 +118,12 @@ class Supervisor:
         self.teardown = self.ephemeral_teardown
         self.relay_seen: tuple[object, ...] = ()
         self.fallback_sent: set[int] = set()
+        self.term: TermBackend | None = None  # window markers: only a window-hosted supervisor
+        self.marked: dict[int, bool] = {}  # run -> the marker state last applied (attention on)
+        self.marker_settled: set[int] = set()  # runs whose pane is gone: no more marker calls
+        self.marker_retry_at: dict[int, float] = {}  # run -> earliest next attempt after a failure
+        self.marker_warned: dict[int, str] = {}  # run -> the failure last logged (once per change)
+        self.clock: Callable[[], float] = time.monotonic
 
     def log(self, event: str, *, level: str = "info", **fields: Any) -> None:
         try:
@@ -151,10 +171,14 @@ class Supervisor:
 
     def run(self) -> Outcome:
         args = self.inv.args
-        if args.host or args.handoff is not None:
+        if args.host:
             raise CliError.of(
-                "internal", "supervise --host and --handoff are not implemented yet (issue #27)"
-            )  # TODO(#27): windows, the handoff and host mode.
+                "internal", "supervise --host is not implemented yet (issue #29)"
+            )  # TODO(#29): host mode.
+        if args.handoff is not None:
+            refused = self.adopt_handoff()
+            if refused is not None:
+                return refused
         try:
             self.store = Store.open(self.state_dir, create=False, gateway=self.gateway)
         except StoreMissing:
@@ -165,6 +189,39 @@ class Supervisor:
             return self.supervise(row)
         finally:
             self.store.close()
+
+    # -- the window handoff --------------------------------------------------------------------
+
+    def adopt_handoff(self) -> Outcome | None:
+        """Receive the launcher's environment over the handoff socket and become its owner: the
+        process environment is replaced (the six terminal variables stay the pane's) and the
+        config is loaded again from it, so the launcher's ``AGENT_SPAWN_*`` overrides apply
+        exactly as they do for a detached supervisor (decision of #11). ``None`` on success; on
+        failure the exit-1 outcome (nothing was started; ``handoff_failed`` is in the log)."""
+        args = self.inv.args
+        try:
+            seconds = float(args.handoff_timeout)
+        except (TypeError, ValueError):
+            seconds = math.nan
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise CliError.usage("supervise: --handoff-timeout must be a positive number")
+        try:
+            env = handoff.receive_environment(
+                args.handoff,
+                timeout=handoff.client_deadline(seconds),
+                pane_env=os.environ,
+                state_dir=self.state_dir,
+                agent_id=self.agent_id,
+                gateway=self.gateway,
+            )
+        except handoff.HandoffFailed:
+            return quiet_error(CliError("failed", "the environment handoff failed", exit_code=1))
+        os.environ.clear()
+        os.environ.update(env)
+        loaded = load_config(self.inv.config_file, environ=env)
+        self.inv.config = loaded.config
+        self.config = loaded.config
+        return None
 
     def backend(self, row: dict[str, Any], *, timeout: float | None = None) -> SessionBackend:
         extra: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
@@ -183,6 +240,12 @@ class Supervisor:
         poller = self.backend(row, timeout=STATUS_TIMEOUT)  # the watch loop never blocks long
         session = row["csession_id"]
         run = row["run"]
+        stored_term = row.get("termctl_path")
+        if self.inv.args.handoff is not None and isinstance(stored_term, str) and stored_term:
+            try:
+                self.term = TermBackend(shlex.split(stored_term), gateway=self.gateway)
+            except ValueError:
+                self.log("warning", level="warn", message="the stored termctl path is unusable")
         if not isinstance(session, str) or not isinstance(run, int):
             raise CliError.of("internal", "the agent has no session to supervise")
         run_row = store.get_run(self.agent_id, run) or {}
@@ -262,14 +325,18 @@ class Supervisor:
         return bool(taken)
 
     def note_signal(self, received: int) -> None:
-        # TODO(#27): SIGINT of an interactive run is ignored, not a termination.
-        if received in FORWARDED:
+        if received in self.signals.forwarded:
             self.terminated = True
 
     def spawn_exec(self, row: dict[str, Any], session: str) -> subprocess.Popen[bytes]:
         assert self.store is not None
         argv = [*shlex.split(row["claude_session_path"]), "exec", "--session-id", session]
-        child = self.gateway.spawn(argv, stdin=gw.DEVNULL)
+        if self.inv.args.handoff is not None:
+            # A window: `exec` is in the pane's foreground process group with the terminal as
+            # its stdin, stdout and stderr (a closed window hangs up only this process).
+            child = self.gateway.spawn(argv)
+        else:
+            child = self.gateway.spawn(argv, stdin=gw.DEVNULL)
         self.child = child
         self.forwarder = None
         self.signals.forwarder = None
@@ -309,6 +376,7 @@ class Supervisor:
                     next_status = now + STATUS_EVERY
                     if not ctx.started:
                         ctx.started = self.look_started(backend, session, ctx)
+                    self.apply_marker(ctx)
                     self.deliver()
                 self.gateway.sleep(TICK)
         except BaseException:
@@ -318,6 +386,53 @@ class Supervisor:
             self.signals.forwarder = None  # `exec` is gone: nothing to forward to
             for sent in self.signals.take_sent():
                 self.log_sent(sent)
+
+    def apply_marker(self, ctx: RunCtx) -> None:
+        """The window marker of this run from the recorded (relayed) state: ``needs-input`` or
+        ``idle`` set ``attention``, ``working`` clears it. Only the current run's window is
+        touched; a termctl failure is a warning and the next look retries."""
+        term = self.term
+        if term is None or self.store is None:
+            return
+        if self.terminated or ctx.run in self.marker_settled:
+            return  # a hangup or stop is under way, or the pane is gone: leave the window alone
+        if self.clock() < self.marker_retry_at.get(ctx.run, 0.0):
+            return
+        try:
+            run_row = self.store.get_run(self.agent_id, ctx.run) or {}
+        except StoreError:
+            return
+        term_id, socket_path = run_row.get("term_id"), run_row.get("socket_path")
+        if not isinstance(term_id, str) or not isinstance(socket_path, str):
+            return
+        state, activity = run_row.get("session_state"), run_row.get("activity")
+        if state in ATTENTION_STATES or activity == "idle":
+            wanted = True
+        elif state == "working" or activity == "working":
+            wanted = False
+        else:
+            return
+        if self.marked.get(ctx.run) == wanted or (ctx.run not in self.marked and not wanted):
+            return
+        try:
+            if wanted:
+                term.mark(term_id, socket_path, ATTENTION_MARKER)
+            else:
+                term.unmark(term_id, socket_path)
+        except CliError as error:
+            if error.tool == "termctl" and error.exit_code == 10:
+                self.marker_settled.add(ctx.run)  # the pane is gone: nothing to mark
+                self.log("warning", message="the window is gone: no more markers")
+                return
+            self.marker_retry_at[ctx.run] = self.clock() + MARKER_BACKOFF
+            reason = f"window marker failed: {error.code}"
+            if self.marker_warned.get(ctx.run) != reason:
+                self.marker_warned[ctx.run] = reason
+                self.log("warning", level="warn", message=reason)
+            return
+        self.marker_warned.pop(ctx.run, None)
+        self.marker_retry_at.pop(ctx.run, None)
+        self.marked[ctx.run] = wanted
 
     def relay_changed(self) -> bool:
         """The relay recorded something new for the agent: poll `status` now (a wake-up only)."""
@@ -354,7 +469,7 @@ class Supervisor:
         SIGCONT follows every SIGTERM (``procs.forward_signal``). The next link of the
         cancellation chain, `claude`, is claude-session's: `exec` forwards to its own child.
         """
-        if received not in FORWARDED:
+        if received not in self.signals.forwarded:
             return
         if self.forwarder is None:
             # `exec`'s identity could not be read: signal the child we spawned (once).
@@ -631,19 +746,32 @@ class Supervisor:
             pass
 
 
+def quiet_error(error: CliError) -> Outcome:
+    """The outcome of a failed supervisor: the exit code and envelope, printed nowhere (a window
+    supervisor writes nothing to its terminal; the log has the reason)."""
+    return dataclasses.replace(error_outcome(error), quiet=True)
+
+
 def supervise(inv: Any) -> Outcome:
-    signals = Signals()
-    restore = procs.install_signal_handlers(
-        {
-            signal.SIGTERM: signals.handle,
-            signal.SIGHUP: signals.handle,
-            signal.SIGINT: signals.handle,  # headless: forwarded (interface.md, Signals)
-            signal.SIGQUIT: signal.SIG_IGN,
-        }
-    )
+    windowed = inv.args.handoff is not None
+    signals = Signals(interactive=windowed)
+    handlers: dict[int, Any] = {
+        signal.SIGTERM: signals.handle,
+        signal.SIGHUP: signals.handle,
+        signal.SIGQUIT: signal.SIG_IGN,
+    }
+    # Headless: SIGINT is forwarded. A window: ignored, the terminal delivers it to `claude`.
+    handlers[signal.SIGINT] = signal.SIG_IGN if windowed else signals.handle
+    restore = procs.install_signal_handlers(handlers)
     # The launcher exec'd us with these blocked: deliver what arrived meanwhile to the handlers.
     signal.pthread_sigmask(signal.SIG_UNBLOCK, FORWARDED)
+    supervisor = Supervisor(inv, signals)
     try:
-        return Supervisor(inv, signals).run()
+        return supervisor.run()
+    except CliError as error:
+        if not windowed and not inv.args.host:
+            raise  # a headless supervisor's stderr is its log; a direct run shows the refusal
+        supervisor.log("warning", level="error", message=f"supervise failed: {error.code}")
+        return quiet_error(error)
     finally:
         restore()

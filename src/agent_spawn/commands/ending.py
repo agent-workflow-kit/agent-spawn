@@ -14,7 +14,7 @@ def stop(inv: Invocation) -> Outcome:
 
 
 def teardown(inv: Invocation) -> Outcome:
-    # TODO(#27): windows; TODO(#32): the pre-teardown hook (see teardown.py).
+    # TODO(#32): the pre-teardown hook (see teardown.py).
     return teardown_module.teardown_command(inv)
 
 

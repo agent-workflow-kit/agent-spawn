@@ -11,6 +11,7 @@ raw.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
 import pwd
 import re
@@ -24,7 +25,7 @@ from . import __version__, gateway, relay
 from . import launch as launch_module
 from .commands.base import Invocation
 from .commands.table import HANDLERS
-from .config import load_config
+from .config import Config, LoadedConfig, default_config_path, load_config
 from .ids import agent_id_arg, check_agent_id_text
 from .labels import label_arg, parse_run_labels, parse_user_label, parse_user_labels, selector_arg
 from .output import (
@@ -540,11 +541,17 @@ def parse_invocation(argv: Sequence[str]) -> Invocation:
     try:
         # Decision (#11): the launcher's AGENT_SPAWN_* overrides apply to everything it starts.
         # A detached supervisor inherits the launcher's environment, so this load already sees
-        # them. TODO(#27): a window supervisor loads this config from the tmux pane's environment
-        # and must re-apply the overrides after it adopts the handoff environment.
+        # them. A window supervisor has only the tmux pane's environment until the handoff: its
+        # authoritative config is the one loaded again from the launcher's environment
+        # (supervise.Supervisor.adopt_handoff), so a config that fails to load here must not stop
+        # it before the handoff (the launcher would only see a handoff timeout).
         loaded = load_config(named, must_exist=named is not None and not internal)
     except CliError as error:
-        raise ConfigFailure(error, decision_ids=capped, result_file=result_file) from None
+        if not (key == "supervise" and (args.handoff is not None or args.host)):
+            raise ConfigFailure(error, decision_ids=capped, result_file=result_file) from None
+        loaded = LoadedConfig(
+            Config(), os.path.abspath(named or default_config_path(os.environ)), ()
+        )
     try:
         tty = stdin_is_tty()
         explicit = args.actor is not None
@@ -675,7 +682,7 @@ def _write(stream: Any, text: str) -> None:
     try:
         stream.write(text)
         stream.flush()
-    except BrokenPipeError:
+    except OSError:  # a broken pipe, or EIO after the terminal hung up
         _silence(stream)
 
 
@@ -769,9 +776,18 @@ def _run(inv: Invocation) -> Outcome:
             render_json(outcome.payload)  # a payload that is not JSON is an internal error
         return outcome
     except CliError as error:
-        return error_outcome(error, inv.decision_ids)
+        return _silenced(inv, error_outcome(error, inv.decision_ids))
     except Exception as exc:
-        if inv.verbose:
+        if inv.verbose and inv.command != "supervise":
             _write(sys.stderr, safe_text(traceback.format_exc(), multiline=True))
         error = CliError.of("internal", f"internal error ({type(exc).__name__})")
-        return error_outcome(error, inv.decision_ids)
+        return _silenced(inv, error_outcome(error, inv.decision_ids))
+
+
+def _silenced(inv: Invocation, outcome: Outcome) -> Outcome:
+    """A window-hosted ``supervise`` prints nothing: its terminal may be gone (a write after a
+    hangup fails with EIO) and its reasons go to its log. A headless one writes to its log
+    file already (its stderr), and a direct run shows why it refused."""
+    if inv.command in INTERNAL_COMMANDS and (inv.args.handoff is not None or inv.args.host):
+        return dataclasses.replace(outcome, quiet=True)
+    return outcome

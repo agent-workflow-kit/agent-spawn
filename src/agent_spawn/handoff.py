@@ -24,12 +24,13 @@ to the window process (the *client*, ``supervise --handoff``) over a Unix stream
 The environment is never put in argv, a log record, an exception message or a file. Messages
 and log details name only a cause (``HandoffFailed.cause``), never a value.
 
-Seams for later issues:
+Users and seams of later issues:
 
-* TODO(#27): the launcher/resume wiring calls ``create`` before ``termctl open`` and ``serve``
-  after it (``pane_pid`` and ``pane_state`` come from termctl's JSON), and ``supervise
-  --handoff`` calls ``receive_environment`` and exits 1 on ``HandoffFailed``. A window
-  supervisor must re-apply its ``AGENT_SPAWN_*`` overrides after adopting the environment.
+* The launcher/resume wiring (``launch.Launch.place_window``) calls ``create`` before ``termctl
+  open`` and ``serve`` after it (``pane_pid`` and ``pane_state`` come from termctl's JSON);
+  ``supervise --handoff`` calls ``receive_environment``, exits 1 on ``HandoffFailed`` and loads
+  its config again from the received environment, so the launcher's ``AGENT_SPAWN_*`` overrides
+  apply (``supervise.Supervisor.adopt_handoff``).
 * TODO(#29): ``supervise --host`` uses the same client.
 * TODO(#33): ``reconcile`` removes handoff directories whose ``owner`` is dead (``read_owner``
   and ``handoff_root`` are the helpers for it).
