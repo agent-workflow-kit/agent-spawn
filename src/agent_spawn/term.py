@@ -287,29 +287,29 @@ class TermBackend:
         return pane
 
     def mark(self, term_id: str, socket_path: str, marker: str = ATTENTION_MARKER) -> None:
-        self._change(["mark", term_id, marker], socket_path)
+        self._change(["mark", term_id, marker], term_id, socket_path)
 
     def unmark(self, term_id: str, socket_path: str) -> None:
-        self._change(["unmark", term_id], socket_path)
+        self._change(["unmark", term_id], term_id, socket_path)
 
     def label_add(self, term_id: str, socket_path: str, pairs: Sequence[str]) -> None:
-        self._change(["label", "add", term_id, *pairs], socket_path)
+        self._change(["label", "add", term_id, *pairs], term_id, socket_path)
 
     def label_remove(self, term_id: str, socket_path: str, pairs: Sequence[str]) -> None:
-        self._change(["label", "remove", term_id, *pairs], socket_path)
+        self._change(["label", "remove", term_id, *pairs], term_id, socket_path)
 
-    def _change(self, args: Sequence[str], socket_path: str) -> None:
-        self._check_id(args)
+    def _change(self, args: Sequence[str], term_id: str, socket_path: str) -> None:
+        self._check_id(term_id)
         reply = self.call([*args, _flag("--socket", socket_path), "--json"])
         if reply.code != 0:
             raise self.fail(reply)
 
     @staticmethod
-    def _check_id(args: Sequence[str]) -> None:
-        for arg in args:
-            if TERM_ID.fullmatch(arg):
-                return
-        raise CliError("internal", "a termctl call without a pane id")
+    def _check_id(term_id: str) -> None:
+        """A pane id from the store is never trusted to be one: a value that is not termctl's id
+        grammar (a flag, say) never reaches argv."""
+        if TERM_ID.fullmatch(term_id) is None:
+            raise CliError("internal", "a termctl call with something that is not a pane id")
 
     def list_dead(self, agent_id: str, socket_path: str) -> list[str]:
         """The ids of the dead panes labeled ``agent=<agent_id>`` on one server."""
@@ -337,7 +337,7 @@ class TermBackend:
 
     def close(self, term_id: str, socket_path: str) -> None:
         """``termctl close`` of a dead pane (no ``--force``: a running pane exits 20)."""
-        self._check_id([term_id])
+        self._check_id(term_id)
         reply = self.call(
             ["close", term_id, _flag("--socket", socket_path), *self.audit_flags(), "--json"]
         )
