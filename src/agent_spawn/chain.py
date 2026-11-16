@@ -6,10 +6,10 @@ pre-start checks and the classification check like any other ``start``. A refusa
 or before ``start`` raises ``ChainFailure``; the supervisor then parks the agent per the run that
 triggered the chain (the chain rule), with the failure in ``post-park``.
 
-Of the five pre-start checks only 1 (the classification dry run) and 3 (the third-party cwd
-rule) run here.
-TODO(#21): checks 2, 4 and 5 (the records of the cwd, the throwaway check ``third_party_run`` and
-the holding of worktree records) join here once wtctl records exist.
+All five pre-start checks run here, before ``start``: the classification dry run, the records of
+the cwd (one ``wtctl list``), the cwd rule of a third-party-reading run or the throwaway check of
+a trusted one, and the holding of the worktree records of the cwd. A refusal or a failure of
+wtctl is a chain failure (``tool`` and ``reason`` of the refusal).
 TODO(#29): promotion is the other supervisor-initiated run; it will reuse this module.
 """
 
@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import shlex
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +36,7 @@ from .session_backend import (
     relay_hook,
 )
 from .store import StoreError
+from .worktrees import WtctlBackend, WtRecord, worktrees_containing
 
 if TYPE_CHECKING:
     from .supervise import Supervisor
@@ -308,22 +310,173 @@ def start_report_resume(
         remove_prompt(prompt)
 
 
+class _Wtctl:
+    """wtctl as the launcher resolved it, resolved on first use: config ``wtctl_cmd``, else the
+    absolute path stored with the agent. ``get()`` is ``None`` under ``wtctl_cmd: null`` (no
+    wtctl on this machine: no records) and raises exit 12 ``tool_missing`` (a chain failure)
+    when neither resolves, only once a lookup of the records of a cwd needs it."""
+
+    def __init__(self, sup: Supervisor, backend: SessionBackend, row: dict[str, Any]) -> None:
+        self._sup = sup
+        self._actor = backend.actor
+        self._row = row
+        self._backend: WtctlBackend | None = None
+
+    def get(self) -> WtctlBackend | None:
+        from .launch import resolve_tool  # late: launch is a big module, this is all we need
+
+        command = self._sup.config.wtctl_cmd
+        if command is None:
+            return None
+        if self._backend is None:
+            stored = self._row.get("wtctl_path")
+            try:
+                argv = resolve_tool(command, "wtctl")
+            except CliError as missing:
+                if not isinstance(stored, str) or not stored:
+                    raise
+                try:
+                    argv = resolve_tool(shlex.split(stored), "wtctl")
+                except (CliError, ValueError):
+                    raise missing from None
+            self._backend = WtctlBackend(
+                argv,
+                actor=self._actor,
+                decision_ids=self._row.get("decision_ids") or [],
+                gateway=self._sup.gateway,
+            )
+        return self._backend
+
+    def list_records(self) -> list[WtRecord]:
+        backend = self.get()
+        return backend.list_records() if backend is not None else []
+
+
+def _same_path(a: str, b: str) -> bool:
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except (ValueError, OSError):
+        return False
+
+
+def _real_cwd(cwd: object) -> str | None:
+    """The cwd of the triggering run as the rule judges it: ``session-dir`` as it is, a path by
+    its realpath, anything else (null, not a string, a path the OS refuses) as unknown."""
+    if not isinstance(cwd, str) or not cwd:
+        return None
+    if cwd == third_party.SESSION_DIR:
+        return cwd
+    try:
+        return os.path.realpath(cwd)
+    except (ValueError, OSError):
+        return None
+
+
+def _judge_cwd(
+    sup: Supervisor,
+    backend: SessionBackend,
+    wt: _Wtctl,
+    reads: bool,
+    session: str,
+    real: str | None,
+) -> bool:
+    """Pre-start checks 2 to 4 for one cwd: its records (one ``wtctl list``), the cwd rule of a
+    third-party-reading run or the throwaway check of a trusted one. Returns whether the cwd is
+    the session's own ``work/`` (it lies in no record: nothing to look up or hold)."""
+    session_work: str | None = None
+    if reads and real is not None and real != third_party.SESSION_DIR:
+        try:  # the one real path besides a throwaway root a third-party run may use
+            session_work = os.path.join(backend.status(session).csession_dir, "work")
+        except CliError:
+            session_work = None  # unknown: the rule fails closed
+    try:
+        in_work = session_work is not None and real == os.path.realpath(session_work)
+        needs = real is not None and real != third_party.SESSION_DIR and not in_work
+        records = wt.list_records() if needs else []
+        third_party.require_cwd_rule(reads, real, session_work=session_work, records=records)
+    except CliError as error:
+        if error.reason in ("third_party_cwd", "third_party_run"):
+            sup.log("third_party_refused", level="warn", details={"reason": error.reason})
+        raise failure_of(error) from None
+    return in_work
+
+
 def _pre_start_checks(
-    sup: Supervisor, backend: SessionBackend, spec: RunSpec, cwd: object
-) -> third_party.Classification:
-    """Pre-start checks 1 (the classification dry run) and 3 (the third-party cwd rule); checks
-    2, 4 and 5 are TODO(#21)."""
+    sup: Supervisor,
+    backend: SessionBackend,
+    spec: RunSpec,
+    row: dict[str, Any],
+    session: str,
+    cwd: object,
+) -> tuple[third_party.Classification, list[str], _Wtctl]:
+    """Pre-start checks 1 to 4 (the holds, check 5, follow in ``_take_holds``): the
+    classification dry run, then the records of the cwd, the cwd rule of a third-party-reading
+    run or the throwaway check of a trusted one. The chain passes no ``--cwd``: the run goes
+    where the plan says, so the plan's cwd is judged too when it is a real path other than the
+    recorded one. Returns the classification, the realpath cwds to hold (the session's own
+    ``work/`` and ``session-dir`` are left out: they lie in no record) and wtctl."""
     try:
         classification = backend.classify(spec)
     except CliError as error:
         raise failure_of(error) from None
-    if classification.reads_third_party:
-        try:
-            third_party.require_cwd_rule(True, cwd if isinstance(cwd, str) else None)
-        except CliError as error:
-            sup.log("third_party_refused", level="warn", details={"reason": error.reason})
-            raise failure_of(error) from None
-    return classification
+    reads = classification.reads_third_party
+    wt = _Wtctl(sup, backend, row)
+    real = _real_cwd(cwd)
+    holdable: list[str] = []
+    if not _judge_cwd(sup, backend, wt, reads, session, real) and real is not None:
+        holdable.append(real)
+    plan = _real_cwd(classification.cwd)
+    if plan is not None and plan != third_party.SESSION_DIR and plan != real:
+        if not _judge_cwd(sup, backend, wt, reads, session, plan):
+            holdable.append(plan)
+    return classification, [c for c in holdable if c != third_party.SESSION_DIR], wt
+
+
+def _take_holds(sup: Supervisor, wt: _Wtctl, cwds: list[str]) -> None:
+    """Pre-start check 5: hold every worktree record of the cwds the agent does not hold yet
+    (``wtctl adopt --holder``). Throwaways are never held. The records are looked up again, so a
+    record created since the checks is not missed."""
+    assert sup.store is not None
+    if not cwds:
+        return
+    store, agent_id = sup.store, sup.agent_id
+    try:
+        backend = wt.get()
+        if backend is None:
+            return
+        records = backend.list_records()
+        for cwd in cwds:
+            around = worktrees_containing(records, cwd)
+            held = {h["record_id"] for h in store.get_holds(agent_id)}
+            for record in around:
+                if record.id in held and agent_id in record.holders:
+                    continue  # both sides agree that the agent holds it
+                # idempotent: re-adds a lost holder
+                adopted, _ = backend.adopt(record.path, agent_id)
+                with store.lease(lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT) as lease:
+                    store.reacquire_hold(
+                        lease, agent_id, adopted.id, adopted.path, owned=adopted.owned is True
+                    )
+            _store_nearest(sup, around)
+    except CliError as error:
+        raise failure_of(error) from None
+
+
+def _store_nearest(sup: Supervisor, around: list[WtRecord]) -> None:
+    """No worktree was created or adopted at launch: the agent's ``worktree`` is the nearest
+    record it holds for its cwd (as the launcher does)."""
+    assert sup.store is not None
+    current = sup.store.get_agent(sup.agent_id)
+    if not around or current is None or current.get("wt_record_id") is not None:
+        return
+    nearest = max(around, key=lambda r: len(os.path.realpath(r.path)))
+    with sup.store.lease(lifecycle.lease_key(sup.agent_id), wait=lifecycle.LEASE_WAIT) as lease:
+        sup.store.update_agent(
+            lease,
+            sup.agent_id,
+            {"wt_record_id": nearest.id, "wt_path": nearest.path, "wt_owned": False},
+            touch=False,
+        )
 
 
 def _start(
@@ -339,9 +492,12 @@ def _start(
     assert sup.store is not None
     agent_id = sup.agent_id
     spec = RunSpec(agent_id=agent_id, mode="headless", resume=session, prompt_file=prompt)
-    classification = _pre_start_checks(sup, backend, spec, cwd)
+    classification, hold_cwds, wt = _pre_start_checks(sup, backend, spec, row, session, cwd)
     if sup.collect_signals():
         raise ChainCanceled  # no run exists yet
+    _take_holds(sup, wt, hold_cwds)
+    if sup.collect_signals():
+        raise ChainCanceled  # no run exists yet (a hold taken stays: teardown releases it)
     outcome_file = new_outcome_file(sup.state_dir, agent_id)
     token = os.path.basename(outcome_file).removesuffix(".json")
     relay = relay_hook(row["agent_spawn_path"], sup.state_dir, row["config_path"])
@@ -355,7 +511,7 @@ def _start(
         raise failure from None
     try:
         return _after_start(
-            sup, backend, session, started, classification, cwd, hooks, token, outcome_file
+            sup, backend, session, started, classification, cwd, hooks, token, outcome_file, wt
         )
     except (ChainFailure, ChainCanceled):
         raise
@@ -378,6 +534,7 @@ def _after_start(
     hooks: object,
     token: str,
     outcome_file: str,
+    wt: _Wtctl,
 ) -> RunCtx:
     assert sup.store is not None
     store, agent_id = sup.store, sup.agent_id
@@ -402,7 +559,7 @@ def _after_start(
                     "auto_resumed": True,
                 },
             )
-    _classification_check(sup, backend, started, classification, work, cwd, hooks, token)
+    _classification_check(sup, backend, started, classification, work, hooks, token, wt)
     if sup.collect_signals():
         # No `exec` child: cancel our own pending run, skip everything else, park.
         cancel_pending(sup, backend, session, started.run, hooks=hooks, token=token)
@@ -494,17 +651,27 @@ def _classification_check(
     started: StartResult,
     classification: third_party.Classification,
     work: str,
-    cwd: object,
     hooks: object,
     token: str,
+    wt: _Wtctl,
 ) -> None:
     assert sup.store is not None
+    looked_up: list[list[WtRecord]] = []
+
+    def rule_allows(actual: bool, run_cwd: str | None) -> bool:
+        # The run's actual cwd is judged by the records as they are now (one `wtctl list` for
+        # the whole check); a lookup error raises and cancels the run as unknown. The session's
+        # own `work/` lies in no record: no lookup for it.
+        if not looked_up:
+            in_work = run_cwd is not None and _same_path(run_cwd, work)
+            needs = run_cwd is not None and run_cwd != third_party.SESSION_DIR and not in_work
+            looked_up.append(wt.list_records() if needs else [])
+        return third_party.cwd_rule_allows(actual, run_cwd, session_work=work, records=looked_up[0])
+
     check = backend.check_classification(
         started,
         classification,
-        rule_allows=lambda actual, run_cwd: third_party.cwd_rule_allows(
-            actual, run_cwd, session_work=work
-        ),
+        rule_allows=rule_allows,
         # The supervisor does not know the launcher's `--result-file`; a mismatch toward
         # third-party-reading therefore cancels rather than continues (fail closed).
         result_file_allows=lambda: False,

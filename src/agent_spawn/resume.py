@@ -637,13 +637,17 @@ class Resume(Launch):
         reads = classification.reads_third_party
         self.enforce_rules(reads, cwd, self.records_for(cwd))
         if reads:
-            self.check_result_file_cwd(cwd)
+            self.check_cwd_result_file(cwd)
 
-    def check_result_file_cwd(self, cwd: str | None) -> None:
-        """A result file inside a third-party-reading run's cwd is refused and never written."""
+    def check_cwd_result_file(self, cwd: str | None) -> None:
+        """The third-party path rule of ``--result-file`` (interface.md, Result file), cwd part:
+        not inside the run's cwd (a throwaway's root). The source session's directory is checked
+        by ``check_session_dir_for_result_file``, after the cwd rule has judged the plan's cwd
+        too."""
         if cwd is not None and cwd != third_party.SESSION_DIR and self.result_file_inside([cwd]):
-            third_party.drop_result_file(self.inv)
-            raise CliError.usage("--result-file lies inside a third-party-reading run's cwd")
+            raise self.refuse_result_file(
+                "--result-file lies inside a third-party-reading run's cwd"
+            )
 
     def check_session_dir_for_result_file(self) -> None:
         """The source session's directory is known up front (unlike a launch's): a result file
@@ -1599,10 +1603,6 @@ class Resume(Launch):
                 refuse = "live"
             if refuse is None:
                 refuse = self.dry_run_rules(classification, cwd)
-            if refuse is None and classification.reads_third_party:
-                # the cwd rule came first; then the result-file checks, read-only
-                self.check_result_file_cwd(cwd)
-                self.check_session_dir_for_result_file()
             names = [] if copies is None else copies.input_names
             argv = [
                 *cs_argv,
@@ -1627,9 +1627,12 @@ class Resume(Launch):
         reads = classification.reads_third_party
         if self.worktree_mode() != "none":
             return "third_party_cwd" if reads else None
-        if third_party.cwd_rule_allows(reads, cwd, records=self.records_for(cwd)):
-            return None
-        return "third_party_cwd" if reads else "third_party_run"
+        if not third_party.cwd_rule_allows(reads, cwd, records=self.records_for(cwd)):
+            return "third_party_cwd" if reads else "third_party_run"
+        if reads:  # the cwd rule came first; then the result-file checks, read-only
+            self.check_cwd_result_file(cwd)
+            self.check_session_dir_for_result_file()
+        return None
 
     def dry_plan(
         self,

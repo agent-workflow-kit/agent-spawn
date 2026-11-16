@@ -521,9 +521,11 @@ class ResultFileTarget:
 
 def resolve_result_file(path: str) -> ResultFileTarget:
     """Check ``path`` and resolve its parent's realpath once (interface.md, Result file)."""
-    # TODO(#21): the third-party path rule (a path inside the run's cwd, throwaway or session dir
-    # exits 2) needs the run's classification; the launch and resume handlers apply it to
-    # ``Invocation.result_file.parent``.
+    # The third-party path rule (a path inside the run's cwd, throwaway or session dir exits 2)
+    # needs the run's classification: launch and resume apply it to
+    # ``Invocation.result_file.parent`` (``check_result_file``, ``check_cwd_result_file``,
+    # ``check_session_dir_for_result_file``).
+    # TODO(#58): ``wait --result-file`` applies the same rule.
     if not path or "\0" in path:
         raise CliError.usage("--result-file needs a path without NUL bytes")
     name = os.path.basename(path)

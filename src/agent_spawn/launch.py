@@ -560,6 +560,12 @@ class Launch:
             return False
         return any(_inside(target.parent, os.path.realpath(d)) for d in directories)
 
+    def refuse_result_file(self, message: str) -> CliError:
+        """The usage error of a refused ``--result-file``; the target is dropped on the way, so
+        nothing is written to it, not even the exit-2 envelope."""
+        self.inv.result_file = None
+        return CliError.usage(message)
+
     # -- wtctl: resolution, the records of a cwd, the rules, the holds -----------------------------
 
     def wtctl_backend(self, stored: str | None = None) -> WtctlBackend | None:
@@ -637,15 +643,22 @@ class Launch:
         if mode != "none" and cwd is not None and wtlib.inside_throwaway(records, cwd):
             raise CliError.usage("--worktree lies inside a wtctl throwaway")
         self.enforce_rules(reads, cwd, records)
+        self.check_result_file(reads, cwd)
+        return cwd
+
+    def check_result_file(self, reads_third_party: bool, cwd: str | None) -> None:
+        """The third-party path rule of ``--result-file``: not inside the run's cwd (a throwaway's
+        root). The session directory does not exist before ``start``; the classification check
+        covers it."""
         if (
-            reads
+            reads_third_party
             and cwd is not None
             and cwd != third_party.SESSION_DIR
             and self.result_file_inside([cwd])
         ):
-            third_party.drop_result_file(self.inv)
-            raise CliError.usage("--result-file lies inside a third-party-reading run's cwd")
-        return cwd
+            raise self.refuse_result_file(
+                "--result-file lies inside a third-party-reading run's cwd"
+            )
 
     # -- hooks --------------------------------------------------------------------------------
 
@@ -864,9 +877,10 @@ class Launch:
         records = self.records_for(cwd)
         if mode != "none" and cwd is not None and wtlib.inside_throwaway(records, cwd):
             raise CliError.usage("--worktree lies inside a wtctl throwaway")
-        if third_party.cwd_rule_allows(reads, cwd, records=records):
-            return None, None
-        return ("third_party_cwd" if reads else "third_party_run"), None
+        if not third_party.cwd_rule_allows(reads, cwd, records=records):
+            return ("third_party_cwd" if reads else "third_party_run"), None
+        self.check_result_file(reads, cwd)
+        return None, None
 
     def hook_listing(self) -> list[dict[str, str]]:
         listing: list[dict[str, str]] = []
@@ -1314,10 +1328,10 @@ class Launch:
             )
 
         def result_file_allows() -> bool:
-            if self.result_file_inside([result.csession_dir, *([cwd] if cwd else [])]):
-                third_party.drop_result_file(self.inv)  # never write into the run's directories
-                return False
-            return True
+            if not self.result_file_inside([result.csession_dir, *([cwd] if cwd else [])]):
+                return True
+            self.inv.result_file = None  # refused: never written, not even the error envelope
+            return False
 
         check = self.backend.check_classification(
             result,
