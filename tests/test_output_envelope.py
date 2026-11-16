@@ -424,6 +424,12 @@ def test_a_lower_third_party_reason_becomes_unknown(reason: str) -> None:
         {"retryable": None},
         {"hint": 3},
         {"hint": None},
+        {"original_failure": {}},
+        {"original_failure": {"code": "failed", "reason": None}},
+        {"original_failure": {"code": 1, "reason": None, "message": "m"}},
+        {"original_failure": {"code": "failed", "reason": 3, "message": "m"}},
+        {"original_failure": {"code": "failed", "reason": None, "message": None}},
+        {"original_failure": {"code": "failed", "reason": None, "message": "m", "x": 1}},
     ],
 )
 def test_details_reject_values_outside_the_schema(details: dict[str, Any]) -> None:
@@ -436,6 +442,9 @@ def test_details_accept_every_schema_value() -> None:
         _check(CliError.of("not_found", "m", details={"status": status, "retryable": False}))
     for cause in ("interrupted", "no_pane_pid", "pane_gone", None):
         _check(CliError.of("no_window", "m", details={"cause": cause, "hint": "h"}))
+    for reason in ("busy", None):
+        failure = {"code": "failed", "reason": reason, "message": "m"}
+        _check(CliError.of("failed", "m", details={"original_failure": failure}))
 
 
 @pytest.mark.parametrize("exit_code", [130, 143])

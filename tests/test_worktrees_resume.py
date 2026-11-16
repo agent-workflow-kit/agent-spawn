@@ -581,6 +581,10 @@ def test_a_busy_forget_keeps_the_failed_fork_parked_with_its_holds(
         ]
     record = records(fakebin)[env.agent(source)["wt_record_id"]]
     assert fork["agent_id"] in record["holders"]  # still held: the row is the handle
+    # The failure that aborted the fork is not lost behind the release failure.
+    original = error["details"]["original_failure"]
+    assert (original["code"], original["reason"]) == ("refused", "live")
+    assert original["message"] == "claude-session refused the request: live"
 
 
 def test_adopt_retry_at_resume_passes_the_repo_given_at_launch_not_the_derived_one(
