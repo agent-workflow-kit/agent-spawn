@@ -58,6 +58,18 @@ MAX_TREE_DEPTH = 32
 UNSUPPORTED = "teardown_unsupported"
 
 
+class GuardSkip(Exception):
+    """An entry guard (``prune``'s protections) declined the agent, judged on its fresh row
+    under the lease: nothing was changed. ``reason`` is the stable skip reason."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+EntryGuard = Callable[[Mapping[str, Any]], "str | None"]
+
+
 @dataclass
 class WtItem:
     """One worktree record of the agent that step 4 processes."""
@@ -166,6 +178,8 @@ class Teardown:
         backend: SessionBackend | None = None,
         gateway: gw.Gateway | None = None,
         log: Callable[..., None] | None = None,
+        entry_guard: EntryGuard | None = None,
+        retry_partial_remove: bool = True,
     ) -> None:
         self.store = store
         self.config = config
@@ -191,6 +205,12 @@ class Teardown:
         self.sticky = False  # a remove with a possibly partial outcome: never back to parked
         self.step4_refused: str | None = None  # step 4 stopped with nothing changed for a record
         self._log = log
+        # ``prune``: judged on the fresh row under the lease, in the same critical section as
+        # the compare-and-set that enters ``tearing_down`` (no gap between check and entry).
+        self.entry_guard = entry_guard
+        # False (``prune``): over ``worktree_partial`` only a tombstone continues; any other
+        # state leaves the agent ``tearing_down`` instead of calling ``remove`` again.
+        self.retry_partial_remove = retry_partial_remove
 
     # -- records ----------------------------------------------------------------------------
 
@@ -425,6 +445,10 @@ class Teardown:
             row = store.get_agent(agent_id)
             if row is None:
                 raise CasLost(agent_id, ("parked",), None)
+            if self.entry_guard is not None:
+                skip = self.entry_guard(row)
+                if skip is not None:
+                    raise GuardSkip(skip)
             if retry_from is not None:
                 done = store.compare_and_set(
                     lease,
@@ -715,6 +739,8 @@ class Teardown:
         if record is None or record.state == "partial":
             raise self.unfinished(agent_id, item)
         if not record.tombstone:
+            if not self.retry_partial_remove:
+                raise self.unfinished(agent_id, item)
             if agent_id not in record.holders or record.owned is not True:
                 raise self.unfinished(agent_id, item)
             self.remove_owned(row, item, marked=True)
@@ -895,7 +921,7 @@ class Teardown:
 # --- the command ----------------------------------------------------------------------------------
 
 
-def _dry_run(td: Teardown, agent_id: str) -> Outcome:
+def dry_run_outcome(td: Teardown, agent_id: str) -> Outcome:
     """Steps 1 and 2 without the compare-and-set; the liveness check only reports.
 
     TODO(#31): the liveness check of step 2 is reported here once issue #31 lands."""
@@ -1035,7 +1061,7 @@ def teardown_command(inv: Any) -> Outcome:
         if resolved is not None and resolved["status"] == "torn_down":
             raise td.torn_down(agent_id, False)
         if args.dry_run:
-            return _dry_run(td, agent_id)
+            return dry_run_outcome(td, agent_id)
         return _run(td, agent_id)
     except CasLost:
         raise CliError(

@@ -48,6 +48,7 @@ IMPLEMENTED = {
     "label remove",
     "launch",
     "list",
+    "prune",
     "resume",
     "show",
     "stop",
