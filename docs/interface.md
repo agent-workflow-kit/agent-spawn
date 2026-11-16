@@ -212,6 +212,8 @@ An agent without a session is always a launch whose session was never allocated 
 
 For `--fork`, every failure before its session exists is the first row (no fork remains, step 7).
 
+A claude-session `start` exit 13 (an escalation; agent-spawn's own pre-launch hooks do not run on resume, so `start` is not expected to return it) is treated like exit 11: the second row.
+
 ### Escalation overrides
 
 `--override-escalation` is human-only and audited. It is passed only to the tool that escalated, on its next call:
