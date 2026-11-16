@@ -921,7 +921,7 @@ class Teardown:
 # --- the command ----------------------------------------------------------------------------------
 
 
-def _dry_run(td: Teardown, agent_id: str) -> Outcome:
+def dry_run_outcome(td: Teardown, agent_id: str) -> Outcome:
     """Steps 1 and 2 without the compare-and-set; the liveness check only reports.
 
     TODO(#31): the liveness check of step 2 is reported here once issue #31 lands."""
@@ -1061,7 +1061,7 @@ def teardown_command(inv: Any) -> Outcome:
         if resolved is not None and resolved["status"] == "torn_down":
             raise td.torn_down(agent_id, False)
         if args.dry_run:
-            return _dry_run(td, agent_id)
+            return dry_run_outcome(td, agent_id)
         return _run(td, agent_id)
     except CasLost:
         raise CliError(

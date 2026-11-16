@@ -3,8 +3,10 @@ one agent's failure from the others, and the fresh-state guard under the lease (
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -13,17 +15,20 @@ from agent_spawn import labels as labellib
 from agent_spawn import prune as prune_module
 from agent_spawn.config import Config
 from agent_spawn.lifecycle import LEASE_WAIT, lease_key
-from agent_spawn.store import Store
+from agent_spawn.output import CliError
+from agent_spawn.store import CasLost, LeaseHeld, Store
+from agent_spawn.teardown import Teardown
 from tests import schema_registry
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
 from tests.launch_support import Env, result_json, script_live_run
-from tests.test_teardown import dead, me, seed
+from tests.test_teardown import dead, log_text, me, seed
 from tests.test_teardown_worktrees import DIRTY, PARTIAL
 from tests.test_worktrees_launch import records, wtctl_calls
 from tests.test_worktrees_resume import launched_in_worktree, set_state
 
 OLD = time.time() - 40 * 86400
+GOLDEN = Path(__file__).parent / "golden"
 
 
 @pytest.fixture
@@ -125,6 +130,17 @@ def test_config_older_than_is_the_default_and_the_flag_wins(
     agent_id = old(env, fakebin)
     assert prune(env)["results"] == []
     assert list(by_id(prune(env, "--older-than", "7d"))) == [agent_id]
+
+
+def test_config_older_than_applies_when_no_flag_is_given(
+    fakebin: Fakebin, isolation_env: Isolation
+) -> None:
+    env = Env(fakebin, isolation_env, "prune:\n  older_than: 7d\n")
+    agent_id = old(env, fakebin)
+    young = seed(env, fakebin, session=False)
+    body = prune(env)
+    assert list(by_id(body)) == [agent_id] and body["results"][0]["result"] == "torn_down"
+    assert status_of(env, young) == "parked"
 
 
 def test_owner_label_protects_until_include_owned(env: Env, fakebin: Fakebin) -> None:
@@ -250,12 +266,15 @@ def test_a_worktree_partial_agent_is_skipped_until_the_record_is_a_tombstone(
     with env.store() as store:
         with store.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
             store.update_agent(lease, agent_id, {"teardown_proc": dead()})
+    before = env.agent(agent_id)
     for state in ("partial", "active"):  # active would be removed again by a teardown retry
         set_state(fakebin, record_id, state)
         entry = by_id(prune(env, "--older-than", "7d"))[agent_id]
         assert (entry["result"], entry["reason"]) == ("skipped", "worktree_partial")
         assert status_of(env, agent_id) == "tearing_down"
         assert len(wtctl_calls(fakebin, "remove")) == 1
+        assert env.agent(agent_id) == before  # skipped before entering: the row is untouched
+        assert '"teardown_retry"' not in log_text(env)
         dry = by_id(prune(env, "--older-than", "7d", "--dry-run"))[agent_id]
         assert dry["reason"] == "worktree_partial"
     set_state(fakebin, record_id, "removed")
@@ -363,3 +382,240 @@ def test_protections_are_rechecked_on_fresh_state_under_the_entry_lease(
     assert results[attention]["reason"] == "needs_attention"
     assert results[owned]["reason"] == "protected"
     assert status_of(env, attention) == status_of(env, owned) == "parked"
+
+
+def corrupt_partial_marker(env: Env, agent_id: str) -> None:
+    """``worktree_partial`` without the record it should name (a dead teardown process)."""
+    with env.store() as store:
+        with store.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
+            store.compare_and_set(
+                lease,
+                agent_id,
+                expect_status="parked",
+                expect={},
+                changes={
+                    "status": "tearing_down",
+                    "teardown_step": "worktree_partial",
+                    "teardown_partial_record": None,
+                    "teardown_proc": dead(),
+                },
+            )
+
+
+@pytest.mark.parametrize("flags", [(), ("--dry-run",)], ids=["real", "dry"])
+def test_a_partial_marker_without_a_record_is_skipped_and_removes_nothing(
+    env: Env, fakebin: Fakebin, flags: tuple[str, ...]
+) -> None:
+    agent_id = launched_in_worktree(env)
+    backdate(env, agent_id)
+    corrupt_partial_marker(env, agent_id)
+    before = env.agent(agent_id)
+    entry = by_id(prune(env, "--older-than", "7d", *flags))[agent_id]
+    assert (entry["result"], entry["reason"]) == ("skipped", "worktree_partial")
+    assert wtctl_calls(fakebin, "remove") == []
+    assert env.agent(agent_id) == before
+
+
+# --- golden --json bodies -----------------------------------------------------------------------
+
+
+def normalized(body: Any, ids: list[str]) -> Any:
+    """The body with the generated agent ids replaced by the golden's fixed ones."""
+    text = json.dumps(body)
+    for real, fixed in zip(ids, ("ag-aaaaaaaa", "ag-bbbbbbbb"), strict=True):
+        text = text.replace(real, fixed)
+    return json.loads(text)
+
+
+@pytest.mark.parametrize(
+    ("flags", "golden"),
+    [((), "prune_result_live.json"), (("--dry-run",), "prune_result_dry_run.json")],
+    ids=["live", "dry"],
+)
+def test_json_body_matches_the_golden_and_validates(
+    env: Env, fakebin: Fakebin, flags: tuple[str, ...], golden: str
+) -> None:
+    gone = old(env, fakebin)
+    kept = old(env, fakebin)
+    backdate(env, gone, OLD)
+    backdate(env, kept, OLD + 100)
+    add_label(env, kept, "owner=flow")
+    body = prune(env, "--older-than", "7d", *flags)
+    expected = json.loads((GOLDEN / golden).read_text())
+    schema_registry.validate(expected, "agent-spawn/cli/prune.json")
+    assert normalized(body, [gone, kept]) == expected
+
+
+# --- the protections under the entry lease -------------------------------------------------------
+
+
+def run_one(env: Env, agent_id: str, judge_wrap: Any = None, dry_run: bool = False) -> Any:
+    with Store.open(env.state_dir) as store:
+        judge = prune_module.Judge(
+            store, Config(), older_than=7 * 86400.0, include_owned=False, include_attention=False
+        )
+        if judge_wrap is not None:
+            judge_wrap(store, judge)
+        row = store.get_agent(agent_id)
+        assert row is not None
+        return prune_module._one(  # pyright: ignore[reportPrivateUsage]
+            store, Config(), judge, row, str(env.state_dir), dry_run, []
+        )
+
+
+@pytest.mark.parametrize("what", ["owner", "attention"])
+def test_the_entry_guard_alone_catches_a_change_after_the_pre_check(
+    env: Env, fakebin: Fakebin, what: str
+) -> None:
+    """The pre-check passes (the stale listing), the change lands before the entry; only the
+    guard under the lease can stop the teardown."""
+    agent_id = old(env, fakebin)
+    calls: list[int] = []
+
+    def wrap(store: Store, judge: prune_module.Judge) -> None:
+        real = judge.skip_reason
+
+        def skip_reason(row: Any) -> str | None:
+            calls.append(1)
+            if len(calls) > 1:
+                return real(row)
+            with store.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
+                if what == "owner":
+                    store.edit_labels(lease, agent_id, "add", [labellib.parse_label("owner=x")])
+                else:
+                    store.update_agent(lease, agent_id, {"needs_attention": "failed"})
+            return None
+
+        judge.skip_reason = skip_reason  # type: ignore[method-assign]
+
+    entry = run_one(env, agent_id, wrap)
+    assert len(calls) == 2  # the pre-check, then the guard under the lease
+    expected = "protected" if what == "owner" else "needs_attention"
+    assert (entry["result"], entry["reason"]) == ("skipped", expected)
+    assert status_of(env, agent_id) == "parked"
+    assert env.agent(agent_id)["teardown_step"] is None
+
+
+# --- first-time unknown outcomes, tearing_down candidates, records, mappings --------------------
+
+
+def test_a_first_time_partial_remove_fails_for_that_agent_and_stays_tearing_down(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = launched_in_worktree(env)
+    backdate(env, agent_id)
+    fakebin.script("wtctl", "remove", times=1, **PARTIAL)
+    entry = by_id(prune(env, "--older-than", "7d"))[agent_id]
+    assert (entry["result"], entry["reason"], entry["tool"]) == ("failed", "partial", "wtctl")
+    assert status_of(env, agent_id) == "tearing_down"
+    assert env.agent(agent_id)["teardown_step"] == "worktree_partial"
+
+
+def test_protections_apply_to_a_tearing_down_candidate(env: Env, fakebin: Fakebin) -> None:
+    agent_id = old(
+        env, fakebin, status="tearing_down", teardown_step="hooks_done", teardown_proc=dead()
+    )
+    add_label(env, agent_id, "owner=flow")
+    entry = by_id(prune(env, "--older-than", "7d"))[agent_id]
+    assert (entry["result"], entry["reason"]) == ("skipped", "protected")
+    assert status_of(env, agent_id) == "tearing_down"
+    assert env.agent(agent_id)["teardown_proc"] == dead()
+
+
+def test_a_prune_log_event_holds_the_result_without_a_message(env: Env, fakebin: Fakebin) -> None:
+    agent_id = old(env, fakebin)
+    kept = old(env, fakebin)
+    add_label(env, kept, "owner=flow")
+    prune(env, "--older-than", "7d")
+    records = [json.loads(line) for line in log_text(env).splitlines()]
+    events = {r["agent_id"]: r for r in records if r["event"] == "prune"}
+    for record in events.values():
+        schema_registry.validate(record, "agent-spawn/log.json")
+        assert "message" not in record and record["actor"] == "auto:agent-spawn"
+    assert events[agent_id]["details"] == {"result": "torn_down", "reason": None}
+    assert events[kept]["details"] == {"result": "skipped", "reason": "protected"}
+
+
+def test_a_dry_run_writes_no_prune_log_event(env: Env, fakebin: Fakebin) -> None:
+    old(env, fakebin)
+    prune(env, "--older-than", "7d", "--dry-run")
+    assert '"prune"' not in log_text(env)
+
+
+def test_the_hook_outbox_is_delivered_after_a_prune_but_not_a_dry_run(
+    fakebin: Fakebin, isolation_env: Isolation, tmp_path: Path
+) -> None:
+    sink = tmp_path / "sink"
+    env = Env(fakebin, isolation_env, f'hooks:\n  post-state-change:\n    - cmd: "cat >> {sink}"\n')
+    old(env, fakebin)
+    prune(env, "--older-than", "7d", "--dry-run")
+    assert not sink.exists()
+    prune(env, "--older-than", "7d")
+    assert sink.exists() and sink.read_text() != ""
+
+
+def test_a_log_write_failure_is_a_warning_in_the_result(
+    env: Env, fakebin: Fakebin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent_id = old(env, fakebin)
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("agent_spawn.teardown.append_log", broken)
+    warnings: list[str] = []
+    with Store.open(env.state_dir) as store:
+        judge = prune_module.Judge(
+            store, Config(), older_than=7 * 86400.0, include_owned=False, include_attention=False
+        )
+        row = store.get_agent(agent_id)
+        assert row is not None
+        prune_module._one(  # pyright: ignore[reportPrivateUsage]
+            store, Config(), judge, row, str(env.state_dir), False, warnings
+        )
+    assert any("could not write the log" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    ("raised", "result", "reason"),
+    [
+        (CliError("not_found", "gone"), "skipped", "gone"),
+        (CasLost("ag-aaaaaaaa", ("parked",), None), "skipped", "changed"),
+        (LeaseHeld("agent:x", me()), "skipped", "lease_held"),
+    ],
+    ids=["not_found", "cas_lost", "lease_held"],
+)
+def test_entry_failures_map_to_skips(
+    env: Env,
+    fakebin: Fakebin,
+    monkeypatch: pytest.MonkeyPatch,
+    raised: Exception,
+    result: str,
+    reason: str,
+) -> None:
+    agent_id = old(env, fakebin)
+
+    def enter(self: Teardown, agent_id: str) -> Any:
+        raise raised
+
+    monkeypatch.setattr(Teardown, "enter", enter)
+    entry = run_one(env, agent_id)
+    assert (entry["result"], entry["reason"], entry["tool"]) == (result, reason, "agent-spawn")
+    assert status_of(env, agent_id) == "parked"
+
+
+def test_a_corrupted_created_value_never_aborts_the_prune(env: Env, fakebin: Fakebin) -> None:
+    healthy = old(env, fakebin)
+    broken = seed(env, fakebin, session=False)
+    db = sqlite3.connect(env.state_dir / "state.db")
+    try:
+        with db:
+            db.execute(
+                "UPDATE agents SET created = 'junk', last_live_at = NULL WHERE agent_id = ?",
+                (broken,),
+            )
+    finally:
+        db.close()
+    body = prune(env, "--older-than", "7d")
+    assert list(by_id(body)) == [healthy]
+    assert status_of(env, broken) == "parked" and status_of(env, healthy) == "torn_down"

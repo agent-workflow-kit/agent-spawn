@@ -26,7 +26,7 @@
               "string",
               "null"
             ],
-            "description": "Why refused, skipped or failed (agent-spawn's or a lower tool's reason, e.g. protected, needs_attention, live, dirty); null for torn_down."
+            "description": "Why refused, skipped or failed; null for torn_down. prune's own skip reasons: protected, needs_attention, not_parked, too_new, tearing_down, worktree_partial, teardown_unsupported (temporary), gone, changed, lease_held; failed: internal. Engine and lower-tool refusals pass their own reason through (e.g. live, dirty). See docs/interface.md, prune."
           },
           "tool": {
             "oneOf": [

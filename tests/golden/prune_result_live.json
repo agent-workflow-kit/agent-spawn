@@ -1,0 +1,20 @@
+{
+  "results": [
+    {
+      "agent_id": "ag-aaaaaaaa",
+      "result": "torn_down",
+      "reason": null,
+      "tool": null,
+      "details": null
+    },
+    {
+      "agent_id": "ag-bbbbbbbb",
+      "result": "skipped",
+      "reason": "protected",
+      "tool": "agent-spawn",
+      "details": null
+    }
+  ],
+  "warnings": [],
+  "dry_run": false
+}

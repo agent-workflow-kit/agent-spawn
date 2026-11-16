@@ -28,13 +28,13 @@ from . import gateway as gw
 from . import labels as labellib
 from .config import Config
 from .output import CliError, Outcome, PayloadKind
-from .store import CasLost, Store, StoreError, StoreMissing, default_state_dir
+from .store import CasLost, LeaseHeld, Store, StoreError, StoreMissing, default_state_dir
 from .teardown import (
     SUPERVISOR_ACTOR,
     UNSUPPORTED,
     GuardSkip,
     Teardown,
-    _dry_run,  # pyright: ignore[reportPrivateUsage]
+    dry_run_outcome,
 )
 from .validate import parse_duration
 
@@ -127,6 +127,15 @@ def _from_error(error: CliError, agent_id: str, *, was_partial: bool) -> dict[st
     return _result(agent_id, "failed", error.code, error.tool, lower or error.details)
 
 
+def _created(row: Mapping[str, Any]) -> float:
+    """The sort key: a non-numeric ``created`` (a corrupted row) sorts first and is never old
+    enough (``Judge.age``), so it cannot abort the whole prune."""
+    created = row.get("created")
+    if isinstance(created, bool) or not isinstance(created, (int, float)):
+        return 0.0
+    return float(created)
+
+
 def _open(state_dir: str) -> Store | None:
     try:
         return Store.open(state_dir, create=False, gateway=gw.get_gateway())
@@ -166,7 +175,7 @@ def prune_command(inv: Any) -> Outcome:
         )
         candidates = sorted(
             store.list_agents(statuses=CANDIDATE_STATUSES),
-            key=lambda r: (r.get("created") or 0, r["agent_id"]),
+            key=lambda r: (_created(r), r["agent_id"]),
         )
         for row in candidates:
             if not judge.old_enough(row):
@@ -212,8 +221,10 @@ def _one(
             entry = _result(agent_id, "skipped", skip, "agent-spawn")
         elif td.unsupported(row) is not None:
             entry = _result(agent_id, "skipped", UNSUPPORTED, "agent-spawn")
+        elif was_partial and _partial_blocks(td, row):
+            entry = _result(agent_id, "skipped", PARTIAL, "wtctl")
         elif dry_run:
-            entry = _plan(td, row, agent_id, was_partial)
+            entry = _plan(td, agent_id)
         else:
             entry = _tear_down(td, agent_id)
     except GuardSkip as skipped:  # fresh state under the lease disagreed with the listing
@@ -222,23 +233,36 @@ def _one(
         entry = _from_error(error, agent_id, was_partial=was_partial)
     except CasLost:
         entry = _result(agent_id, "skipped", "changed", "agent-spawn")
+    except LeaseHeld:  # another process is working on this agent: try again next run
+        entry = _result(agent_id, "skipped", "lease_held", "agent-spawn")
     except Exception as error:  # noqa: BLE001 - bulk command: one agent never stops the others
         name = type(error).__name__
         entry = _result(agent_id, "failed", "internal", "agent-spawn", {"error": name})
     if td is not None:
-        for problem in td.warnings:
-            warnings.append(f"{agent_id}: {problem}")
         if not dry_run:
+            td.log("prune", agent_id=agent_id, details=_log_details(entry))  # never raises
             try:
-                td.log("prune", agent_id=agent_id, message=_message(entry))
-            except Exception:  # noqa: BLE001 - a log failure never changes a result
-                pass
-            td.deliver(agent_id)
+                td.deliver(agent_id)
+            except Exception as error:  # noqa: BLE001 - bulk command: delivery never stops it
+                td.warnings.append(f"could not deliver hooks ({type(error).__name__})")
+        for problem in td.warnings:  # after log and deliver: their warnings count too
+            warnings.append(f"{agent_id}: {problem}")
     return entry
 
 
-def _message(entry: Mapping[str, Any]) -> str:
-    return f"{entry['result']}" + (f": {entry['reason']}" if entry["reason"] else "")
+def _log_details(entry: Mapping[str, Any]) -> dict[str, Any]:
+    return {"result": entry["result"], "reason": entry["reason"]}
+
+
+def _partial_blocks(td: Teardown, row: Mapping[str, Any]) -> bool:
+    """Whether a ``worktree_partial`` agent is skipped: unless its record is a tombstone. Read
+    only and decided before the agent is entered, so a skipped agent's row is never touched
+    and the dry run and the real run agree. A marker without a record is never continued."""
+    record = row.get("teardown_partial_record")
+    if not isinstance(record, str) or not record:
+        return True
+    shown = td.wtctl(row).show(record)
+    return shown is None or not shown.tombstone
 
 
 def _tear_down(td: Teardown, agent_id: str) -> dict[str, Any]:
@@ -247,14 +271,9 @@ def _tear_down(td: Teardown, agent_id: str) -> dict[str, Any]:
     return _result(agent_id, "torn_down")
 
 
-def _plan(td: Teardown, row: dict[str, Any], agent_id: str, was_partial: bool) -> dict[str, Any]:
+def _plan(td: Teardown, agent_id: str) -> dict[str, Any]:
     """The dry run: the teardown dry run (read-only), never a mutation."""
-    if was_partial:
-        record = row.get("teardown_partial_record")
-        shown = td.wtctl(row).show(record) if isinstance(record, str) else None
-        if shown is None or not shown.tombstone:
-            return _result(agent_id, "skipped", PARTIAL, "wtctl")
-    outcome = _dry_run(td, agent_id)
+    outcome = dry_run_outcome(td, agent_id)
     reason = outcome.payload.get("would_refuse") if isinstance(outcome.payload, dict) else None
     if reason is None:
         return _result(agent_id, "torn_down")

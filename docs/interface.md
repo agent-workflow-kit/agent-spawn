@@ -514,6 +514,26 @@ agent-spawn prune [--older-than <duration>] [--include-owned] [--include-attenti
 
 Tears down parked agents whose age (`last_live_at`, else `created`) exceeds `--older-than` (else config `prune.older_than`; with neither, prune does nothing and warns), and continues `tearing_down` agents older than the threshold whose teardown process is dead. Skipped: agents with a label matching `prune.protect_labels` (keys or `key=value` pairs; default `[owner]`) unless `--include-owned`; agents with `needs_attention` set unless `--include-attention`; agents whose `teardown_step` is `worktree_partial` and whose record is not a tombstone ([Teardown order](#teardown-order) step 4). Each teardown runs under automation rules (never `--force`). Output: `{"results": [{"agent_id", "result": "torn_down"|"refused"|"skipped"|"failed", "reason", "tool", "details"}], "warnings", "dry_run"}` ([schemas/cli/prune.json](../schemas/cli/prune.json)); exit 0 whatever the per-agent results (2 on usage errors).
 
+With `--dry-run`, `torn_down` means "would be torn down"; nothing is changed and no `prune` log event is written.
+
+`reason` strings prune itself produces (stable; any other `refused` or `failed` reason is the engine's or wtctl's, passed through with its `tool`):
+
+| `result` | `reason` | `tool` | Meaning |
+|---|---|---|---|
+| `skipped` | `protected` | `agent-spawn` | a label matches `prune.protect_labels` |
+| `skipped` | `needs_attention` | `agent-spawn` | `needs_attention` is set |
+| `skipped` | `not_parked` | `agent-spawn` | the agent is no longer `parked` or `tearing_down` (seen on fresh state) |
+| `skipped` | `too_new` | `agent-spawn` | the age is not over the threshold on fresh state |
+| `skipped` | `tearing_down` | `agent-spawn` | a teardown process of the agent is alive |
+| `skipped` | `worktree_partial` | `wtctl` | the marker is set and its record is missing or not a tombstone; decided before the agent is entered, so its row is untouched |
+| `skipped` | `teardown_unsupported` | `agent-spawn` | the agent has a window or pre-teardown hooks, which teardown does not handle yet (temporary, until #27 and #32) |
+| `skipped` | `gone` | `agent-spawn` | the agent disappeared or was torn down meanwhile |
+| `skipped` | `changed` | `agent-spawn` | the agent changed status between the listing and the entry |
+| `skipped` | `lease_held` | `agent-spawn` | another process holds the agent's lease; tried again next run |
+| `failed` | `internal` | `agent-spawn` | an unexpected error for this agent (`details.error` is the exception name) |
+
+Engine and wtctl refusals (`live`, `dirty`, `unpushed`, ...) are `refused` with their own reason and `tool`.
+
 ### `reconcile`
 
 ```text
