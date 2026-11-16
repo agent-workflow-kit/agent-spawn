@@ -15,9 +15,11 @@ from . import procs
 from .agent_lookup import backend_for, open_existing, resolve_existing, store_failed
 from .agent_view import CORRUPT_ROW, agent_object, ts, unusable_row
 from .commands.base import Invocation
+from .launch import resolve_wtctl
 from .output import CliError, Outcome, PayloadKind, safe_text
 from .session_backend import STATES, SessionStatus
 from .store import Store, StoreError
+from .worktrees import WtctlBackend, inside_throwaway
 
 __all__ = ["show"]
 
@@ -25,6 +27,7 @@ _REPORT_STATUSES = frozenset({"done", "blocked", "needs-input", "failed"})
 _ACTIVITIES = frozenset({"working", "idle"})
 _NEEDS_INPUT = frozenset({"permission", "question", "elicitation"})
 _MODES = frozenset({"interactive", "headless"})
+SHOW_TIMEOUT = 15.0  # seconds per read-only wtctl call: show must stay quick
 
 
 def session_summary(status: SessionStatus) -> dict[str, Any] | None:
@@ -122,26 +125,51 @@ def _session(inv: Invocation, row: Mapping[str, Any], warnings: list[str]) -> di
     return summary
 
 
+def _wtctl(inv: Invocation, row: Mapping[str, Any]) -> WtctlBackend | None:
+    """wtctl as the agent was launched with it (config's command, else the absolute path stored
+    with the agent); ``None`` when there is no wtctl on this machine (``wtctl_cmd: null``)."""
+    assert inv.config is not None
+    command = inv.config.wtctl_cmd
+    if command is None:
+        return None
+    stored = row.get("wtctl_path")
+    argv = resolve_wtctl(command, stored if isinstance(stored, str) else None)
+    return WtctlBackend(argv)
+
+
 def third_party_run(inv: Invocation, row: Mapping[str, Any], warnings: list[str]) -> bool | None:
     """Whether the cwd lies inside a live throwaway record (None: unknown, with a warning)."""
     cwd = row.get("cwd")
     if not isinstance(cwd, str):
         return None
-    assert inv.config is not None
-    if inv.config.wtctl_cmd is None:
-        return False  # no wtctl on this machine: the records of every cwd are empty
-    # TODO(#21): the records of a cwd come from `wtctl list --json` (interface.md, Records of a
-    # cwd); the lookup, its fail-closed rules and the holds belong to that issue.
-    warnings.append("the throwaway records of the cwd were not looked up")
-    return None
-
-
-def repo_config_changed(row: Mapping[str, Any], warnings: list[str]) -> dict[str, Any] | None:
-    if row.get("wt_record_id") is None:
+    try:
+        backend = _wtctl(inv, row)
+        if backend is None:
+            return False  # no wtctl on this machine: the records of every cwd are empty
+        return inside_throwaway(backend.list_records(timeout=SHOW_TIMEOUT), cwd)
+    except CliError as error:
+        warnings.append(
+            f"the throwaway records of the cwd were not looked up ({safe_text(error.code)})"
+        )
         return None
-    # TODO(#20): `wtctl baseline check <record>` of the agent's own worktree record.
-    warnings.append("the repo config baseline was not checked")
-    return None
+
+
+def repo_config_changed(
+    inv: Invocation, row: Mapping[str, Any], warnings: list[str]
+) -> dict[str, Any] | None:
+    """``wtctl baseline check`` of the agent's own worktree record (informational)."""
+    record_id = row.get("wt_record_id")
+    if not isinstance(record_id, str):
+        return None
+    try:
+        backend = _wtctl(inv, row)
+        if backend is None:
+            warnings.append("the repo config baseline was not checked (no wtctl)")
+            return None
+        return backend.baseline_check(record_id, timeout=SHOW_TIMEOUT)
+    except CliError as error:
+        warnings.append(f"the repo config baseline was not checked ({safe_text(error.code)})")
+        return None
 
 
 def _human(payload: Mapping[str, Any]) -> str:
@@ -190,7 +218,7 @@ def show(inv: Invocation) -> Outcome:
         supervisor = supervisor_object(row)
         session = _session(inv, row, warnings)
         third = third_party_run(inv, row, warnings)
-        config_changed = repo_config_changed(row, warnings)
+        config_changed = repo_config_changed(inv, row, warnings)
     payload = {
         "agent": agent,
         "runs": runs,

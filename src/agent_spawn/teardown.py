@@ -609,7 +609,7 @@ class Teardown:
         stored with the agent. Teardown with a record and no wtctl is refused (nothing changed)."""
         if self.wt_backend is not None:
             return self.wt_backend
-        from .launch import resolve_tool  # the tool resolution launch uses
+        from .launch import resolve_wtctl  # the tool resolution launch uses
 
         command = self.config.wtctl_cmd
         if command is None:
@@ -618,16 +618,8 @@ class Teardown:
                 "this agent holds worktree records, but wtctl_cmd is null in the config",
                 tool=WTCTL,
             )
-        try:
-            argv = resolve_tool(command, WTCTL)
-        except CliError as missing:
-            stored = row.get("wtctl_path")
-            if not isinstance(stored, str) or not stored:
-                raise
-            try:
-                argv = resolve_tool(shlex.split(stored), WTCTL)
-            except (CliError, ValueError):
-                raise missing from None
+        stored = row.get("wtctl_path")
+        argv = resolve_wtctl(command, stored if isinstance(stored, str) else None)
         self.wt_backend = WtctlBackend(
             argv, actor=self.actor, decision_ids=self.decision_ids, gateway=self.gateway
         )
