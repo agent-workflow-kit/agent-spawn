@@ -20,6 +20,7 @@ from tests.fakebin.harness import Fakebin
 from tests.launch_support import result_json, script_hung_exec, script_live_run, track_agent
 from tests.procguard import ProcTracker
 from tests.private_tmux import PrivateTmux
+from tests.test_worktrees_launch import fake_throwaway
 from tests.window_support import Capture, WindowEnv, send_signal
 
 LAUNCH = ("launch", "--mode", "headless", "--skill", "do-it", "--json")
@@ -202,7 +203,12 @@ def test_a_failed_window_preflight_creates_no_pending_run(
     assert row["needs_attention"] == "escalated" and row["run"] == 1
     assert row["promotion_pending"] is False
     failure = post_park(wenv, agent_id)["chain_failure"]
-    assert failure == {"tool": "termctl", "reason": failure["reason"], "run": None, "end_reason": None}
+    assert failure == {
+        "tool": "termctl",
+        "reason": failure["reason"],
+        "run": None,
+        "end_reason": None,
+    }
     assert len(runs(wenv, agent_id)) == 1
 
 
@@ -269,7 +275,12 @@ def test_a_pane_without_a_pid_fails_the_handoff_and_parks_per_the_trigger(
     row = wenv.agent(agent_id)
     assert row["park_reason"] == "blocked" and row["needs_attention"] == "blocked"
     failure = post_park(wenv, agent_id)["chain_failure"]
-    assert failure == {"tool": "agent-spawn", "reason": "handoff_failed", "run": 2, "end_reason": None}
+    assert failure == {
+        "tool": "agent-spawn",
+        "reason": "handoff_failed",
+        "run": 2,
+        "end_reason": None,
+    }
     assert len([a for a in fakebin.argvs("claude-session") if "stop" in a]) == 1
     # the host got no environment: it exits 1, tmux keeps the dead pane and the supervisor closes it
     wenv.wait_for(lambda: wenv.panes() == [], "the dead promotion pane to be closed")
@@ -322,7 +333,7 @@ def test_signals_during_a_promotion_go_to_the_host_pane_process_only(
     sent = [e for e in log_events(wenv) if e["event"] == "signal_sent"]
     # exactly two forwards, both SIGTERM: supervisor -> the host pane process, host -> exec
     assert [e["signal"] for e in sent] == ["SIGTERM", "SIGTERM"]
-    assert sent[0]["pid"] == host.pid and sent[1]["pid"] != host.pid
+    assert [e["pid"] for e in sent].count(host.pid) == 1  # the supervisor's: only the host
     exec_calls = [i for i in fakebin.invocations("claude-session") if "exec" in i.argv]
     assert exec_calls[1].signals == [int(signal.SIGTERM)]  # the host forwarded SIGTERM once
     assert exec_calls[0].signals == []  # the first (headless) exec never got the signal
@@ -367,3 +378,40 @@ def test_supervise_host_needs_a_handoff(wenv: WindowEnv) -> None:
         "--config", str(wenv.config),
     )  # fmt: skip
     assert done.returncode == 2
+
+
+# --- the pre-start checks fail closed for a promotion -------------------------------------------------
+
+
+def test_a_trusted_promotion_in_a_throwaway_is_refused_before_the_window_is_touched(
+    wenv: WindowEnv, fakebin: Fakebin
+) -> None:
+    throwaway = fake_throwaway(fakebin)
+    script_first_run(fakebin)
+    done = wenv.run(
+        *LAUNCH, "--cwd", throwaway["path"], "--reads-third-party", "--promote", "--wait"
+    )
+    agent_id = result_json(done)["agent"]["agent_id"]
+    failure = post_park(wenv, agent_id)["chain_failure"]
+    assert failure is not None
+    assert (failure["tool"], failure["reason"]) == ("agent-spawn", "third_party_run")
+    assert len(real_starts(fakebin)) == 1  # nothing was started
+    assert not open_calls(fakebin, dry_run=True) and not open_calls(fakebin, dry_run=False)
+    row = wenv.agent(agent_id)
+    assert row["park_reason"] == "blocked" and row["promotion_pending"] is False
+    assert any(e["event"] == "third_party_refused" for e in log_events(wenv))
+
+
+def test_a_promotion_whose_records_lookup_fails_creates_no_run_and_no_window(
+    wenv: WindowEnv, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    script_first_run(fakebin)
+    fakebin.script("wtctl", "list", times=2)  # the two lookups of the launch
+    fakebin.script("wtctl", "list", error={"code": "failed", "message": "broken"}, exit=1)
+    done = wenv.run(*LAUNCH, "--cwd", str(tmp_path), "--promote", "--wait")
+    agent_id = result_json(done)["agent"]["agent_id"]
+    failure = post_park(wenv, agent_id)["chain_failure"]
+    assert failure is not None and failure["tool"] == "wtctl" and failure["run"] is None
+    assert len(real_starts(fakebin)) == 1
+    assert not open_calls(fakebin, dry_run=False)
+    assert wenv.agent(agent_id)["park_reason"] == "blocked"
