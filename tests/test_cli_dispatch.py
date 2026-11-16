@@ -25,7 +25,6 @@ OWNERS = {
     "wait": 17,
     "list": 15,
     "show": 15,
-    "attach": 28,
     "ack": 15,
     "label add": 15,
     "label remove": 15,
@@ -42,6 +41,7 @@ OWNERS = {
 
 
 IMPLEMENTED = {
+    "attach",
     "ack",
     "export",
     "label add",

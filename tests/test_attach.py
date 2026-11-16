@@ -63,9 +63,7 @@ def live(env: AttachEnv, agent: str = A1, runs: Any = None, **fields: Any) -> No
     seed_agent(env, agent, status="live", mode="interactive", run=len(runs), runs=runs, **fields)
 
 
-def tmux_argv(
-    sock: str, tmux: str = "/usr/bin/tmux", target: str = "=$1:@2.%3"
-) -> list[str]:
+def tmux_argv(sock: str, tmux: str = "/usr/bin/tmux", target: str = "=$1:@2.%3") -> list[str]:
     return [tmux, "-S", sock, "attach", "-E", "-t", target]
 
 
@@ -168,9 +166,7 @@ def test_torn_down_and_unknown_agents(env: AttachEnv, fakebin: Fakebin) -> None:
     assert focus_calls(fakebin) == []
 
 
-def test_an_ambiguous_prefix_is_exit_21_and_calls_nothing(
-    env: AttachEnv, fakebin: Fakebin
-) -> None:
+def test_an_ambiguous_prefix_is_exit_21_and_calls_nothing(env: AttachEnv, fakebin: Fakebin) -> None:
     live(env, "ag-aaaaaaaa")
     live(env, "ag-aaaabbbb", runs=[{"term_id": env.t2, "socket_path": env.sock}])
     body = out(env.run("attach", "ag-aaaa", "--json"), ERROR, 21)

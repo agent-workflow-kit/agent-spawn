@@ -337,7 +337,9 @@ class TermBackend:
         if no_attach:
             args.append("--no-attach")
         try:
-            done = self.gateway.run_on_terminal([*self.command, *args, "--json"], timeout=FOCUS_TIMEOUT)
+            done = self.gateway.run_on_terminal(
+                [*self.command, *args, "--json"], timeout=FOCUS_TIMEOUT
+            )
         except (FileNotFoundError, PermissionError):
             raise CliError(
                 "tool_missing",
@@ -370,9 +372,9 @@ class TermBackend:
                 raise unusable
             return {"action": "switched", "client": answered, "argv": None}
         if action == "attach" and not no_attach and client is None and answered is None:
-            if not _attach_argv_ok(argv, socket_path):
+            if not isinstance(argv, list) or not _attach_argv_ok(argv, socket_path):
                 raise unusable
-            return {"action": "attach", "client": None, "argv": list(argv)}
+            return {"action": "attach", "client": None, "argv": [str(a) for a in argv]}
         raise unusable
 
     def label_add(self, term_id: str, socket_path: str, pairs: Sequence[str]) -> None:
