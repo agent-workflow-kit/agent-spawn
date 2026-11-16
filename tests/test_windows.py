@@ -20,7 +20,7 @@ from tests.fakebin.harness import Fakebin
 from tests.launch_support import result_json, script_hung_exec, script_live_run, track_agent
 from tests.private_tmux import PrivateTmux
 from tests.procguard import ProcTracker
-from tests.window_support import WindowEnv
+from tests.window_support import WindowEnv, send_signal
 
 LAUNCH = ("launch", "--skill", "do-it", "--json")
 
@@ -339,10 +339,8 @@ def test_sigint_and_sigquit_are_ignored_by_a_window_supervisor(
     agent = launch_live(wenv, fakebin, proc_tracker)
     agent_id = agent["agent_id"]
     supervisor = wenv.agent(agent_id)["supervisor"]
-    with procs.open_verified(supervisor) as handle:
-        assert handle is not None
-        handle.send(signal.SIGINT)
-        handle.send(signal.SIGQUIT)
+    send_signal(supervisor, signal.SIGINT)
+    send_signal(supervisor, signal.SIGQUIT)
     (pane,) = wenv.panes()
     # still the supervisor, still live: the ignored signals did nothing and reached nobody
     assert procs.is_alive(supervisor) and wenv.agent(agent_id)["status"] == "live"
@@ -359,9 +357,7 @@ def test_sigterm_of_a_window_supervisor_is_forwarded_to_exec(
     agent = launch_live(wenv, fakebin, proc_tracker)
     agent_id = agent["agent_id"]
     supervisor = wenv.agent(agent_id)["supervisor"]
-    with procs.open_verified(supervisor) as handle:
-        assert handle is not None
-        handle.send(signal.SIGTERM)
+    send_signal(supervisor, signal.SIGTERM)
     wenv.wait_for(lambda: wenv.agent(agent_id)["status"] == "parked", "the agent to park")
     assert int(signal.SIGTERM) in exec_signals(fakebin)
     assert wenv.agent(agent_id)["needs_attention"] is None
@@ -373,9 +369,7 @@ def test_a_sigkilled_window_supervisor_leaves_a_live_agent_for_liveness(
     agent = launch_live(wenv, fakebin, proc_tracker)
     agent_id = agent["agent_id"]
     supervisor = wenv.agent(agent_id)["supervisor"]
-    with procs.open_verified(supervisor) as handle:
-        assert handle is not None
-        handle.send(signal.SIGKILL)
+    send_signal(supervisor, signal.SIGKILL)
     wenv.wait_for(lambda: not procs.is_alive(supervisor), "the supervisor to die")
     # Nothing else parks the agent: it stays `live` with a dead supervisor (spike B9). Setting
     # `supervisor_lost` is the liveness check's job.  TODO(#31): assert supervisor_lost here.
@@ -383,24 +377,87 @@ def test_a_sigkilled_window_supervisor_leaves_a_live_agent_for_liveness(
     assert row["status"] == "live" and row["park_reason"] is None
 
 
-def test_a_supervisor_with_a_failing_start_writes_nothing_to_its_terminal(
-    wenv: WindowEnv, fakebin: Fakebin
+def test_a_window_supervisor_that_fails_writes_nothing_to_its_terminal(
+    wenv: WindowEnv,
 ) -> None:
-    """`supervise` refuses an unknown agent (exit 2): the pane shows nothing but the shell's echo."""
+    """A failed handoff (exit 1) shows nothing in the pane: no message, no usage text."""
     from tests.launch_support import agent_spawn_path
 
-    config = wenv.config
-    config.parent.mkdir(parents=True, exist_ok=True)
     state = wenv.state_dir
     state.mkdir(parents=True, exist_ok=True)
     marker = state.parent / "rc"
     done = wenv.tmux.run(
         "new-window", "-d", "-P", "-F", "#{pane_id}", "--", "sh", "-c",
-        f"{agent_spawn_path()} supervise ag-aaaaaaaa --state-dir {state} --config {config}; "
+        f"{agent_spawn_path()} supervise ag-aaaaaaaa --handoff {state}/nothing "
+        f"--handoff-timeout 1 --state-dir {state} --config {wenv.config}; "
         f"echo rc=$? > {marker}; sleep 30",
     )  # fmt: skip
     pane = done.stdout.strip()
     wenv.wait_for(marker.exists, "the supervisor to exit")
-    assert marker.read_text().strip() == "rc=2"
-    screen = wenv.tmux.run("capture-pane", "-p", "-t", pane).stdout
-    assert screen.strip() == ""  # no error message, no usage text, nothing
+    assert marker.read_text().strip() == "rc=1"
+    assert wenv.tmux.run("capture-pane", "-p", "-t", pane).stdout.strip() == ""
+    assert any(e["event"] == "handoff_failed" for e in log_events(wenv))
+
+
+def test_a_refused_window_supervisor_exits_2_and_prints_nothing(
+    wenv: WindowEnv, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The record does not name this process: exit 2, logged, nothing on stdout or stderr."""
+    from agent_spawn import cli, handoff
+
+    monkeypatch.setattr(handoff, "receive_environment", lambda *a, **k: dict(os.environ))
+    wenv.state_dir.mkdir(parents=True, exist_ok=True)
+    with wenv.store_create() as store:
+        assert store is not None
+    code = cli.main(
+        [
+            "supervise", "ag-aaaaaaaa", "--handoff", "/x", "--handoff-timeout", "1",
+            "--state-dir", str(wenv.state_dir), "--config", str(wenv.config),
+        ]
+    )  # fmt: skip
+    captured = capsys.readouterr()
+    assert code == 2 and captured.out == "" and captured.err == ""
+    assert "supervise refused" in (wenv.state_dir / "log.jsonl").read_text()
+
+
+def test_the_handed_environment_replaces_the_panes_and_the_launchers_overrides_apply(
+    wenv: WindowEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent_spawn import cli, handoff
+    from agent_spawn.supervise import Signals, Supervisor
+
+    handed = {"HOME": "/handed", "AGENT_SPAWN_TOMBSTONE_DAYS": "7", "KEPT": "yes"}
+    argv = [
+        "supervise", "ag-aaaaaaaa", "--handoff", "/x", "--handoff-timeout", "1",
+        "--state-dir", str(wenv.state_dir), "--config", str(wenv.config),
+    ]  # fmt: skip
+    monkeypatch.setattr(handoff, "receive_environment", lambda *a, **k: dict(handed))
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "environ", {"AGENT_SPAWN_TOMBSTONE_DAYS": "99", "PANE_ONLY": "1"})
+        inv = cli.parse_invocation(argv)
+        assert inv.config.tombstone_days == 99  # loaded from the pane's environment
+        supervisor = Supervisor(inv, Signals(interactive=True))
+        assert supervisor.adopt_handoff() is None
+        assert dict(os.environ) == handed  # the pane's own variables are gone
+        assert supervisor.config.tombstone_days == 7 and inv.config.tombstone_days == 7
+
+
+def test_a_failed_handoff_exits_1_and_starts_nothing(
+    wenv: WindowEnv, fakebin: Fakebin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent_spawn import cli, handoff
+    from agent_spawn.supervise import Signals, Supervisor
+
+    def refuse(*args: object, **kwargs: object) -> dict[str, str]:
+        raise handoff.HandoffFailed("timeout", "x")
+
+    monkeypatch.setattr(handoff, "receive_environment", refuse)
+    inv = cli.parse_invocation(
+        [
+            "supervise", "ag-aaaaaaaa", "--handoff", "/x", "--handoff-timeout", "1",
+            "--state-dir", str(wenv.state_dir), "--config", str(wenv.config),
+        ]
+    )  # fmt: skip
+    outcome = Supervisor(inv, Signals(interactive=True)).adopt_handoff()
+    assert outcome is not None and outcome.exit_code == 1 and outcome.quiet
+    fakebin.assert_not_called("claude-session")

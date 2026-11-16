@@ -749,6 +749,8 @@ def supervise(inv: Any) -> Outcome:
     try:
         return supervisor.run()
     except CliError as error:
+        if not windowed and not inv.args.host:
+            raise  # a headless supervisor's stderr is its log; a direct run shows the refusal
         supervisor.log("warning", level="error", message=f"supervise failed: {error.code}")
         return quiet_error(error)
     finally:

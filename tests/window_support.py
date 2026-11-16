@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_spawn import procs
+from agent_spawn.store import Store
 from tests.conftest import REAL_TMUX, Isolation
 from tests.fakebin.harness import Fakebin
 from tests.launch_support import Env
@@ -34,6 +35,10 @@ class WindowEnv(Env):
                 **(extra or {}),
             }
         )
+
+    def store_create(self) -> Store:
+        """Create the state database (a supervisor only opens an existing one)."""
+        return Store.open(self.state_dir)
 
     def panes(self) -> list[dict[str, Any]]:
         """The fake termctl's view of the panes (it syncs from tmux first)."""
@@ -61,3 +66,11 @@ def tmux_text(done: subprocess.CompletedProcess[str]) -> str:
 
 def log_lines(path: Path) -> list[str]:
     return path.read_text().splitlines() if path.exists() else []
+
+
+def send_signal(identity: procs.ProcessIdentity, signum: int) -> None:
+    """Signal exactly the recorded process (verified by pidfd, PID and start time)."""
+    handle = procs.open_verified(identity)
+    assert handle is not None, "the process is gone"
+    with handle:
+        handle.send(signum)

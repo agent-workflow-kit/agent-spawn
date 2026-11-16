@@ -153,7 +153,7 @@ def resolve_tool(argv: Sequence[str], name: str) -> list[str]:
 
 def args_mode(args: Any) -> str:
     """The run mode a launch asks for (claude-session's default is interactive)."""
-    return args.mode or "interactive"
+    return getattr(args, "mode", None) or "interactive"
 
 
 def resolve_wtctl(command: Sequence[str], stored: str | None) -> list[str]:
@@ -1626,8 +1626,14 @@ class Launch:
                     override_escalation=self.term_override,
                 )
             except CliError as error:
+                if self.term_override:
+                    self.term_override_audit(
+                        "refused" if error.exit_code == 20 else "error", agent_id
+                    )
                 self.placement_failed(result, error)
                 raise  # unreachable
+            if self.term_override:
+                self.term_override_audit("ok", agent_id)
             identity = self.record_window(result, pane)
             try:
                 listener.serve(
@@ -1647,6 +1653,9 @@ class Launch:
         self.supervised = True
         self.log("launch", message="window supervisor started", pid=identity.pid)
         return self.wait()
+
+    def term_override_audit(self, result: str, agent_id: str) -> None:
+        """``--override-escalation`` went to ``termctl open`` (resume only)."""
 
     @staticmethod
     def handoff_error(failure: HandoffFailed) -> CliError:

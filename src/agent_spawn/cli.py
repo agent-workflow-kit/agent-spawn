@@ -780,8 +780,9 @@ def _run(inv: Invocation) -> Outcome:
 
 
 def _silenced(inv: Invocation, outcome: Outcome) -> Outcome:
-    """An internal command (``supervise``) prints nothing: a window supervisor's terminal may be
-    gone (a write after a hangup fails with EIO) and its reasons go to its log."""
-    if inv.command in INTERNAL_COMMANDS:
+    """A window-hosted ``supervise`` prints nothing: its terminal may be gone (a write after a
+    hangup fails with EIO) and its reasons go to its log. A headless one writes to its log
+    file already (its stderr), and a direct run shows why it refused."""
+    if inv.command in INTERNAL_COMMANDS and (inv.args.handoff is not None or inv.args.host):
         return dataclasses.replace(outcome, quiet=True)
     return outcome
