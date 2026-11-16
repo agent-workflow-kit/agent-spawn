@@ -246,9 +246,7 @@ class TermBackend:
         if reply.code == 0:
             raise CliError("failed", "termctl printed unusable output", tool=TOOL)
         code = reply.code if reply.code == 2 else 12
-        error = from_lower_tool(
-            TOOL, code, self.error_of(reply), window_preflight=True
-        )
+        error = from_lower_tool(TOOL, code, self.error_of(reply), window_preflight=True)
         if code == 12:
             error.details = {**(error.details or {}), "hint": PREFLIGHT_HINT}
         raise error
@@ -280,9 +278,7 @@ class TermBackend:
         )
         if override_escalation:
             args.append("--override-escalation")
-        reply = self.call(
-            ["open", *args, *self.audit_flags(), "--", *argv], timeout=OPEN_TIMEOUT
-        )
+        reply = self.call(["open", *args, *self.audit_flags(), "--", *argv], timeout=OPEN_TIMEOUT)
         if reply.code != 0:
             raise self.fail(reply)
         pane = _parse_pane(reply.data)
@@ -347,4 +343,3 @@ class TermBackend:
         )
         if reply.code != 0:
             raise self.fail(reply)
-

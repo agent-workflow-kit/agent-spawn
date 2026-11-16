@@ -11,6 +11,7 @@ raw.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
 import pwd
 import re
@@ -540,8 +541,9 @@ def parse_invocation(argv: Sequence[str]) -> Invocation:
     try:
         # Decision (#11): the launcher's AGENT_SPAWN_* overrides apply to everything it starts.
         # A detached supervisor inherits the launcher's environment, so this load already sees
-        # them. TODO(#27): a window supervisor loads this config from the tmux pane's environment
-        # and must re-apply the overrides after it adopts the handoff environment.
+        # them. A window supervisor loads this config from the tmux pane's environment and
+        # loads it again from the launcher's environment after the handoff
+        # (supervise.Supervisor.adopt_handoff).
         loaded = load_config(named, must_exist=named is not None and not internal)
     except CliError as error:
         raise ConfigFailure(error, decision_ids=capped, result_file=result_file) from None
@@ -769,9 +771,17 @@ def _run(inv: Invocation) -> Outcome:
             render_json(outcome.payload)  # a payload that is not JSON is an internal error
         return outcome
     except CliError as error:
-        return error_outcome(error, inv.decision_ids)
+        return _silenced(inv, error_outcome(error, inv.decision_ids))
     except Exception as exc:
-        if inv.verbose:
+        if inv.verbose and inv.command != "supervise":
             _write(sys.stderr, safe_text(traceback.format_exc(), multiline=True))
         error = CliError.of("internal", f"internal error ({type(exc).__name__})")
-        return error_outcome(error, inv.decision_ids)
+        return _silenced(inv, error_outcome(error, inv.decision_ids))
+
+
+def _silenced(inv: Invocation, outcome: Outcome) -> Outcome:
+    """An internal command (``supervise``) prints nothing: a window supervisor's terminal may be
+    gone (a write after a hangup fails with EIO) and its reasons go to its log."""
+    if inv.command in INTERNAL_COMMANDS:
+        return dataclasses.replace(outcome, quiet=True)
+    return outcome

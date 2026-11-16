@@ -5,6 +5,12 @@ checks), ``pre-launch`` hooks, allocation, the worktree (``wtctl create`` or ``a
 and the holds (step 5), the session (``claude-session start`` and the post-start classification
 check), the detached supervisor, and the return.
 
+Window placement (interactive, ``--placement window``, step 7): the launcher listens on the
+environment handoff socket, opens the window with ``termctl open`` (after the same call with
+``--dry-run`` as the preflight of step 1, before any hook or allocation), records the pane's
+process as the supervisor and serves the handoff. The window preflight, labels and cwd rules
+live here; ``term.py`` makes the calls.
+
 Signals (interface.md, Signals). Until a supervisor is recorded the handlers raise
 ``LaunchInterrupted`` in the main thread, which stops the in-flight lower-tool call (the gateway
 kills exactly its own child), cancels a pending run, parks the agent ``killed`` without attention
@@ -36,6 +42,7 @@ from . import lifecycle, procs, third_party
 from . import worktrees as wtlib
 from .agent_view import agent_object, chain_first_working_at, outcome_object
 from .config import Config
+from .handoff import HandoffFailed, HandoffListener
 from .ids import IdEntry, new_agent_id
 from .labels import LabelSet, job_label, parse_run_labels
 from .output import (
@@ -60,6 +67,7 @@ from .session_backend import (
     relay_hook,
 )
 from .store import Store, StoreError, default_state_dir
+from .term import Pane, TermBackend, window_labels
 from .validate import GrammarError, default_name, parse_duration
 from .worktrees import CreatePlan, WtctlBackend, WtctlError, WtRecord
 
@@ -143,12 +151,21 @@ def resolve_tool(argv: Sequence[str], name: str) -> list[str]:
     return [path, *argv[1:]]
 
 
+def args_mode(args: Any) -> str:
+    """The run mode a launch asks for (claude-session's default is interactive)."""
+    return args.mode or "interactive"
+
+
 def resolve_wtctl(command: Sequence[str], stored: str | None) -> list[str]:
-    """wtctl as configured, else as stored with the agent (an absolute path, possibly with
+    return resolve_stored_tool(command, "wtctl", stored)
+
+
+def resolve_stored_tool(command: Sequence[str], name: str, stored: str | None) -> list[str]:
+    """``name`` as configured, else as stored with the agent (an absolute path, possibly with
     arguments); exit 12 ``tool_missing`` when neither resolves. A blank stored value counts as
     none."""
     try:
-        return resolve_tool(command, "wtctl")
+        return resolve_tool(command, name)
     except CliError as missing:
         if not stored:
             raise
@@ -156,7 +173,7 @@ def resolve_wtctl(command: Sequence[str], stored: str | None) -> list[str]:
             argv = shlex.split(stored)
             if not argv:
                 raise missing from None
-            return resolve_tool(argv, "wtctl")
+            return resolve_tool(argv, name)
         except (CliError, ValueError):
             raise missing from None
 
@@ -332,6 +349,11 @@ class Launch:
         self.wt_records: list[WtRecord] | None = None  # the last `wtctl list`
         self.holds_started = False  # `take_holds` may have adopted a record
         self.stored_wtctl: str | None = None  # the absolute wtctl path stored with the agent
+        self.mode = args_mode(self.args)  # interactive or headless
+        self.term: TermBackend | None = None  # resolved when a window will be opened
+        self.term_argv: list[str] | None = None
+        self.stored_termctl: str | None = None  # the absolute termctl path stored with the agent
+        self.term_override = False  # --override-escalation goes to `termctl open` (resume)
 
     # -- logging ------------------------------------------------------------------------------
 
@@ -399,7 +421,7 @@ class Launch:
             raise CliError.usage("worktree flags need wtctl, but wtctl_cmd is null in the config")
         if worktree != "none":
             self.worktree_usage(worktree)
-        mode = args.mode or "interactive"
+        mode = self.mode
         if args.placement == "here" and args.wait_timeout is not None:
             raise CliError.usage("--wait-timeout cannot be combined with --placement here")
         if args.placement == "here" and mode == "interactive" and not _tty_pair():
@@ -413,14 +435,13 @@ class Launch:
             self.max_turns()
         input_names(args)
         self.label_set = self.labels()  # a reserved label key is exit 2, before any tool lookup
-        # Seams owned by later issues; the usage checks above already ran.
-        if mode != "headless":
+        if mode == "headless":
+            if args.placement is not None:
+                self.warnings.append("--placement is ignored for a headless launch")
+        elif args.placement == "here":
             raise CliError.of(
-                "internal",
-                "interactive launches are not implemented yet (windows: #27, here: #30)",
-            )  # TODO(#27): windows; TODO(#30): --placement here.
-        if args.placement is not None:
-            self.warnings.append("--placement is ignored for a headless launch")
+                "internal", "--placement here is not implemented yet (issue #30)"
+            )  # TODO(#30): --placement here.
 
     def worktree_usage(self, worktree: str) -> None:
         """Grammars and containment of the worktree flags (exit 2, nothing created)."""
@@ -462,6 +483,61 @@ class Launch:
     def tool_argv(self, name: str, command: Sequence[str]) -> list[str]:
         return resolve_tool(command, name)
 
+    @property
+    def windowed(self) -> bool:
+        """A window will host the supervisor: interactive mode with placement ``window``."""
+        return self.mode == "interactive" and (self.args.placement or "window") == "window"
+
+    def termctl_backend(self) -> TermBackend:
+        """termctl, resolved once (exit 12 ``tool_missing`` before anything changes): config's
+        command, else the absolute path stored with the agent."""
+        if self.term is not None:
+            return self.term
+        argv = self.resolve_termctl()
+        self.term = TermBackend(
+            argv, actor=self.inv.actor, decision_ids=self.decision_ids, gateway=self.gateway
+        )
+        return self.term
+
+    def resolve_termctl(self) -> list[str]:
+        if self.term_argv is None:
+            self.term_argv = resolve_stored_tool(
+                self.config.termctl_cmd, "termctl", self.stored_termctl
+            )
+        return self.term_argv
+
+    def window_name(self, agent_id: str) -> str:
+        return _name_of(agent_id, self.args)
+
+    def window_term_placement(self) -> str | None:
+        return self.args.term_placement
+
+    def window_preflight(
+        self,
+        agent_id: str,
+        run_kind: str | None,
+        label_texts: Sequence[str],
+        cwd: str | None,
+        self_path: str,
+        name: str | None = None,
+    ) -> list[str]:
+        """Launch step 1, window preflight: ``termctl open --dry-run`` with the real open's
+        name, labels and placement, ``--cwd`` only for a directory that exists (never
+        ``session-dir``). Returns the window labels (with their warnings noted)."""
+        labels, notes = window_labels(run_kind, agent_id, label_texts)
+        self.warnings.extend(w for w in notes if w not in self.warnings)
+        directory = None
+        if cwd is not None and cwd != third_party.SESSION_DIR and os.path.isdir(cwd):
+            directory = os.path.realpath(cwd)
+        self.termctl_backend().preflight(
+            name=name or self.window_name(agent_id),
+            labels=labels,
+            placement=self.window_term_placement(),
+            cwd=directory,
+            argv=[self_path, "supervise"],
+        )
+        return labels
+
     def labels(self) -> LabelSet:
         given = parse_run_labels(self.args.label or [])
         extra = list(given)
@@ -485,7 +561,7 @@ class Launch:
         a = self.args
         return RunSpec(
             agent_id=agent_id,
-            mode="headless",
+            mode=self.mode,
             kind=a.kind,
             skill=a.skill,
             plugin_dirs=tuple(os.path.abspath(p) for p in (a.plugin_dir or [])),
@@ -515,8 +591,8 @@ class Launch:
         worktree = a.worktree or "none"
         return {
             "kind": a.kind,
-            "mode": "headless",
-            "placement": None,
+            "mode": self.mode,
+            "placement": self.placement_value(),
             "term_placement": a.term_placement,
             "name": a.name or a.worktree_name,
             # `--worktree <path>` stores the literal --repo (or null): a retry of its `adopt`
@@ -541,6 +617,10 @@ class Launch:
             "wait": bool(a.wait),
             "wait_timeout": a.wait_timeout,
         }
+
+    def placement_value(self) -> str | None:
+        """The stored placement: ``window`` or ``here`` for an interactive run, else null."""
+        return (self.args.placement or "window") if self.mode == "interactive" else None
 
     def pass_throughs(self) -> dict[str, Any]:
         found: dict[str, Any] = {}
@@ -695,10 +775,10 @@ class Launch:
             "run_kind": classification.run_kind,
             "reads_third_party": classification.reads_third_party,
             "tainted": None,
-            "mode": "headless",
+            "mode": self.mode,
             "status": None,
             "needs_attention": None,
-            "placement": None,
+            "placement": self.placement_value(),
             "term_placement": a.term_placement,
             "worktree": a.worktree or "none",
             "branch": a.branch,
@@ -745,6 +825,8 @@ class Launch:
         self.usage_checks()
         config = self.config
         cs_argv = self.tool_argv("claude-session", config.claude_session_cmd)
+        if self.windowed:
+            self.termctl_backend()  # tool resolution: exit 12 tool_missing before anything changes
         if self.worktree_mode() != "none":
             self.wtctl_backend()  # tool resolution: exit 12 tool_missing before anything changes
         self_path = resolve_self()
@@ -772,6 +854,11 @@ class Launch:
             spec = self.build_spec(proposed, labels, self._classification_cwd(), self.copies)
             classification = self.backend.classify(spec)
             cwd = self.pre_start_checks(classification)
+            if self.windowed:
+                # Before any hook or allocation: a machine without a usable tmux fails here.
+                self.window_preflight(
+                    proposed, classification.run_kind, labels.texts(), cwd, self_path
+                )
             self.run_pre_launch(labels, classification, cwd, self.copies)
             # The hooks' decision ids join every later call of the launcher.
             self.backend.decision_ids = list(self.decision_ids)
@@ -842,6 +929,13 @@ class Launch:
         worktree_plan: dict[str, Any] | None = None
         if would_refuse is None:
             would_refuse, worktree_plan = self.dry_run_worktree(classification, cwd, agent_id)
+        term_plan: dict[str, Any] | None = None
+        if self.windowed and would_refuse is None:
+            # The preflight of step 1 and termctl's read-only plan; a failure is the real run's.
+            window = self.window_preflight(
+                agent_id, classification.run_kind, labels.texts(), cwd, resolve_self()
+            )
+            term_plan = self.termctl_backend().placements(window)
         outcome_path = os.path.join(self.state_dir, "outcomes", agent_id, "TOKEN.json")
         relay = relay_hook(resolve_self(), self.state_dir, self.inv.config_file or "")
         argv = [
@@ -862,9 +956,13 @@ class Launch:
             "reads_third_party": classification.reads_third_party,
             "session_plan": session_plan,
             "would_refuse": would_refuse,
-            "tools": {"claude-session": list(cs_argv), "termctl": None, "wtctl": self.wt_argv},
+            "tools": {
+                "claude-session": list(cs_argv),
+                "termctl": self.term_argv if self.windowed else None,
+                "wtctl": self.wt_argv,
+            },
             "worktree_plan": worktree_plan,
-            "term_plan": None,
+            "term_plan": term_plan,
             "session_start_argv": argv,
             "hooks": self.hook_listing(),
             "warnings": self.warnings,
@@ -929,8 +1027,8 @@ class Launch:
         fields: dict[str, Any] = {
             "status": "launching",
             "launch_kind": args.kind,
-            "mode": "headless",
-            "placement": None,
+            "mode": self.mode,
+            "placement": self.placement_value(),
             "term_placement": args.term_placement,
             "name": name,
             "repo": args.repo or classification.repo,
@@ -949,6 +1047,8 @@ class Launch:
         }
         if self.wt_argv is not None:
             fields["wtctl_path"] = shlex.join(self.wt_argv)
+        if self.windowed and self.term_argv is not None:
+            fields["termctl_path"] = shlex.join(self.term_argv)
         # A signal is held back until the record and the flag agree: an interrupt must never
         # find a record the launcher does not know about.
         with _signals_held():
@@ -958,7 +1058,7 @@ class Launch:
         assert self.agent_id is not None
         if self.agent_id != proposed:
             self.copies = _rename_copies(self.state_dir, self.copies, self.agent_id, args)
-        self.log("launch", details={"mode": "headless", "kind": args.kind})
+        self.log("launch", details={"mode": self.mode, "kind": args.kind})
         if self.override_hook is not None:
             self.audit(
                 "launch_escalation_override",
@@ -1228,14 +1328,18 @@ class Launch:
                     result.run,
                     {
                         "plan_run_kind": classification.run_kind,
-                        "mode": "headless",
-                        "placement": None,
+                        "mode": self.mode,
+                        "placement": self.run_placement(),
                         "cwd": cwd,
                         "reads_third_party": classification.reads_third_party,
                         "outcome_token": token,
                         "hooks": self.run_hooks,
                     },
                 )
+
+    def run_placement(self) -> str | None:
+        """The run's placement: ``window`` or null (``here`` is #30)."""
+        return "window" if self.windowed else None
 
     def fail_start(self, error: StartError, row: dict[str, Any]) -> None:
         """Park after a failed ``start`` (launch step 6) and raise the pass-through error."""
@@ -1259,7 +1363,7 @@ class Launch:
         if session is not None:
             self.csession_id = session
             agent_changes: dict[str, object] = {"csession_id": session}
-            run_fields: dict[str, object] = {"mode": "headless", "hooks": self.run_hooks}
+            run_fields: dict[str, object] = {"mode": self.mode, "hooks": self.run_hooks}
             if run:
                 # The run was allocated and never started: it is recorded with its not-started
                 # outcome, updating `run`, `last_outcome` and `last_end_reason` together.
@@ -1428,6 +1532,8 @@ class Launch:
         assert agent_id is not None
         row = store.get_agent(agent_id)
         assert row is not None
+        if self.windowed:
+            return self.place_window(result, row)
         supervise_dir = os.path.join(self.state_dir, "supervise")
         os.makedirs(supervise_dir, mode=0o700, exist_ok=True)
         argv = [
@@ -1463,8 +1569,124 @@ class Launch:
         self.log("launch", message="supervisor started", pid=identity.pid)
         return self.wait()
 
+    def window_cwd(self, row: dict[str, Any], result: StartResult) -> str | None:
+        """The window's cwd (launch step 7): the run's cwd; for ``session-dir`` the realpath of
+        ``<csession_dir>/work``. ``None`` leaves it to termctl (the launcher's directory)."""
+        cwd = row.get("cwd")
+        if cwd == third_party.SESSION_DIR:
+            return os.path.realpath(os.path.join(result.csession_dir, "work"))
+        return os.path.realpath(cwd) if isinstance(cwd, str) and cwd else None
+
+    def supervise_argv(self, row: dict[str, Any], listener: HandoffListener) -> list[str]:
+        """The window's command: absolute paths only, no secret and no agent text."""
+        return [
+            row["agent_spawn_path"],
+            "supervise",
+            row["agent_id"],
+            "--handoff",
+            str(listener.socket_path),
+            "--handoff-timeout",
+            str(self.config.handoff_timeout),
+            "--state-dir",
+            self.state_dir,
+            "--config",
+            row["config_path"],
+        ]
+
+    def place_window(self, result: StartResult, row: dict[str, Any]) -> Outcome:
+        """Launch step 7, interactive window: listen on the handoff socket, ``termctl open``,
+        record the pane's process as the supervisor and serve the handoff. A failure before the
+        handoff completed means no supervisor exists: the pending run is canceled and the agent
+        parked (exactly one process parks)."""
+        assert self.store is not None and self.agent_id is not None
+        store, agent_id = self.store, self.agent_id
+        term_backend = self.termctl_backend()
+        try:
+            listener = HandoffListener.create(
+                self.state_dir, agent_id=agent_id, gateway=self.gateway
+            )
+        except HandoffFailed as failure:
+            self.placement_failed(result, self.handoff_error(failure))
+            raise  # unreachable
+        try:
+            run_kind = row.get("run_kind")
+            labels, notes = window_labels(
+                run_kind if isinstance(run_kind, str) else None,
+                agent_id,
+                store.get_labels(agent_id).texts(),
+            )
+            self.warnings.extend(w for w in notes if w not in self.warnings)
+            try:
+                pane = term_backend.open(
+                    name=row["name"],
+                    labels=labels,
+                    placement=row.get("term_placement"),
+                    cwd=self.window_cwd(row, result),
+                    argv=self.supervise_argv(row, listener),
+                    override_escalation=self.term_override,
+                )
+            except CliError as error:
+                self.placement_failed(result, error)
+                raise  # unreachable
+            identity = self.record_window(result, pane)
+            try:
+                listener.serve(
+                    pane_pid=pane.pid,
+                    pane_state=pane.state,
+                    timeout=self.config.handoff_timeout,
+                    env=dict(os.environ),
+                )
+            except HandoffFailed as failure:
+                self.placement_failed(result, self.handoff_error(failure))
+                raise  # unreachable
+        finally:
+            listener.close()
+        assert identity is not None  # a served handoff always had a readable pane process
+        self.forwarder = procs.SignalForwarder(identity, gateway=self.gateway)
+        self.sig.raising = False  # from here a signal is forwarded, not a reason to cancel
+        self.supervised = True
+        self.log("launch", message="window supervisor started", pid=identity.pid)
+        return self.wait()
+
+    @staticmethod
+    def handoff_error(failure: HandoffFailed) -> CliError:
+        return CliError(
+            "handoff_failed",
+            "the environment handoff to the window failed",
+            details={"cause": failure.cause},
+        )
+
+    def record_window(self, result: StartResult, pane: Pane) -> procs.ProcessIdentity | None:
+        """Store the window on the run (``term_id``, ``socket_path``, the pane process) and the
+        pane process as the supervisor, before the handoff completes (the supervisor checks its
+        record once it has its environment)."""
+        assert self.store is not None and self.agent_id is not None
+        identity: procs.ProcessIdentity | None = None
+        if pane.pid is not None and pane.state != "gone":
+            try:
+                identity = procs.read_identity(pane.pid, gateway=self.gateway)
+            except (procs.ProcessIdentityError, OSError):
+                identity = None
+        agent_id = self.agent_id
+        with self.store.lease(lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT) as lease:
+            with self.store.transaction():
+                self.store.put_run(
+                    lease,
+                    agent_id,
+                    result.run,
+                    {
+                        "term_id": pane.term_id,
+                        "socket_path": pane.socket_path,
+                        "pane_proc": identity,
+                    },
+                )
+                if identity is not None:
+                    self.store.update_agent(lease, agent_id, {"supervisor": identity})
+        return identity
+
     def placement_failed(self, result: StartResult, error: BaseException) -> None:
-        """No supervisor exists: cancel the pending run and park ``launch_failed``."""
+        """No supervisor exists: cancel the pending run and park (``launch_failed``; a termctl
+        veto or escalation parks as such)."""
         assert self.store is not None and self.backend is not None and self.agent_id is not None
         agent_id = self.agent_id
         self.sig.raising = False  # a signal during this cleanup is recorded, never aborts it
@@ -1481,17 +1703,29 @@ class Launch:
             self.backend.stop(result.csession_id)
         except CliError:
             pass
+        fields: dict[str, Any] = {
+            "park_reason": "launch_failed",
+            "needs_attention": "launch_failed",
+        }
+        if isinstance(error, CliError) and error.tool == "termctl":
+            if error.exit_code == 11:
+                fields = {"park_reason": "vetoed", "needs_attention": None}
+            elif error.exit_code == 13:
+                fields = {
+                    "park_reason": "escalated",
+                    "needs_attention": "escalated",
+                    "escalated_by": "termctl",
+                }
         try:
-            lifecycle.park(
-                self.store,
-                agent_id,
-                park_reason="launch_failed",
-                needs_attention="launch_failed",
-                from_status="launching",
-            )
+            lifecycle.park(self.store, agent_id, from_status="launching", **fields)
         except StoreError:
             # TODO(#31): the liveness check parks an agent that stayed launching.
             self.log("warning", level="warn", message="could not park the agent")
+        self.log("status_change", level="warn", details={"to": "parked", **fields})
+        if isinstance(error, CliError):
+            error.agent_id = agent_id
+            error.decision_ids = list(self.decision_ids)
+            raise error
         raise CliError(
             "launch_failed",
             f"could not start the detached supervisor ({type(error).__name__})",
