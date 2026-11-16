@@ -26,6 +26,7 @@ from typing import Any
 from . import gateway as gw
 from .labels import parse_label
 from .output import CliError, from_lower_tool
+from .store import StoreError
 from .validate import GrammarError
 
 __all__ = [
@@ -472,3 +473,31 @@ class TermBackend:
         )
         if reply.code != 0:
             raise self.fail(reply)
+
+
+def sync_window_labels(
+    backend: TermBackend,
+    store: Any,
+    agent_id: str,
+    pane: Pane,
+    run_kind: object,
+    opened: Sequence[str],
+) -> bool:
+    """Labels were read before ``open`` (which can take long) and a ``label add`` or ``remove``
+    in that gap found no window to mirror to: push the difference between the labels now stored
+    and the ones the window was opened with. Best effort; False when it could not be done."""
+    try:
+        wanted, _ = window_labels(
+            run_kind if isinstance(run_kind, str) else None,
+            agent_id,
+            store.get_labels(agent_id).texts(),
+        )
+        add = [label for label in wanted if label not in opened]
+        remove = [label for label in opened if label not in wanted]
+        if add:
+            backend.label_add(pane.term_id, pane.socket_path, add)
+        if remove:
+            backend.label_remove(pane.term_id, pane.socket_path, remove)
+    except (CliError, StoreError):
+        return False
+    return True

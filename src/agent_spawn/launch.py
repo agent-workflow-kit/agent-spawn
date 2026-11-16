@@ -67,7 +67,7 @@ from .session_backend import (
     relay_hook,
 )
 from .store import Store, StoreError, default_state_dir
-from .term import Pane, TermBackend, window_labels
+from .term import Pane, TermBackend, sync_window_labels, window_labels
 from .validate import GrammarError, default_name, parse_duration
 from .worktrees import CreatePlan, WtctlBackend, WtctlError, WtRecord
 
@@ -1683,19 +1683,7 @@ class Launch:
         ``remove`` in that gap found no window to mirror to: push the difference between the
         labels now stored and the ones the window was opened with. Best effort."""
         assert self.store is not None and self.agent_id is not None
-        try:
-            wanted, _ = window_labels(
-                run_kind if isinstance(run_kind, str) else None,
-                self.agent_id,
-                self.store.get_labels(self.agent_id).texts(),
-            )
-            add = [label for label in wanted if label not in opened]
-            remove = [label for label in opened if label not in wanted]
-            if add:
-                term_backend.label_add(pane.term_id, pane.socket_path, add)
-            if remove:
-                term_backend.label_remove(pane.term_id, pane.socket_path, remove)
-        except (CliError, StoreError):
+        if not sync_window_labels(term_backend, self.store, self.agent_id, pane, run_kind, opened):
             self.log("warning", level="warn", message="the window's labels could not be synced")
 
     def panes_before_open(self, term_backend: TermBackend) -> set[tuple[str, str]] | None:

@@ -86,12 +86,16 @@ def result_json(done: subprocess.CompletedProcess[str]) -> Any:
     return json.loads(done.stdout)
 
 
-def script_live_run(fakebin: Fakebin, *, times: int | None = None) -> None:
-    """`claude-session status` reports the current run live in its session phase."""
+def script_live_run(
+    fakebin: Fakebin, *, times: int | None = None, until_called: str | None = None
+) -> None:
+    """`claude-session status` reports the current run live in its session phase (until a call
+    of the ``until_called`` subcommand, when given)."""
     fakebin.script(
         "claude-session",
         "status",
         times=times,
+        until_called=until_called,
         merge={
             "state": "working",
             "live": True,

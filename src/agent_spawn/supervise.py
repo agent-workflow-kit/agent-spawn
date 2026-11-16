@@ -128,6 +128,11 @@ class Supervisor:
         self.marker_warned: dict[int, str] = {}  # run -> the failure last logged (once per change)
         self.clock: Callable[[], float] = time.monotonic
         self.promoted = False  # this run chain's one promotion was decided
+        #: Runs this supervisor canceled itself (``chain.cancel_pending``, a host that died before
+        #: its ``exec`` adopted the run): such a cancel is a chain failure, while a promoted run
+        #: that ended ``canceled`` without one is somebody's deliberate ``stop``.
+        self.self_canceled: set[int] = set()
+        self.window_socket: str | None = None  # the tmux server the window preflight named
 
     def log(self, event: str, *, level: str = "info", **fields: Any) -> None:
         try:
@@ -199,9 +204,7 @@ class Supervisor:
         check that a promotion is pending for this very process, run ``exec`` with the terminal
         as its stdin, stdout and stderr, forward SIGHUP and SIGTERM to it and exit 0 once it
         exited. The supervisor does the bookkeeping."""
-        if self.inv.args.handoff is None:
-            raise CliError.usage("supervise --host needs --handoff")
-        refused = self.adopt_handoff()
+        refused = self.adopt_handoff()  # the CLI refuses a --host without --handoff (exit 2)
         if refused is not None:
             return refused
         try:
@@ -377,13 +380,12 @@ class Supervisor:
                 self.collect_signals()
             final = self.end_of_run(backend, session, ctx)
             if previous is not None and self.ended_in_launch(final):
-                if (
-                    self.terminated
-                    and final.result.outcome == "not-started"
-                    and final.result.end_reason in CANCEL_END_REASONS
+                if final.result.outcome == "not-started" and (
+                    (self.terminated and final.result.end_reason in CANCEL_END_REASONS)
+                    or self.stopped_promotion(final)
                 ):
-                    # A user's SIGTERM or SIGHUP canceled the chain run: not a chain failure;
-                    # the Signals rule applies (killed, no attention).
+                    # A user's SIGTERM or SIGHUP canceled the chain run, or somebody stopped a
+                    # promotion's pending run: not a chain failure (killed, no attention).
                     return self.park_final(final)
                 # A supervisor-initiated run that ended in its launch phase stops the chain.
                 failure = chain.ChainFailure(
@@ -412,6 +414,15 @@ class Supervisor:
             except chain.ChainCanceled:
                 return self.park_final(final)
             previous = final
+
+    def stopped_promotion(self, final: Final) -> bool:
+        """The promoted run was canceled by someone else (``stop``): this supervisor did not
+        cancel it, so it is a deliberate stop and parks per the canceled run."""
+        return (
+            final.ctx.promoted
+            and final.ctx.run not in self.self_canceled
+            and final.result.end_reason == "canceled"
+        )
 
     # -- watching `exec` ---------------------------------------------------------------------
 
@@ -484,12 +495,14 @@ class Supervisor:
             self.watch_until(handle.is_alive, lambda: handle.wait_exit(TICK), backend, session, ctx)
         except BaseException:
             # This supervisor failed while the host lives: tell the host to stop (it forwards
-            # to `exec`); the exact verified process only.
+            # to `exec`) and give it the grace `exec` gets; the exact verified process only.
             self.forward_host_stop(host)
+            procs.wait_for_exit(host, EXEC_GRACE, gateway=self.gateway)
             raise
         finally:
             handle.close()
             self.signals.forwarder = None
+            self.forwarder = None
             for sent in self.signals.take_sent():
                 self.log_sent(sent)
 
@@ -504,18 +517,19 @@ class Supervisor:
         self, backend: SessionBackend, poller: SessionBackend, session: str, ctx: RunCtx
     ) -> None:
         """The host exited. A dead pane is closed (``--keep-on-exit failed`` keeps it), and a run
-        nothing ever adopted (the host died before its `exec` did) is canceled so that it ends."""
+        that is not final (the host died before its `exec` adopted it, or while it ran) is
+        stopped so that it ends."""
         try:
             status = poller.status(session)
         except CliError as error:
             self.log("warning", level="warn", message=f"status failed: {error.code}")
             status = None
-        if (
-            status is not None
-            and status.run.run == ctx.run
-            and status.run.outcome is None
-            and status.pending
-        ):
+        if status is not None and status.run.run == ctx.run and status.run.outcome is None:
+            # The host is gone but the run is not final: a run nothing adopted is canceled (the
+            # supervisor's own cancel), a live one is stopped (its `exec` died with the host).
+            # The outcome is read again afterwards.
+            if status.pending:
+                self.self_canceled.add(ctx.run)
             chain.stop_pending(self, backend, session)
         if self.term is not None:
             promotion.close_dead(self, self.term, ctx, wait=promotion.HOST_STOP_WAIT)

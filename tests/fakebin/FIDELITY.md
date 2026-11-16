@@ -63,7 +63,7 @@ Places where the claude-session fake accepts or answers what the real tool (per 
 
 - `forget` of a pending or live session succeeds; the real tool refuses a live run.
 - `start --dry-run` answers constants: `taints` is false and `would_refuse` is null whatever the session's state (use `fakebin.script` to get a refusal).
-- `status` never reports a pending run, `recent_events` is always empty and `reconcile` finds nothing.
+- `status` never reports a pending run unless a test scripts `pending_unadopted: true` (then a run nothing adopted yet, and not final, is reported `pending` in its launch phase with a null outcome; **unverified**, see Unverified), `recent_events` is always empty and `reconcile` finds nothing.
 - The outcome-file refusal of launch step 2 (a path under a session-writable path) is not modeled.
 - A plain `--resume` with `--cwd` is accepted; the real tool exits 2 when it differs from the stored cwd.
 
@@ -75,3 +75,4 @@ Places where the claude-session fake accepts or answers what the real tool (per 
 - Anything the fakes do not log or model (timing, concurrency between real sibling processes, lease contention) is not tested by them.
 - The signal table of `exec` (end reasons, SIGINT ignored by an interactive run), the `stop` states, run bookkeeping across resumes and forks, and the `--actor`/`--decision-id` caps of claude-session are from its interface document only.
 - The `/proc` dependence of the process tests is gone: the PID plus start-time identity of `private_tmux` comes from `ps -o lstart=` (the same on Linux and macOS). The one assertion that reads a process environment still needs `/proc` and is skipped elsewhere.
+- Promotion (#29), not yet checked against the real programs (reported on the live-test issue #36): (A) the real `pane_pid` under tmux's default-shell wrapping and termctl's `pid: null` rules, against the host's self-identity requirement (`pane_proc` must equal the `supervise --host` process); (B) the real `claude-session status` of an unadopted promoted run (`pending: true`, phase `launch`, `expires_at`, the `expired`/`never_adopted` finalization), which the fake reports only when a test scripts `pending_unadopted`; (C) `claude-session start --resume <id> --mode interactive --json` with no prompt file; (D) `exec --session-id` inside a pty host, and exit 20 `expired` after an unadopted run (the host must still exit 0); (E) `termctl open --dry-run` against a real open (drift); (F) `--keep-on-exit failed` keeping only failed panes, and the timing of `close_dead`; (G) `never_adopted` is modeled as an `exec` that prints it, while the real sequence is claude-session finalizing the unadopted run later.

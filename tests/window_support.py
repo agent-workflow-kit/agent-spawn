@@ -32,12 +32,16 @@ class WindowEnv(Env):
     def argv(self, *args: str) -> list[str]:
         return [self.spawn, *args] if self.spawn is not None else super().argv(*args)
 
-    def capture_supervisor(self, directory: Path, launcher_prologue: str = "") -> Capture:
+    def capture_supervisor(
+        self, directory: Path, launcher_prologue: str = "", host_gate: Path | None = None
+    ) -> Capture:
         """Run every window supervisor under a wrapper named ``agent-spawn`` (the launcher puts
         its own path in the pane's command) that is the pane process itself: it sends the
-        supervisor's stdout and stderr to files and records its exit code atomically."""
+        supervisor's stdout and stderr to files and records its exit code atomically. With
+        ``host_gate`` a ``supervise --host`` process waits (it is live, doing nothing) until that
+        file exists before it starts its work, so a test can hold a host back."""
         capture = Capture(directory)
-        self.spawn = str(capture.write(launcher_prologue))
+        self.spawn = str(capture.write(launcher_prologue, host_gate))
         return capture
 
     def env(self, extra: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -84,7 +88,7 @@ class Capture:
         self.err = directory / "stderr"
         self.rc = directory / "rc"
 
-    def write(self, launcher_prologue: str = "") -> Path:
+    def write(self, launcher_prologue: str = "", host_gate: Path | None = None) -> Path:
         """The wrapper script; ``launcher_prologue`` (Python) runs first in every process that is
         not a supervisor, to patch the launcher under test."""
         script = self.directory / "agent-spawn"
@@ -96,8 +100,17 @@ class Capture:
             "if supervisor:\n"
             f"    for fd, path in ((1, {str(self.out)!r}), (2, {str(self.err)!r})):\n"
             "        os.dup2(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), fd)\n"
-            "if not supervisor:\n"
         )
+        if host_gate is not None:
+            head += (
+                "if '--host' in args:\n"
+                "    import time\n"
+                "    for _ in range(1200):\n"  # bounded: a test that never opens it ends in time
+                f"        if os.path.exists({str(host_gate)!r}):\n"
+                "            break\n"
+                "        time.sleep(0.05)\n"
+            )
+        head += "if not supervisor:\n"
         tail = (
             "from agent_spawn.cli import main\n"
             "code = main(args)\n"

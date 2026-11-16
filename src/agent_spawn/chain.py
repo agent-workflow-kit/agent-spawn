@@ -279,7 +279,9 @@ def cancel_pending(
     promoted: bool = False,
 ) -> None:
     """Cancel the chain run (no process can adopt it yet) and record it; a run that ``stop``
-    did not end is recorded without an outcome."""
+    did not end is recorded without an outcome. The cancel is this supervisor's own: it is not a
+    deliberate stop by someone else (``Supervisor.self_canceled``)."""
+    sup.self_canceled.add(run)
     ended = stop_pending(sup, backend, session)
     record_unstarted(
         sup,
@@ -512,6 +514,8 @@ def _take_holds(sup: Supervisor, wt: _Wtctl, cwds: list[str]) -> None:
             _store_nearest(sup, around)
     except CliError as error:
         raise failure_of(error) from None
+    except StoreError:
+        raise ChainFailure("agent-spawn", "failed") from None
 
 
 def _store_nearest(sup: Supervisor, around: list[WtRecord]) -> None:
@@ -618,9 +622,13 @@ def _after_start(
     work = os.path.join(started.csession_dir, "work")
     with store.lease(lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT) as lease:
         with store.transaction():
-            store.update_agent(
-                lease, agent_id, {"run": started.run, "run_kind": classification.run_kind}
-            )
+            agent_changes: dict[str, object] = {
+                "run": started.run,
+                "run_kind": classification.run_kind,
+            }
+            if promoted:  # the agent's mode and placement are its last run's (Objects)
+                agent_changes.update(mode="interactive", placement="window")
+            store.update_agent(lease, agent_id, agent_changes)
             store.put_run(
                 lease,
                 agent_id,
