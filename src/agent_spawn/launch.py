@@ -1080,7 +1080,7 @@ class Launch:
                 from_status="launching",
             )
         except StoreError:
-            # TODO(#32): the liveness check parks an agent that stayed launching.
+            # TODO(#31): the liveness check parks an agent that stayed launching.
             self.log("warning", level="warn", message="could not park the agent")
         raise CliError(
             "launch_failed",
@@ -1125,7 +1125,7 @@ class Launch:
                     self.park_unsupervised(row)  # raises once it parked the agent
                     continue
                 if dead_looks >= DEAD_SUPERVISOR_POLLS:
-                    # TODO(#32): the liveness check parks a live agent whose supervisor died.
+                    # TODO(#31): the liveness check parks a live agent whose supervisor died.
                     raise CliError(
                         "failed",
                         "the supervisor exited before the agent parked (see reconcile)",
@@ -1174,9 +1174,18 @@ class Launch:
             decision_ids=list(self.decision_ids),
         )
 
-    def first_working_at(self, row: dict[str, Any]) -> str | None:
+    def first_working_at(self, row: dict[str, Any], run: int | None = None) -> str | None:
         assert self.store is not None
-        run_row = self.store.get_run(row["agent_id"], row["run"]) if row.get("run") else None
+        number = run if run is not None else row.get("run")
+        if not isinstance(number, int) or number < 1:
+            return None
+        # The run chain's first run: an automatic report resume belongs to the run before it.
+        run_row = self.store.get_run(row["agent_id"], number)
+        while run_row is not None and run_row.get("auto_resumed") and number > 1:
+            earlier = self.store.get_run(row["agent_id"], number - 1)
+            if earlier is None:
+                break
+            number, run_row = number - 1, earlier
         return ts(run_row.get("first_working_at")) if run_row else None
 
     def forward_signal(self, received: int) -> Outcome | None:
@@ -1197,7 +1206,7 @@ class Launch:
         store = self.store
         agent_id = row["agent_id"]
         agent = agent_object(store, row, warnings=self.warnings)
-        first = self.first_working_at(row)
+        first = self.first_working_at(row)  # the chain's first run, whichever run ended last
         if not final:
             payload = result_object(agent=agent, first_working_at=first, warnings=self.warnings)
             return Outcome(0, payload, PayloadKind.RESULT)
@@ -1272,7 +1281,7 @@ class Launch:
             try:
                 self.cancel_pending(agent_id)
             except (CliError, StoreError):
-                pass  # TODO(#32): the liveness check parks an agent that stayed launching.
+                pass  # TODO(#31): the liveness check parks an agent that stayed launching.
             if self.csession_id is not None and self.copies is not None:
                 remove_copies(self.copies.directory)
         self.log("warning", level="warn", message=f"state error ({type(error).__name__})")

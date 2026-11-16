@@ -15,6 +15,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 from collections.abc import Callable
 from datetime import datetime
@@ -729,6 +730,33 @@ def end_run(session_id: str, outcome: str) -> None:
     update_sessions(change)
 
 
+CHILD_SCRIPT = """
+import os, signal, sys, time
+path, parent = sys.argv[1], int(sys.argv[2])
+def note(signum, _frame):
+    with open(path, "a") as handle:
+        handle.write(signal.Signals(signum).name + "\\n")
+    if signum == signal.SIGTERM:
+        os._exit(0)
+for number in (signal.SIGTERM, signal.SIGCONT, signal.SIGHUP):
+    signal.signal(number, note)
+deadline = time.monotonic() + 120
+while time.monotonic() < deadline and os.getppid() == parent:
+    time.sleep(0.05)
+"""
+
+
+def spawn_child(ctx: Context) -> subprocess.Popen[bytes]:
+    """A real child of the fake ``exec`` (a stand-in for ``claude``): it records the signals it
+    gets in a file named by the ``child_started`` record, and ends on SIGTERM."""
+    path = os.path.join(os.environ.get("FAKEBIN_LOG", "/tmp") + ".child-signals")
+    child = subprocess.Popen(
+        [sys.executable, "-c", CHILD_SCRIPT, path, str(os.getpid())], stdin=subprocess.DEVNULL
+    )
+    log_event("child_started", id=ctx.invoke_id, pid=child.pid, signals_file=path)
+    return child
+
+
 def run_session(
     ctx: Context,
     command: str,
@@ -753,12 +781,20 @@ def run_session(
     name = response.get("outcome", "done")
     numbers = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
     killing = bool(response.get("hang")) and "on_signal" not in response
+    child = spawn_child(ctx) if response.get("child") else None
     if killing:
 
         def killed(signum: int, _frame: Any) -> None:
             for number in numbers:
                 signal.signal(number, drop_signal)
             ctx.signaled.append(signum)
+            if child is not None:  # like claude-session's exec: pass the signal to `claude`
+                child.send_signal(signum)
+                try:
+                    child.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
             stopped = load_sessions().get(session_id, {}).get("stop_requested")
             reason = "stopped" if stopped else SIGNAL_CAUSES[signal.Signals(signum)]
             obj = outcome_object("killed", session_id, run, end_reason=reason)

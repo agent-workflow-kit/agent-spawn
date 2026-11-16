@@ -447,8 +447,14 @@ def forward_signal(
         if not handle.send(sig):
             return SignalOutcome(identity.pid, sig, "gone")
         if sig == signal.SIGTERM:
-            handle.send(signal.SIGCONT)
+            try:
+                handle.send(signal.SIGCONT)
+            except OSError:
+                pass  # best effort: the SIGTERM was delivered, so the forward counts as sent
     return SignalOutcome(identity.pid, sig, "sent")
+
+
+_FORWARDED_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 
 
 class SignalForwarder:
@@ -461,11 +467,22 @@ class SignalForwarder:
 
     def forward(self, sig: int) -> SignalOutcome | None:
         """Forward ``sig``; ``None`` when this signal was already forwarded."""
-        if sig in self._forwarded:
-            return None
-        outcome = forward_signal(self.identity, sig, gateway=self._gateway)
-        self._forwarded.add(sig)  # only a completed forward (sent or gone) counts
-        return outcome
+        # Check and mark with the forwarded signals blocked: a handler that interleaves between
+        # the check and the mark would send the same signal twice.
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, _FORWARDED_SIGNALS)
+        try:
+            if sig in self._forwarded:
+                return None
+            self._forwarded.add(sig)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        # Only a send that failed is unmarked, so it can be retried: once the main signal was
+        # delivered (see ``forward_signal``) the signal counts as sent.
+        try:
+            return forward_signal(self.identity, sig, gateway=self._gateway)
+        except BaseException:
+            self._forwarded.discard(sig)
+            raise
 
 
 def install_signal_handlers(

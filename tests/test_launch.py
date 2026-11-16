@@ -190,9 +190,8 @@ def _agents(env: Env) -> list[dict[str, Any]]:
         return []
 
 
-# TODO(#12): the fake `exec` has no child of its own, so this proves the supervisor forwards
-# SIGTERM to the exact `exec` but not that `exec`'s own child gets SIGTERM (and SIGCONT); that
-# needs a fake `exec` that spawns a real child, with the forwarding owned by issue #12.
+# The fake `exec` has no child of its own here; the chain down to a real child of `exec` is
+# test_supervise_chain.py::test_sigterm_chain_reaches_exec_and_its_child_even_when_exec_is_stopped.
 def test_sigterm_chain_launcher_supervisor_exec(
     env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
 ) -> None:

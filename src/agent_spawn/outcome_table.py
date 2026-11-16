@@ -34,7 +34,7 @@ def park_row(outcome: str, end_reason: str | None) -> ParkRow:
     if outcome == "failed":
         return ParkRow("failed", "failed")
     if outcome == "exited-unreported":
-        # TODO(#12): a headless run gets one automatic report resume before this row applies.
+        # A headless run got one automatic report resume before this row applied (supervise.py).
         return ParkRow("unreported", "unreported")
     if outcome == "killed":
         if end_reason in DELIBERATE_END_REASONS:

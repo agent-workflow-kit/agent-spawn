@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .agent_view import agent_object, lifecycle_events
+from .procs import ProcessIdentity
 from .store import CasLost, Store
 
 LEASE_WAIT = 30.0  # seconds a lifecycle write waits for another live holder of the lease
@@ -121,6 +122,119 @@ def go_live(
                 expect_status="launching",
                 changes=all_changes,
                 events=events,
+            )
+        except CasLost:
+            return None
+
+
+def run_started(
+    store: Store,
+    agent_id: str,
+    *,
+    run: int,
+    auto_resumed: bool = False,
+    changes: Mapping[str, object] | None = None,
+) -> dict[str, Any] | None:
+    """A later run of the chain started (status stays ``live``): clears ``needs_attention`` and
+    records ``post-launch`` for that run. ``None`` when the agent is no longer live."""
+    with store.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
+        row = store.get_agent(agent_id)
+        if row is None or row["status"] != "live":
+            return None
+        all_changes: dict[str, object] = {
+            **(changes or {}),
+            "updated": store.gateway.wall_time(),
+            "needs_attention": None,
+        }
+        before = agent_object(store, row)
+        after = agent_object(store, {**row, **all_changes})
+        events = lifecycle_events(
+            before,
+            after,
+            reads_third_party=reads_third_party_of(store, {**row, "run": run}),
+            started_run=run,
+            auto_resumed=auto_resumed,
+        )
+        try:
+            return store.compare_and_set(
+                lease, agent_id, expect_status="live", changes=all_changes, events=events
+            )
+        except CasLost:
+            return None
+
+
+def enter_ephemeral_teardown(
+    store: Store,
+    agent_id: str,
+    *,
+    supervisor: ProcessIdentity,
+    changes: Mapping[str, object] | None = None,
+) -> dict[str, Any] | None:
+    """The supervisor of an ephemeral agent whose run is ``done``: ``live`` → ``tearing_down``
+    with the supervisor as the teardown process. ``None`` when the compare-and-set lost."""
+    with store.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
+        row = store.get_agent(agent_id)
+        if row is None or row["status"] != "live":
+            return None
+        now = store.gateway.wall_time()
+        all_changes: dict[str, object] = {
+            **(changes or {}),
+            "updated": now,
+            "status": "tearing_down",
+            "teardown_step": "started",
+            "teardown_proc": supervisor,
+            "teardown_partial_record": None,
+        }
+        before = agent_object(store, row)
+        after = agent_object(store, {**row, **all_changes})
+        events = lifecycle_events(before, after, reads_third_party=reads_third_party_of(store, row))
+        try:
+            return store.compare_and_set(
+                lease,
+                agent_id,
+                expect_status="live",
+                expect={"ephemeral": True, "supervisor": supervisor},
+                changes=all_changes,
+                events=events,
+            )
+        except CasLost:
+            return None
+
+
+def refuse_ephemeral_teardown(
+    store: Store, agent_id: str, *, outcome: Mapping[str, Any] | None
+) -> dict[str, Any] | None:
+    """An ephemeral teardown that was refused at a step that changed nothing: ``tearing_down``
+    → ``parked`` (``park_reason: done``) with ``post-park`` carrying ``teardown_refused``."""
+    with store.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
+        row = store.get_agent(agent_id)
+        if row is None or row["status"] != "tearing_down":
+            return None
+        if row.get("teardown_step") == "worktree_partial":
+            return None
+        all_changes: dict[str, object] = {
+            "updated": store.gateway.wall_time(),
+            "status": "parked",
+            "park_reason": "done",
+            "needs_attention": None,
+            "escalated_by": None,
+            "promotion_pending": False,
+            "teardown_step": None,
+            "teardown_proc": None,
+            "teardown_partial_record": None,
+        }
+        before = agent_object(store, row)
+        after = agent_object(store, {**row, **all_changes})
+        events = lifecycle_events(
+            before,
+            after,
+            reads_third_party=reads_third_party_of(store, row),
+            outcome=outcome,
+            teardown_refused=True,
+        )
+        try:
+            return store.compare_and_set(
+                lease, agent_id, expect_status="tearing_down", changes=all_changes, events=events
             )
         except CasLost:
             return None
