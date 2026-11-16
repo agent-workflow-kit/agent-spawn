@@ -42,10 +42,15 @@ OWNERS = {
 
 
 IMPLEMENTED = {
+    "ack",
     "export",
+    "label add",
+    "label remove",
     "launch",
-    "stop",
+    "list",
     "resume",
+    "show",
+    "stop",
     "supervise",
     "teardown",
     "wait",

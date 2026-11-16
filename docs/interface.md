@@ -471,11 +471,13 @@ Edits the agent's labels (at least one pair; exit 2 otherwise; keys `agent` and 
 
 1. `<csession_id>` must equal `CSESSION_ID` (full id), and `CSESSION_DIR` must be set (exit 2 otherwise).
 2. Every key must be in config `self_label_keys` (default `[pr]`; exit 2 otherwise). Only `add` is allowed.
-3. agent-spawn never creates a database in this mode: a missing `state.db` exits 12 (`failed`, hint naming `XDG_STATE_HOME` and `XDG_CONFIG_HOME`, which the session's environment must carry when they are not the defaults).
+3. agent-spawn never creates a database in this mode: a missing `state.db` exits 12 (`failed`, hint naming `XDG_STATE_HOME` and `XDG_CONFIG_HOME`, which the session's environment must carry when they are not the defaults). A `state.db` with an older schema also exits 12 (self-labeling never migrates the database).
 4. `claude-session status <csession_id> --json`: a `tainted` session or a current run with `reads_third_party: true` exits 11. `CSESSION_DIR` must equal the reported `csession_dir` (compared by realpath; exit 11 otherwise).
 5. agent-spawn opens `$CSESSION_DIR/secret` without following symlinks; the file must be a regular file owned by the user, mode 0600 and at most 128 bytes (exit 11 otherwise).
 6. It runs `claude-session verify-secret <csession_id>` with the secret on stdin; a mismatch (exit 11) exits 11.
 7. It adds the pairs to the agent whose session is `<csession_id>` (exit 10 if none) and mirrors them.
+
+A failed check (steps 4 to 6) is an error envelope with `code: vetoed` and exit 11; its message never carries the secret, the session directory or any text read from the session.
 
 Supported case: trusted, unsandboxed kinds whose permission profile allows `Bash(agent-spawn label add --session:*)` and whose environment carries `XDG_STATE_HOME` and `XDG_CONFIG_HOME` when they are not the defaults.
 
