@@ -4,14 +4,13 @@ from __future__ import annotations
 
 from typing import NoReturn
 
-from .. import annotate, listing, self_label, showing
+from .. import annotate, listing, self_label, showing, wait_agent
 from ..output import Outcome
 from .base import Invocation, not_implemented
 
 
-def wait(inv: Invocation) -> NoReturn:
-    # TODO(#17): wait with exit codes, timeouts and result files.
-    not_implemented("wait", 17)
+def wait(inv: Invocation) -> Outcome:
+    return wait_agent.wait(inv)
 
 
 def list_agents(inv: Invocation) -> Outcome:

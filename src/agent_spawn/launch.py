@@ -32,7 +32,7 @@ from typing import Any
 from . import gateway as gw
 from . import hooks as hooklib
 from . import lifecycle, procs, third_party
-from .agent_view import agent_object, outcome_object, ts
+from .agent_view import agent_object, chain_first_working_at, outcome_object
 from .config import Config
 from .ids import IdEntry, new_agent_id
 from .labels import LabelSet, job_label, parse_run_labels
@@ -156,9 +156,7 @@ def resolve_self() -> str:
     raise CliError("tool_missing", "agent-spawn cannot find its own executable path")
 
 
-def _inside(path: str, directory: str) -> bool:
-    """Whether ``path`` equals ``directory`` or lies below it (both realpaths)."""
-    return path == directory or path.startswith(directory.rstrip("/") + "/")
+_inside = third_party.inside
 
 
 def _same_file(info: os.stat_result, fd_info: os.stat_result) -> bool:
@@ -215,16 +213,23 @@ class _Copies:
     input_names: list[str] = field(default_factory=lambda: [])
 
 
-def make_copies(state_dir: str, agent_id: str, args: Any) -> _Copies:
+def make_copies(state_dir: str, agent_id: str, args: Any, *, subdir: str | None = None) -> _Copies:
     """Copy the prompt and the inputs into ``<state>/prompts/<agent_id>/`` (launch step 1).
 
     The directory is made exclusively (mode 0700): two launchers that drew the same id never
-    share it. Later steps pass these copies, never the caller's paths.
+    share it. Later steps pass these copies, never the caller's paths. A resume of an agent
+    that already has a prompt directory copies into ``subdir`` below it instead.
     """
     names = input_names(args)  # exit 2 before anything is created
     base = os.path.join(state_dir, "prompts")
     os.makedirs(base, mode=0o700, exist_ok=True)
     directory = os.path.join(base, agent_id)
+    parent: str | None = None  # the per-agent directory this call created (subdir mode)
+    if subdir is not None:
+        if not os.path.isdir(directory):
+            parent = directory
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        directory = os.path.join(directory, subdir)
     try:
         os.mkdir(directory, 0o700)
     except FileExistsError:
@@ -252,6 +257,11 @@ def make_copies(state_dir: str, agent_id: str, args: Any) -> _Copies:
             copies.input_names.append(name)
     except BaseException:
         shutil.rmtree(directory, ignore_errors=True)
+        if parent is not None:
+            try:
+                os.rmdir(parent)  # only when empty
+            except OSError:
+                pass
         raise
     return copies
 
@@ -508,6 +518,7 @@ class Launch:
                 and cwd != third_party.SESSION_DIR
                 and self.result_file_inside([cwd])
             ):
+                third_party.drop_result_file(self.inv)
                 raise CliError.usage("--result-file lies inside a third-party-reading run's cwd")
         # TODO(#20): the records of the cwd (throwaway and worktree containment, third_party_run).
         return cwd
@@ -594,8 +605,10 @@ class Launch:
         state.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.store = Store.open(self.state_dir, gateway=self.gateway)
         store = self.store
-        # TODO(#13): no `kill_grace` config key exists yet, so every `stop` of this backend uses
-        # claude-session's default grace (30 s); a key needs a spec change first.
+        # No `kill_grace` config key: the launcher never passes `--grace` to `stop`
+        # (claude-session's own grace applies), so the backend's `kill_grace` only widens a call
+        # timeout that is never lengthened here (decided in #13; a key is needed only when a
+        # command takes a grace).
         self.backend = SessionBackend(
             cs_argv,
             actor=self.inv.actor,
@@ -937,7 +950,10 @@ class Launch:
             return third_party.cwd_rule_allows(actual, run_cwd, session_work=work)
 
         def result_file_allows() -> bool:
-            return not self.result_file_inside([result.csession_dir, *([cwd] if cwd else [])])
+            if self.result_file_inside([result.csession_dir, *([cwd] if cwd else [])]):
+                third_party.drop_result_file(self.inv)  # never write into the run's directories
+                return False
+            return True
 
         check = self.backend.check_classification(
             result,
@@ -959,6 +975,10 @@ class Launch:
         if check.verdict == "accept":
             return
         cause = check.decision.cause or "classification_unknown"
+        # The run is third-party-reading or unknown: fail closed, so the error envelope is never
+        # written into its session directory or cwd (only the stdout copy remains).
+        if self.result_file_inside([result.csession_dir, *([cwd] if cwd else [])]):
+            third_party.drop_result_file(self.inv)
         self.log(
             "classification_unknown"
             if cause == "classification_unknown"
@@ -1117,7 +1137,7 @@ class Launch:
                     return self.result(row, final=False)
                 if ended and not alive:  # the run ended before this launcher saw it started
                     return self.result(row, final=True)
-            elif ended and not row["promotion_pending"] and not alive:
+            elif lifecycle.run_settled(row, supervisor_alive=alive):
                 return self.result(row, final=True)
             if not alive and status in ("launching", "live"):
                 dead_looks += 1
@@ -1176,17 +1196,7 @@ class Launch:
 
     def first_working_at(self, row: dict[str, Any], run: int | None = None) -> str | None:
         assert self.store is not None
-        number = run if run is not None else row.get("run")
-        if not isinstance(number, int) or number < 1:
-            return None
-        # The run chain's first run: an automatic report resume belongs to the run before it.
-        run_row = self.store.get_run(row["agent_id"], number)
-        while run_row is not None and run_row.get("auto_resumed") and number > 1:
-            earlier = self.store.get_run(row["agent_id"], number - 1)
-            if earlier is None:
-                break
-            number, run_row = number - 1, earlier
-        return ts(run_row.get("first_working_at")) if run_row else None
+        return chain_first_working_at(self.store, row, run)
 
     def forward_signal(self, received: int) -> Outcome | None:
         """Handle a flagged signal: forward SIGTERM to the supervisor and keep waiting, or (a
@@ -1269,6 +1279,13 @@ class Launch:
             decision_ids=list(self.decision_ids),
         )
         return error_outcome(error, self.inv.decision_ids)
+
+    def cleanup_failed(self, failure: CliError) -> None:
+        """Undo what a failed command left that its error path did not (called once, with
+        signals recorded rather than raised). A launch before its record exists drops its
+        prompt copies; once the record exists they stay for the next resume."""
+        if self.copies is not None and not self.agent_inserted:
+            remove_copies(self.copies.directory)
 
     def store_failed(self, error: StoreError) -> CliError:
         """The state database failed mid-launch: end what is pending and report, never escape.
@@ -1378,6 +1395,12 @@ def _tty_pair() -> bool:
 _pending_restore: Callable[[], None] | None = None
 
 
+def defer_restore(restore: Callable[[], None]) -> None:
+    """Keep handlers installed until ``restore_signal_handlers`` (see ``launch``)."""
+    global _pending_restore
+    _pending_restore = restore
+
+
 def restore_signal_handlers() -> None:
     """Put back the handlers ``launch(..., restore_handlers=False)`` replaced (idempotent)."""
     global _pending_restore
@@ -1393,9 +1416,16 @@ def launch(inv: Any, *, restore_handlers: bool = True) -> Outcome:
     after this returns, so a signal that arrives while the result is printed cannot lose it;
     the caller then calls ``restore_signal_handlers`` once the output is flushed.
     """
+    return run_command(inv, Launch, restore_handlers=restore_handlers)
+
+
+def run_command(
+    inv: Any, make: Callable[[Any, SignalState], Launch], *, restore_handlers: bool
+) -> Outcome:
+    """The signal handling and failure cleanup shared by ``launch`` and ``resume``."""
     global _pending_restore
     sig = SignalState()
-    launch_run = Launch(inv, sig)
+    launch_run = make(inv, sig)
     restore = procs.install_signal_handlers(
         {signal.SIGTERM: sig.handle, signal.SIGHUP: sig.handle, signal.SIGINT: sig.handle}
     )
@@ -1415,8 +1445,7 @@ def launch(inv: Any, *, restore_handlers: bool = True) -> Outcome:
         except CliError as error:
             sig.raising = False
             failure = error
-        if launch_run.copies is not None and not launch_run.agent_inserted:
-            remove_copies(launch_run.copies.directory)
+        launch_run.cleanup_failed(failure)
         if failure.agent_id is None and launch_run.agent_inserted:
             failure.agent_id = launch_run.agent_id
         launch_run.deliver()
