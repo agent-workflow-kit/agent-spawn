@@ -192,6 +192,10 @@ def test_newer_schema_is_refused_with_exit_12_and_writes_nothing(state_dir: Path
         Store.open(state_dir)
     assert caught.value.code == "schema_newer"
     assert caught.value.exit_code == 12
+    assert (caught.value.found, caught.value.expected) == (  # pyright: ignore[reportAttributeAccessIssue]
+        SCHEMA_VERSION + 5,
+        SCHEMA_VERSION,
+    )
     with pytest.raises(CliError):
         Store.open(state_dir, migrate=False, create=False)
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before
@@ -1713,6 +1717,7 @@ def test_a_newer_schema_seen_only_by_the_read_write_open_leaves_the_files_alone(
     with pytest.raises(CliError) as caught:
         Store.open(state_dir)
     assert caught.value.code == "schema_newer"
+    assert caught.value.found > SCHEMA_VERSION  # pyright: ignore[reportAttributeAccessIssue]
     assert {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in (db, wal)} == before
 
 

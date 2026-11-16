@@ -4,17 +4,19 @@ from __future__ import annotations
 
 from typing import NoReturn
 
+from .. import stop as stop_module
+from .. import teardown as teardown_module
+from ..output import Outcome
 from .base import Invocation, not_implemented
 
 
-def stop(inv: Invocation) -> NoReturn:
-    # TODO(#16): stop a run chain.
-    not_implemented("stop", 16)
+def stop(inv: Invocation) -> Outcome:
+    return stop_module.stop(inv)
 
 
-def teardown(inv: Invocation) -> NoReturn:
-    # TODO(#18): teardown without a worktree; TODO(#23): worktrees and named steps.
-    not_implemented("teardown", 18)
+def teardown(inv: Invocation) -> Outcome:
+    # TODO(#23): worktrees and windows; TODO(#32): the pre-teardown hook (see teardown.py).
+    return teardown_module.teardown_command(inv)
 
 
 def prune(inv: Invocation) -> NoReturn:

@@ -20,7 +20,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, NoReturn
 
-from . import __version__, gateway
+from . import __version__, gateway, relay
 from . import launch as launch_module
 from .commands.base import Invocation
 from .commands.table import HANDLERS
@@ -57,7 +57,7 @@ DESCRIPTION = (
 
 _ME_NAME_INVALID = re.compile(r"[^A-Za-z0-9._@-]")
 
-INTERNAL_COMMANDS = ("supervise", "_session-event")
+INTERNAL_COMMANDS = ("supervise",)  # `_session-event` is routed to relay.run before parsing
 # Commands whose --result-file receives what --json prints (interface.md, Result file); browse's
 # file is an intent file its handler writes (interface.md, TUI).
 RESULT_FILE_COMMANDS = ("launch", "resume", "wait")
@@ -371,7 +371,6 @@ def build_parser() -> SpawnParser:
     add(commands, "export", "export", _add_export, "print audit records")
     add(commands, "browse", "browse", _add_browse, "browse agents in a TUI")
     add(commands, "supervise", "supervise", _add_supervise, None)
-    add(commands, "_session-event", "_session-event", lambda p: None, None)
 
     for group_name, verbs in (
         ("label", (("add", True), ("remove", False))),
@@ -432,9 +431,6 @@ def _check_usage(args: argparse.Namespace, key: str) -> None:
     state_dir: str | None = getattr(args, "state_dir", None)
     config: str | None = getattr(args, "config", None)
     if internal:
-        # TODO(#14): decide relay exit on malformed argv and on an invalid config (State relay
-        # says exit 0 always; Internal commands says exit 2; parse_invocation exits 2 on
-        # config_invalid before the relay handler runs).
         for flag, value in (("--state-dir", state_dir), ("--config", config)):
             if value is None or not value.startswith("/") or "\0" in value:
                 raise ValueError(f"{key} needs an absolute {flag}")
@@ -592,6 +588,39 @@ def _head(argv: Sequence[str]) -> list[str]:
     return head
 
 
+# The public command names (the first word of each parser key); a test keeps it equal to the parser.
+_COMMAND_NAMES = (
+    "ack attach browse cron export label launch list prune reconcile resume show stop "
+    "supervise teardown wait"
+).split()
+
+
+def _is_relay(argv: Sequence[str]) -> bool:
+    """Whether the command is ``_session-event``: a standalone token that is no value of a known
+    global flag, before any other command name (unknown tokens are skipped), or the token after
+    ``--`` when no command came before it.
+
+    Deliberately lenient: the relay is a hook that must exit 0 whatever its argv, so an unknown
+    flag's separate value is skipped as a token, and the converse (``--prompt _session-event
+    launch``, where it is a flag's value) also lands on the relay. A failing hook would be worse.
+    """
+    commands = set(_COMMAND_NAMES)
+    tokens = list(argv)
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return index + 1 < len(tokens) and tokens[index + 1] == "_session-event"
+        if token in _GLOBAL_VALUE_FLAGS:
+            index += 1  # its value is the next token
+        elif token == "_session-event":
+            return True
+        elif token in commands:
+            return False
+        index += 1
+    return False
+
+
 def _json_requested(argv: Sequence[str]) -> bool:
     """Whether ``--json`` was given, for errors raised before parsing finished."""
     return "--json" in _head(argv)
@@ -682,6 +711,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     gateway.reset_sigchld()  # before any subprocess: an ignored SIGCHLD hides exit codes
     _reconfigure_streams()
     argv_list = list(sys.argv[1:] if argv is None else argv)
+    if _is_relay(argv_list):
+        # The relay always exits 0: no argparse, no config load, no error envelope.
+        return relay.run(argv_list)
     try:
         inv = parse_invocation(argv_list)
     except _ParserExit as done:  # --help or --version, printed by argparse
