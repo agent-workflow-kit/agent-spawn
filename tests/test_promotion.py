@@ -18,8 +18,8 @@ from tests import schema_registry
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
 from tests.launch_support import result_json, script_hung_exec, script_live_run, track_agent
-from tests.procguard import ProcTracker
 from tests.private_tmux import PrivateTmux
+from tests.procguard import ProcTracker
 from tests.test_worktrees_launch import fake_throwaway
 from tests.window_support import Capture, WindowEnv, send_signal
 
@@ -114,7 +114,7 @@ def post_park(env: WindowEnv, agent_id: str) -> dict[str, Any]:
     return parks[0]
 
 
-# --- the decision ---------------------------------------------------------------------------------
+# --- the decision ----
 
 
 def test_a_run_is_not_promoted_unless_promote_resolves_true(
@@ -183,7 +183,7 @@ def test_an_interactive_agent_is_never_promoted(wenv: WindowEnv, fakebin: Fakebi
     assert len(real_starts(fakebin)) == 1
 
 
-# --- the chain rule ---------------------------------------------------------------------------------
+# --- the chain rule ----
 
 
 def test_a_failed_window_preflight_creates_no_pending_run(
@@ -287,7 +287,7 @@ def test_a_pane_without_a_pid_fails_the_handoff_and_parks_per_the_trigger(
     assert not [i for i in fakebin.invocations("claude-session") if "exec" in i.argv][1:]
 
 
-# --- the host and the signals -------------------------------------------------------------------------
+# --- the host and the signals ----
 
 
 def start_hung_promotion(
@@ -380,7 +380,7 @@ def test_supervise_host_needs_a_handoff(wenv: WindowEnv) -> None:
     assert done.returncode == 2
 
 
-# --- the pre-start checks fail closed for a promotion -------------------------------------------------
+# --- the pre-start checks fail closed for a promotion ----
 
 
 def test_a_trusted_promotion_in_a_throwaway_is_refused_before_the_window_is_touched(
