@@ -9,6 +9,7 @@ earlier.
 from __future__ import annotations
 
 import os
+import shlex
 import signal
 from collections.abc import Mapping
 from types import FrameType
@@ -113,8 +114,11 @@ class _Wait:
         config = self.inv.config
         assert config is not None
         try:
+            stored = row.get("claude_session_path")  # the agent's own claude-session first
             status = SessionBackend(
-                launch.resolve_tool(config.claude_session_cmd, "claude-session"),
+                shlex.split(stored)
+                if isinstance(stored, str) and stored
+                else launch.resolve_tool(config.claude_session_cmd, "claude-session"),
                 gateway=self.gateway,
             ).status(session)
         except CliError as error:

@@ -38,7 +38,11 @@ from .session_backend import SessionBackend, SessionStatus
 from .store import LeaseHeld, Store, StoreError, StoreMissing, default_state_dir
 
 WAIT_MARGIN = 30.0  # seconds added to the grace
-DEFAULT_GRACE = 10.0  # claude-session's kill_grace default; TODO(#13): read it from the config
+# claude-session's kill_grace default. claude-session exposes it only as a config key of its own
+# (not in status or stop output) and agent-spawn has no such key (decided in #13), so the wait
+# budget assumes the default.
+# todo(#36): the live suite should check that claude-session's default kill_grace is still 10 s.
+DEFAULT_GRACE = 10.0
 POLL = 0.1  # seconds between looks at the agent row while waiting
 STATUS_EVERY = 1.0  # seconds between looks at `claude-session status` while waiting
 ATTEMPTS = 3  # plans made when the state changes under a signal
@@ -375,7 +379,7 @@ class Stop:
             elif planned_tearing:
                 return row
             elif status not in IN_PROGRESS:
-                if not self.alive(row.get("supervisor")):
+                if lifecycle.run_settled(row, supervisor_alive=self.alive(row.get("supervisor"))):
                     return row
             elif status in IN_PROGRESS and now >= next_status:
                 next_status = now + STATUS_EVERY

@@ -176,6 +176,12 @@ def _clean(value: object) -> str | None:
     return None
 
 
+def _absolute(value: object) -> bool:
+    """Whether ``value`` is an absolute path string: a relative or empty session directory would
+    be resolved against agent-spawn's own cwd by the result-file checks, so it is unusable."""
+    return isinstance(value, str) and value.startswith("/")
+
+
 def _session_id(value: object) -> str:
     """A positional session id: exactly a csession_id, so it can never be read as a flag."""
     if not isinstance(value, str) or SESSION_ID.fullmatch(value) is None:
@@ -543,6 +549,7 @@ def parse_status(data: Mapping[str, Any]) -> SessionStatus | None:
         not isinstance(session_id, str)
         or SESSION_ID.fullmatch(session_id) is None
         or not isinstance(directory, str)
+        or not _absolute(directory)
         or not _is_int(current)
         or current < 1
         or not isinstance(tainted, bool)
@@ -684,6 +691,7 @@ def parse_start(data: Mapping[str, Any]) -> StartResult | None:
         not isinstance(session, str)
         or SESSION_ID.fullmatch(session) is None
         or not isinstance(directory, str)
+        or not _absolute(directory)
         or not _is_int(run)
         or run < 1
         or argv is None
