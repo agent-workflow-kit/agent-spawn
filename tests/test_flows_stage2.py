@@ -367,3 +367,52 @@ def test_review_respond_reads_third_party_content_in_a_throwaway_and_acts_in_the
     flow.validate_everything(
         expect_hooks=["post-launch", "post-park", "post-teardown"], expect_audit=1
     )
+
+
+# --- ticket work in a window: the window step comes after the worktree, before the session ------
+
+
+def test_ticket_work_in_a_window_closes_its_dead_window_in_the_order_of_the_teardown(
+    flow: Flow, fakebin: Fakebin, isolation_env: Isolation, private_tmux: Any
+) -> None:
+    from tests.window_support import WindowEnv
+
+    private_tmux.start()
+    flow.env = WindowEnv(fakebin, isolation_env, private_tmux)  # same state dir and hook config
+    done = flow.cli(
+        schema("launch"), "launch", "--skill", "do-it", "--json", "--wait",
+        "--repo", REPO, "--worktree", "new", "--branch", "feat/ticket-1", "--base", "main",
+    )  # fmt: skip
+    assert done.code == 0, (done.stdout, done.stderr)
+    agent_id = done.body["agent"]["agent_id"]
+    assert done.body["agent"]["mode"] == "interactive" and done.body["agent"]["window"]
+    (record,) = records(flow.fakebin).values()
+    cwd = [a for a in fakebin.argvs("termctl") if "open" in a and "--dry-run" not in a][-1]
+    assert f"--cwd={os.path.realpath(record['path'])}" in cwd  # the window opens in the worktree
+    flow.wait_settled(agent_id)
+    # a window process of an earlier crash: its dead pane is still there, labeled with the agent
+    leftover = fakebin.run(
+        "termctl", "open", f"--label=agent={agent_id}", "--keep-on-exit=failed", "--json",
+        "--", "sh", "-c", "exit 3", env=flow.env.env(),
+    )  # fmt: skip
+    assert leftover.returncode == 0, leftover.stderr
+    flow.env.wait_for(
+        lambda: any(p["state"] == "dead" for p in flow.env.panes()),  # type: ignore[attr-defined]
+        "the leftover pane to die",
+    )
+
+    gone = flow.cli(schema("teardown"), "teardown", agent_id, "--merged-head", SHA, "--json")
+    assert gone.code == 0, (gone.stdout, gone.stderr)
+    (closed,) = gone.body["windows_closed"]
+    assert closed.startswith("tc-")
+    steps = [
+        (i.tool, i.argv[0])
+        for i in fakebin.invocations()
+        if (i.tool, i.argv[0])
+        in {("wtctl", "remove"), ("termctl", "close"), ("claude-session", "forget")}
+    ]
+    assert steps == [("wtctl", "remove"), ("termctl", "close"), ("claude-session", "forget")]
+    assert flow.env.panes() == []  # type: ignore[attr-defined]
+    flow.validate_everything(
+        expect_hooks=["post-launch", "post-park", "post-teardown"], expect_audit=1
+    )

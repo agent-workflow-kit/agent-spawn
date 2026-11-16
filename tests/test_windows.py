@@ -993,3 +993,14 @@ def test_a_waiting_launcher_forwards_sigterm_to_the_window_supervisor(
     assert body["agent"]["status"] == "parked" and body["agent"]["park_reason"] == "killed"
     assert launcher.returncode != 143
     assert int(signal.SIGTERM) in exec_signals(fakebin)
+
+
+def test_show_and_list_report_the_window(wenv: WindowEnv) -> None:
+    agent_id = launched_window(wenv, "--name", "my window")
+    shown = result_json(wenv.run("show", agent_id, "--json"))
+    schema_registry.validate(shown, "agent-spawn/cli/show.json")
+    assert shown["agent"]["window"]["term_id"].startswith("tc-")
+    assert shown["agent"]["name"] == "my window"
+    listed = result_json(wenv.run("list", "--json"))
+    schema_registry.validate(listed, "agent-spawn/cli/list.json")
+    assert listed["agents"][0]["window"] == shown["agent"]["window"]
