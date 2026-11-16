@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -110,12 +111,156 @@ def test_an_interrupted_run_sends_sigterm_first(tmp_path: Path) -> None:
     def fire(signum: int, frame: object) -> None:
         raise Interrupt
 
+    main_ident = threading.get_ident()
+    stop = threading.Event()
+
+    def deliver_once_ready() -> None:
+        # Interrupt only once the child exists and traps SIGTERM, never earlier.
+        deadline = time.monotonic() + 30
+        while not stop.is_set() and time.monotonic() < deadline:
+            if ready.exists():
+                signal.pthread_kill(main_ident, signal.SIGALRM)
+                return
+            time.sleep(0.01)
+
+    helper = threading.Thread(target=deliver_once_ready, daemon=True)
     old = signal.signal(signal.SIGALRM, fire)
     try:
-        signal.setitimer(signal.ITIMER_REAL, 1.5)
+        helper.start()
         with pytest.raises(Interrupt):
-            run(tmp_path, code, timeout=30)
+            gw.SystemGateway().run_on_terminal([sys.executable, "-I", "-c", code], timeout=60)
+    finally:
+        stop.set()
+        helper.join(timeout=5)
+        signal.signal(signal.SIGALRM, old)
+    assert seen.read_text() == "term"
+
+
+def test_run_on_terminal_captures_stdout_and_bounds_a_hung_child() -> None:
+    import subprocess
+
+    from agent_spawn.gateway import SystemGateway
+
+    gateway = SystemGateway()
+    done = gateway.run_on_terminal(["/bin/sh", "-c", "echo hi"], timeout=30)
+    assert (done.returncode, done.stdout) == (0, "hi\n")
+    with pytest.raises(subprocess.TimeoutExpired):
+        gateway.run_on_terminal(["/bin/sleep", "30"], timeout=0.3)
+
+
+def test_exec_replace_replaces_the_process_and_fails_with_oserror() -> None:
+    import subprocess
+    import sys
+
+    code = (
+        "from agent_spawn.gateway import SystemGateway;"
+        "SystemGateway().exec_replace(['/bin/echo', 'replaced'])"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
+    assert (done.returncode, done.stdout) == (0, "replaced\n")
+    from agent_spawn.gateway import SystemGateway
+
+    with pytest.raises(OSError):
+        SystemGateway().exec_replace(["/nonexistent/tmux"])
+
+
+def test_run_on_terminal_passes_the_users_terminal_through() -> None:
+    import pty
+
+    code = (
+        "from agent_spawn.gateway import SystemGateway;"
+        "done = SystemGateway().run_on_terminal("
+        "['/bin/sh', '-c', '[ -t 0 ] && [ -t 2 ] && echo tty || echo notty']);"
+        "print(done.stdout.strip())"
+    )
+    master, slave = pty.openpty()
+    try:
+        done = subprocess.run(
+            [sys.executable, "-c", code],
+            stdin=slave,
+            stderr=slave,
+            stdout=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    finally:
+        os.close(slave)
+        os.close(master)
+    assert (done.returncode, done.stdout) == (0, "tty\n")
+
+
+def test_run_on_terminal_bounds_the_output_while_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gw, "MAX_RUN_OUTPUT", 256 * 1024)
+    pid_file = tmp_path / "pid"
+    code = (
+        "import os, sys\n"
+        f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+        "while True:\n"
+        "    sys.stdout.buffer.write(b'x' * 65536)\n"
+        "    sys.stdout.buffer.flush()\n"
+    )
+    with pytest.raises(gw.OutputTooLarge):
+        gw.SystemGateway().run_on_terminal([sys.executable, "-I", "-c", code], timeout=60)
+    with pytest.raises(ProcessLookupError):  # killed and reaped
+        os.kill(int(pid_file.read_text()), 0)
+
+
+def test_an_interrupted_run_on_terminal_stops_the_child_politely(tmp_path: Path) -> None:
+    import signal
+
+    seen = tmp_path / "seen"
+    ready = tmp_path / "ready"
+    code = (
+        "import signal, sys, time\n"
+        f"def term(*a):\n    open({str(seen)!r}, 'w').write('term'); sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, term)\n"
+        f"open({str(ready)!r}, 'w').write('x')\n"
+        "time.sleep(60)\n"
+    )
+
+    class Interrupt(BaseException):
+        pass
+
+    def fire(signum: int, frame: object) -> None:
+        deadline = time.monotonic() + 30  # fire only once the child traps SIGTERM
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        raise Interrupt
+
+    old = signal.signal(signal.SIGALRM, fire)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 0.2)
+        with pytest.raises(Interrupt):
+            gw.SystemGateway().run_on_terminal([sys.executable, "-I", "-c", code], timeout=60)
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, old)
     assert seen.read_text() == "term"
+
+
+def test_a_failed_exec_restores_the_signal_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    import signal
+
+    def handler(signum: int, frame: object) -> None:
+        pass
+
+    def refuse(path: str, argv: list[str]) -> None:
+        raise OSError("no exec")
+
+    monkeypatch.setattr(os, "execv", refuse)
+    old_int = signal.signal(signal.SIGINT, handler)
+    old_term = signal.signal(signal.SIGTERM, handler)
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR2})
+    try:
+        with pytest.raises(OSError):
+            gw.SystemGateway().exec_replace(["/nonexistent/tmux"])
+        assert signal.getsignal(signal.SIGINT) is handler
+        assert signal.getsignal(signal.SIGTERM) is handler
+        assert signal.SIGUSR2 in signal.pthread_sigmask(signal.SIG_BLOCK, ())
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)

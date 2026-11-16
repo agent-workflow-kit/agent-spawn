@@ -51,6 +51,7 @@ class FakeGateway:
     signals: list[tuple[int, int]] = field(default_factory=list)  # (pid, signal) delivered
     killed_by_pid: list[tuple[int, int]] = field(default_factory=list)
     run_calls: list[list[str]] = field(default_factory=list)
+    exec_calls: list[list[str]] = field(default_factory=list)
     run_envs: list[dict[str, str] | None] = field(default_factory=list)
     run_timeouts: list[float | None] = field(default_factory=list)
     now: float = 1000.0
@@ -107,6 +108,14 @@ class FakeGateway:
         self.run_envs.append(None if env is None else dict(env))
         self.run_timeouts.append(timeout)
         return self.run_results[argv[0]](argv)
+
+    def run_on_terminal(
+        self, argv: Sequence[str], *, timeout: float | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run(argv, timeout=timeout)
+
+    def exec_replace(self, argv: Sequence[str]) -> None:
+        self.exec_calls.append(list(argv))
 
     def spawn(
         self,

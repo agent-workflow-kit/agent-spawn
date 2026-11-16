@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from typing import NoReturn
-
-from .. import annotate, listing, self_label, showing, wait_agent
+from .. import annotate, attaching, listing, self_label, showing, wait_agent
 from ..output import Outcome
-from .base import Invocation, not_implemented
+from .base import Invocation
 
 
 def wait(inv: Invocation) -> Outcome:
@@ -21,9 +19,8 @@ def show(inv: Invocation) -> Outcome:
     return showing.show(inv)
 
 
-def attach(inv: Invocation) -> NoReturn:
-    # TODO(#28): attach to an agent's window.
-    not_implemented("attach", 28)
+def attach(inv: Invocation) -> Outcome:
+    return attaching.attach(inv)
 
 
 def ack(inv: Invocation) -> Outcome:

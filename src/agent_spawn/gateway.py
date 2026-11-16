@@ -105,6 +105,12 @@ class Gateway(Protocol):
         start_new_session: bool = False,
     ) -> subprocess.Popen[bytes]: ...
 
+    def run_on_terminal(
+        self, argv: Sequence[str], *, timeout: float | None = None
+    ) -> subprocess.CompletedProcess[str]: ...
+
+    def exec_replace(self, argv: Sequence[str]) -> None: ...
+
     # files, clocks, platform
     def read_file(self, path: str) -> str: ...
     def monotonic(self) -> float: ...
@@ -196,8 +202,9 @@ def _communicate(
     sizes: dict[int, int] = {}
     selector = selectors.DefaultSelector()
     pending = data
-    assert proc.stdout is not None and proc.stderr is not None
-    out_fd, err_fd = proc.stdout.fileno(), proc.stderr.fileno()
+    assert proc.stdout is not None
+    out_fd = proc.stdout.fileno()
+    err_fd = None if proc.stderr is None else proc.stderr.fileno()  # None: left inherited
     streams = [stream for stream in (proc.stdin, proc.stdout, proc.stderr) if stream is not None]
     try:
         if proc.stdin is not None:
@@ -207,7 +214,8 @@ def _communicate(
                 os.set_blocking(proc.stdin.fileno(), False)
                 selector.register(proc.stdin, selectors.EVENT_WRITE, "in")
         for name, stream in (("out", proc.stdout), ("err", proc.stderr)):
-            assert stream is not None
+            if stream is None:
+                continue
             os.set_blocking(stream.fileno(), False)
             chunks[stream.fileno()] = []
             sizes[stream.fileno()] = 0
@@ -264,7 +272,7 @@ def _communicate(
                 stream.close()
             except OSError:
                 pass
-    return b"".join(chunks[out_fd]), b"".join(chunks[err_fd])
+    return b"".join(chunks[out_fd]), b"" if err_fd is None else b"".join(chunks[err_fd])
 
 
 class SystemGateway:
@@ -327,6 +335,41 @@ class SystemGateway:
             start_new_session=start_new_session,
             preexec_fn=_reset_child_signals,
         )
+
+    def run_on_terminal(
+        self, argv: Sequence[str], *, timeout: float | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a command that must see this process's own stdin and stderr (a command that
+        decides by ``isatty`` whether the user is at a terminal). Only stdout is captured; the
+        output is bounded like ``run``'s (the cap is enforced while reading). On a timeout or
+        an overflow the child itself is killed; on an interrupt it is stopped politely."""
+        proc = subprocess.Popen(
+            list(argv),
+            stdin=None,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            preexec_fn=_reset_child_signals,
+        )
+        out, _ = _communicate(proc, None, timeout, argv)
+        return subprocess.CompletedProcess(list(argv), proc.returncode, decode(out), "")
+
+    def exec_replace(self, argv: Sequence[str]) -> None:
+        """Replace this process with ``argv`` (the user's own terminal and environment pass
+        through). Returns only by raising ``OSError``; nothing of this process's signal state
+        survives into the new program."""
+        sys.stdout.flush()
+        sys.stderr.flush()
+        old_handlers = {sig: signal.getsignal(sig) for sig in _RESET_SIGNALS}
+        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        _reset_child_signals()
+        try:
+            os.execv(argv[0], list(argv))
+        except OSError:  # still this process: put its signal state back before reporting
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+            for sig, handler in old_handlers.items():
+                if handler is not None:
+                    signal.signal(sig, handler)
+            raise
 
     # files, clocks, platform
     def read_file(self, path: str) -> str:
