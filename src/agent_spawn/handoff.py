@@ -31,7 +31,7 @@ Seams for later issues:
   --handoff`` calls ``receive_environment`` and exits 1 on ``HandoffFailed``. A window
   supervisor must re-apply its ``AGENT_SPAWN_*`` overrides after adopting the environment.
 * TODO(#29): ``supervise --host`` uses the same client.
-* TODO(#32): ``reconcile`` removes handoff directories whose ``owner`` is dead (``read_owner``
+* TODO(#33): ``reconcile`` removes handoff directories whose ``owner`` is dead (``read_owner``
   and ``handoff_root`` are the helpers for it).
 """
 
@@ -40,6 +40,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import secrets
 import socket
 import stat
@@ -96,7 +97,11 @@ class HandoffFailed(Exception):
 
     Causes: ``no_pane_pid``, ``pane_gone``, ``timeout``, ``socket_path_too_long``,
     ``unsafe_directory``, ``invalid_env``, ``payload_too_large``, ``send_failed``,
-    ``connect_failed``, ``empty_payload``, ``malformed_payload``, ``listen_failed``.
+    ``connect_failed``, ``empty_payload``, ``malformed_payload``, ``listen_failed``,
+    ``pane_unreadable``.
+
+    ``handoff_rejected`` records carry one of ``peer_unreadable``, ``wrong_uid``, ``wrong_pid``,
+    ``peer_gone``, ``wrong_start_time``.
     """
 
     def __init__(self, cause: str, message: str | None = None) -> None:
@@ -112,6 +117,11 @@ def client_deadline(handoff_timeout: float) -> float:
 # --- the payload ---------------------------------------------------------------------------------
 
 
+# Lone surrogates other than U+DC80..U+DCFF (os.fsdecode's escapes for undecodable bytes) cannot
+# be turned back into bytes by os.fsencode.
+_BAD_SURROGATE = re.compile("[\ud800-\udc7f\udd00-\udfff]")
+
+
 def _valid_pair(name: object, value: object) -> bool:
     return (
         isinstance(name, str)
@@ -120,6 +130,8 @@ def _valid_pair(name: object, value: object) -> bool:
         and "=" not in name
         and "\0" not in name
         and "\0" not in value
+        and _BAD_SURROGATE.search(name) is None
+        and _BAD_SURROGATE.search(value) is None
     )
 
 
@@ -127,13 +139,17 @@ def encode_payload(env: Mapping[str, str]) -> bytes:
     """The wire bytes for ``env`` minus the terminal variables.
 
     ``ensure_ascii`` keeps lone surrogates (undecodable bytes in ``os.environ``) intact and the
-    result pure ASCII. Raises ``HandoffFailed`` for a malformed name or value, or a payload over
+    result pure ASCII. An entry that cannot be exported (empty name, ``=`` or NUL in the name, NUL
+    in the value, a surrogate that is not an undecodable-byte escape) is skipped silently, never
+    named. Raises ``HandoffFailed`` for a non-string name or value, or a payload over
     ``MAX_PAYLOAD``; the message never contains a value.
     """
     cleaned: dict[str, str] = {}
     for name, value in env.items():
-        if not _valid_pair(name, value):
+        if not isinstance(name, str) or not isinstance(value, str):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise HandoffFailed("invalid_env", "the environment holds a malformed variable")
+        if not _valid_pair(name, value):
+            continue
         if name not in TERMINAL_VARIABLES:
             cleaned[name] = value
     data = json.dumps({"env": cleaned}, separators=(",", ":")).encode("ascii")
@@ -306,7 +322,10 @@ class HandoffListener:
         sock: socket.socket | None = None
         try:
             os.chmod(directory, 0o700)  # not subject to the umask
-            me = procs.read_identity(gw.getpid(), gateway=gw)
+            try:
+                me = procs.read_identity(gw.getpid(), gateway=gw)
+            except procs.ProcessIdentityError:
+                me = None
             if me is None:
                 raise HandoffFailed("listen_failed", "cannot identify the listening process")
             fd = os.open(
@@ -387,7 +406,10 @@ class HandoffListener:
             raise HandoffFailed("pane_gone", "the pane is gone")
         deadline = gw.monotonic() + timeout
         data = encode_payload(env)  # before accepting: an oversized environment fails at once
-        pane = procs.inspect(pane_pid, gateway=gw)
+        try:
+            pane = procs.inspect(pane_pid, gateway=gw)
+        except (procs.ProcessIdentityError, OSError):
+            raise HandoffFailed("pane_unreadable", "the pane process cannot be read") from None
         if pane is None or not pane.alive:
             raise HandoffFailed("pane_gone", "the pane process is gone")
         expected = pane.identity

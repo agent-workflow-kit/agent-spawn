@@ -8,15 +8,27 @@ XDG and TMUX_TMPDIR), never the user's server. The stand-in window process is
 from __future__ import annotations
 
 import json
+import shutil
 import sys
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from agent_spawn import procs
 from agent_spawn.handoff import MAX_PAYLOAD, HandoffFailed, HandoffListener
 from tests.private_tmux import PrivateTmux
-from tests.test_handoff import CHILD, SECRET, log_records, read_result
+from tests.test_handoff import (
+    CHILD,
+    SECRET,
+    hang_guard,  # noqa: F401  (autouse fixture)
+    log_records,
+    make_short_state,
+    read_result,
+    wait_for_file,
+)
 
 
 def open_window(tmux: PrivateTmux, socket_path: Path, result: Path, timeout: float = 20) -> int:
@@ -30,10 +42,12 @@ def open_window(tmux: PrivateTmux, socket_path: Path, result: Path, timeout: flo
 
 
 @pytest.fixture
-def state(tmp_path: Path) -> Path:
-    path = tmp_path / "st"
-    path.mkdir(mode=0o700)
-    return path
+def state() -> Iterator[Path]:
+    base = make_short_state()
+    try:
+        yield base
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
 
 
 def test_the_window_process_gets_the_environment_and_pane_pid_is_its_pid(
@@ -68,25 +82,39 @@ def test_terminal_variables_come_from_the_pane_not_the_launcher(
     assert "COLORTERM" not in got["env"] or got["env"]["COLORTERM"] == got["before"]["COLORTERM"]
 
 
+THIEF = (
+    "import json,socket,sys\n"
+    "s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);open(sys.argv[2],'w').close()\n"
+    "d=b''\n"
+    "while True:\n c=s.recv(65536)\n if not c: break\n d+=c\n"
+    "out={'failed':'empty_payload'} if d==b'' else {'data':d.decode('latin-1')}\n"
+    "open(sys.argv[3],'w').write(json.dumps(out))"
+)
+
+
 def test_a_thief_window_never_gets_the_environment_and_the_pane_window_does(
     private_tmux: PrivateTmux, state: Path, tmp_path: Path
 ) -> None:
     """A6-A7: another process of the same user connecting to the socket is refused."""
     private_tmux.start()
     listener = HandoffListener.create(state, agent_id="ag-aaaaaaaa")
-    thief_result, real_result = tmp_path / "thief.json", tmp_path / "real.json"
-    thief_pid = open_window(private_tmux, listener.socket_path, thief_result)
+    connected, thief_result, real_result = tmp_path / "c", tmp_path / "thief.json", tmp_path / "r"
+    done = private_tmux.run(
+        "new-window", "-d", "-P", "-F", "#{pane_pid}", "--",
+        sys.executable, "-c", THIEF, str(listener.socket_path), str(connected), str(thief_result),
+    )  # fmt: skip
+    assert done.returncode == 0, done.stderr
+    thief_pid = int(done.stdout.strip())
+    assert wait_for_file(connected)  # the thief is queued ahead of the real window
     real_pid = open_window(private_tmux, listener.socket_path, real_result)
     assert thief_pid != real_pid
     listener.serve(pane_pid=real_pid, pane_state="running", timeout=20, env={"K": SECRET})
     assert read_result(real_result)["env"]["K"] == SECRET
-    thief = read_result(thief_result)  # refused (closed without data) or reset: it failed
-    assert "env" not in thief and thief["failed"] in {"empty_payload", "connect_failed"}
-    assert SECRET not in json.dumps(thief)
+    assert read_result(thief_result) == {"failed": "empty_payload"}
     records: list[dict[str, Any]] = log_records(state)
-    assert all(
-        r["details"]["cause"] == "wrong_pid" for r in records if r["event"] == "handoff_rejected"
-    )
+    causes = [r["details"]["cause"] for r in records if r["event"] == "handoff_rejected"]
+    assert causes == ["wrong_pid"]
+    assert SECRET not in json.dumps(records)
 
 
 def test_a_window_that_exits_before_serve_is_gone(
@@ -98,10 +126,15 @@ def test_a_window_that_exits_before_serve_is_gone(
         "new-window", "-d", "-P", "-F", "#{pane_pid}", "--", sys.executable, "-c", "pass"
     )
     pid = int(done.stdout.strip())
-    # The process may linger as a zombie of tmux until reaped; either way it is not alive.
-    with pytest.raises(HandoffFailed) as info:
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:  # a zombie of tmux counts as not alive
+        info = procs.inspect(pid)
+        if info is None or not info.alive:
+            break
+        time.sleep(0.02)
+    with pytest.raises(HandoffFailed) as info_:
         listener.serve(pane_pid=pid, pane_state="running", timeout=2, env={"A": "1"})
-    assert info.value.cause in {"pane_gone", "timeout"}
+    assert info_.value.cause == "pane_gone"
     assert not listener.directory.exists()
 
 
