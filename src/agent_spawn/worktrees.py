@@ -487,6 +487,34 @@ class WtctlBackend:
                 found.append(record)
         return found
 
+    def baseline_check(self, record_id: str) -> dict[str, Any]:
+        """``baseline check <id> --json`` as ``{"changed", "changed_classes", "items"}`` (exit 0:
+        unchanged; exit 20 ``repo_config_changed``: changed). Any other result raises."""
+        if RECORD_ID.fullmatch(record_id) is None:
+            raise CliError.usage("not a wtctl record id")
+        reply = self.call(["baseline", "check", record_id, "--json"])
+        if reply.code == 0:
+            return {"changed": False, "changed_classes": [], "items": []}
+        error = reply.data.get("error") if reply.data is not None else None
+        if (
+            reply.code == 20
+            and isinstance(error, dict)
+            and error.get("reason") == "repo_config_changed"  # pyright: ignore[reportUnknownMemberType]
+        ):
+            details = error.get("details")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+            classes = details.get("changed_classes") if isinstance(details, dict) else None  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+            items = error.get("items")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+            if (
+                isinstance(classes, list)
+                and all(c in ("git", "claude") for c in classes)  # pyright: ignore[reportUnknownVariableType]
+                and len(set(classes)) == len(classes)  # pyright: ignore[reportUnknownArgumentType]
+                and isinstance(items, list)
+                and all(isinstance(i, dict) for i in items)  # pyright: ignore[reportUnknownVariableType]
+            ):
+                return {"changed": True, "changed_classes": classes, "items": items}
+            raise self._unusable("a baseline check")
+        raise self._fail(reply, "baseline check")
+
     def release(self, record_id: str, holder: str) -> WtResult:
         """``forget <id> --holder <h>``: the holder is released. Exit 10 for a record that is
         already a tombstone counts as done (``already`` set, no result). Any other failure

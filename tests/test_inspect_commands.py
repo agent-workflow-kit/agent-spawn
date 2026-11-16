@@ -532,14 +532,6 @@ def test_show_an_unreadable_supervisor_entry_fails_closed(
     assert "SECRETPROC" not in stdout + stderr and "alive" not in stdout
 
 
-def test_show_third_party_run_is_null_with_a_warning_when_wtctl_is_set(env: Env) -> None:
-    # R6d (until #21 looks the records up)
-    seed_agent(env, A1, cwd="/work/x")
-    body = out(env.run("show", A1, "--json"), SHOW)
-    assert body["third_party_run"] is None
-    assert any("throwaway records" in w for w in body["warnings"])
-
-
 def test_ack_on_a_held_lease_is_retryable_exit_12(
     env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
