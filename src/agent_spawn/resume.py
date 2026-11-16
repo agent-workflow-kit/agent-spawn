@@ -637,32 +637,48 @@ class Resume(Launch):
         reads = classification.reads_third_party
         self.enforce_rules(reads, cwd, self.records_for(cwd))
         if reads:
-            self.check_session_result_file(cwd)
+            self.check_cwd_result_file(cwd)
 
-    def check_session_result_file(self, cwd: str | None) -> None:
-        """The third-party path rule of ``--result-file`` (interface.md, Result file): not inside
-        the run's cwd (a throwaway's root) nor inside the session's directory, ``outbox/``
-        included. The session directory is known from ``claude-session status``; a session that
-        cannot be read fails the command (the rule cannot be checked) rather than skipping it.
-        A fork's own directory does not exist yet: the source's is checked, and the classification
-        check covers the fork's."""
-        if self.inv.result_file is None:
-            return
-        directories: list[str] = []
-        if cwd is not None and cwd != third_party.SESSION_DIR:
-            directories.append(cwd)
-        if self.source_session is not None:
-            assert self.backend is not None
-            directories.append(self.backend.status(self.source_session).csession_dir)
-        if self.result_file_inside(directories):
+    def check_cwd_result_file(self, cwd: str | None) -> None:
+        """The third-party path rule of ``--result-file`` (interface.md, Result file), cwd part:
+        not inside the run's cwd (a throwaway's root). The source session's directory is checked
+        by ``check_session_dir_for_result_file``, after the cwd rule has judged the plan's cwd
+        too."""
+        if cwd is not None and cwd != third_party.SESSION_DIR and self.result_file_inside([cwd]):
             raise self.refuse_result_file(
-                "--result-file lies inside a third-party-reading run's cwd or session directory"
+                "--result-file lies inside a third-party-reading run's cwd"
+            )
+
+    def check_session_dir_for_result_file(self) -> None:
+        """The source session's directory is known up front (unlike a launch's): a result file
+        inside it is refused for every third-party-reading run, whether or not the classes
+        agree (interface.md, Result file). For a fork this is the SOURCE session's directory;
+        the fork's own new directory is known only after ``start`` and is checked then, on a
+        class mismatch only (shared with launch). A refused path is never written, not even
+        the error; a status failure other than 10 (no such session) fails closed the same way."""
+        if self.inv.result_file is None or self.source_session is None:
+            return
+        assert self.backend is not None
+        try:
+            directory = self.backend.status(self.source_session).csession_dir
+        except CliError as error:
+            if error.exit_code == 10:  # the session is gone: it has no directory to protect
+                return
+            third_party.drop_result_file(self.inv)
+            raise
+        if self.result_file_inside([directory]):
+            third_party.drop_result_file(self.inv)
+            raise CliError.usage(
+                "--result-file lies inside a third-party-reading run's session dir"
             )
 
     def check_plan_cwd(self, classification: third_party.Classification, cwd: str | None) -> None:
         """A plain resume passes no ``--cwd``: the run starts where claude-session's plan says.
         When that differs from the recorded cwd the cwd rule applies to the plan's cwd too
         (the session's own ``work/`` directory is the one real path a third-party run may use)."""
+        # todo(#20): once throwaway roots land, test the result file against the real plan cwd
+        # and the run's actual cwd here too (today it is tested against the recorded cwd only,
+        # in check_cwd_rule, and after start against the status cwd).
         plan = classification.cwd
         if (
             self.fork
@@ -891,6 +907,10 @@ class Resume(Launch):
             cwd = classification.cwd
         self.check_cwd_rule(classification, cwd)
         self.check_plan_cwd(classification, cwd)
+        if (
+            classification.reads_third_party
+        ):  # the cwd rule is first (interface.md, Third-party runs)
+            self.check_session_dir_for_result_file()
         self.resume_cwd = cwd
         self.take_holds(run_id, cwd)  # step 6
         # The session (step 7).
@@ -1623,8 +1643,9 @@ class Resume(Launch):
             return "third_party_cwd" if reads else None
         if not third_party.cwd_rule_allows(reads, cwd, records=self.records_for(cwd)):
             return "third_party_cwd" if reads else "third_party_run"
-        if reads:
-            self.check_session_result_file(cwd)
+        if reads:  # the cwd rule came first; then the result-file checks, read-only
+            self.check_cwd_result_file(cwd)
+            self.check_session_dir_for_result_file()
         return None
 
     def dry_plan(
