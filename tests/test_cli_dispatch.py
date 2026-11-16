@@ -44,6 +44,7 @@ OWNERS = {
 IMPLEMENTED = {
     "export",
     "launch",
+    "stop",
     "resume",
     "supervise",
 }  # commands whose issue has landed (no longer stubs)
