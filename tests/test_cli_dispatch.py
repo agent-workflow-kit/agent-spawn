@@ -41,7 +41,6 @@ OWNERS = {
 }
 
 
-# commands whose issue has landed (no longer stubs)
 IMPLEMENTED = {
     "ack",
     "export",
@@ -55,7 +54,7 @@ IMPLEMENTED = {
     "supervise",
     "teardown",
     "wait",
-}
+}  # commands whose issue has landed (no longer stubs)
 
 
 @pytest.mark.parametrize("command", sorted(set(MIN_ARGV) - IMPLEMENTED))

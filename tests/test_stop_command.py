@@ -18,7 +18,7 @@ import pytest
 from agent_spawn import lifecycle, procs
 from agent_spawn.procs import ProcessIdentity
 from agent_spawn.stop import Plan, Stop
-from agent_spawn.store import LeaseHeld, Store
+from agent_spawn.store import Store
 from tests import schema_registry
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
@@ -116,7 +116,7 @@ def release(marker: Path) -> None:
 
 def delete_record(env: Env) -> None:
     with Store.open(env.state_dir, create=False) as store:
-        with store.lease(lifecycle.lease_key(AGENT)) as lease:
+        with store.lease(lifecycle.lease_key(AGENT), wait=10) as lease:
             assert store.delete_agent(lease, AGENT)
 
 
@@ -405,11 +405,14 @@ def test_a_process_with_another_start_time_is_never_signaled(
 def test_a_launching_fork_deleted_by_its_launcher_is_removed(
     env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
 ) -> None:
-    launcher, marker = stand_in(env, proc_tracker, tmp_path)
+    # It exits only once the record is settled: stop's own wait loop would otherwise park the
+    # agent as an orphan first on a slow runner.
+    launcher, marker = stand_in(env, proc_tracker, tmp_path, on_term="release")
     seed(env, fakebin, status="launching", launcher=launcher, forked_from="ag-bbbbbbbb")
     proc = start_stop(env, proc_tracker)
     env.wait_for(marker.exists, "the launcher to get SIGTERM")
     delete_record(env)
+    release(marker)
     code, body = finish(proc)
     assert code == 0
     check_stop(body)
@@ -422,11 +425,12 @@ def test_a_launching_fork_deleted_by_its_launcher_is_removed(
 def test_a_launching_agent_without_a_session_signals_its_launcher_and_waits_for_the_park(
     env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
 ) -> None:
-    launcher, marker = stand_in(env, proc_tracker, tmp_path)
+    launcher, marker = stand_in(env, proc_tracker, tmp_path, on_term="release")
     seed(env, fakebin, status="launching", launcher=launcher)
     proc = start_stop(env, proc_tracker)
     env.wait_for(marker.exists, "the launcher to get SIGTERM")
     park(env)
+    release(marker)
     code, body = finish(proc)
     assert code == 0
     check_stop(body)
@@ -735,24 +739,14 @@ def test_a_wait_that_sees_tearing_down_ends_when_the_run_is_final(
     seed(env, fakebin, csession_id=SESSION, supervisor=supervisor)
     proc = start_stop(env, proc_tracker)
     env.wait_for(marker.exists, "the supervisor to get SIGTERM")
-
-    def hand_over() -> (
-        bool
-    ):  # an ephemeral hand-over to teardown; the running stop may hold the lease
-        with Store.open(env.state_dir, create=False) as store:
-            try:
-                with store.lease(lifecycle.lease_key(AGENT)) as lease:
-                    store.compare_and_set(
-                        lease,
-                        AGENT,
-                        expect_status="live",
-                        changes={"status": "tearing_down", "teardown_step": "started"},
-                    )
-            except LeaseHeld:
-                return False
-        return True
-
-    env.wait_for(hand_over, "the agent lease to be free")
+    with Store.open(env.state_dir, create=False) as store:  # an ephemeral hand-over to teardown
+        with store.lease(lifecycle.lease_key(AGENT), wait=10) as lease:
+            store.compare_and_set(
+                lease,
+                AGENT,
+                expect_status="live",
+                changes={"status": "tearing_down", "teardown_step": "started"},
+            )
     code, body = finish(proc)
     assert code == 0
     check_stop(body)
@@ -827,11 +821,14 @@ def test_a_record_vanishing_under_a_supervisor_signal_exits_1(
     env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
 ) -> None:
     fakebin.seed_session(SESSION)
-    supervisor, marker = stand_in(env, proc_tracker, tmp_path)
+    # It stays alive until the record is gone: an exited supervisor with a final run would be
+    # parked as an orphan by stop's own wait loop on a slow runner, before the record vanishes.
+    supervisor, marker = stand_in(env, proc_tracker, tmp_path, on_term="release")
     seed(env, fakebin, csession_id=SESSION, supervisor=supervisor)
     proc = start_stop(env, proc_tracker)
     env.wait_for(marker.exists, "the supervisor to get SIGTERM")
     delete_record(env)
+    release(marker)
     code, body = finish(proc)
     assert code == 1
     check_error(body)

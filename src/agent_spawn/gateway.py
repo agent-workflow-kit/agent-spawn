@@ -54,6 +54,7 @@ TimeoutExpired = subprocess.TimeoutExpired
 # Re-exported stdio redirections for ``Gateway.spawn`` (callers never import subprocess).
 PIPE = subprocess.PIPE
 DEVNULL = subprocess.DEVNULL
+
 #: ``SystemGateway.run`` keeps at most this many bytes of each of stdout and stderr; one more
 #: byte kills the child and raises ``OutputTooLarge`` (a runaway child cannot exhaust memory).
 MAX_RUN_OUTPUT = 8 * 1024 * 1024
