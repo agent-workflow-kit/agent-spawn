@@ -20,7 +20,7 @@ import pytest
 
 from agent_spawn import chain, handoff, lifecycle, procs, promotion
 from agent_spawn.store import StoreError
-from agent_spawn.supervise import Supervisor
+from agent_spawn.supervise import Signals, Supervisor
 from tests import schema_registry
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
@@ -265,6 +265,12 @@ def test_a_window_that_fails_to_open_cancels_the_pending_run_and_parks_per_the_t
     assert row["last_outcome"]["run"] == 1 and row["last_outcome"]["outcome"] == "blocked"
     failure = post_park(wenv, agent_id)["chain_failure"]
     assert failure["tool"] == "termctl" and failure["run"] == 2
+    # the window never existed: the agent is as it was (headless, no placement)
+    parked = post_park(wenv, agent_id)["agent"]
+    assert parked["mode"] == "headless" and parked["placement"] is None
+    shown = result_json(wenv.run("show", agent_id, "--json"))
+    schema_registry.validate(shown, "agent-spawn/cli/show.json")
+    assert shown["agent"]["mode"] == "headless" and shown["agent"]["placement"] is None
     stops = [a for a in fakebin.argvs("claude-session") if "stop" in a]
     assert len(stops) == 1 and row["csession_id"] in stops[0]
     first, second = runs(wenv, agent_id)
@@ -482,12 +488,9 @@ def test_a_promotion_whose_records_lookup_fails_creates_no_run_and_no_window(
 
 
 def signal_delivered(pid: int, signum: int) -> bool:
-    """Whether the process took ``signum`` (it is no longer pending for it). Where ``/proc`` does
-    not exist the signal is assumed delivered (``kill`` returns after the kernel queued it)."""
-    try:
-        text = Path(f"/proc/{pid}/status").read_text()
-    except OSError:
-        return True
+    """Whether the process took ``signum`` (it is no longer pending for it). An unreadable
+    ``/proc`` fails the test: the supervisor writes nothing observable when it takes a signal."""
+    text = Path(f"/proc/{pid}/status").read_text()  # raises: never a silent pass
     for line in text.splitlines():
         if line.startswith(("SigPnd:", "ShdPnd:")) and int(line.split()[1], 16) >> (signum - 1) & 1:
             return False
@@ -533,6 +536,49 @@ def test_a_signal_while_the_window_opens_cancels_the_promotion_and_parks_per_the
     assert not [e for e in log_events(wenv) if e["event"] == "signal_sent"]  # nothing forwarded
     wenv.wait_for(lambda: wenv.panes() == [], "the dead promotion pane to be closed")
     assert capture.out.read_text() == "" and capture.err.read_text() == ""
+
+
+@pytest.mark.parametrize("sent", [signal.SIGTERM, signal.SIGHUP, signal.SIGINT])
+def test_a_signal_while_the_window_open_fails_parks_per_the_trigger_without_a_chain_failure(
+    wenv: WindowEnv, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path, sent: int
+) -> None:
+    wenv.capture_supervisor(tmp_path / "cap")
+    script_first_run(fakebin)
+    gate = tmp_path / "open-gate"
+    fakebin.script("termctl", "open", argv_contains=["--dry-run"])
+    fakebin.script(
+        "termctl", "open", gate=str(gate), error={"code": "failed", "message": "no"}, exit=12
+    )
+    agent_id = result_json(wenv.run(*LAUNCH, "--promote"))["agent"]["agent_id"]
+    track_agent(wenv, proc_tracker, agent_id)
+    fakebin.wait_for_gate(gate)
+    supervisor = wenv.agent(agent_id)["supervisor"]
+    send_signal(supervisor, sent)
+    wenv.wait_for(lambda: signal_delivered(supervisor.pid, sent), "the supervisor to take it")
+    gate.write_text("")  # `termctl open` fails now
+    wenv.wait_for(lambda: wenv.agent(agent_id)["status"] == "parked", "the agent to park")
+    row = wenv.agent(agent_id)
+    assert row["park_reason"] == "blocked" and row["needs_attention"] == "blocked"
+    assert row["promotion_pending"] is False
+    assert post_park(wenv, agent_id)["chain_failure"] is None  # a stop, not a failure
+    assert len(stops(fakebin)) == 1  # the pending run was canceled exactly once
+    assert len(execs(fakebin)) == 1
+
+
+@pytest.mark.parametrize("sent", [signal.SIGTERM, signal.SIGINT])
+def test_a_signal_after_the_handoff_before_the_host_is_tracked_cancels_the_promotion(
+    sent: int,
+) -> None:
+    signals = Signals()
+    sup = SimpleNamespace(signals=signals, terminated=False, forwarder=None, child="exec")
+    sup.note_signal = lambda received: Supervisor.note_signal(sup, received)  # type: ignore[arg-type]
+    sup.collect_signals = lambda: Supervisor.collect_signals(sup)  # type: ignore[arg-type]
+    signals.received.append(sent)  # delivered while `serve` ran
+    ctx = SimpleNamespace(host=None)
+    with pytest.raises(chain.ChainCanceled):
+        promotion._track_host(sup, ctx, object())  # type: ignore[arg-type]
+    assert ctx.host is None and sup.forwarder is None  # the host was never tracked
+    assert sup.terminated is True
 
 
 def test_a_stop_during_the_window_open_parks_killed_without_a_chain_failure(
@@ -730,10 +776,10 @@ def test_the_agent_object_is_interactive_in_a_window_once_promoted(
     shown = result_json(wenv.run("show", agent_id, "--json"))
     schema_registry.validate(shown, "agent-spawn/cli/show.json")
     assert shown["agent"]["mode"] == "interactive" and shown["agent"]["placement"] == "window"
-    for name, payload in events(wenv, agent_id):
-        if name == "post-launch" and payload["run"] == 2:
-            assert payload["agent"]["mode"] == "interactive"
-            assert payload["agent"]["placement"] == "window"
+    launches = [p for name, p in events(wenv, agent_id) if name == "post-launch" and p["run"] == 2]
+    assert len(launches) == 1  # run 2's event was found, not skipped
+    assert launches[0]["agent"]["mode"] == "interactive"
+    assert launches[0]["agent"]["placement"] == "window"
     parked = post_park(wenv, agent_id)
     assert parked["agent"]["mode"] == "interactive" and parked["agent"]["placement"] == "window"
 

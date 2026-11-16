@@ -626,8 +626,8 @@ def _after_start(
                 "run": started.run,
                 "run_kind": classification.run_kind,
             }
-            if promoted:  # the agent's mode and placement are its last run's (Objects)
-                agent_changes.update(mode="interactive", placement="window")
+            # a promotion's mode and placement (the agent's are its last run's, Objects) are
+            # written once its window is recorded (promotion._record_window), not before
             store.update_agent(lease, agent_id, agent_changes)
             store.put_run(
                 lease,

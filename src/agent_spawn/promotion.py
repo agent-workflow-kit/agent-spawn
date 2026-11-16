@@ -174,6 +174,7 @@ def open_window(
         _open(sup, backend, term, row, session, ctx, opened)
     except chain.ChainFailure as failure:
         _abandon(sup, backend, term, session, ctx, opened, hooks, token)
+        _check_stop(sup)  # a signal during the failing open parks per the trigger, no failure
         failure.run = ctx.run
         raise
     except chain.ChainCanceled:
@@ -181,10 +182,13 @@ def open_window(
         raise
     except CliError as error:
         _abandon(sup, backend, term, session, ctx, opened, hooks, token)
+        _check_stop(sup)
         raise chain.failure_of(error, run=ctx.run) from None
     except BaseException as error:
         sup.log("warning", level="error", message=f"promotion failed: {type(error).__name__}")
         _abandon(sup, backend, term, session, ctx, opened, hooks, token)
+        if isinstance(error, Exception):
+            _check_stop(sup)
         if isinstance(error, Exception):
             raise chain.ChainFailure("agent-spawn", "failed", run=ctx.run) from None
         raise
@@ -324,15 +328,21 @@ def _recover_pane(
 
 def _record_window(sup: Supervisor, ctx: RunCtx, pane: Pane) -> None:
     """Store the window on the promoted run (``term_id``, ``socket_path``, ``placement:
-    window``) before anything else can fail: cleanup closes the pane by this record."""
+    window``) before anything else can fail: cleanup closes the pane by this record. The agent
+    becomes ``interactive`` in a ``window`` in the same transaction (its mode and placement are
+    its last run's): a promotion canceled before its window exists leaves the agent as it was."""
     assert sup.store is not None
     with sup.store.lease(lifecycle.lease_key(sup.agent_id), wait=lifecycle.LEASE_WAIT) as lease:
-        sup.store.put_run(
-            lease,
-            sup.agent_id,
-            ctx.run,
-            {"term_id": pane.term_id, "socket_path": pane.socket_path, "placement": "window"},
-        )
+        with sup.store.transaction():
+            sup.store.update_agent(
+                lease, sup.agent_id, {"mode": "interactive", "placement": "window"}
+            )
+            sup.store.put_run(
+                lease,
+                sup.agent_id,
+                ctx.run,
+                {"term_id": pane.term_id, "socket_path": pane.socket_path, "placement": "window"},
+            )
 
 
 def _record_identity(sup: Supervisor, ctx: RunCtx, pane: Pane) -> procs.ProcessIdentity | None:
