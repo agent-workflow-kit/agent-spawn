@@ -1047,3 +1047,27 @@ def test_the_already_running_body_validates_against_the_schema(env: Env, fakebin
     bad = {**body, "changes": [{"agent_id": "ag-aaaaaaaa", "kind": "parked", "details": {}}]}
     with pytest.raises(Exception):  # noqa: B017, PT011 - the schema forbids changes here
         schema_registry.validate(bad, "agent-spawn/cli/reconcile.json")
+
+
+# --- human output ------------------------------------------------------------------------------
+
+
+def test_human_output_summarizes_and_warnings_go_to_stderr(env: Env, fakebin: Fakebin) -> None:
+    old = tombstone(env, fakebin, 40.0)
+    fakebin.script("claude-session", "reconcile", exit=12, error={"code": "failed", "message": "x"})
+    done = env.run("reconcile")
+    assert done.returncode == 0
+    assert done.stdout.splitlines() == ["changed 1 thing(s)", f"  {old}: tombstone_deleted"]
+    assert done.stderr.count("warning: ") == 1 and "claude-session reconcile failed" in done.stderr
+
+
+def test_quiet_prints_no_summary_but_a_warning_still_reaches_stderr(
+    env: Env, fakebin: Fakebin
+) -> None:
+    tombstone(env, fakebin, 40.0)
+    fakebin.script("claude-session", "reconcile", exit=12, error={"code": "failed", "message": "x"})
+    done = env.run("reconcile", "--quiet")
+    assert done.returncode == 0 and done.stdout == ""
+    assert "claude-session reconcile failed" in done.stderr
+    quiet_json = env.run("reconcile", "--quiet", "--json")
+    assert json.loads(quiet_json.stdout)["already_running"] is False  # --json still prints

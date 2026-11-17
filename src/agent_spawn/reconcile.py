@@ -55,7 +55,7 @@ from .agent_lookup import (
     store_failed,
 )
 from .agent_view import ts
-from .annotate import mirror_labels
+from .annotate import mirror_labels, print_warnings
 from .commands.base import Invocation
 from .ids import is_agent_id
 from .labels import Label
@@ -398,23 +398,30 @@ class _Pass:
 
 
 def _outcome(
-    changes: list[dict[str, Any]], warnings: list[str], already_running: bool, dry_run: bool
+    inv: Invocation,
+    changes: list[dict[str, Any]],
+    warnings: list[str],
+    already_running: bool,
+    dry_run: bool,
 ) -> Outcome:
+    """The result. In human mode the summary goes to stdout (not with ``--quiet``, which is what
+    cron passes) and every warning to stderr, so a problem still reaches cron's mail."""
     payload = {
         "changes": changes,
         "warnings": warnings,
         "already_running": already_running,
         "dry_run": dry_run,
     }
+    print_warnings(inv, warnings)
     if already_running:
         human = "another reconcile is running: nothing done"
     else:
         verb = "would change" if dry_run else "changed"
         lines = [f"{verb} {len(changes)} thing(s)"]
         lines.extend(f"  {c['agent_id']}: {c['kind']}" for c in changes)
-        lines.extend(f"warning: {safe_text(w)}" for w in warnings)
         human = "\n".join(lines)
-    return Outcome(0, payload, PayloadKind.COMMAND, human)
+    quiet = inv.quiet and not inv.as_json
+    return Outcome(0, payload, PayloadKind.COMMAND, human, quiet=quiet)
 
 
 def reconcile_command(inv: Invocation) -> Outcome:
@@ -424,7 +431,7 @@ def reconcile_command(inv: Invocation) -> Outcome:
     store = open_existing(inv)
     warnings = list(inv.warnings)
     if store is None:  # no state.db: no agents, nothing to reconcile, nothing is created
-        return _outcome([], warnings, False, dry_run)
+        return _outcome(inv, [], warnings, False, dry_run)
     try:
         run = _Pass(inv, store, state_dir, dry_run)
         run.warnings = warnings
@@ -434,7 +441,7 @@ def reconcile_command(inv: Invocation) -> Outcome:
             try:
                 lease = store.acquire_lease(LEASE)
             except LeaseHeld:
-                return _outcome([], warnings, True, dry_run)
+                return _outcome(inv, [], warnings, True, dry_run)
             except StoreError as error:  # e.g. a lease row whose holder cannot be parsed
                 raise store_failed(error) from None
             try:
@@ -444,6 +451,6 @@ def reconcile_command(inv: Invocation) -> Outcome:
                     store.release_lease(lease)
                 except StoreError:
                     run.warn(None, "the reconcile lease could not be released")
-        return _outcome(run.changes, run.warnings, False, dry_run)
+        return _outcome(inv, run.changes, run.warnings, False, dry_run)
     finally:
         store.close()
