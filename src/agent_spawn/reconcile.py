@@ -146,14 +146,25 @@ class _Pass:
     def session_reconcile(self) -> None:
         try:
             backend = backend_for(_internal(self.inv))
-            backend.reconcile(dry_run=self.dry_run)
+            reply = backend.reconcile(dry_run=self.dry_run)
         except CliError as error:
             self.warn(None, f"claude-session reconcile failed ({error.code})")
+            return
+        # Its own warnings must not vanish under ``--quiet`` cron; unknown fields are tolerated.
+        if not isinstance(reply, Mapping):
+            return
+        if reply.get("already_running") is True:
+            self.warn(None, "claude-session: reconcile already running")
+        texts = reply.get("warnings")
+        if isinstance(texts, list):
+            for text in texts:  # pyright: ignore[reportUnknownVariableType]
+                if isinstance(text, str) and text:
+                    self.warn(None, f"claude-session: {safe_text(text)}")
 
     # -- 2: liveness --------------------------------------------------------------------------
 
     def liveness(self) -> None:
-        check = liveness_for(self.inv, self.store, dry_run=self.dry_run)
+        check = liveness_for(self.inv, self.store, dry_run=self.dry_run, actor=SUPERVISOR_ACTOR)
         for row in self.store.list_agents(statuses=("launching", "live")):
             agent_id = row["agent_id"]
             try:
@@ -216,7 +227,7 @@ class _Pass:
             partial = row.get("teardown_partial_record")
             if step == "worktree_partial" and isinstance(partial, str):
                 details["partial_record"] = partial
-            if step == "started" and alive is False:
+            if step == "started" and alive is False:  # False from a valid identity only
                 # The pre-teardown hook ran (or was about to) in a process that is gone. A
                 # SIGTERM/SIGHUP/SIGINT stops the hook with its teardown; only a SIGKILL can
                 # leave it running, and its identity is not recorded: the retry runs it again.
@@ -225,7 +236,7 @@ class _Pass:
 
     def _alive(self, identity: object) -> bool | None:
         if not isinstance(identity, procs.ProcessIdentity):
-            return False
+            return None  # none recorded (or unreadable): never "dead", as for a retry
         try:
             if identity.boot_id != procs.read_boot_id(gateway=self.gateway):
                 return False
@@ -382,7 +393,9 @@ class _Pass:
                     return False
                 problems = remove_agent_files(self.state_dir, agent_id)
                 if problems:
+                    # keep the record: without it the files are never swept, the next pass retries
                     self.warn(agent_id, "its leftover files could not all be deleted")
+                    return False
                 return self.store.delete_agent(lease, agent_id)
         except LeaseHeld:
             return False

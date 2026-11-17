@@ -180,28 +180,37 @@ def _terminate_hook_on_signal(gateway: gw.Gateway) -> Iterator[None]:
     installed: dict[int, Any] = {}
 
     def raiser(signum: int, _frame: object) -> None:
+        # A second signal must not interrupt the shutdown the first one starts (the hook runner's
+        # cleanup waits for the group and escalates to SIGKILL): ignore both until it is over.
+        for sig in installed:
+            gateway.install_signal_handler(sig, signal.SIG_IGN)
         raise _Terminated(signum)
 
     try:
-        for sig in (signal.SIGTERM, signal.SIGHUP):
-            previous = gateway.install_signal_handler(sig, raiser)
-            if previous is signal.SIG_DFL:
-                installed[sig] = previous
-            else:
-                gateway.install_signal_handler(sig, previous)
-    except ValueError:  # not the main thread
-        pass
-    try:
+        try:
+            for sig in (signal.SIGTERM, signal.SIGHUP):
+                previous = gateway.install_signal_handler(sig, raiser)
+                if previous is signal.SIG_DFL:
+                    installed[sig] = previous
+                elif previous is not None:  # someone else's handler: put it back
+                    gateway.install_signal_handler(sig, previous)
+                # None: a handler installed from C, which cannot be put back: left as foreign
+        except ValueError:  # not the main thread
+            pass
         yield
     except _Terminated as caught:
-        for sig, previous in installed.items():
-            gateway.install_signal_handler(sig, previous)
-        installed.clear()
+        _restore(gateway, installed)
         os.kill(os.getpid(), caught.signum)  # the default action: this process ends by it
         raise
     finally:
-        for sig, previous in installed.items():
-            gateway.install_signal_handler(sig, previous)
+        _restore(gateway, installed)
+
+
+def _restore(gateway: gw.Gateway, installed: dict[int, Any]) -> None:
+    """Put back the handlers this module replaced (once)."""
+    for sig, previous in installed.items():
+        gateway.install_signal_handler(sig, previous)
+    installed.clear()
 
 
 # --- the engine -----------------------------------------------------------------------------------

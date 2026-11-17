@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ import pytest
 from agent_spawn import labels as labellib
 from agent_spawn import lifecycle, procs
 from agent_spawn.agent_view import agent_object
+from agent_spawn.gateway import SystemGateway, set_gateway
 from agent_spawn.hooks import agent_event
 from agent_spawn.lifecycle import LEASE_WAIT, lease_key
 from agent_spawn.store import Store
@@ -114,6 +116,34 @@ def launching_dead(env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, **fiel
     )
 
 
+QUIET_RECONCILE = {
+    "already_running": False,
+    "dry_run": False,
+    "changes": [],
+    "orphans": [],
+    "warnings": [],
+}
+
+
+def script_label_pushes(fakebin: Fakebin) -> None:
+    """claude-session's ``label add|remove`` and ``reconcile`` scripted explicitly (never the
+    fake's defaults)."""
+    for action in ("add", "remove"):
+        fakebin.script(
+            "claude-session",
+            f"label {action}",
+            replace=True,
+            stdout={
+                "csession_id": SESSION,
+                "labels": [],
+                "added": [],
+                "removed": [],
+                "dry_run": False,
+            },
+        )
+    fakebin.script("claude-session", "reconcile", replace=True, stdout=QUIET_RECONCILE)
+
+
 # --- the empty and the unknown ------------------------------------------------------------------
 
 
@@ -127,6 +157,7 @@ def test_a_quiet_state_reports_nothing_and_leaves_no_lease_behind(
     env: Env, fakebin: Fakebin
 ) -> None:
     seed(env, fakebin)
+    fakebin.script("claude-session", "reconcile", replace=True, stdout=QUIET_RECONCILE)
     body = reconcile(env)
     assert body["changes"] == [] and body["already_running"] is False
     assert db_rows(env, "SELECT key FROM leases") == []
@@ -136,7 +167,13 @@ def test_a_quiet_state_reports_nothing_and_leaves_no_lease_behind(
 def test_a_failing_claude_session_reconcile_is_a_warning_and_the_pass_goes_on(
     env: Env, fakebin: Fakebin
 ) -> None:
-    fakebin.script("claude-session", "reconcile", exit=12, error={"code": "failed", "message": "x"})
+    fakebin.script(
+        "claude-session",
+        "reconcile",
+        replace=True,
+        exit=12,
+        error={"code": "failed", "message": "x"},
+    )
     old = tombstone(env, fakebin)
     body = reconcile(env)
     assert any("claude-session reconcile failed" in w for w in body["warnings"])
@@ -149,6 +186,44 @@ def test_reconcile_calls_claude_session_as_the_internal_actor(env: Env, fakebin:
     assert done.returncode == 0
     (call,) = calls(fakebin, "claude-session", "reconcile")
     assert not any("human:alice" in part for part in call)
+
+
+def test_claude_sessions_own_warnings_are_passed_through_with_a_prefix(
+    env: Env, fakebin: Fakebin
+) -> None:
+    seed(env, fakebin)
+    fakebin.script(
+        "claude-session",
+        "reconcile",
+        replace=True,
+        stdout={
+            "already_running": False,
+            "dry_run": False,
+            "changes": [],
+            "orphans": [],
+            "warnings": ["a hook interpreter is gone", 7, "", "second"],
+            "surprise": {"unknown": "field"},
+        },
+    )
+    body = reconcile(env)
+    assert body["warnings"] == [
+        "claude-session: a hook interpreter is gone",
+        "claude-session: second",
+    ]
+
+
+def test_a_claude_session_reconcile_already_running_is_a_warning(
+    env: Env, fakebin: Fakebin
+) -> None:
+    seed(env, fakebin)
+    fakebin.script(
+        "claude-session",
+        "reconcile",
+        replace=True,
+        stdout={"already_running": True, "dry_run": False, "changes": [], "orphans": []},
+    )
+    body = reconcile(env)  # no `warnings` field at all: tolerated
+    assert body["warnings"] == ["claude-session: reconcile already running"]
 
 
 # --- step 2: liveness ----------------------------------------------------------------------------
@@ -198,6 +273,31 @@ def test_a_live_agent_with_a_dead_supervisor_is_flagged_and_never_signaled_or_st
     assert reconcile(env)["changes"] == []  # idempotent
 
 
+def test_a_here_agent_with_a_dead_launcher_and_a_live_exec_is_supervisor_lost_without_termctl(
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    """#30: with ``placement = here`` the launcher is the supervisor and there is no pane."""
+    survivor = proc_tracker.popen(["sleep", "300"], stdin=subprocess.DEVNULL)
+    survivor_identity = procs.read_identity(survivor.pid)
+    assert survivor_identity is not None
+    agent_id = seed(
+        env,
+        fakebin,
+        status="live",
+        park_reason=None,
+        placement="here",
+        launcher=dead_identity(),
+        supervisor=dead_identity(),
+        exec_proc=survivor_identity,
+    )
+    script_live_run(fakebin)
+    body = reconcile(env)
+    assert (agent_id, "supervisor_lost") in kinds(body)
+    assert env.agent(agent_id)["status"] == "live"
+    assert fakebin.argvs("termctl") == []
+    assert survivor.poll() is None
+
+
 def test_a_session_claude_session_does_not_know_is_parked_session_missing(
     env: Env, fakebin: Fakebin
 ) -> None:
@@ -238,7 +338,9 @@ def test_a_fork_whose_launcher_was_killed_before_start_returned_is_removed_with_
     env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
 ) -> None:
     source = seed(env, fakebin)
-    fork = launching_dead(env, fakebin, proc_tracker, forked_from=source)
+    fork = launching_dead(
+        env, fakebin, proc_tracker, forked_from=source, decision_ids=["d-1", "d-2"]
+    )
     with Store.open(env.state_dir) as store:
         with store.lease(lifecycle.lease_key(fork), wait=5) as lease:
             store.put_hold(lease, fork, "wt-aaaaaaaa", "/x/y", owned=False)
@@ -250,6 +352,8 @@ def test_a_fork_whose_launcher_was_killed_before_start_returned_is_removed_with_
     assert not (env.state_dir / "prompts" / fork).exists()
     forgets = calls(fakebin, "wtctl", "forget")
     assert forgets and forgets[0][1] == "wt-aaaaaaaa" and f"--holder={fork}" in forgets[0]
+    assert "--actor=auto:agent-spawn" in forgets[0]
+    assert "--decision-id=d-1" in forgets[0] and "--decision-id=d-2" in forgets[0]
     assert reconcile(env)["changes"] == []
 
 
@@ -386,6 +490,16 @@ def test_a_dead_teardown_at_the_hook_step_says_a_hook_may_be_running(
     assert change["details"]["hook_may_be_running"] is True
 
 
+def test_a_teardown_without_a_recorded_process_is_neither_alive_nor_dead(
+    env: Env, fakebin: Fakebin
+) -> None:
+    """``Teardown`` never treats such a row as dead (a retry is refused), so the report must not
+    say the hook may be running either."""
+    tearing_down(env, fakebin, "started", None)
+    (change,) = reconcile(env)["changes"]
+    assert change["details"] == {"teardown_step": "started", "teardown_alive": None}
+
+
 def test_a_partial_worktree_removal_names_its_record(env: Env, fakebin: Fakebin) -> None:
     tearing_down(
         env, fakebin, "worktree_partial", dead_identity(), teardown_partial_record="wt-aaaaaaaa"
@@ -424,6 +538,7 @@ def test_pending_label_changes_are_pushed_to_the_session_and_dropped(
     env: Env, fakebin: Fakebin
 ) -> None:
     agent_id = seed(env, fakebin)
+    script_label_pushes(fakebin)
     add_labels(env, agent_id, "team=a", "owner=flow")
     remove_labels(env, agent_id, "owner=flow")
     assert pending(env, agent_id) == [("team=a", "add"), ("owner=flow", "remove")]
@@ -441,7 +556,13 @@ def test_a_failed_push_stays_queued_with_a_warning_and_no_change(
 ) -> None:
     agent_id = seed(env, fakebin)
     add_labels(env, agent_id, "team=a")
-    fakebin.script("claude-session", "label add", exit=12, error={"code": "failed", "message": "x"})
+    fakebin.script(
+        "claude-session",
+        "label add",
+        replace=True,
+        exit=12,
+        error={"code": "failed", "message": "x"},
+    )
     body = reconcile(env)
     assert only(body, "labels_resynced") == []
     assert any(w.startswith(agent_id) and "queued for reconcile" in w for w in body["warnings"])
@@ -499,12 +620,140 @@ def test_an_old_tombstone_is_deleted_with_everything_it_owns_and_its_id_stays_re
     assert reconcile(env)["changes"] == []
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can delete from a read-only directory")
+def test_a_tombstone_whose_files_cannot_be_removed_keeps_its_record_and_is_retried(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = tombstone(env, fakebin, 40.0)
+    locked = env.state_dir / "outcomes" / agent_id / "locked"
+    locked.mkdir()
+    (locked / "f").write_text("x")
+    locked.chmod(0o500)  # its entries cannot be unlinked
+    try:
+        body = reconcile(env)
+        assert (agent_id, "tombstone_deleted") not in kinds(body)
+        assert f"{agent_id}: its leftover files could not all be deleted" in body["warnings"]
+        with Store.open(env.state_dir) as store:
+            assert store.get_agent(agent_id) is not None  # kept: outcomes/<id> needs its record
+    finally:
+        locked.chmod(0o700)
+    assert kinds(reconcile(env)) == [(agent_id, "tombstone_deleted")]
+    assert not (env.state_dir / "outcomes" / agent_id).exists()
+
+
 def test_a_young_tombstone_and_one_without_a_time_stay(env: Env, fakebin: Fakebin) -> None:
     young = tombstone(env, fakebin, 1.0)
     untimed = tombstone(env, fakebin, None)
     assert reconcile(env)["changes"] == []
     with Store.open(env.state_dir) as store:
         assert store.get_agent(young) is not None and store.get_agent(untimed) is not None
+
+
+def test_a_dry_run_does_not_report_a_young_or_an_untimed_tombstone(
+    env: Env, fakebin: Fakebin
+) -> None:
+    tombstone(env, fakebin, 1.0)
+    tombstone(env, fakebin, None)
+    assert reconcile(env, "--dry-run")["changes"] == []
+
+
+def test_a_boolean_torn_down_at_is_never_old_enough() -> None:
+    from agent_spawn.reconcile import _Pass  # pyright: ignore[reportPrivateUsage]
+
+    assert _Pass._expired({"torn_down_at": True}, 10_000.0, 1.0) is False  # pyright: ignore[reportPrivateUsage]
+    assert _Pass._expired({"torn_down_at": False}, 10_000.0, 1.0) is False  # pyright: ignore[reportPrivateUsage]
+    assert _Pass._expired({"torn_down_at": 1.0}, 10_000.0, 1.0) is True  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("resurrection", ["parked", "torn_down_again"])
+def test_a_tombstone_that_changed_after_it_was_listed_is_judged_again_and_kept(
+    env: Env,
+    fakebin: Fakebin,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    resurrection: str,
+) -> None:
+    """Between ``list_agents`` and the lease another command resurrects the row (back to parked)
+    or tears it down again (``torn_down_at`` is now): the deletion judges the fresh row."""
+    from tests.inspect_support import run_inprocess
+
+    agent_id = tombstone(env, fakebin, 40.0)
+    original = Store.acquire_lease
+    done: list[bool] = []
+
+    def changed_first(self: Store, key: str, **kwargs: Any) -> Any:
+        if key == f"delivery:{agent_id}" and not done:
+            done.append(True)
+            with Store.open(env.state_dir) as other:
+                with other.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
+                    changes: dict[str, Any] = {"torn_down_at": time.time()}
+                    if resurrection == "parked":
+                        changes.update(status="parked", park_reason="done")
+                    other.update_agent(lease, agent_id, changes)
+        return original(self, key, **kwargs)
+
+    monkeypatch.setattr(Store, "acquire_lease", changed_first)
+    code, out, _ = run_inprocess(env, monkeypatch, capsys, "reconcile", "--json")
+    assert code == 0 and done
+    body = json.loads(out)
+    assert (agent_id, "tombstone_deleted") not in kinds(body)
+    with Store.open(env.state_dir) as store:
+        assert store.get_agent(agent_id) is not None
+    assert all(
+        x["details"]["kind"] != "tombstone_deleted" for x in log_events(env, "reconcile_change")
+    )
+
+
+class _Clock(SystemGateway):
+    """The system gateway with a fixed wall clock (boundary tests)."""
+
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def wall_time(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def clock() -> Iterator[_Clock]:
+    fake = _Clock(2_000_000_000.0)
+    previous = set_gateway(fake)
+    try:
+        yield fake
+    finally:
+        set_gateway(previous)
+
+
+def reconcile_inprocess(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> Any:
+    from tests.inspect_support import run_inprocess
+
+    code, out, err = run_inprocess(env, monkeypatch, capsys, "reconcile", "--json")
+    assert code == 0, (out, err)
+    return json.loads(out)
+
+
+@pytest.mark.parametrize(("offset", "deleted"), [(-1.0, False), (0.0, False), (1.0, True)])
+def test_a_tombstone_is_deleted_only_past_tombstone_days(
+    env: Env,
+    fakebin: Fakebin,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    clock: _Clock,
+    offset: float,
+    deleted: bool,
+) -> None:
+    agent_id = seed(
+        env,
+        fakebin,
+        session=False,
+        status="torn_down",
+        park_reason=None,
+        torn_down_at=clock.now - 30 * DAY - offset,  # tombstone_days defaults to 30
+    )
+    body = reconcile_inprocess(env, monkeypatch, capsys)
+    assert ((agent_id, "tombstone_deleted") in kinds(body)) is deleted
 
 
 def test_tombstone_days_comes_from_the_config(fakebin: Fakebin, isolation_env: Isolation) -> None:
@@ -573,6 +822,23 @@ def test_prompt_copies_without_a_record_go_only_after_an_hour(env: Env, fakebin:
     assert [(x["agent_id"], x["details"]["reason"]) for x in logged] == [(None, "no_record")]
 
 
+@pytest.mark.parametrize(("age", "removed"), [(3599.0, False), (3600.0, False), (3601.0, True)])
+def test_an_orphan_prompt_copy_goes_only_past_an_hour(
+    env: Env,
+    fakebin: Fakebin,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    clock: _Clock,
+    age: float,
+    removed: bool,
+) -> None:
+    init_state(env, fakebin)
+    directory = make_dir(env, "prompts", "ag-aaaaaaaa")
+    os.utime(directory, (clock.now - age, clock.now - age))
+    reconcile_inprocess(env, monkeypatch, capsys)
+    assert directory.exists() is not removed
+
+
 @pytest.mark.parametrize("status", ["parked", "launching", "live", "tearing_down"])
 def test_an_agent_with_a_record_keeps_its_old_prompt_copies(
     env: Env, fakebin: Fakebin, status: str
@@ -619,6 +885,44 @@ def test_deletion_never_follows_a_symlink(env: Env, fakebin: Fakebin, tmp_path: 
     assert (outside / "precious").read_text() == "keep"
     assert os.path.islink(env.state_dir / "prompts" / "ag-aaaaaaaa")  # not ours to delete
     assert not orphan.exists() and not (env.state_dir / "outcomes" / gone).exists()
+
+
+@pytest.mark.parametrize("sub", ["prompts", "outcomes"])
+def test_entries_that_are_symlinks_or_not_directories_are_never_swept(
+    env: Env, fakebin: Fakebin, tmp_path: Path, sub: str
+) -> None:
+    init_state(env, fakebin)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "precious").write_text("keep")
+    backdate(outside, 10 * DAY)
+    parent = env.state_dir / sub
+    parent.mkdir(exist_ok=True)
+    gone = tombstone(env, fakebin, 1.0)  # young: only its files are swept, never its record
+    for stale in (parent / gone,):
+        for child in stale.iterdir():
+            child.unlink()
+        stale.rmdir()
+    orphan_link = parent / "ag-aaaaaaaa"
+    tomb_link = parent / gone
+    file_like_id = parent / "ag-bbbbbbbb"
+    os.symlink(outside, orphan_link)
+    os.symlink(outside, tomb_link)
+    file_like_id.write_text("not a directory")
+    for entry in (orphan_link, tomb_link, file_like_id):
+        old = time.time() - 10 * DAY
+        os.utime(entry, (old, old), follow_symlinks=False)  # old on its own
+    reconcile(env)
+    assert (outside / "precious").read_text() == "keep"
+    assert os.path.islink(orphan_link) and os.path.islink(tomb_link)
+    assert file_like_id.is_file() and file_like_id.read_text() == "not a directory"
+    assert os.readlink(orphan_link) == str(outside) and os.readlink(tomb_link) == str(outside)
+    removed = [
+        x["details"]
+        for x in log_events(env, "reconcile_change")
+        if x["details"]["kind"] == "files_removed"
+    ]
+    assert [d for d in removed if d["directory"] == sub] == []  # (the other directory's go)
 
 
 def test_a_prompts_directory_that_is_a_symlink_is_not_swept(
@@ -685,6 +989,7 @@ def test_a_zombie_owner_counts_as_dead(
     env.wait_for(
         lambda: (info := procs.inspect(child.pid)) is not None and not info.alive,
         "the child to exit (it is not reaped yet)",
+        timeout=30.0,
     )
     identity = procs.read_identity(child.pid)
     assert identity is not None  # a zombie: still in the process table
@@ -795,9 +1100,9 @@ def test_a_second_caller_exits_0_already_running_and_does_nothing(
 def test_concurrent_reconciles_released_together_deliver_every_event_once(
     env: Env, fakebin: Fakebin, tmp_path: Path
 ) -> None:
-    sink = tmp_path / "sink"
-    config = f'hooks:\n  post-state-change:\n    - cmd: "cat >> {sink}; echo >> {sink}"\n'
-    racing = Env(fakebin, env.iso, config)
+    """Four callers released at once; the winner's hook holds the lease until the three others
+    have answered ``already_running``, so the overlap is guaranteed, never a lucky schedule."""
+    racing, started, gate, sink = hold_gate_env(env, tmp_path)
     agents = [seed(racing, fakebin) for _ in range(3)]
     for agent_id in agents:
         for _ in range(3):
@@ -815,18 +1120,29 @@ def test_concurrent_reconciles_released_together_deliver_every_event_once(
         )
         for _ in range(4)
     ]
-    barrier.write_text("")  # all four go at once
+    outputs: list[tuple[str, str]] = []
+    try:
+        barrier.write_text("")  # all four go at once
+        racing.wait_for(started.exists, "the winner to be delivering (holding the lease)")
+        racing.wait_for(
+            lambda: sum(proc.poll() is not None for proc in procs_) == 3,
+            "the three losers to answer",
+            timeout=60.0,
+        )
+    finally:
+        gate.write_text("")
+        outputs = [proc.communicate(timeout=120) for proc in procs_]
     bodies: list[Any] = []
-    for proc in procs_:
-        out, err = proc.communicate(timeout=120)
+    for proc, (out, err) in zip(procs_, outputs, strict=True):
         assert proc.returncode == 0, err
         body = json.loads(out)
         schema_registry.validate(body, "agent-spawn/cli/reconcile.json")
         bodies.append(body)
+    assert sum(b["already_running"] for b in bodies) == 3
+    assert all(b["changes"] == [] for b in bodies if b["already_running"])
     delivered = sum(c["details"]["count"] for b in bodies for c in only(b, "events_delivered"))
     assert delivered == 9 and sink.read_text().count('"hook"') == 9
     assert db_rows(racing, "SELECT count(*) FROM events WHERE delivered = 0") == [(0,)]
-    assert all(b["changes"] == [] for b in bodies if b["already_running"])
 
 
 def test_a_lease_of_a_dead_holder_is_taken_over(env: Env, fakebin: Fakebin) -> None:
@@ -1045,7 +1361,9 @@ def test_the_already_running_body_validates_against_the_schema(env: Env, fakebin
             store.release_lease(lease)
     assert body["already_running"] is True
     bad = {**body, "changes": [{"agent_id": "ag-aaaaaaaa", "kind": "parked", "details": {}}]}
-    with pytest.raises(Exception):  # noqa: B017, PT011 - the schema forbids changes here
+    problems = list(schema_registry.validator("agent-spawn/cli/reconcile.json").iter_errors(bad))
+    assert [(list(e.absolute_path), e.validator) for e in problems] == [(["changes"], "maxItems")]
+    with pytest.raises(AssertionError, match="changes"):
         schema_registry.validate(bad, "agent-spawn/cli/reconcile.json")
 
 
@@ -1054,7 +1372,13 @@ def test_the_already_running_body_validates_against_the_schema(env: Env, fakebin
 
 def test_human_output_summarizes_and_warnings_go_to_stderr(env: Env, fakebin: Fakebin) -> None:
     old = tombstone(env, fakebin, 40.0)
-    fakebin.script("claude-session", "reconcile", exit=12, error={"code": "failed", "message": "x"})
+    fakebin.script(
+        "claude-session",
+        "reconcile",
+        replace=True,
+        exit=12,
+        error={"code": "failed", "message": "x"},
+    )
     done = env.run("reconcile")
     assert done.returncode == 0
     assert done.stdout.splitlines() == ["changed 1 thing(s)", f"  {old}: tombstone_deleted"]
@@ -1065,7 +1389,13 @@ def test_quiet_prints_no_summary_but_a_warning_still_reaches_stderr(
     env: Env, fakebin: Fakebin
 ) -> None:
     tombstone(env, fakebin, 40.0)
-    fakebin.script("claude-session", "reconcile", exit=12, error={"code": "failed", "message": "x"})
+    fakebin.script(
+        "claude-session",
+        "reconcile",
+        replace=True,
+        exit=12,
+        error={"code": "failed", "message": "x"},
+    )
     done = env.run("reconcile", "--quiet")
     assert done.returncode == 0 and done.stdout == ""
     assert "claude-session reconcile failed" in done.stderr
