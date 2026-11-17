@@ -126,9 +126,36 @@ def test_a_later_veto_overrides_an_earlier_escalation(
 def test_decision_ids_a_hook_prints_are_logged(env: Env, fakebin: Fakebin) -> None:
     agent_id = seed(env, fakebin)
     cmd = """pre-teardown=echo '{"decision_id": "d-9"}'; exit 1"""
-    assert td(env, agent_id, "--hook", cmd).returncode == 11
-    log = (env.state_dir / "log.jsonl").read_text()
-    assert "hook_veto" in log
+    done = td(env, agent_id, "--hook", cmd)
+    assert done.returncode == 11
+    body = result_json(done)
+    schema_registry.validate(body, "agent-spawn/cli/error.json")
+    assert body["error"]["decision_ids"] == ["d-9"]
+    logged = [json.loads(line) for line in (env.state_dir / "log.jsonl").read_text().splitlines()]
+    (veto,) = [r for r in logged if r["event"] == "hook_veto"]
+    assert veto["decision_ids"] == ["d-9"] and veto["hook"] == "pre-teardown"
+
+
+def test_decision_ids_of_an_escalating_hook_are_logged(env: Env, fakebin: Fakebin) -> None:
+    agent_id = seed(env, fakebin)
+    cmd = """pre-teardown=echo '{"decision_id": "d-8"}'; exit 13"""
+    done = td(env, agent_id, "--hook", cmd)
+    assert done.returncode == 13
+    assert result_json(done)["error"]["decision_ids"] == ["d-8"]
+    logged = [json.loads(line) for line in (env.state_dir / "log.jsonl").read_text().splitlines()]
+    (escalate,) = [r for r in logged if r["event"] == "hook_escalate"]
+    assert escalate["decision_ids"] == ["d-8"]
+
+
+def test_the_decision_ids_of_an_error_are_capped_at_32(env: Env, fakebin: Fakebin) -> None:
+    agent_id = seed(env, fakebin)
+    flags = [f for n in range(32) for f in ("--decision-id", f"c-{n}")]
+    cmd = """pre-teardown=echo '{"decision_id": "extra"}'; exit 1"""
+    done = td(env, agent_id, "--hook", cmd, *flags)
+    body = result_json(done)
+    assert done.returncode == 11, (done.stdout, done.stderr)
+    schema_registry.validate(body, "agent-spawn/cli/error.json")
+    assert body["error"]["decision_ids"] == [f"c-{n}" for n in range(32)]
 
 
 # --- the override --------------------------------------------------------------------------------
@@ -167,7 +194,9 @@ def test_the_override_reaches_the_hook_and_wtctl_remove_and_nothing_else(
     done = td(env, agent_id, "--hook", f"pre-teardown=cat > {sink}; exit 13",
               *HUMAN, "--override-escalation")  # fmt: skip
     assert done.returncode == 0, (done.stdout, done.stderr)
+    assert result_json(done).get("warnings", []) == []
     payload = json.loads(sink.read_text())
+    schema_registry.validate(payload, "agent-spawn/hooks/pre-teardown.json")
     assert payload["override_escalation"] is True
     (remove,) = wtctl_calls(fakebin, "remove")
     assert "--override-escalation" in remove
@@ -175,9 +204,31 @@ def test_the_override_reaches_the_hook_and_wtctl_remove_and_nothing_else(
     assert all("--override-escalation" not in a for a in others)
     for argv in fakebin.argvs("claude-session") + fakebin.argvs("termctl"):
         assert "--override-escalation" not in argv
-    # one audit record per wtctl remove call that carried the flag
+    # one audit record per wtctl remove call that carried the flag, and one for the hook
     actions = sorted(a["action"] for a in audit_records(env))
-    assert actions == ["teardown", "teardown_escalation_override"]
+    assert actions == ["teardown", "teardown_escalation_override", "teardown_escalation_override"]
+
+
+def test_an_overridden_hook_escalation_is_audited_once_without_a_worktree(
+    env: Env, fakebin: Fakebin
+) -> None:
+    agent_id = seed(env, fakebin)
+    done = td(env, agent_id, "--hook", ESCALATE, *HUMAN, "--override-escalation",
+              "--decision-id", "d-5")  # fmt: skip
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert result_json(done).get("warnings", []) == []
+    (record,) = [a for a in audit_records(env) if a["action"] == "teardown_escalation_override"]
+    assert record["result"] == "ok" and record["target"] == agent_id
+    assert record["decision_id"] == ["d-5"] and record["inputs"]["worktree"] is None
+    assert wtctl_calls(fakebin, "remove") == []
+    assert [a["action"] for a in audit_records(env)] == ["teardown_escalation_override"]
+
+
+def test_an_override_that_meets_no_escalation_is_not_audited(env: Env, fakebin: Fakebin) -> None:
+    agent_id = seed(env, fakebin)
+    done = td(env, agent_id, "--hook", "pre-teardown=true", *HUMAN, "--override-escalation")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert audit_records(env) == []
 
 
 # --- the payload ---------------------------------------------------------------------------------
@@ -211,6 +262,21 @@ def test_a_selector_that_does_not_match_skips_the_entry(
     cfg_env = Env(fakebin, isolation_env, config)
     agent_id = seed(cfg_env, fakebin)
     assert td(cfg_env, agent_id).returncode == 0
+
+
+def test_veto_and_escalation_payloads_match_their_schema(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    agent_id = seed(env, fakebin)
+    for code in (1, 13):
+        sink = tmp_path / f"payload-{code}.json"
+        done = td(env, agent_id, "--hook", f"pre-teardown=cat > {sink}; exit {code}",
+                  "--merged-head", "c" * 40, *HUMAN, "--force")  # fmt: skip
+        assert done.returncode == (11 if code == 1 else 13), (done.stdout, done.stderr)
+        payload = json.loads(sink.read_text())
+        schema_registry.validate(payload, "agent-spawn/hooks/pre-teardown.json")
+        assert payload["merged_head"] == "c" * 40 and payload["force"] is True
+        assert payload["actor"] == "human:tester" and payload["override_escalation"] is False
 
 
 # --- retries ---
@@ -261,16 +327,71 @@ def test_a_run_that_went_live_during_the_hook_returns_the_agent_to_parked(
 
     agent_id = seed(env, fakebin)
     before = env.agent(agent_id)
+    marker = tmp_path / "hook-ran"
     # The first `status` (step 2's live check) answers like the fake's default, every later one
     # (step 3's re-check, after the hook) reports a live run.
     fakebin.script("claude-session", "status", times=1)
     script_live_run(fakebin)
-    done = td(env, agent_id, "--hook", "pre-teardown=true")
+    done = td(env, agent_id, "--hook", f"pre-teardown=touch {marker}")
     body = result_json(done)
     assert done.returncode == 20, (done.stdout, done.stderr)
+    assert marker.exists()  # the hook ran, so the refusal is the re-check after it
+    assert [a for a in fakebin.argvs("claude-session") if a[0] == "status"][1:]  # re-checked
     assert body["error"]["reason"] == "live"
     unchanged(env, agent_id, before)
     assert forget_calls(fakebin) == []
+
+
+# --- concurrency, dry runs and selectors ---
+
+
+def test_a_teardown_and_a_resume_during_a_running_hook_are_refused(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    import subprocess
+
+    agent_id = seed(env, fakebin)
+    started, gate = tmp_path / "started", tmp_path / "gate"
+    hook = f"pre-teardown=touch {started}; while [ ! -e {gate} ]; do sleep 0.1; done"
+    proc = subprocess.Popen(
+        env.argv("teardown", agent_id, "--json", "--hook", hook),
+        env=env.env(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        env.wait_for(started.exists, "the hook to start")
+        other = td(env, agent_id)
+        assert other.returncode == 20, (other.stdout, other.stderr)
+        assert result_json(other)["error"]["reason"] == "tearing_down"
+        resumed = env.run("resume", agent_id, "--json")
+        assert resumed.returncode == 20, (resumed.stdout, resumed.stderr)
+    finally:
+        gate.write_text("")
+        out, _ = proc.communicate(timeout=60)
+    assert proc.returncode == 0, out
+    assert env.agent(agent_id)["status"] == "torn_down"
+
+
+def test_a_dry_run_does_not_run_the_hook(env: Env, fakebin: Fakebin, tmp_path: Path) -> None:
+    agent_id = seed(env, fakebin)
+    ran = tmp_path / "ran"
+    done = td(env, agent_id, "--dry-run", "--hook", f"pre-teardown=touch {ran}; exit 1")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert not ran.exists() and env.agent(agent_id)["status"] == "parked"
+
+
+def test_a_selector_that_matches_the_agent_vetoes(
+    fakebin: Fakebin, isolation_env: Isolation
+) -> None:
+    config = 'hooks:\n  pre-teardown:\n    - cmd: "exit 1"\n      labels: ["only=this"]\n'
+    cfg_env = Env(fakebin, isolation_env, config)
+    agent_id = seed(cfg_env, fakebin)
+    added = cfg_env.run("label", "add", agent_id, "only=this", "--json")
+    assert added.returncode == 0, (added.stdout, added.stderr)
+    assert td(cfg_env, agent_id).returncode == 11
+    assert cfg_env.agent(agent_id)["status"] == "parked"
 
 
 # --- events ---

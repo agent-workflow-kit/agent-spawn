@@ -784,3 +784,21 @@ def test_an_ephemeral_agent_with_a_pre_teardown_hook_parks_done_with_teardown_re
     assert park["teardown_refused"] is True
     assert "post-teardown" not in [n for n, _ in emitted]
     assert forget_calls(fakebin) == []
+
+
+def test_an_ephemeral_agent_whose_pre_teardown_hook_escalates_parks_done_with_teardown_refused(
+    fakebin: Fakebin, isolation_env: Isolation
+) -> None:
+    config = 'hooks:\n  pre-teardown:\n    - cmd: "exit 13"\n'
+    cfg_env = Env(fakebin, isolation_env, config)
+    done = cfg_env.run(
+        "launch", "--mode", "headless", "--skill", "do-it", "--json", "--ephemeral", "--wait"
+    )
+    agent_id = result_json(done)["agent"]["agent_id"]
+    row = cfg_env.agent(agent_id)
+    assert row["status"] == "parked" and row["park_reason"] == "done"
+    assert row["teardown_step"] is None and row["teardown_proc"] is None
+    emitted = events(cfg_env, agent_id)
+    assert next(p for n, p in emitted if n == "post-park")["teardown_refused"] is True
+    assert "post-teardown" not in [n for n, _ in emitted]
+    assert forget_calls(fakebin) == []

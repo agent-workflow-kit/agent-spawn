@@ -82,3 +82,11 @@ def test_a_headless_fork_has_no_target_for_the_override(env: Env, fakebin: Fakeb
     assert done.returncode == 2, (done.stdout, done.stderr)
     assert carrying_flag(fakebin) == [] and len(env.agents()) == 1
     assert result_json(done)["error"]["code"] == "usage"
+
+
+def test_a_here_fork_has_no_target_for_the_override(env: Env, fakebin: Fakebin) -> None:
+    agent_id = launched(env)
+    done = env.run("resume", agent_id, "--fork", "--placement", "here", FLAG, *HUMAN, "--json")
+    assert done.returncode == 2, (done.stdout, done.stderr)
+    assert carrying_flag(fakebin) == [] and len(env.agents()) == 1
+    assert result_json(done)["error"]["code"] == "usage"

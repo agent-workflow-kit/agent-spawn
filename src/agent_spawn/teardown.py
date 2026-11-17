@@ -631,6 +631,10 @@ class Teardown:
             decision_ids=list(self.decision_ids),
             override_escalation=self.override_escalation,
         )
+        # todo(#33): SIGTERM/SIGINT of this teardown during a slow hook leaves the hook running
+        # (its own process group) and the agent tearing_down/started; reconcile and retry must
+        # terminate or account for the orphaned pre-teardown hook of a dead teardown before
+        # running the hook again.
         verdict = hooklib.run_pre_hooks(
             PRE_TEARDOWN,
             body,
@@ -645,12 +649,8 @@ class Teardown:
         if verdict.verdict == "ok":
             return
         if verdict.verdict == "escalate" and self.override_escalation:
-            self.log(
-                "escalation_overridden",
-                level="warn",
-                agent_id=agent_id,
-                message="--override-escalation overrode a pre-teardown escalation",
-            )
+            # hook_escalate is already logged; the override itself is audited
+            self.audit(row, action="teardown_escalation_override", result="ok")
             return
         error = hooklib.verdict_error(verdict, agent_id=agent_id)
         assert error is not None

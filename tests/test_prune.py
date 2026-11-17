@@ -337,6 +337,17 @@ def test_a_pre_teardown_hook_runs_for_each_agent_and_a_veto_refuses_only_that_on
     assert not any("#32" in w for w in body["warnings"])
 
 
+def test_an_escalating_pre_teardown_hook_refuses_the_agent_as_escalated(
+    fakebin: Fakebin, isolation_env: Isolation
+) -> None:
+    hooked = Env(fakebin, isolation_env, 'hooks:\n  pre-teardown:\n    - cmd: "exit 13"\n')
+    agent_id = old(hooked, fakebin)
+    entry = by_id(prune(hooked, "--older-than", "7d"))[agent_id]
+    assert entry["result"] == "refused" and entry["reason"] == "escalated"
+    assert entry["tool"] == "agent-spawn" and entry["details"] == {"hook": "pre-teardown"}
+    assert status_of(hooked, agent_id) == "parked"
+
+
 def test_one_agents_refusal_does_not_stop_the_others(env: Env, fakebin: Fakebin) -> None:
     first = launched_in_worktree(env)
     second = old(env, fakebin)

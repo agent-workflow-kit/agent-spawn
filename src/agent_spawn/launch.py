@@ -399,6 +399,9 @@ class Launch:
 
     def usage_checks(self) -> None:
         args = self.args
+        if getattr(args, "override_escalation", False) and not self.inv.actor.startswith("human:"):
+            # The CLI already gates this flag; this keeps the handler safe when called directly.
+            raise CliError.usage("--override-escalation needs an actor human:<user>")
         worktree = args.worktree or "none"
         if worktree not in ("new", "none") and not os.path.isabs(worktree):
             raise CliError.usage("--worktree needs new, none or an absolute path")

@@ -43,7 +43,7 @@
               "object",
               "null"
             ],
-            "description": "The lower tool's details, verbatim.",
+            "description": "For a refusal by a lower tool (tool wtctl, termctl or claude-session): that tool's details, verbatim (untrusted). For a vetoed or escalated pre-teardown hook (tool agent-spawn): agent-spawn's own {\"hook\": \"pre-teardown\"}.",
             "x-untrusted": true
           }
         },
