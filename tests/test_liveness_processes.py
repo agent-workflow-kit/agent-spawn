@@ -32,6 +32,14 @@ def kill_exactly(identity: procs.ProcessIdentity) -> None:
         assert handle.wait_exit(10)
 
 
+def end_run_killed(flow: Flow, agent_id: str) -> None:
+    """The run ends `killed`: `status` answers that (scripted before the signal, so no read can
+    see the live script after `exec` ended), then `exec` gets its SIGTERM."""
+    flow.back_to_final_status()
+    flow.fakebin.script("claude-session", "status", outcome="killed")
+    flow.end_live_run(agent_id)
+
+
 def stop_calls(flow: Flow) -> list[list[str]]:
     return [a for a in flow.fakebin.argvs("claude-session") if a[0] == "stop"]
 
@@ -93,10 +101,9 @@ def test_a_launcher_killed_after_the_supervisor_took_over_changes_nothing(
     assert shown.body["agent"]["status"] == "live"
     assert shown.body["agent"]["supervisor_lost"] is False
     assert shown.body["supervisor"]["alive"] is True
-    # the run goes on and the supervisor finishes it
-    flow.end_live_run(agent_id)
-    flow.back_to_final_status()
-    flow.fakebin.script("claude-session", "status", outcome="killed")
+    # the run goes on and the supervisor finishes it: the final status is scripted first, so
+    # whatever a supervisor reads once `exec` ends is the final one (never the live script)
+    end_run_killed(flow, agent_id)
     waited = flow.cli(schema("wait"), "wait", agent_id, "--json")
     assert waited.body["agent"]["status"] == "parked"
     flow.wait_settled(agent_id)
@@ -118,9 +125,7 @@ def test_a_sigkilled_supervisor_leaves_supervisor_lost_and_stop_is_the_remedy(
     # the remedy: `stop` ends the orphaned run through claude-session, then the next look parks
     stopper = flow.start(proc_tracker, "stop", agent_id, "--json")
     flow.env.wait_for(lambda: bool(stop_calls(flow)), "claude-session stop")
-    flow.end_live_run(agent_id)
-    flow.back_to_final_status()
-    flow.fakebin.script("claude-session", "status", outcome="killed")
+    end_run_killed(flow, agent_id)
     stopped = flow.finish(schema("stop"), stopper)
     assert stopped.code == 0, (stopped.stdout, stopped.stderr)
     agent = flow.agent(agent_id)

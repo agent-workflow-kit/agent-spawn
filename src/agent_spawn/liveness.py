@@ -22,14 +22,16 @@ Safety. The check never signals anything and never calls ``claude-session stop``
 (``status``, ``list``) and writes agent-spawn's own state. Every write is a compare-and-set under
 the agent's lease whose guard names the exact process and run that were judged, so of several
 concurrent checks exactly one applies a recovery and the others find it applied; a row that moved
-in between is left alone. No lower-tool call and no hook runs while the lease is held, and the
-check never delivers hooks: its events wait in the outbox for the next mutating command, the
+in between is left alone. No mutating lower-tool call and no hook runs while the lease is held
+(the check may read ``claude-session status`` before its compare-and-set), and the check never
+delivers hooks: its events wait in the outbox for the next mutating command, the
 supervisor or ``reconcile``. In a dry run it only reports (the returned row is the one the real
 check would leave).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 from collections.abc import Callable, Mapping, Sequence
@@ -42,7 +44,7 @@ from .agent_view import outcome_object, ts
 from .outcome_table import CANCEL_END_REASONS, LAUNCH_PHASE_OUTCOMES, park_row
 from .output import CliError
 from .procs import ProcessIdentity
-from .records import RecordsError, append_log, parse_record_ts
+from .records import LOG_NAME, RecordsError, append_log, parse_record_ts
 from .session_backend import RunOutcome, SessionBackend, SessionStatus
 from .store import LeaseHeld, Store
 from .worktrees import WtctlBackend, worktrees_containing
@@ -64,6 +66,8 @@ FORK_ABANDONED = "fork_abandoned"
 #: Not a ``reconcile`` kind of its own in the interface: a restored pre-resume row is reported as
 #: ``parked`` (the agent is parked again) with ``details.restored``.
 RESTORED = "restored"
+#: How much of the end of ``log.jsonl`` is read to find out whether a change was logged already.
+_LOG_TAIL = 256 * 1024
 WtctlFor = Callable[[Mapping[str, Any]], WtctlBackend | None]
 
 
@@ -106,6 +110,15 @@ class _Ctx:
     @property
     def agent_id(self) -> str:
         return self.row["agent_id"]
+
+
+def row_moved(before: Mapping[str, Any] | None, after: Mapping[str, Any] | None) -> bool:
+    """Whether a check really moved the agent (a polling loop looks again at once only then;
+    a report-only change such as ``pending_run`` is not news)."""
+    if before is None or after is None:
+        return before is not after
+    names = ("status", "updated", "supervisor_lost", "csession_id")
+    return any(before.get(name) != after.get(name) for name in names)
 
 
 def unreadable(agent_id: str, what: str) -> CliError:
@@ -265,9 +278,37 @@ class Liveness:
 
         return same
 
-    def _note(self, ctx: _Ctx, kind: str, **details: Any) -> None:
+    def _note(self, ctx: _Ctx, kind: str, *, log: bool = True, **details: Any) -> None:
         ctx.changes.append(Change(ctx.agent_id, kind, dict(details)))
-        self.log("reconcile_change", agent_id=ctx.agent_id, details={"kind": kind, **details})
+        if log:
+            self.log("reconcile_change", agent_id=ctx.agent_id, details={"kind": kind, **details})
+
+    def _logged_pending(self, ctx: _Ctx, run: int) -> bool:
+        """Whether ``pending_run`` was logged for this run already (the recent log is read:
+        a pending run is checked on every poll and is logged once, not on every call)."""
+        path = os.path.join(self.state_dir, LOG_NAME)
+        try:
+            with open(path, "rb") as handle:
+                size = handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, size - _LOG_TAIL))
+                tail = handle.read().decode("utf-8", "replace")
+        except OSError:
+            return False
+        for line in tail.splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            details = record.get("details") if isinstance(record, dict) else None
+            if (
+                isinstance(details, dict)
+                and record.get("event") == "reconcile_change"  # pyright: ignore[reportUnknownMemberType]
+                and record.get("agent_id") == ctx.agent_id  # pyright: ignore[reportUnknownMemberType]
+                and details.get("kind") == PENDING_RUN  # pyright: ignore[reportUnknownMemberType]
+                and details.get("run") == run  # pyright: ignore[reportUnknownMemberType]
+            ):
+                return True
+        return False
 
     def log(self, event: str, *, level: str = "info", **fields: Any) -> None:
         if self.dry_run:
@@ -349,17 +390,23 @@ class Liveness:
         # A crash between `start` and the recording of its session: the session carries the
         # `agent=<id>` label.
         try:
-            found = backend.list_by_label(f"agent={agent_id}")
+            labeled = backend.list_labeled(f"agent={agent_id}")
         except CliError as error:
             ctx.warnings.append(f"claude-session list failed ({error.code})")
             return
+        found = [session for session, _labels in labeled]
         if len(found) > 1:
-            if self._park(ctx, park_reason="launch_failed", needs_attention="launch_failed"):
-                self._note(ctx, AMBIGUOUS_SESSION, sessions=sorted(found))
-                self._note(ctx, LAUNCH_FAILED, cause="ambiguous_session")
+            self._ambiguous(ctx, found)
             return
         if len(found) == 1:
-            self._adopt_found(ctx, found[0])
+            session, labels = labeled[0]
+            reason = self._not_ours(ctx, session, labels)
+            if reason is not None:
+                # Not adopted: a session of another agent, or labeled for more than this one.
+                ctx.warnings.append(f"the session {session} {reason}: it was not adopted")
+                self._ambiguous(ctx, found)
+                return
+            self._adopt_found(ctx, session)
             return
         if row.get("forked_from") is not None:
             self._abandon_fork(ctx)
@@ -367,6 +414,24 @@ class Liveness:
             self._restore(ctx, "no session")
         else:
             self._launch_failed(ctx, cause="launcher_died")
+
+    def _ambiguous(self, ctx: _Ctx, sessions: Sequence[str]) -> None:
+        """The agent's session cannot be told: ``launch_failed`` without recording any."""
+        if self._park(ctx, park_reason="launch_failed", needs_attention="launch_failed"):
+            self._note(ctx, AMBIGUOUS_SESSION, sessions=sorted(sessions))
+            self._note(ctx, LAUNCH_FAILED, cause="ambiguous_session")
+
+    def _not_ours(self, ctx: _Ctx, session: str, labels: list[str] | None) -> str | None:
+        """Why the session found by label is not safely this agent's, else ``None``: it is
+        recorded on another agent, or its ``agent=`` labels are not exactly this agent's."""
+        for other in self.store.list_agents():
+            if other["agent_id"] != ctx.agent_id and other.get("csession_id") == session:
+                return f"belongs to agent {other['agent_id']}"
+        if labels is not None:
+            owners = [label for label in labels if label.startswith("agent=")]
+            if owners != [f"agent={ctx.agent_id}"]:
+                return "does not carry exactly this agent's label"
+        return None
 
     def _adopt_found(self, ctx: _Ctx, session: str) -> None:
         """Record the one session found by label (and its current run), then judge it."""
@@ -441,6 +506,8 @@ class Liveness:
             ctx.removed = True
             self._note(ctx, FORK_ABANDONED)
             return
+        if not self._still_abandoned(ctx):
+            return  # something moved since the first look: no side effect, the next check judges
         failed = self._release_fork_holds(ctx)
         if failed:
             return  # the record and its holds stay: the warnings say why
@@ -462,6 +529,24 @@ class Liveness:
         self.log("fork_abandoned", level="warn", agent_id=agent_id)
         self._note(ctx, FORK_ABANDONED)
 
+    def _still_abandoned(self, ctx: _Ctx) -> bool:
+        """Right before anything is released: the fork's record is still the one judged and
+        claude-session still knows no session for it (a session that appeared meanwhile, or a
+        row that moved, aborts the abandonment with no side effect)."""
+        backend = self.backend(ctx.row)
+        if backend is None:
+            ctx.warnings.append("claude-session is not known: liveness was not judged")
+            return False
+        try:
+            found = backend.list_by_label(f"agent={ctx.agent_id}")
+        except CliError as error:
+            ctx.warnings.append(f"claude-session list failed ({error.code})")
+            return False
+        if found:
+            return False
+        fresh = self.store.get_agent(ctx.agent_id)  # read last: nothing can move it unseen
+        return fresh is not None and self._guard(ctx.row)(fresh)
+
     def _release_fork_holds(self, ctx: _Ctx) -> bool:
         """``wtctl forget <record> --holder <fork id>`` for every record the fork holds: its hold
         rows and the records of its cwd that list it as a holder (a crash between ``adopt`` and
@@ -481,10 +566,12 @@ class Liveness:
             except CliError as error:  # the holds are unknown: the fork must stay
                 ctx.warnings.append(f"wtctl list failed ({error.code}): the fork's holds stay")
                 failed = True
+        if backend is None and record_ids:
+            ctx.warnings.append("wtctl is not available: the fork's holds stay")
+            return True
         for record_id in record_ids:
             try:
-                if backend is None:
-                    raise CliError("tool_missing", "wtctl is not available", tool="wtctl")
+                assert backend is not None
                 backend.forget(record_id, agent_id)
             except CliError as error:
                 if error.exit_code == 10:
@@ -525,7 +612,8 @@ class Liveness:
             return
         if current.pending or status.pending:
             # Nothing adopted the run: claude-session's own expiry ends it (`never_adopted`).
-            self._note(ctx, PENDING_RUN, run=current.run)
+            once = not self._logged_pending(ctx, current.run)
+            self._note(ctx, PENDING_RUN, log=once, run=current.run)
             return
         # The run is adopted and live.
         if row["status"] == "launching":

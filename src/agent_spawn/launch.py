@@ -28,7 +28,6 @@ import signal
 import stat
 import sys
 import tempfile
-import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -45,7 +44,7 @@ from .config import Config
 from .handoff import HandoffFailed, HandoffListener
 from .ids import IdEntry, new_agent_id
 from .labels import LabelSet, job_label, parse_run_labels
-from .liveness import Liveness
+from .liveness import Liveness, row_moved, unreadable
 from .output import (
     EXIT_SIGINT,
     EXIT_SIGTERM,
@@ -1916,7 +1915,7 @@ class Launch:
         wait = self.waits
         deadline = None
         if wait and args.wait_timeout is not None:
-            deadline = time.monotonic() + _seconds(args.wait_timeout)
+            deadline = self.gateway.monotonic() + _seconds(args.wait_timeout)
         next_liveness = 0.0
         while True:
             row = store.get_agent(agent_id)
@@ -1929,7 +1928,11 @@ class Launch:
                 if forward is not None:
                     return forward
             supervisor = row.get("supervisor")
-            alive = supervisor is not None and procs.is_alive(supervisor, gateway=self.gateway)
+            try:
+                alive = supervisor is not None and procs.is_alive(supervisor, gateway=self.gateway)
+            except procs.ProcessIdentityError:
+                # unreadable is an error, never "dead" (interface.md, Liveness)
+                raise unreadable(agent_id, "supervisor") from None
             ended = status not in ("launching", "live")
             if not wait:
                 if status == "live":
@@ -1942,7 +1945,7 @@ class Launch:
                 # Nothing drives the agent: the liveness check decides on each poll (it never
                 # signals, never stops the run and delivers no hook; it is rate limited because
                 # it calls claude-session).
-                now = time.monotonic()
+                now = self.gateway.monotonic()
                 if now >= next_liveness:
                     next_liveness = now + LIVENESS_EVERY
                     checked = Liveness(
@@ -1951,10 +1954,9 @@ class Launch:
                         fallback_command=self.backend.command if self.backend else None,
                         gateway=self.gateway,
                     ).check(agent_id)
-                    if checked.changes:
-                        next_liveness = 0.0
-                        continue  # the row changed: look at it again
-            if deadline is not None and time.monotonic() >= deadline:
+                    if row_moved(row, checked.row):
+                        continue  # a real transition: look at the new row once, at once
+            if deadline is not None and self.gateway.monotonic() >= deadline:
                 payload = result_object(
                     agent=agent_object(store, row, warnings=self.warnings),
                     timed_out=True,

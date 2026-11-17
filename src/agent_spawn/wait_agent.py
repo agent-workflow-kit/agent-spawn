@@ -21,6 +21,7 @@ from .agent_lookup import liveness_for
 from .agent_view import agent_object, chain_first_working_at
 from .commands.base import Invocation
 from .ids import resolve_agent_id
+from .liveness import row_moved, unreadable
 from .output import (
     EXIT_SIGINT,
     EXIT_SIGTERM,
@@ -190,7 +191,11 @@ class _Wait:
                 if stopped is not None:
                     return stopped
                 holder = self.holder(row)
-                alive = holder is not None and procs.is_alive(holder, gateway=self.gateway)
+                try:
+                    alive = holder is not None and procs.is_alive(holder, gateway=self.gateway)
+                except procs.ProcessIdentityError:
+                    # unreadable is an error, never "dead" (interface.md, Liveness)
+                    raise unreadable(agent_id, "supervisor") from None
                 if lifecycle.run_settled(row, supervisor_alive=alive):
                     return self.final(store, row)
                 if not alive and row["status"] in ("launching", "live"):
@@ -204,9 +209,8 @@ class _Wait:
                         self.warnings.extend(w for w in checked.warnings if w not in self.warnings)
                         if checked.row is None:
                             raise CliError.of("not_found", f"agent {agent_id} no longer exists")
-                        if checked.changes:
-                            next_liveness = 0.0
-                            continue  # the row changed: look at it again
+                        if row_moved(row, checked.row):
+                            continue  # a real transition: look at the new row once, at once
                 elif not alive and row.get("promotion_pending"):
                     # A pending promotion on an agent that is not live cannot be (every park
                     # clears it): a damaged row. Report it instead of waiting for ever.

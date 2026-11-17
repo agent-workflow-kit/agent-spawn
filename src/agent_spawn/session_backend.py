@@ -1138,6 +1138,11 @@ class SessionBackend:
 
     def list_by_label(self, pair: str) -> list[str]:
         """The ``csession_id`` of every session with the label (``list --label k=v --json``)."""
+        return [session for session, _labels in self.list_labeled(pair)]
+
+    def list_labeled(self, pair: str) -> list[tuple[str, list[str] | None]]:
+        """Every session with the label and the labels its ``list`` item carries (``None``
+        when the item has no usable ``labels`` list)."""
         try:
             parse_label(pair)
         except GrammarError as error:
@@ -1148,12 +1153,18 @@ class SessionBackend:
         sessions = reply.data.get("sessions") if reply.data is not None else None
         if not isinstance(sessions, list):
             raise self._unusable("a session list")
-        found: list[str] = []
+        found: list[tuple[str, list[str] | None]] = []
         for item in sessions:
             session = item.get("csession_id") if isinstance(item, dict) else None
             if not isinstance(session, str) or SESSION_ID.fullmatch(session) is None:
                 raise self._unusable("a session list")
-            found.append(session)
+            labels = item.get("labels") if isinstance(item, dict) else None
+            usable = (
+                [label for label in labels if isinstance(label, str)]
+                if isinstance(labels, list)
+                else None
+            )
+            found.append((session, usable))
         return found
 
     def reconcile(self, *, dry_run: bool = False) -> dict[str, Any]:

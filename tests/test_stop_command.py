@@ -16,7 +16,10 @@ from typing import Any
 import pytest
 
 from agent_spawn import lifecycle, procs
+from agent_spawn.liveness import Checked, Liveness
+from agent_spawn.output import CliError
 from agent_spawn.procs import ProcessIdentity
+from agent_spawn.session_backend import SessionBackend
 from agent_spawn.stop import Plan, Stop
 from agent_spawn.store import Store
 from tests import schema_registry
@@ -486,7 +489,7 @@ def make_stop(env: Env, fakebin: Fakebin) -> Stop:
         warnings=[],
         actor="auto:tester",
         decision_ids=[],
-        config=None,
+        config=SimpleNamespace(claude_session_cmd=["claude-session"], wtctl_cmd=None, hooks=[]),
     )
     stop = Stop(inv)
     stop.agent_id = AGENT
@@ -855,3 +858,31 @@ def test_dry_run_of_a_signal_action_signals_nothing(
     time.sleep(0.3)
     assert not marker.exists() and procs.is_alive(supervisor)
     assert agent_row(env)["status"] == "live" and audits(env) == []
+
+
+def test_a_session_missing_park_that_did_not_happen_is_exit_12_not_already_parked(
+    env: Env, fakebin: Fakebin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The session is unknown to claude-session, but another process holds the agent (or won the
+    # race): the agent is not parked, so "nothing to stop" would be a lie.
+    seed(env, fakebin, csession_id="cs-zzzzzzzz")
+    stop = make_stop(env, fakebin)
+    try:
+        row = stop.store.get_agent(AGENT)  # type: ignore[union-attr]
+        assert row is not None
+        stop.backend = SessionBackend([str(fakebin.bin_dir / "claude-session")])
+
+        def unknown(*_a: object, **_k: object) -> Any:
+            raise CliError("not_found", "no such session", tool="claude-session", exit_code=10)
+
+        def not_parked(self: Liveness, agent_id: str, session: str) -> Checked:
+            return Checked(self.store.get_agent(agent_id), warnings=["the agent is busy"])
+
+        monkeypatch.setattr(SessionBackend, "status", unknown)
+        monkeypatch.setattr(Liveness, "session_missing", not_parked)
+        with pytest.raises(CliError) as caught:
+            stop.plan(row, checked=True)
+        assert caught.value.exit_code == 12 and "try again" in caught.value.message
+    finally:
+        assert stop.store is not None
+        stop.store.close()

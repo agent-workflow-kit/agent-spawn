@@ -28,6 +28,7 @@ from typing import Any
 from . import gateway as gw
 from . import hooks as hooklib
 from . import lifecycle, procs
+from .agent_lookup import liveness_for
 from .agent_view import agent_object
 from .ids import resolve_agent_id
 from .launch import resolve_tool
@@ -249,13 +250,11 @@ class Stop:
 
     def liveness(self, *, dry_run: bool = False) -> Liveness:
         assert self.store is not None
-        return Liveness(
-            self.store,
-            state_dir=self.state_dir,
-            fallback_command=self.fallback,
-            dry_run=dry_run,
-            gateway=self.gateway,
-        )
+        # wtctl as the fork's row (or its source) recorded it: an abandoned fork's holds
+        live = liveness_for(self.inv, self.store, dry_run=dry_run)
+        if self.fallback is not None:
+            live.fallback_command = list(self.fallback)
+        return live
 
     def check(self, row: dict[str, Any]) -> dict[str, Any] | None:
         """The liveness check of the agent (parking events are delivered: ``stop`` is a
@@ -309,7 +308,17 @@ class Stop:
                 # The session is missing: the liveness check parks the agent `session_missing`
                 # (a dry run only reports), and there is no run left to stop.
                 parked = self.liveness(dry_run=self.dry_run).session_missing(self.agent_id, session)
-                return Plan("none", parked.row or row)
+                after = parked.row or row
+                if after["status"] in IN_PROGRESS:
+                    # Still launching or live: another process holds the agent's lease (or won
+                    # the race), so it is not parked and "nothing to stop" would be a lie.
+                    raise CliError.of(
+                        "failed",
+                        "the agent changed while it was being stopped (try again)",
+                        exit_code=12,
+                        agent_id=self.agent_id,
+                    ) from None
+                return Plan("none", after)
             if current.run.outcome is None:  # pending or live
                 return Plan("session_stop", row, session=session)
         if status == "tearing_down":

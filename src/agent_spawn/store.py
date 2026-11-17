@@ -922,7 +922,8 @@ class Store:
         events: Sequence[OutboxEvent] = (),
     ) -> dict[str, Any]:
         """Plain resume: ``parked`` → ``launching``, recording the launcher and
-        ``expect_run_after`` and saving the park fields for ``restore_pre_resume``."""
+        ``expect_run_after`` and saving the park fields for ``restore_pre_resume``. The
+        previous run's ``supervisor``, ``exec_proc`` and ``supervisor_lost`` are cleared."""
         with self.transaction():
             self._require_lease(lease, f"agent:{agent_id}")
             current = self._get_agent(agent_id)
@@ -939,6 +940,11 @@ class Store:
                     "launcher": launcher,
                     "expect_run_after": expect_run_after,
                     "pre_resume": saved,
+                    # the previous run's processes are history: a resume in flight is judged
+                    # by its launcher, never by a stale (dead) supervisor of the run before
+                    "supervisor": None,
+                    "exec_proc": None,
+                    "supervisor_lost": False,
                 },
                 events=events,
             )

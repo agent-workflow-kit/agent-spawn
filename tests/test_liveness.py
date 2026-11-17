@@ -93,6 +93,25 @@ def show(env: Env, agent_id: str = AGENT) -> dict[str, Any]:
     return body
 
 
+def liveness_parks(env: Env, agent_id: str = AGENT) -> list[dict[str, Any]]:
+    """The ``status_change`` log lines of the parks the liveness check made for the agent."""
+    path = env.state_dir / "log.jsonl"
+    lines = [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
+    return [
+        x
+        for x in lines
+        if x["event"] == "status_change"
+        and x["agent_id"] == agent_id
+        and (x.get("details") or {}).get("cause") == "liveness"
+    ]
+
+
+def parked_first(env: Env, agent_id: str = AGENT) -> None:
+    """The check itself parked the agent (a post-park event and a liveness status_change)."""
+    assert "post-park" in [e["event"] for e in events(env, agent_id)]
+    assert len(liveness_parks(env, agent_id)) == 1
+
+
 def calls(fakebin: Fakebin, *names: str) -> list[list[str]]:
     return [a for a in fakebin.argvs("claude-session") if a[0] in names]
 
@@ -129,26 +148,33 @@ def test_a_live_supervisor_means_nothing_changes_and_claude_session_is_not_calle
     env: Env, fakebin: Fakebin
 ) -> None:
     seed(env, supervisor=me(env))
-    body = show(env)
-    assert body["agent"]["status"] == "live" and body["agent"]["supervisor_lost"] is False
-    assert [c for c in fakebin.argvs("claude-session") if c[0] != "status"] == []
+    done = env.run("list", "--json")  # (`show` reads the session's status itself)
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout)["agents"][0]["supervisor_lost"] is False
+    assert env.agent(AGENT)["status"] == "live"
+    assert fakebin.argvs("claude-session") == []  # nothing is read, let alone changed
     assert events(env) == []
 
 
 def test_a_reused_pid_is_a_dead_supervisor(env: Env, fakebin: Fakebin) -> None:
     mine = me(env)
+    fakebin.script("claude-session", "status", outcome="done")
     # the same PID with another start time is not the recorded process
     seed(env, supervisor=ProcessIdentity(mine.pid, mine.start_time + 1, mine.boot_id))
-    assert show(env)["agent"]["status"] == "parked"  # the fake's status: a final `done` run
+    assert show(env)["agent"]["status"] == "parked"
+    parked_first(env)
 
 
-def test_another_boot_id_is_a_dead_supervisor(env: Env) -> None:
+def test_another_boot_id_is_a_dead_supervisor(env: Env, fakebin: Fakebin) -> None:
     mine = me(env)
+    fakebin.script("claude-session", "status", outcome="done")
     seed(env, supervisor=ProcessIdentity(mine.pid, mine.start_time, "another-boot"))
     assert show(env)["agent"]["status"] == "parked"
+    parked_first(env)
 
 
-def test_a_zombie_supervisor_is_dead(env: Env, proc_tracker: ProcTracker) -> None:
+def test_a_zombie_supervisor_is_dead(env: Env, fakebin: Fakebin, proc_tracker: ProcTracker) -> None:
+    fakebin.script("claude-session", "status", outcome="done")
     child = proc_tracker.popen([sys.executable, "-c", "pass"], stdin=subprocess.DEVNULL)
     identity = procs.read_identity(child.pid)
     assert identity is not None
@@ -156,6 +182,7 @@ def test_a_zombie_supervisor_is_dead(env: Env, proc_tracker: ProcTracker) -> Non
     env.wait_for(lambda: not procs.is_alive(identity), "the child to exit")
     seed(env, supervisor=identity)
     assert show(env)["agent"]["status"] == "parked"
+    parked_first(env)
     child.wait(timeout=30)
 
 
@@ -206,6 +233,7 @@ def test_a_final_run_is_parked_by_the_outcome_table_without_any_resume_or_stop(
 def test_read_only_commands_record_the_park_but_deliver_no_hook(
     env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
 ) -> None:
+    fakebin.script("claude-session", "status", outcome="done")
     marker = tmp_path / "hook-ran"
     hook_config = (
         f"hooks:\n  post-park:\n    - cmd: 'touch {marker}'\n"
@@ -221,8 +249,7 @@ def test_read_only_commands_record_the_park_but_deliver_no_hook(
     seed(env, OTHER, supervisor=dead(proc_tracker), csession_id=SESSION)
     assert env.run("list", "--json").returncode == 0
     assert not marker.exists()  # `list` neither
-    assert env.run("wait", AGENT, "--json").returncode == 0
-    assert not marker.exists()  # nor `wait`
+    # (`wait` parking a fresh agent without a delivery: test_liveness_review.py)
 
 
 def test_a_mutating_command_delivers_what_the_check_queued(
@@ -540,22 +567,25 @@ def test_an_abandoned_fork_is_removed_with_its_holds_and_prompt_copies(
 def test_a_dry_run_reports_and_changes_nothing(
     env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
 ) -> None:
+    fakebin.script("claude-session", "status", outcome="done")
     seed(env, supervisor=dead(proc_tracker))
     done = env.run("teardown", AGENT, "--dry-run", "--json")
     assert done.returncode == 0, (done.stdout, done.stderr)  # the real run would park it first
     row = env.agent(AGENT)
     assert row["status"] == "live" and row["supervisor_lost"] is False
-    assert events(env) == []
+    assert events(env) == [] and liveness_parks(env) == []
     assert calls(fakebin, "stop") == []
 
 
 def test_teardown_parks_a_dead_supervisors_agent_first_then_tears_it_down(
     env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
 ) -> None:
+    fakebin.script("claude-session", "status", outcome="done")
     seed(env, supervisor=dead(proc_tracker))
     done = env.run("teardown", AGENT, "--json")
     assert done.returncode == 0, (done.stdout, done.stderr)
     assert env.agent(AGENT)["status"] == "torn_down"
+    assert len(liveness_parks(env)) == 1  # parked by the check first, then torn down
 
 
 def test_teardown_still_refuses_a_live_session_with_a_dead_supervisor(
@@ -573,10 +603,12 @@ def test_teardown_still_refuses_a_live_session_with_a_dead_supervisor(
 def test_resume_parks_a_dead_supervisors_agent_first(
     env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
 ) -> None:
+    fakebin.script("claude-session", "status", outcome="done")
     seed(env, supervisor=dead(proc_tracker))
     done = env.run("resume", AGENT, "--wait", "--json")
     assert done.returncode == 0, (done.stdout, done.stderr)
     assert result_json(done)["agent"]["agent_id"] == AGENT
+    assert len(liveness_parks(env)) == 1  # the check parked it, then the resume entered
 
 
 def test_resume_of_a_session_missing_agent_exits_10_with_the_status(
@@ -622,36 +654,16 @@ def start_together(
     return started  # type: ignore[return-value]
 
 
-def test_concurrent_checks_park_once(
-    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
-) -> None:
-    seed(env, supervisor=dead(proc_tracker))
-    procs_ = start_together(env, proc_tracker, tmp_path, [["show", AGENT, "--json"]] * 6)
-    for proc in procs_:
-        proc.communicate(timeout=120)
-        assert proc.returncode == 0
-    kinds = [e["event"] for e in events(env)]
-    assert kinds.count("post-park") == 1 and kinds.count("post-state-change") == 1
-    assert env.agent(AGENT)["status"] == "parked"
-
-
-def test_concurrent_checks_flag_supervisor_lost_once(
-    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
-) -> None:
-    script_live_run(fakebin)
-    seed(env, supervisor=dead(proc_tracker))
-    procs_ = start_together(env, proc_tracker, tmp_path, [["show", AGENT, "--json"]] * 6)
-    for proc in procs_:
-        proc.communicate(timeout=120)
-        assert proc.returncode == 0
-    assert [e["event"] for e in events(env)].count("post-escalate") == 1
+# (concurrent checks apply a recovery once: test_liveness_review.py)
 
 
 def test_list_runs_the_check_for_live_and_launching_rows(
     env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
 ) -> None:
+    fakebin.script("claude-session", "status", outcome="done")
     seed(env, supervisor=dead(proc_tracker))
     done = env.run("list", "--json")
     body = json.loads(done.stdout)
     assert [a["status"] for a in body["agents"]] == ["parked"]
+    parked_first(env)
     assert os.path.exists(env.state_dir / "state.db")

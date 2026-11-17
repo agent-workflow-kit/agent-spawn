@@ -9,18 +9,40 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from .agent_lookup import liveness_for, open_existing, resolve_existing, store_failed
+from .agent_lookup import (
+    liveness_for,
+    open_existing,
+    resolve_existing,
+    state_dir_of,
+    store_failed,
+)
 from .agent_view import CORRUPT_ROW, agent_object, unusable_row
 from .commands.base import Invocation
 from .ids import ID_CHARS, check_agent_id_text
 from .labels import Label, parse_user_label
 from .output import CliError, Outcome, PayloadKind, safe_text
+from .records import RecordsError, append_log
 from .session_backend import STATES
 from .store import Store, StoreError
 from .store_schema import STATUSES
 from .validate import GrammarError, parse_since
 
 __all__ = ["list_agents"]
+
+
+def _log_unreadable(inv: Invocation, agent_id: str, error: CliError) -> None:
+    """A row whose process entry cannot be read stays as it is in the listing; the log says so."""
+    try:
+        append_log(
+            state_dir_of(inv),
+            "warning",
+            level="warn",
+            agent_id=agent_id,
+            message="liveness_unreadable",
+            details={"cause": "liveness_unreadable", "reason": safe_text(error.message)},
+        )
+    except (RecordsError, ValueError, OSError):
+        pass  # a log that cannot be written never fails a listing
 
 
 def _check_choices(values: list[str], allowed: tuple[str, ...] | frozenset[str], what: str) -> None:
@@ -145,7 +167,10 @@ def _select(
         for row in store.list_agents(statuses=("launching", "live")):
             try:
                 live.check(row["agent_id"])
-            except CliError:
+            except CliError as error:
+                if error.exit_code == 12:
+                    # unreadable process entry (documented): listed unchanged, and logged
+                    _log_unreadable(inv, row["agent_id"], error)
                 continue
         rows = [row for row in store.list_agents() if _matches(row, ids, wanted)]
         rows.sort(key=lambda row: row["agent_id"])

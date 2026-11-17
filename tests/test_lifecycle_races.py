@@ -131,11 +131,28 @@ def test_exactly_one_entry_wins_and_the_loser_calls_nothing(
     reasons: set[str],
 ) -> None:
     seed_parked(env)
+    marker = tmp_path / "hook-ran"
+    env.config.parent.mkdir(parents=True, exist_ok=True)
+    env.config.write_text(
+        "hooks:\n"
+        + "".join(
+            f"  {name}:\n    - cmd: 'touch {marker}'\n"
+            for name in ("post-launch", "post-park", "post-escalate", "post-teardown")
+        )
+    )
     loser, winners, gate = race(env, proc_tracker, tmp_path, [first, second])
     code, out, err = finish(loser)
     assert code == 20, (out, err)
     error = result_json(subprocess.CompletedProcess([], code, out, err))["error"]
     assert error["code"] == "refused" and error["reason"] in reasons
+    # the loser's reason is the winner's entry: the row is in the state that reason names
+    winner_status = env.agent(AGENT)["status"]
+    assert error["reason"] == {"launching": "live", "tearing_down": "tearing_down"}[winner_status]
+    # the loser delivered no hook (the hooks above can fire only after the winner is released),
+    # queued no event of its own and logged no change
+    assert not marker.exists()
+    assert [e for e in pending_events(env) if e["event"] in ("post-park", "post-escalate")] == []
+    assert loser_changes(env) == []
     # the only mutating claude-session call so far is the winner's, held at the gate: the
     # loser made none (it may have read `status`, which changes nothing)
     mutating = [c for c in claude_session_calls(fakebin) if c[0] != "status"]
@@ -147,6 +164,19 @@ def test_exactly_one_entry_wins_and_the_loser_calls_nothing(
     assert code == 0, (out, err)
     track_agent(env, proc_tracker, AGENT)
     assert env.agent(AGENT)["status"] in ("live", "parked", "torn_down")
+
+
+def pending_events(env: Env) -> list[dict[str, Any]]:
+    with Store.open(env.state_dir) as store:
+        return store.pending_events(AGENT)
+
+
+def loser_changes(env: Env) -> list[str]:
+    """Log lines that record a liveness change (a refused entry records none)."""
+    path = env.state_dir / "log.jsonl"
+    if not path.exists():
+        return []
+    return [line for line in path.read_text().splitlines() if "reconcile_change" in line]
 
 
 def loser_hooks(env: Env) -> list[str]:
