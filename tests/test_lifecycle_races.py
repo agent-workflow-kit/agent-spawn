@@ -92,6 +92,7 @@ def race(
     barrier.write_text("go")
     env.fakebin.wait_for_gate(gate, timeout=60)
     deadline = time.monotonic() + 60
+    finished: list[subprocess.Popen[str]] = []
     while time.monotonic() < deadline:
         finished = [p for p in started if p.poll() is not None]
         if finished:
