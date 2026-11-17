@@ -31,7 +31,7 @@ Users and seams of later issues:
   ``supervise --handoff`` calls ``receive_environment``, exits 1 on ``HandoffFailed`` and loads
   its config again from the received environment, so the launcher's ``AGENT_SPAWN_*`` overrides
   apply (``supervise.Supervisor.adopt_handoff``).
-* TODO(#29): ``supervise --host`` uses the same client.
+* ``supervise --host`` (a promotion window, ``supervise.Supervisor.run_host``) uses the same client.
 * TODO(#33): ``reconcile`` removes handoff directories whose ``owner`` is dead (``read_owner``
   and ``handoff_root`` are the helpers for it).
 """

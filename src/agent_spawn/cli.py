@@ -445,6 +445,8 @@ def _check_usage(args: argparse.Namespace, key: str) -> None:
 
     if key == "supervise" and (args.handoff is None) != (args.handoff_timeout is None):
         raise ValueError("supervise needs --handoff and --handoff-timeout together")
+    if key == "supervise" and args.host and args.handoff is None:
+        raise ValueError("supervise --host needs --handoff and --handoff-timeout")
 
     if args.command == "label":
         items: list[str] = args.items

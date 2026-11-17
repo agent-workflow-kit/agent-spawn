@@ -13,7 +13,10 @@ SIGINT (the terminal delivers it to ``claude``) and SIGQUIT, forwards SIGHUP and
 ``exec``, applies the window markers from the recorded state and never writes to its terminal
 (a write after a hangup fails with EIO): errors are logged, never printed.
 
-TODO(#29): promotion and host mode (``--host``).
+Promotion (``promotion.py``): a headless run that ended with a session-phase exit 13 continues in a
+window. The supervisor opens it (``supervise --host``, host mode below), waits for the host pane
+process (the ``exec`` runs there, not here) and forwards SIGTERM and SIGHUP to that process only.
+Host mode runs the ``exec`` argv in its window and does no bookkeeping.
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ from collections.abc import Callable
 from types import FrameType
 from typing import Any
 
-from . import chain, handoff, lifecycle, procs
+from . import chain, handoff, lifecycle, procs, promotion
 from . import gateway as gw
 from . import hooks as hooklib
 from . import teardown as teardown_module
@@ -124,6 +127,12 @@ class Supervisor:
         self.marker_retry_at: dict[int, float] = {}  # run -> earliest next attempt after a failure
         self.marker_warned: dict[int, str] = {}  # run -> the failure last logged (once per change)
         self.clock: Callable[[], float] = time.monotonic
+        self.promoted = False  # this run chain's one promotion was decided
+        #: Runs this supervisor canceled itself (``chain.cancel_pending``, a host that died before
+        #: its ``exec`` adopted the run): such a cancel is a chain failure, while a promoted run
+        #: that ended ``canceled`` without one is somebody's deliberate ``stop``.
+        self.self_canceled: set[int] = set()
+        self.window_socket: str | None = None  # the tmux server the window preflight named
 
     def log(self, event: str, *, level: str = "info", **fields: Any) -> None:
         try:
@@ -172,9 +181,7 @@ class Supervisor:
     def run(self) -> Outcome:
         args = self.inv.args
         if args.host:
-            raise CliError.of(
-                "internal", "supervise --host is not implemented yet (issue #29)"
-            )  # TODO(#29): host mode.
+            return self.run_host()
         if args.handoff is not None:
             refused = self.adopt_handoff()
             if refused is not None:
@@ -189,6 +196,85 @@ class Supervisor:
             return self.supervise(row)
         finally:
             self.store.close()
+
+    # -- host mode -----------------------------------------------------------------------------
+
+    def run_host(self) -> Outcome:
+        """``supervise --host``: the window of a promoted run. Adopt the supervisor's environment,
+        check that a promotion is pending for this very process, run ``exec`` with the terminal
+        as its stdin, stdout and stderr, forward SIGHUP and SIGTERM to it and exit 0 once it
+        exited. The supervisor does the bookkeeping."""
+        refused = self.adopt_handoff()  # the CLI refuses a --host without --handoff (exit 2)
+        if refused is not None:
+            return refused
+        try:
+            self.store = Store.open(self.state_dir, create=False, gateway=self.gateway)
+        except StoreMissing:
+            self.log("warning", level="warn", message="supervise refused: no state database")
+            raise CliError.usage("supervise: there is no state database") from None
+        try:
+            row = self.host_check()
+            self.host_exec(row)
+        finally:
+            self.store.close()
+        return DONE
+
+    def host_check(self) -> dict[str, Any]:
+        """A promotion must be pending and its promoted run must name this process as its pane
+        process (exit 2 otherwise, logged)."""
+        assert self.store is not None
+        row = self.store.get_agent(self.agent_id)
+        problem = None
+        run_row: dict[str, Any] = {}
+        if row is not None and isinstance(row.get("run"), int):
+            run_row = self.store.get_run(self.agent_id, row["run"]) or {}
+        if row is None:
+            problem = "no such agent"
+        elif row["status"] != "live" or not row.get("promotion_pending"):
+            problem = "no promotion is pending"
+        elif (
+            not run_row.get("promoted") or run_row.get("pane_proc") != self.store.holder_identity()
+        ):
+            problem = "the promoted run does not name this process as its host"
+        elif not isinstance(row.get("csession_id"), str):
+            problem = "the agent has no session"
+        if problem is not None:
+            self.log("warning", level="warn", message=f"supervise --host refused: {problem}")
+            raise CliError.usage(f"supervise: {problem}")
+        assert row is not None
+        return row
+
+    def host_exec(self, row: dict[str, Any]) -> None:
+        """Run ``exec`` for the promoted run until it exits; nothing is recorded."""
+        if self.collect_signals():
+            return  # told to stop before exec ran: the supervisor cancels the pending run
+        argv = [
+            *shlex.split(row["claude_session_path"]),
+            "exec",
+            "--session-id",
+            row["csession_id"],
+        ]
+        child = self.gateway.spawn(argv)  # the terminal is its stdin, stdout and stderr
+        self.child = child
+        try:
+            identity = procs.read_identity(child.pid, gateway=self.gateway)
+            if identity is not None:
+                self.forwarder = procs.SignalForwarder(identity, gateway=self.gateway)
+                self.signals.forwarder = self.forwarder
+            while child.poll() is None:
+                for sent in self.signals.take_sent():
+                    self.log_sent(sent)
+                for received in self.signals.take():
+                    self.note_signal(received)
+                    self.forward(received)
+                self.gateway.sleep(TICK)
+        except BaseException:
+            self.stop_child(child)
+            raise
+        finally:
+            self.signals.forwarder = None
+            for sent in self.signals.take_sent():
+                self.log_sent(sent)
 
     # -- the window handoff --------------------------------------------------------------------
 
@@ -260,41 +346,46 @@ class Supervisor:
 
         previous: Final | None = None
         while True:
-            try:
-                child = self.spawn_exec(row, session)
-            except (OSError, StoreError) as error:
-                # `exec` could not be started (or was stopped again because it could not be
-                # recorded): the run it should have adopted must not stay pending.
-                self.log("warning", level="error", message=f"could not start exec: {error}")
-                if previous is None:
-                    return self.park_canceled(backend, session, ctx)
-                run_row = store.get_run(self.agent_id, ctx.run) or {}
+            if ctx.promoted:
+                # The promoted run's `exec` runs in the host window: wait for the host process.
+                self.watch_host(poller, session, ctx)
+                self.collect_signals()
+                self.settle_promoted(backend, poller, session, ctx)
+            else:
                 try:
-                    chain.cancel_pending(
-                        self,
-                        backend,
-                        session,
-                        ctx.run,
-                        hooks=run_row.get("hooks"),
-                        token=run_row.get("outcome_token"),
-                    )
-                except Exception as problem:  # noqa: BLE001 - best effort, as chain._start
-                    self.log(
-                        "warning", level="warn", message=f"could not cancel the run: {problem}"
-                    )
-                failure = chain.ChainFailure("agent-spawn", "failed", run=ctx.run)
-                return self.park_chain_failure(previous, failure)
-            self.watch(child, poller, session, ctx)
-            self.collect_signals()
+                    child = self.spawn_exec(row, session)
+                except (OSError, StoreError) as error:
+                    # `exec` could not be started (or was stopped again because it could not be
+                    # recorded): the run it should have adopted must not stay pending.
+                    self.log("warning", level="error", message=f"could not start exec: {error}")
+                    if previous is None:
+                        return self.park_canceled(backend, session, ctx)
+                    run_row = store.get_run(self.agent_id, ctx.run) or {}
+                    try:
+                        chain.cancel_pending(
+                            self,
+                            backend,
+                            session,
+                            ctx.run,
+                            hooks=run_row.get("hooks"),
+                            token=run_row.get("outcome_token"),
+                        )
+                    except Exception as problem:  # noqa: BLE001 - best effort, as chain._start
+                        self.log(
+                            "warning", level="warn", message=f"could not cancel the run: {problem}"
+                        )
+                    failure = chain.ChainFailure("agent-spawn", "failed", run=ctx.run)
+                    return self.park_chain_failure(previous, failure)
+                self.watch(child, poller, session, ctx)
+                self.collect_signals()
             final = self.end_of_run(backend, session, ctx)
             if previous is not None and self.ended_in_launch(final):
-                if (
-                    self.terminated
-                    and final.result.outcome == "not-started"
-                    and final.result.end_reason in CANCEL_END_REASONS
+                if final.result.outcome == "not-started" and (
+                    (self.terminated and final.result.end_reason in CANCEL_END_REASONS)
+                    or self.stopped_promotion(final)
                 ):
-                    # A user's SIGTERM or SIGHUP canceled the chain run: not a chain failure;
-                    # the Signals rule applies (killed, no attention).
+                    # A user's SIGTERM or SIGHUP canceled the chain run, or somebody stopped a
+                    # promotion's pending run: not a chain failure (killed, no attention).
                     return self.park_final(final)
                 # A supervisor-initiated run that ended in its launch phase stops the chain.
                 failure = chain.ChainFailure(
@@ -304,6 +395,16 @@ class Supervisor:
                     end_reason=final.result.end_reason,
                 )
                 return self.park_chain_failure(previous, failure)
+            if promotion.wants(self, final):
+                try:
+                    ctx = promotion.start(self, backend, session, final)
+                    promotion.open_window(self, backend, session, ctx, final)
+                except chain.ChainFailure as failure:
+                    return self.park_chain_failure(final, failure)
+                except chain.ChainCanceled:
+                    return self.park_final(final)
+                previous = final
+                continue
             if not self.wants_report_resume(row, final, previous):
                 return self.park_final(final)
             try:
@@ -313,6 +414,15 @@ class Supervisor:
             except chain.ChainCanceled:
                 return self.park_final(final)
             previous = final
+
+    def stopped_promotion(self, final: Final) -> bool:
+        """The promoted run was canceled by someone else (``stop``): this supervisor did not
+        cancel it, so it is a deliberate stop and parks per the canceled run."""
+        return (
+            final.ctx.promoted
+            and final.ctx.run not in self.self_canceled
+            and final.result.end_reason == "canceled"
+        )
 
     # -- watching `exec` ---------------------------------------------------------------------
 
@@ -359,26 +469,7 @@ class Supervisor:
     ) -> None:
         """Until ``exec`` exits: forward signals, poll for the start and deliver the outbox."""
         try:
-            next_status = 0.0
-            next_relay = 0.0
-            while child.poll() is None:
-                for sent in self.signals.take_sent():
-                    self.log_sent(sent)
-                for received in self.signals.take():
-                    self.note_signal(received)
-                    self.forward(received)
-                now = time.monotonic()
-                woken = False
-                if now >= next_relay and not ctx.started:
-                    next_relay = now + RELAY_EVERY
-                    woken = self.relay_changed()
-                if now >= next_status or woken:
-                    next_status = now + STATUS_EVERY
-                    if not ctx.started:
-                        ctx.started = self.look_started(backend, session, ctx)
-                    self.apply_marker(ctx)
-                    self.deliver()
-                self.gateway.sleep(TICK)
+            self.watch_until(lambda: child.poll() is None, self.sleep_tick, backend, session, ctx)
         except BaseException:
             self.stop_child(child)
             raise
@@ -386,6 +477,93 @@ class Supervisor:
             self.signals.forwarder = None  # `exec` is gone: nothing to forward to
             for sent in self.signals.take_sent():
                 self.log_sent(sent)
+
+    def sleep_tick(self) -> None:
+        self.gateway.sleep(TICK)
+
+    def watch_host(self, backend: SessionBackend, session: str, ctx: RunCtx) -> None:
+        """Until the host pane process of the promoted run exits (a pidfd; kqueue on macOS):
+        forward SIGTERM and SIGHUP to exactly that process, poll for the start and deliver the
+        outbox. The process is verified by PID, start time and boot id every time."""
+        host = ctx.host
+        assert host is not None
+        handle = procs.open_verified(host, gateway=self.gateway)
+        if handle is None:
+            self.signals.forwarder = None
+            return  # the host is gone already: the outcome decides
+        try:
+            self.watch_until(handle.is_alive, lambda: handle.wait_exit(TICK), backend, session, ctx)
+        except BaseException:
+            # This supervisor failed while the host lives: tell the host to stop (it forwards
+            # to `exec`) and give it the grace `exec` gets; the exact verified process only.
+            self.forward_host_stop(host)
+            procs.wait_for_exit(host, EXEC_GRACE, gateway=self.gateway)
+            raise
+        finally:
+            handle.close()
+            self.signals.forwarder = None
+            self.forwarder = None
+            for sent in self.signals.take_sent():
+                self.log_sent(sent)
+
+    def forward_host_stop(self, host: procs.ProcessIdentity) -> None:
+        try:
+            outcome = procs.forward_signal(host, signal.SIGTERM, gateway=self.gateway)
+            self.log_sent(outcome)
+        except OSError as error:
+            self.log("warning", level="warn", message=f"could not stop the host: {error.strerror}")
+
+    def settle_promoted(
+        self, backend: SessionBackend, poller: SessionBackend, session: str, ctx: RunCtx
+    ) -> None:
+        """The host exited. A dead pane is closed (``--keep-on-exit failed`` keeps it), and a run
+        that is not final (the host died before its `exec` adopted it, or while it ran) is
+        stopped so that it ends."""
+        try:
+            status = poller.status(session)
+        except CliError as error:
+            self.log("warning", level="warn", message=f"status failed: {error.code}")
+            status = None
+        if status is not None and status.run.run == ctx.run and status.run.outcome is None:
+            # The host is gone but the run is not final: a run nothing adopted is canceled (the
+            # supervisor's own cancel), a live one is stopped (its `exec` died with the host).
+            # The outcome is read again afterwards.
+            if status.pending:
+                self.self_canceled.add(ctx.run)
+            chain.stop_pending(self, backend, session)
+        if self.term is not None:
+            promotion.close_dead(self, self.term, ctx, wait=promotion.HOST_STOP_WAIT)
+
+    def watch_until(
+        self,
+        alive: Callable[[], bool],
+        idle: Callable[[], object],
+        backend: SessionBackend,
+        session: str,
+        ctx: RunCtx,
+    ) -> None:
+        """The watch loop: while ``alive()``, forward signals, poll for the start, apply the
+        window marker and deliver the outbox; ``idle()`` waits one tick."""
+        next_status = 0.0
+        next_relay = 0.0
+        while alive():
+            for sent in self.signals.take_sent():
+                self.log_sent(sent)
+            for received in self.signals.take():
+                self.note_signal(received)
+                self.forward(received)
+            now = time.monotonic()
+            woken = False
+            if now >= next_relay and not ctx.started:
+                next_relay = now + RELAY_EVERY
+                woken = self.relay_changed()
+            if now >= next_status or woken:
+                next_status = now + STATUS_EVERY
+                if not ctx.started:
+                    ctx.started = self.look_started(backend, session, ctx)
+                self.apply_marker(ctx)
+                self.deliver()
+            idle()
 
     def apply_marker(self, ctx: RunCtx) -> None:
         """The window marker of this run from the recorded (relayed) state: ``needs-input`` or
@@ -523,6 +701,7 @@ class Supervisor:
                 self.agent_id,
                 run=ctx.run,
                 auto_resumed=ctx.auto_resumed,
+                promoted=ctx.promoted,
                 changes=changes,
             )
         return True
@@ -577,7 +756,12 @@ class Supervisor:
         # `run_outcome`), else null.
         first = ts(run_row.get("first_working_at")) or result.first_working_at
         outcome = outcome_object(
-            self.agent_id, result, result.raw, first_working_at=first, auto_resumed=ctx.auto_resumed
+            self.agent_id,
+            result,
+            result.raw,
+            first_working_at=first,
+            auto_resumed=ctx.auto_resumed,
+            promoted=ctx.promoted,
         )
         if not ctx.started and result.phase == "session":
             ctx.started = self.mark_started(ctx, result.phase)  # it started, then ended

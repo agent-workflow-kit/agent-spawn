@@ -25,6 +25,20 @@ FAKEBIN_DIR = Path(__file__).resolve().parent
 SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
 
 
+def read_log_records(path: Path) -> list[dict[str, Any]]:
+    """The complete records of a JSON-lines log a fake may be appending to right now.
+
+    A fake writes each record with one ``write`` and a terminating newline, but a reader that
+    polls mid-write can still see the record cut short. A final line without its newline is
+    that in-flight record: it is ignored (the next poll sees it whole). A malformed line that
+    is newline-terminated is a real defect and still raises.
+    """
+    text = path.read_text()
+    lines = text.split("\n")
+    lines.pop()  # "" after the last newline, or the unterminated in-flight record
+    return [json.loads(line) for line in lines if line]
+
+
 @dataclass(frozen=True)
 class Invocation:
     tool: str
@@ -96,7 +110,11 @@ class Fakebin:
         ``error`` (``{"code", "message", ...}`` printed as the error envelope), ``stderr``,
         ``sleep`` (seconds), ``hang`` (block until a signal), ``on_signal``
         (``{"SIGTERM": {"exit": 143}}`` or ``"ignore"``), ``outcome`` (claude-session: the
-        outcome name of ``exec``/``resume``/``wait``/``status``) and ``secret``
+        outcome name of ``exec``/``resume``/``wait``/``status``), ``pending_unadopted``
+        (claude-session ``status`` only: a run nothing adopted yet is reported pending, in its
+        launch phase, with no outcome; unscripted, ``status`` never reports a pending run),
+        ``end_reason`` (claude-session
+        ``exec`` only: replaces the outcome's end reason) and ``secret``
         (claude-session ``verify-secret``). Rules match in the order added; ``times`` limits
         how many calls a rule answers.
         """
@@ -174,17 +192,18 @@ class Fakebin:
 
     def records(self, event: str) -> list[dict[str, Any]]:
         """The log records of a kind other than a call (``outcome_file_failed``...)."""
-        found = [json.loads(line) for line in self.log.read_text().splitlines()]
-        return [record for record in found if record["event"] == event]
+        return [record for record in self._log_records() if record["event"] == event]
 
     # --- the log -----------------------------------------------------------------------
+
+    def _log_records(self) -> list[dict[str, Any]]:
+        return read_log_records(self.log)
 
     def invocations(self, tool: str | None = None) -> list[Invocation]:
         invokes: dict[str, dict[str, Any]] = {}
         exits: dict[str, dict[str, Any]] = {}
         order: list[str] = []
-        for line in self.log.read_text().splitlines():
-            record = json.loads(line)
+        for record in self._log_records():
             if record["event"] == "invoke":
                 invokes[record["id"]] = record
                 order.append(record["id"])
@@ -216,8 +235,7 @@ class Fakebin:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self.log.exists():
-                for line in self.log.read_text().splitlines():
-                    record = json.loads(line)
+                for record in self._log_records():
                     if record["event"] == "hang_ready" and record["pid"] == pid:
                         return
             time.sleep(0.02)

@@ -441,6 +441,7 @@ def new_entry(**fields: Any) -> dict[str, Any]:
         "adopted": False,
         "final": False,
         "outcome": None,
+        "end_reason": None,
         "stop_requested": False,
         "outcome_file": None,
         "labels": [],
@@ -719,7 +720,13 @@ def begin_run(
     def change(data: dict[str, dict[str, Any]]) -> None:
         entry = data.setdefault(session_id, new_entry(**(fields or {})))
         entry.update(
-            run=run, adopted=True, final=False, outcome=None, stop_requested=False, mode=mode
+            run=run,
+            adopted=True,
+            final=False,
+            outcome=None,
+            end_reason=None,
+            stop_requested=False,
+            mode=mode,
         )
         if forked_from is not None:
             entry["forked_from"] = forked_from
@@ -820,6 +827,8 @@ def run_session(
             for number in numbers:
                 signal.signal(number, drop_signal)
     obj = outcome_object(name, session_id, run)
+    if isinstance(response.get("end_reason"), str):  # e.g. a `not-started` ended never_adopted
+        obj["end_reason"] = response["end_reason"]
     obj["forked_from"] = forked_from
     write_outcome_file(outcome_file, obj)
     end_run(session_id, name)
@@ -929,7 +938,9 @@ def do_stop(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         if not dry:
 
             def cancel(data: dict[str, dict[str, Any]]) -> None:
-                data[session_id].update(final=True, outcome="not-started", adopted=False)
+                data[session_id].update(
+                    final=True, outcome="not-started", adopted=False, end_reason="canceled"
+                )
 
             update_sessions(cancel)
     elif dry:
@@ -980,6 +991,8 @@ def do_status(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
     name = ctx.response("status").get("outcome") or entry.get("outcome") or "done"
     code, state, end_reason, phase, _ = OUTCOMES[name]
     outcome = outcome_object(name, session_id, run)
+    if entry.get("final") and entry.get("end_reason") and not ctx.response("status").get("outcome"):
+        end_reason = outcome["end_reason"] = entry["end_reason"]  # e.g. a pending run's `stop`
     out: dict[str, Any] = {
         "csession_id": session_id,
         "created_at": FIXED_TS,
@@ -1049,6 +1062,26 @@ def do_status(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         "recent_events": [],
         "warnings": [],
     }
+    if (
+        ctx.response("status").get("pending_unadopted") is True
+        and not entry.get("adopted")
+        and not entry.get("final")
+    ):
+        # Opt-in (a scripted ``pending_unadopted``): a run nothing adopted yet is reported
+        # pending, in its launch phase, as the interface says (unverified, FIDELITY.md).
+        out.update(state="starting", pending=True, expires_at="2026-11-03T10:01:00Z")
+        out["run"].update(
+            state="starting",
+            phase="launch",
+            pending=True,
+            expires_at="2026-11-03T10:01:00Z",
+            session_started_at=None,
+            ended_at=None,
+            report=None,
+            outcome=None,
+            end_reason=None,
+            exit_code=None,
+        )
     return 0, out, "status"
 
 
