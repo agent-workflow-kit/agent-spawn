@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -639,6 +640,26 @@ def test_a_tombstone_whose_files_cannot_be_removed_keeps_its_record_and_is_retri
         locked.chmod(0o700)
     assert kinds(reconcile(env)) == [(agent_id, "tombstone_deleted")]
     assert not (env.state_dir / "outcomes" / agent_id).exists()
+
+
+def test_a_tombstone_whose_files_are_out_of_reach_is_deleted_anyway(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    """A symlinked ``outcomes`` root cannot be cleaned by any retry: the record must not stay
+    forever, and the symlink's target is never touched."""
+    agent_id = tombstone(env, fakebin, 40.0)
+    target = tmp_path / "elsewhere"
+    (target / agent_id).mkdir(parents=True)
+    (target / agent_id / "keep").write_text("x")
+    real = env.state_dir / "outcomes"
+    shutil.rmtree(real)
+    real.symlink_to(target)
+    body = reconcile(env)
+    assert (agent_id, "tombstone_deleted") in kinds(body)
+    assert f"{agent_id}: its leftover files could not all be deleted" in body["warnings"]
+    with Store.open(env.state_dir) as store:
+        assert store.get_agent(agent_id) is None
+    assert (target / agent_id / "keep").read_text() == "x"
 
 
 def test_a_young_tombstone_and_one_without_a_time_stay(env: Env, fakebin: Fakebin) -> None:

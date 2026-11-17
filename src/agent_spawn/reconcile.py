@@ -393,9 +393,11 @@ class _Pass:
                     return False
                 problems = remove_agent_files(self.state_dir, agent_id)
                 if problems:
-                    # keep the record: without it the files are never swept, the next pass retries
                     self.warn(agent_id, "its leftover files could not all be deleted")
-                    return False
+                    if _removable_leftover(self.state_dir, agent_id):
+                        return False  # keep the record: without it they are never swept; retry
+                    # nothing of ours is reachable (symlinked root, foreign owner): a retry
+                    # cannot help, so the record goes anyway
                 return self.store.delete_agent(lease, agent_id)
         except LeaseHeld:
             return False
@@ -408,6 +410,34 @@ class _Pass:
             self.warn(None, text)
         for name in sweep.removed:
             self.log(None, "handoff_removed", directory=name)
+
+
+def _removable_leftover(state_dir: str, agent_id: str) -> bool:
+    """Whether a real directory of ours named for the agent still stands under ``prompts/`` or
+    ``outcomes/`` (a retry may remove it). Never follows a symlink."""
+    try:
+        base = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        for sub in ("prompts", "outcomes"):
+            try:
+                parent = os.open(
+                    sub, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=base
+                )
+            except OSError:
+                continue
+            try:
+                info = os.lstat(agent_id, dir_fd=parent)
+            except OSError:
+                continue
+            finally:
+                os.close(parent)
+            if stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid():
+                return True
+        return False
+    finally:
+        os.close(base)
 
 
 def _outcome(

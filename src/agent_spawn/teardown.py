@@ -189,12 +189,21 @@ def _terminate_hook_on_signal(gateway: gw.Gateway) -> Iterator[None]:
     try:
         try:
             for sig in (signal.SIGTERM, signal.SIGHUP):
-                previous = gateway.install_signal_handler(sig, raiser)
-                if previous is signal.SIG_DFL:
-                    installed[sig] = previous
-                elif previous is not None:  # someone else's handler: put it back
+                # Record a handler to restore before the raiser can run: the default action is
+                # assumed while the install is in flight, the real previous one right after.
+                installed[sig] = signal.SIG_DFL
+                try:
+                    previous = gateway.install_signal_handler(sig, raiser)
+                except BaseException:
+                    del installed[sig]
+                    raise
+                if previous is None:  # installed from C: cannot be put back, left as foreign
+                    del installed[sig]
+                    continue
+                installed[sig] = previous
+                if previous is not signal.SIG_DFL:  # someone else's handler: put it back
                     gateway.install_signal_handler(sig, previous)
-                # None: a handler installed from C, which cannot be put back: left as foreign
+                    del installed[sig]
         except ValueError:  # not the main thread
             pass
         yield

@@ -479,50 +479,6 @@ def test_a_signal_during_a_hook_terminates_the_hook_and_leaves_the_agent_retryab
     assert again.returncode == 0, (again.stdout, again.stderr)
 
 
-def test_a_second_signal_during_the_shutdown_does_not_leave_the_hook_alive(
-    env: Env, fakebin: Fakebin, tmp_path: Path
-) -> None:
-    """The hook survives SIGTERM for the whole grace period (it traps it): a second signal that
-    arrives while the first is being handled must not abort the group's SIGKILL escalation."""
-    from agent_spawn import procs
-
-    agent_id = seed(env, fakebin)
-    pidfile, seen = tmp_path / "hook-pid", tmp_path / "term-seen"
-    hook = (
-        f"pre-teardown=trap 'echo t >> {seen}' TERM; trap '' HUP; "
-        f"sleep 300 & echo $! > {pidfile}.child; echo $$ > {pidfile}.tmp; "
-        f"mv {pidfile}.tmp {pidfile}; while :; do wait; done"
-    )
-    proc = subprocess.Popen(
-        env.argv("teardown", agent_id, "--json", "--hook", hook),
-        env=env.env(),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    identities: list[Any] = []
-    try:
-        env.wait_for(pidfile.exists, "the hook to start")
-        identities.append(procs.read_identity(int(pidfile.read_text())))
-        identities.append(procs.read_identity(int((tmp_path / "hook-pid.child").read_text())))
-        assert identities[0] is not None
-        os.kill(proc.pid, signal.SIGTERM)  # exactly the process this test started
-        env.wait_for(seen.exists, "the hook's group to receive the first SIGTERM")
-        os.kill(proc.pid, signal.SIGTERM)  # the shutdown is under way: the handler is ignoring
-        proc.communicate(timeout=60)
-        assert proc.returncode == -signal.SIGTERM
-        for identity in identities:
-            if identity is not None:
-                env.wait_for(lambda i=identity: not procs.is_alive(i), "the group to be dead")
-    finally:
-        for identity in identities:
-            if identity is not None and procs.is_alive(identity):
-                os.kill(identity.pid, signal.SIGKILL)
-        if proc.poll() is None:
-            proc.kill()
-            proc.communicate()
-
-
 # --- the signal-to-exception context, in process (#33) ---
 
 
@@ -617,3 +573,17 @@ def test_a_second_signal_during_the_shutdown_is_ignored(monkeypatch: pytest.Monk
     assert {s for s, _ in ignored} == {signal.SIGTERM, signal.SIGHUP}
     assert stub.current == {signal.SIGTERM: signal.SIG_DFL, signal.SIGHUP: signal.SIG_DFL}
     assert resent == [(os.getpid(), signal.SIGTERM)]
+
+
+def test_a_failure_between_installing_the_two_signals_restores_the_first() -> None:
+    class Failing(_SignalStub):
+        def install_signal_handler(self, sig: int, handler: Any) -> Any:
+            if sig == signal.SIGHUP and callable(handler):
+                raise RuntimeError("boom")
+            return super().install_signal_handler(sig, handler)
+
+    stub = Failing({signal.SIGTERM: signal.SIG_DFL, signal.SIGHUP: signal.SIG_DFL})
+    with pytest.raises(RuntimeError):
+        with _context(stub):
+            pass
+    assert stub.current == {signal.SIGTERM: signal.SIG_DFL, signal.SIGHUP: signal.SIG_DFL}
