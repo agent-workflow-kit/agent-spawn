@@ -21,6 +21,7 @@ Host mode runs the ``exec`` argv in its window and does no bookkeeping.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import math
 import os
@@ -28,7 +29,7 @@ import shlex
 import signal
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from types import FrameType
 from typing import Any
 
@@ -106,14 +107,27 @@ class Signals:
 
 
 class Supervisor:
-    def __init__(self, inv: Any, signals: Signals) -> None:
+    def __init__(
+        self,
+        inv: Any,
+        signals: Signals,
+        *,
+        agent_id: str | None = None,
+        state_dir: str | None = None,
+        in_process: bool = False,
+    ) -> None:
         self.inv = inv
         self.signals = signals
         self.config: Config = inv.config
-        self.state_dir: str = inv.state_dir
+        self.state_dir: str = state_dir or inv.state_dir
         self.gateway = gw.get_gateway()
         self.store: Store | None = None
-        self.agent_id: str = inv.args.agent_id
+        self.agent_id: str = agent_id or inv.args.agent_id
+        #: ``launch|resume --placement here``: this is the launcher's own process (interface.md,
+        #: Hosting). The terminal is ``exec``'s stdio; the handlers of the launcher stay in
+        #: place until ``exec`` is spawned (``spawn_exec`` swaps them for the supervisor's).
+        self.in_process = in_process
+        self.restore_handlers: Callable[[], None] | None = None
         self.forwarder: procs.SignalForwarder | None = None
         self.child: subprocess.Popen[bytes] | None = None  # the current `exec`
         self.runner: hooklib.AsyncRunner | None = None
@@ -196,6 +210,12 @@ class Supervisor:
             return self.supervise(row)
         finally:
             self.store.close()
+
+    def run_in_process(self, store: Store, row: dict[str, Any]) -> Outcome:
+        """``--placement here``: supervise from the launcher's own process, with the launcher's
+        open state database (the agent's record already names this process as supervisor)."""
+        self.store = store
+        return self.supervise(row)
 
     # -- host mode -----------------------------------------------------------------------------
 
@@ -327,7 +347,11 @@ class Supervisor:
         session = row["csession_id"]
         run = row["run"]
         stored_term = row.get("termctl_path")
-        if self.inv.args.handoff is not None and isinstance(stored_term, str) and stored_term:
+        if (
+            getattr(self.inv.args, "handoff", None) is not None
+            and isinstance(stored_term, str)
+            and stored_term
+        ):
             try:
                 self.term = TermBackend(shlex.split(stored_term), gateway=self.gateway)
             except ValueError:
@@ -441,16 +465,53 @@ class Supervisor:
     def spawn_exec(self, row: dict[str, Any], session: str) -> subprocess.Popen[bytes]:
         assert self.store is not None
         argv = [*shlex.split(row["claude_session_path"]), "exec", "--session-id", session]
-        if self.inv.args.handoff is not None:
-            # A window: `exec` is in the pane's foreground process group with the terminal as
-            # its stdin, stdout and stderr (a closed window hangs up only this process).
-            child = self.gateway.spawn(argv)
-        else:
-            child = self.gateway.spawn(argv, stdin=gw.DEVNULL)
-        self.child = child
-        self.forwarder = None
-        self.signals.forwarder = None
+        # A window: `exec` is in the pane's foreground process group with the terminal as its
+        # stdin, stdout and stderr (a closed window hangs up only this process). `--placement
+        # here` is the same with the launcher's terminal.
+        on_terminal = self.in_process or getattr(self.inv.args, "handoff", None) is not None
+        with self.signals_held():
+            if on_terminal:
+                child = self.gateway.spawn(argv)
+            else:
+                child = self.gateway.spawn(argv, stdin=gw.DEVNULL)
+            self.child = child
+            self.forwarder = None
+            self.signals.forwarder = None
+            self.record_exec(child)
+        return child
+
+    @contextlib.contextmanager
+    def signals_held(self) -> Iterator[None]:
+        """In process only: SIGTERM, SIGHUP and SIGINT stay blocked from before ``exec`` exists
+        until the supervisor's handlers are installed and ``exec`` is recorded, so a signal is
+        either the launcher's (no ``exec`` yet) or the supervisor's, never lost in between."""
+        if not self.in_process:
+            yield
+            return
+        old = signal.pthread_sigmask(signal.SIG_BLOCK, ())  # the current mask, unchanged
         try:
+            # A launcher handler that was already flagged runs here (raising the launcher's
+            # interrupt) before `exec` exists; the mask is restored either way.
+            signal.pthread_sigmask(signal.SIG_BLOCK, FORWARDED)
+            yield
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
+    def record_exec(self, child: subprocess.Popen[bytes]) -> None:
+        assert self.store is not None
+        try:
+            if self.in_process and self.restore_handlers is None:
+                # The supervisor's rows from now on ("the launcher rows until `exec` is
+                # spawned, then as `supervise`"): SIGINT and SIGQUIT are ignored.
+                self.restore_handlers = procs.install_signal_handlers(
+                    {
+                        signal.SIGTERM: self.signals.handle,
+                        signal.SIGHUP: self.signals.handle,
+                        signal.SIGINT: signal.SIG_IGN,
+                        signal.SIGQUIT: signal.SIG_IGN,
+                    },
+                    gateway=self.gateway,
+                )
             identity = procs.read_identity(child.pid, gateway=self.gateway)
             if identity is not None:
                 self.forwarder = procs.SignalForwarder(identity, gateway=self.gateway)
@@ -462,7 +523,6 @@ class Supervisor:
             self.signals.forwarder = None
             self.stop_child(child)
             raise
-        return child
 
     def watch(
         self, child: subprocess.Popen[bytes], backend: SessionBackend, session: str, ctx: RunCtx

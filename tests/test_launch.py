@@ -428,7 +428,7 @@ def test_third_party_run_outside_session_dir_exits_20_before_allocation(
         (
             "launch",
             "--mode",
-            "headless",
+            "interactive",
             "--skill",
             "s",
             "--placement",

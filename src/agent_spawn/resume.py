@@ -27,7 +27,8 @@ or escalation of ``create``, a ``creating`` record and a record in another state
 
 An interactive resume with placement ``window`` runs launch step 7 for its window
 (``Launch.place_window``): the window preflight follows the pre-start checks, the termctl
-``--override-escalation`` goes to the real ``open`` only. TODO(#30): ``--placement here``.
+``--override-escalation`` goes to the real ``open`` only. ``--placement here`` runs the
+supervisor in the resuming process (``Launch.place_here``).
 TODO(#31): the liveness check that precedes the lifecycle entry.
 """
 
@@ -176,10 +177,6 @@ class Resume(Launch):
                 a.cwd = os.path.realpath(a.cwd)  # launch resolves a relative --cwd the same way
         if a.prompt is not None and a.prompt_file is not None:
             raise CliError.usage("--prompt cannot be combined with --prompt-file")
-        if a.placement == "here" and not _tty_pair():
-            raise CliError.usage("--placement here needs a terminal on stdin and stdout")
-        if a.placement == "here" and a.wait_timeout is not None:
-            raise CliError.usage("--wait-timeout cannot be combined with --placement here")
         for value in a.hook or []:
             if value.partition("=")[0] == "pre-launch":
                 raise CliError.usage(
@@ -314,10 +311,11 @@ class Resume(Launch):
         if self.mode == "headless":
             if a.placement is not None:
                 self.warnings.append("--placement is ignored for a headless resume")
-        elif a.placement == "here":
-            raise CliError.of(
-                "internal", "--placement here is not implemented yet (issue #30)"
-            )  # TODO(#30): --placement here.
+        elif self.here:  # the resolved mode is interactive: the here-specific usage checks
+            if a.wait_timeout is not None:
+                raise CliError.usage("--wait-timeout cannot be combined with --placement here")
+            if not a.dry_run and not _tty_pair():
+                raise CliError.usage("--placement here needs a terminal on stdin and stdout")
         if self.windowed:
             self.termctl_backend()  # tool resolution: exit 12 tool_missing before any change
         self.plan_override(row)
@@ -834,7 +832,7 @@ class Resume(Launch):
                 "plugin_dirs": list(self.plugin_dirs),
                 "promote": a.promote if a.promote is not None else row.get("promote"),
                 "ephemeral": False,
-                "wait": bool(a.wait),
+                "wait": self.waits,
                 "wait_timeout": a.wait_timeout,
             }
         )
@@ -1738,7 +1736,7 @@ class Resume(Launch):
                 "plugin_dirs": list(self.plugin_dirs),
                 "promote": a.promote if a.promote is not None else row.get("promote"),
                 "ephemeral": False if self.fork else bool(row.get("ephemeral")),
-                "wait": bool(a.wait),
+                "wait": self.waits,
                 "wait_timeout": a.wait_timeout,
             }
         )

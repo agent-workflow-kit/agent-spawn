@@ -9,10 +9,8 @@ from .base import Invocation
 
 
 def launch(inv: Invocation) -> Outcome:
-    # TODO(#30): --placement here (see launch.Launch.usage_checks).
     return launch_module.launch(inv, restore_handlers=False)
 
 
 def resume(inv: Invocation) -> Outcome:
-    # TODO(#30): --placement here (see resume.Resume.plan_run).
     return resume_module.resume(inv, restore_handlers=False)
