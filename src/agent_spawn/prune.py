@@ -33,7 +33,6 @@ from .output import CliError, Outcome, PayloadKind
 from .store import CasLost, LeaseHeld, Store, StoreError, StoreMissing, default_state_dir
 from .teardown import (
     SUPERVISOR_ACTOR,
-    UNSUPPORTED,
     GuardSkip,
     Teardown,
     dry_run_outcome,
@@ -124,6 +123,8 @@ def _from_error(error: CliError, agent_id: str, *, was_partial: bool) -> dict[st
     if error.code == "partial" and was_partial:
         # The marker was already set: skipped, left for reconcile and a human (Teardown order 4).
         return _result(agent_id, "skipped", PARTIAL, error.tool, lower)
+    if error.code in ("vetoed", "escalated"):  # a pre-teardown hook: the agent is parked again
+        return _result(agent_id, "refused", error.code, "agent-spawn", {"hook": error.hook})
     if error.code == "not_found":
         return _result(agent_id, "skipped", "gone", "agent-spawn")
     return _result(agent_id, "failed", error.code, error.tool, lower or error.details)
@@ -185,12 +186,6 @@ def prune_command(inv: Any) -> Outcome:
             results.append(_one(store, config, judge, row, state_dir, dry_run, warnings))
     finally:
         store.close()
-    unsupported = sum(1 for r in results if r["reason"] == UNSUPPORTED)
-    if unsupported:
-        warnings.append(
-            f"{unsupported} agent(s) skipped: teardown with pre-teardown hooks is not "
-            "implemented yet (tracked in issue #32)"
-        )
     return _outcome(results, warnings, dry_run)
 
 
@@ -221,8 +216,6 @@ def _one(
         skip = judge.skip_reason(row)
         if skip is not None:
             entry = _result(agent_id, "skipped", skip, "agent-spawn")
-        elif td.unsupported(row) is not None:
-            entry = _result(agent_id, "skipped", UNSUPPORTED, "agent-spawn")
         elif was_partial and _partial_blocks(td, row):
             entry = _result(agent_id, "skipped", PARTIAL, "wtctl")
         elif dry_run:

@@ -147,7 +147,8 @@ def test_ticket_work_in_a_new_worktree_to_teardown_with_merged_head(
     assert [r["target"] for r in audit.body] == [agent_id]
     assert audit.body[0]["decision_id"] == ["d-1"]
     flow.validate_everything(
-        expect_hooks=["post-launch", "post-park", "post-teardown"], expect_audit=1
+        expect_hooks=["post-launch", "post-park", "pre-teardown", "post-teardown"],
+        expect_audit=1,
     )
     (post,) = flow.hooks_named("post-teardown", agent_id)
     assert [(w["record_id"], w["action"]) for w in post["worktrees"]] == [(record["id"], "removed")]
@@ -226,9 +227,27 @@ def test_prune_tears_down_an_old_parked_worktree_agent_and_leaves_the_rest(flow:
         backdate(flow, agent_id)
     (record,) = records(flow.fakebin).values()
 
+    # a second pre-teardown policy (after the recording one) vetoes the first attempt only
+    once = flow.state_dir.parent / "vetoed-once"
+    veto = f"[ -e {once} ] || {{ touch {once}; exit 1; }}"
+    text = flow.env.config.read_text()
+    head, _, tail = text.partition("  pre-teardown:\n")
+    recording, _, rest = tail.partition("\n")
+    flow.env.config.write_text(f'{head}  pre-teardown:\n{recording}\n    - cmd: "{veto}"\n{rest}')
+
     dry = flow.cli(schema("prune"), "prune", "--older-than", "7d", "--dry-run", "--json")
     assert dry.code == 0 and dry.body["dry_run"] is True
     assert os.path.isdir(record["path"])
+    vetoed = flow.cli(schema("prune"), "prune", "--older-than", "7d", "--json")
+    assert vetoed.code == 0, (vetoed.stdout, vetoed.stderr)
+    refused = {r["agent_id"]: r for r in vetoed.body["results"]}[old]
+    assert (refused["result"], refused["reason"], refused["tool"]) == (
+        "refused",
+        "vetoed",
+        "agent-spawn",
+    )
+    assert refused["details"] == {"hook": "pre-teardown"}
+    assert flow.agent(old)["status"] == "parked" and os.path.isdir(record["path"])
     pruned = flow.cli(schema("prune"), "prune", "--older-than", "7d", "--json")
     assert pruned.code == 0, (pruned.stdout, pruned.stderr)
     results = {r["agent_id"]: r for r in pruned.body["results"]}
@@ -247,7 +266,7 @@ def test_prune_tears_down_an_old_parked_worktree_agent_and_leaves_the_rest(flow:
     # prune acts as the automation actor and its removal is audited
     audit = flow.cli(schema("export"), "export", "--action", "teardown", "--json").body
     assert [(r["target"], r["actor"]) for r in audit] == [(old, "auto:agent-spawn")]
-    flow.validate_everything(expect_hooks=["post-teardown"], expect_audit=1)
+    flow.validate_everything(expect_hooks=["pre-teardown", "post-teardown"], expect_audit=1)
 
 
 def test_prune_refuses_the_source_of_a_young_fork_until_the_fork_is_old_too(flow: Flow) -> None:

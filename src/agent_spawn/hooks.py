@@ -347,6 +347,7 @@ def _log(
     signal_name: str | None = None,
     message: str | None = None,
     details: Mapping[str, Any] | None = None,
+    decision_ids: Sequence[str] | None = None,
 ) -> None:
     """Append a log record; a log that cannot be written never aborts a hook run."""
     try:
@@ -360,6 +361,7 @@ def _log(
             signal=signal_name,
             message=message,
             details=details,
+            decision_ids=decision_ids or None,
         )
     except (ValueError, records.RecordsError, OSError):
         pass
@@ -915,6 +917,7 @@ def run_pre_hooks(
                 agent_id=agent_id,
                 hook=hook,
                 details=details,
+                decision_ids=decided[:MAX_DECISION_IDS],
             )
             if escalated is None:
                 escalated = PreHookVerdict(
@@ -937,6 +940,7 @@ def run_pre_hooks(
             agent_id=agent_id,
             hook=hook,
             details=details,
+            decision_ids=decided[:MAX_DECISION_IDS],
         )
         stderr = result.stderr or (result.error or "").encode()
         return PreHookVerdict("veto", hook, stderr, cause, result.exit_code, decided)

@@ -320,15 +320,31 @@ def test_an_agent_with_a_window_is_torn_down_with_its_dead_panes_closed(
     assert len(listing) == 1 and "--dead" in listing[0]  # step 5 ran
 
 
-def test_a_configured_pre_teardown_hook_still_skips_every_agent(
+def test_a_pre_teardown_hook_runs_for_each_agent_and_a_veto_refuses_only_that_one(
+    fakebin: Fakebin, isolation_env: Isolation, tmp_path: Path
+) -> None:
+    gate = tmp_path / "veto-this"
+    cmd = f'[ "$AGENT_SPAWN_ID" = "$(cat {gate})" ] && exit 1; exit 0'
+    hooked = Env(fakebin, isolation_env, f"hooks:\n  pre-teardown:\n    - cmd: {json.dumps(cmd)}\n")
+    vetoed, passed = old(hooked, fakebin), old(hooked, fakebin)
+    gate.write_text(vetoed)
+    body = prune(hooked, "--older-than", "7d")
+    results = by_id(body)
+    assert results[vetoed]["result"] == "refused" and results[vetoed]["reason"] == "vetoed"
+    assert results[vetoed]["tool"] == "agent-spawn"
+    assert results[passed]["result"] == "torn_down"
+    assert status_of(hooked, vetoed) == "parked" and status_of(hooked, passed) == "torn_down"
+    assert not any("#32" in w for w in body["warnings"])
+
+
+def test_an_escalating_pre_teardown_hook_refuses_the_agent_as_escalated(
     fakebin: Fakebin, isolation_env: Isolation
 ) -> None:
-    # TODO(#32): the hook runs instead of skipping.
-    hooked = Env(fakebin, isolation_env, 'hooks:\n  pre-teardown:\n    - cmd: "true"\n')
+    hooked = Env(fakebin, isolation_env, 'hooks:\n  pre-teardown:\n    - cmd: "exit 13"\n')
     agent_id = old(hooked, fakebin)
-    body = prune(hooked, "--older-than", "7d")
-    assert by_id(body)[agent_id]["reason"] == "teardown_unsupported"
-    assert any("#32" in w and "#27" not in w for w in body["warnings"])
+    entry = by_id(prune(hooked, "--older-than", "7d"))[agent_id]
+    assert entry["result"] == "refused" and entry["reason"] == "escalated"
+    assert entry["tool"] == "agent-spawn" and entry["details"] == {"hook": "pre-teardown"}
     assert status_of(hooked, agent_id) == "parked"
 
 

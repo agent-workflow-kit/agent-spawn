@@ -23,9 +23,10 @@ from tests.launch_support import Env, script_hung_exec
 from tests.procguard import ProcTracker
 
 ERROR = "agent-spawn/cli/error.json"
-#: The hooks a flow records. ``pre-teardown`` is left out: teardown refuses to run it until #32.
+#: The hooks a flow records.
 HOOKS = (
     "pre-launch",
+    "pre-teardown",
     "post-launch",
     "post-state-change",
     "post-escalate",
@@ -247,7 +248,9 @@ class Flow:
         fired = {p["hook"] for p in payloads}
         missing = set(expect_hooks) - fired
         assert not missing, f"hooks that never fired: {sorted(missing)} (fired: {sorted(fired)})"
-        event_ids = [p["event_id"] for p in payloads if p["hook"] != "pre-launch"]
+        event_ids = [
+            p["event_id"] for p in payloads if p["hook"] not in ("pre-launch", "pre-teardown")
+        ]
         assert len(event_ids) == len(set(event_ids)), "an event was delivered twice"
         log, audit = self.log(), self.audit()
         assert len(log) >= expect_log, f"expected {expect_log} log records, found {len(log)}"

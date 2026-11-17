@@ -537,3 +537,27 @@ def test_failed_launch_delivers_its_park_events(env: Env, fakebin: Fakebin, tmp_
     payload = json.loads(sink.read_text())
     schema_registry.validate(payload, "agent-spawn/hooks/post-park.json")
     assert payload["reason"] == "launch_failed" and payload["outcome"] is None
+
+
+def test_the_launch_handler_refuses_a_non_human_override_before_any_state_change(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from agent_spawn import launch
+    from agent_spawn.output import CliError
+
+    inv = SimpleNamespace(
+        args=SimpleNamespace(override_escalation=True, mode="headless"),
+        actor="auto:bot",
+        warnings=[],
+        decision_ids=[],
+        state_dir=str(tmp_path / "state"),
+        config=None,
+        result_file=None,
+    )
+    run = launch.Launch(inv, launch.SignalState())
+    with pytest.raises(CliError) as excinfo:
+        run.usage_checks()
+    assert excinfo.value.exit_code == 2
+    assert not (tmp_path / "state").exists()

@@ -16,7 +16,7 @@ import pytest
 from agent_spawn import procs
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
-from tests.flow_support import HOOKS, LIVE_LAUNCH_PHASE, Flow, schema
+from tests.flow_support import LIVE_LAUNCH_PHASE, Flow, schema
 from tests.launch_support import script_hung_exec
 from tests.procguard import ProcTracker
 
@@ -365,24 +365,19 @@ def test_stop_is_the_remedy_for_an_ephemeral_agent_left_tearing_down(
     flow.validate_everything(expect_hooks=["post-teardown"], expect_audit=1)
 
 
-def test_ephemeral_agent_with_a_pre_teardown_hook_parks_done_with_teardown_refused(
+def test_ephemeral_agent_runs_its_pre_teardown_hook_before_the_teardown(
     fakebin: Fakebin, isolation_env: Isolation, tmp_path: Path
 ) -> None:
-    flow = Flow(fakebin, isolation_env, tmp_path, hooks=(*HOOKS, "pre-teardown"))
+    flow = Flow(fakebin, isolation_env, tmp_path)
     started = flow.cli(schema("launch"), *EPHEMERAL, "--wait")
     assert started.code == 0, (started.stdout, started.stderr)
     agent_id = started.body["agent"]["agent_id"]
-    assert started.body["agent"]["status"] == "parked"
-    assert started.body["agent"]["park_reason"] == "done"
     assert flow.settled(agent_id)
-    (park,) = flow.hooks_named("post-park", agent_id)
-    assert park["reason"] == "done" and park["teardown_refused"] is True
-    assert flow.hooks_named("post-teardown", agent_id) == []
-    # resume works again: a refused teardown changed nothing
-    resumed = flow.cli(schema("resume"), "resume", agent_id, "--wait", "--json")
-    assert resumed.code == 0 and flow.agent(agent_id)["run"] == 2
-    assert flow.settled(agent_id)
-    flow.validate_everything(expect_hooks=["post-park"])
+    assert flow.agent(agent_id)["status"] == "torn_down"
+    (pre,) = flow.hooks_named("pre-teardown", agent_id)
+    assert pre["override_escalation"] is False and pre["actor"] == "auto:agent-spawn"
+    assert len(flow.hooks_named("post-teardown", agent_id)) == 1
+    flow.validate_everything(expect_hooks=["pre-teardown", "post-teardown"])
 
 
 def test_job_launch_wait_canceled_after_the_run_started_parks_killed(

@@ -331,10 +331,12 @@ class Resume(Launch):
             return
         if self.fork:
             # Only a window's `termctl open` takes it for a fork; never claude-session.
-            if self.windowed:
-                self.term_override = True
-            else:
-                self.warnings.append("--override-escalation has no effect on a headless fork")
+            if not self.windowed:
+                raise CliError.usage(
+                    "--override-escalation has no target: a fork passes it only to its "
+                    "`termctl open` (window placement)"
+                )
+            self.term_override = True
             return
         by = row.get("escalated_by")
         last = row.get("last_outcome")
