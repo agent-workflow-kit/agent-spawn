@@ -23,6 +23,8 @@ from tests.launch_support import Env, agent_spawn_path
 GOLDEN = Path(__file__).parent / "golden"
 FOREIGN_TOP = "# my jobs\nMAILTO=me@example.invalid\n0 3 * * * /usr/bin/backup --all\n"
 FOREIGN_BOTTOM = "\n@reboot /bin/true\n# last line\n"
+JOB = "*/5 * * * * PATH='/usr/bin' '/usr/bin/agent-spawn' reconcile --quiet"
+CHANGED = "FAKE_CRONTAB_APPEND_ON_SECOND_LIST"
 
 
 @pytest.fixture
@@ -79,7 +81,7 @@ def test_install_into_no_crontab_writes_exactly_the_block(env: Env, fakebin: Fak
     assert body["action"] == "installed" and body["interval_minutes"] == 10
     assert body["dry_run"] is False and body["env_file"] is None
     assert table(fakebin) == body["block"] + "\n"
-    assert fakebin.argvs("crontab") == [["-l"], ["-"]]
+    assert fakebin.argvs("crontab") == [["-l"], ["-l"], ["-"]]
     lines = body["block"].split("\n")
     assert lines[0] == "# agent-spawn managed" and lines[2] == "# agent-spawn managed end"
     job = lines[1]
@@ -94,7 +96,11 @@ def test_install_into_no_crontab_writes_exactly_the_block(env: Env, fakebin: Fak
 def test_golden_install_and_uninstall_bodies(env: Env, fakebin: Fakebin) -> None:
     _, installed = run_json(env, "install", "--interval", "5")
     _, removed = run_json(env, "uninstall")
-    for name, body in (("cron_install", installed), ("cron_uninstall", removed)):
+    for name, body, schema in (
+        ("cron_install", installed, "cron-install"),
+        ("cron_uninstall", removed, "cron-uninstall"),
+    ):
+        schema_registry.validate(body, f"agent-spawn/cli/{schema}.json")
         golden = json.loads((GOLDEN / f"{name}.json").read_text())
         assert normalized(env, body) == golden
 
@@ -412,12 +418,7 @@ def test_no_crontab_command_is_exit_12(env: Env, tmp_path: Path) -> None:
 def test_an_unterminated_block_is_refused_and_nothing_is_written(
     env: Env, fakebin: Fakebin
 ) -> None:
-    broken = (
-        FOREIGN_TOP
-        + cron.BEGIN
-        + "\n*/5 * * * * agent-spawn reconcile --quiet\n"
-        + "0 1 * * * /x\n"
-    )
+    broken = FOREIGN_TOP + cron.BEGIN + f"\n{JOB}\n" + "0 1 * * * /x\n"
     put(fakebin, broken)
     for command in ("install", "uninstall"):
         done = env.run("--json", "cron", command)
@@ -430,7 +431,7 @@ def test_an_unterminated_block_is_refused_and_nothing_is_written(
 def test_a_foreign_line_inside_the_block_is_refused_not_swallowed(
     env: Env, fakebin: Fakebin
 ) -> None:
-    broken = f"{cron.BEGIN}\n*/5 * * * * agent-spawn reconcile --quiet\n0 1 * * * /x\n{cron.END}\n"
+    broken = f"{cron.BEGIN}\n{JOB}\n0 1 * * * /x\n{cron.END}\n"
     put(fakebin, broken)
     for command in ("install", "uninstall"):
         done = env.run("--json", "cron", command)
@@ -439,18 +440,269 @@ def test_a_foreign_line_inside_the_block_is_refused_not_swallowed(
     assert table(fakebin) == broken
 
 
-def test_a_stray_end_marker_alone_is_a_foreign_comment(env: Env, fakebin: Fakebin) -> None:
-    put(fakebin, cron.END + "\n")
-    _, body = run_json(env, "install")
-    assert body["action"] == "installed"
-    assert (table(fakebin) or "").startswith(cron.END + "\n" + cron.BEGIN)
+@pytest.mark.parametrize(
+    "foreign",
+    [
+        "0 4 * * * /opt/backup --reconcile-db",
+        "0 * * * * rm -rf ~ # reconcile",
+        "30 2 * * * /x/reconcile-backups",
+        f"{JOB} ; rm -rf ~",
+        f"{JOB} # reconcile",
+    ],
+)
+def test_a_foreign_job_mentioning_reconcile_is_refused_and_nothing_is_written(
+    env: Env, fakebin: Fakebin, foreign: str
+) -> None:
+    broken = f"{FOREIGN_TOP}{cron.BEGIN}\n{foreign}\n{cron.END}\n"
+    put(fakebin, broken)
+    for command in ("install", "uninstall"):
+        done = env.run("--json", "cron", command)
+        assert done.returncode == 12, done.stdout
+        assert "line 5" in json.loads(done.stdout)["error"]["message"]
+    assert table(fakebin) == broken
+    assert writes(fakebin) == []
+
+
+def test_every_shape_of_the_real_block_is_accepted_again(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    envfile = tmp_path / "it's 100%.env"
+    envfile.write_text("A=1\n")
+    envfile.chmod(0o600)
+    config = tmp_path / "my config.yaml"
+    config.write_text("{}\n")
+    for flags in ([], ["--env-file", str(envfile)]):
+        for config_args in ([], ["--config", str(config)]):
+            done = env.run("--json", *config_args, "cron", "install", *flags)
+            assert done.returncode == 0, done.stderr
+            job = json.loads(done.stdout)["block"].split("\n")[1]
+            assert cron.is_job(job), job
+            again = env.run("--json", *config_args, "cron", "install", *flags)
+            assert json.loads(again.stdout)["action"] == "unchanged"
+    assert env.run("--json", "cron", "uninstall").returncode == 0
+    assert table(fakebin) is None
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        f"{cron.END}\n",
+        f"{cron.BEGIN}\n{cron.END}\n{cron.END}\n",
+        f"{cron.END}\n{cron.BEGIN}\n",
+        f"{cron.END}\n{cron.BEGIN}\n{cron.END}\n",
+        f"{cron.BEGIN}\n{cron.BEGIN}\n{cron.END}\n",
+        f"{cron.BEGIN}\n{JOB}\n{cron.BEGIN}\n{cron.END}\n{cron.END}\n",
+    ],
+)
+def test_a_stray_repeated_or_reversed_marker_is_refused_and_nothing_is_written(
+    env: Env, fakebin: Fakebin, broken: str
+) -> None:
+    put(fakebin, FOREIGN_TOP + broken)
+    for command in ("install", "uninstall"):
+        done = env.run("--json", "cron", command)
+        assert done.returncode == 12, done.stdout
+    assert table(fakebin) == FOREIGN_TOP + broken
+    assert writes(fakebin) == []
+
+
+def test_trailing_blanks_on_the_marker_lines_are_tolerated(env: Env, fakebin: Fakebin) -> None:
+    put(fakebin, f"{cron.BEGIN} \t\r\n{JOB}\n{cron.END}\r\n{FOREIGN_BOTTOM}")
+    _, body = run_json(env, "uninstall")
+    assert body["action"] == "removed" and table(fakebin) == FOREIGN_BOTTOM
+
+
+def test_non_utf8_foreign_bytes_round_trip(env: Env, fakebin: Fakebin) -> None:
+    raw = b"# caf\xe9 \xff\xfe\n0 1 * * * echo \x80\n"
+    (fakebin.root / "invocations.jsonl.crontab").write_bytes(raw)
+    run_json(env, "install")
+    run_json(env, "uninstall")
+    assert (fakebin.root / "invocations.jsonl.crontab").read_bytes() == raw
+
+
+# --- the table changing under us -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("command", ["install", "uninstall"])
+def test_a_table_changed_between_read_and_write_is_not_overwritten(
+    env: Env, fakebin: Fakebin, command: str
+) -> None:
+    run_json(env, "install")
+    put(fakebin, FOREIGN_TOP + (table(fakebin) or ""))
+    (fakebin.root / "invocations.jsonl.crontab.lists").unlink(missing_ok=True)
+    before = table(fakebin)
+    args = ["install", "--interval", "3"] if command == "install" else ["uninstall"]
+    done = env.run("--json", "cron", *args, extra_env={CHANGED: "0 9 * * * /new/job"})
+    assert done.returncode == 12, done.stdout
+    assert "changed while it was being updated" in json.loads(done.stdout)["error"]["message"]
+    assert table(fakebin) == (before or "") + "0 9 * * * /new/job\n"
+    assert writes(fakebin) == [["-"]]  # only the setup install wrote
+
+
+def test_a_table_created_between_read_and_write_is_not_overwritten_by_the_remove_path(
+    env: Env, fakebin: Fakebin
+) -> None:
+    run_json(env, "install")  # the block is the only content: uninstall would use `crontab -r`
+    (fakebin.root / "invocations.jsonl.crontab.lists").unlink(missing_ok=True)
+    done = env.run("--json", "cron", "uninstall", extra_env={CHANGED: "0 9 * * * /new/job"})
+    assert done.returncode == 12
+    assert ["-r"] not in fakebin.argvs("crontab")
+    assert "/new/job" in (table(fakebin) or "")
+
+
+def test_an_unchanged_table_is_written_without_a_false_failure(env: Env, fakebin: Fakebin) -> None:
+    assert env.run("--json", "cron", "install").returncode == 0
+    assert fakebin.argvs("crontab") == [["-l"], ["-l"], ["-"]]
+
+
+def test_dry_run_reads_once_and_cannot_see_a_change(env: Env, fakebin: Fakebin) -> None:
+    done = env.run("--json", "cron", "install", "--dry-run", extra_env={CHANGED: "x"})
+    assert done.returncode == 0 and fakebin.argvs("crontab") == [["-l"]]
+
+
+@pytest.mark.parametrize("command", ["install", "uninstall"])
+def test_a_failing_read_in_dry_run_is_exit_12_and_prints_no_table(
+    env: Env, fakebin: Fakebin, command: str
+) -> None:
+    fakebin.script("crontab", "list", exit=1, stderr="crontab: permission denied\n")
+    done = env.run("--json", "cron", command, "--dry-run")
+    assert done.returncode == 12
+    body = json.loads(done.stdout)
+    assert "block" not in body and body["error"]["code"] == "failed"
+    assert fakebin.argvs("crontab") == [["-l"]]
+
+
+def test_a_failing_remove_in_uninstall_is_exit_12_and_leaves_the_table(
+    env: Env, fakebin: Fakebin
+) -> None:
+    run_json(env, "install")
+    before = table(fakebin)
+    fakebin.script("crontab", "remove", exit=1, stderr="crontab: cannot remove\n")
+    done = env.run("--json", "cron", "uninstall")
+    assert done.returncode == 12
+    message = json.loads(done.stdout)["error"]["message"]
+    assert "cannot remove" in message and "may not have been changed" in message
+    assert table(fakebin) == before
+
+
+def test_a_failing_write_in_uninstall_is_exit_12_and_leaves_the_table(
+    env: Env, fakebin: Fakebin
+) -> None:
+    run_json(env, "install")
+    put(fakebin, FOREIGN_TOP + (table(fakebin) or ""))
+    before = table(fakebin)
+    fakebin.script("crontab", "install", exit=1, stderr="crontab: no space left\n")
+    done = env.run("--json", "cron", "uninstall")
+    assert done.returncode == 12 and table(fakebin) == before
+
+
+# --- the crontab calls, as the gateway sees them ----------------------------------------------
+
+
+class _Calls:
+    """A gateway standing in for crontab: the table is a string; every call is recorded."""
+
+    def __init__(self, platform: str = "linux", table: str = "") -> None:
+        from tests.fake_gateway import FakeGateway
+
+        self.table = table
+        self.fake = FakeGateway(platform_name=platform)
+        self.fake.run_results["crontab"] = self.answer
+
+    def answer(self, argv: Any) -> subprocess.CompletedProcess[str]:
+        if list(argv) == ["crontab", "-l"]:
+            return subprocess.CompletedProcess(argv, 0, self.table, "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+@pytest.fixture
+def calls() -> Any:
+    from agent_spawn import gateway
+
+    holder = _Calls()
+    previous = gateway.set_gateway(holder.fake)  # type: ignore[arg-type]
+    try:
+        yield holder
+    finally:
+        gateway.set_gateway(previous)
+
+
+def test_lc_all_and_the_timeout_go_to_every_crontab_call(calls: _Calls) -> None:
+    text = cron.read_table()
+    cron.write_table(["0 1 * * * /x"], text)
+    cron.write_table([], text)
+    assert calls.fake.run_calls == [
+        ["crontab", "-l"],
+        ["crontab", "-l"],
+        ["crontab", "-"],
+        ["crontab", "-l"],
+        ["crontab", "-r"],
+    ]
+    assert all(e is not None and e["LC_ALL"] == "C" for e in calls.fake.run_envs)
+    assert calls.fake.run_timeouts == [cron.CRONTAB_TIMEOUT] * 5
+
+
+def test_homebrew_is_appended_to_path_on_darwin_only() -> None:
+    from agent_spawn import gateway
+
+    for platform, expected in (("darwin", True), ("linux", False)):
+        previous = gateway.set_gateway(_Calls(platform).fake)  # type: ignore[arg-type]
+        try:
+            assert (
+                cron.MACOS_PATH in cron._search_path("/opt/x/agent-spawn").split(":")
+            ) is expected
+        finally:
+            gateway.set_gateway(previous)
+
+
+def test_a_colon_in_a_path_directory_is_refused() -> None:
+    with pytest.raises(CliError, match="':'"):
+        cron._search_path("/opt/a:b/agent-spawn")
+
+
+def test_xdg_variables_relative_are_dropped_absolute_are_carried(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    relative = env.run(
+        "--json",
+        "cron",
+        "install",
+        extra_env={"XDG_STATE_HOME": "rel/s", "XDG_CONFIG_HOME": "rel/c"},
+    )
+    job = json.loads(relative.stdout)["block"].split("\n")[1]
+    assert "XDG_STATE_HOME" not in job and "XDG_CONFIG_HOME" not in job
+    absolute = env.run(
+        "--json",
+        "cron",
+        "install",
+        extra_env={"XDG_STATE_HOME": str(tmp_path / "s"), "XDG_CONFIG_HOME": str(tmp_path / "c")},
+    )
+    job = json.loads(absolute.stdout)["block"].split("\n")[1]
+    assert f"XDG_STATE_HOME='{tmp_path / 's'}' XDG_CONFIG_HOME='{tmp_path / 'c'}' PATH=" in job
+
+
+def test_a_backslash_before_a_percent_is_refused(
+    env: Env, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    config = tmp_path / "a\\%b.yaml"
+    config.write_text("{}\n")
+    envfile = tmp_path / "c\\%d.env"
+    envfile.write_text("A=1\n")
+    envfile.chmod(0o600)
+    for args in (
+        ["--config", str(config), "cron", "install"],
+        ["cron", "install", "--env-file", str(envfile)],
+    ):
+        done = env.run("--json", *args)
+        assert done.returncode == 12, done.stdout
+        assert "backslash" in json.loads(done.stdout)["error"]["message"]
+    assert fakebin.argvs("crontab") == []
 
 
 # --- the pure parts ----------------------------------------------------------------------------
 
 
 def test_installed_and_uninstalled_on_plain_lines() -> None:
-    block = [cron.BEGIN, "*/10 * * * * x reconcile --quiet", cron.END]
+    block = [cron.BEGIN, JOB, cron.END]
     action, out = cron.installed(["a", "b"], block)
     assert (action, out) == ("installed", ["a", "b", *block])
     assert cron.uninstalled(out) == (["a", "b"], block)

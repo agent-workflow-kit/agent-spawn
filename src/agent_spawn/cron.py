@@ -8,7 +8,9 @@ The user's crontab is shared with every other tool, so the rules here are strict
   byte for byte where it was;
 * a read that fails (anything but exit 1 with ``no crontab for <user>``, which is an empty table)
   aborts before anything is written;
-* a table with an unterminated or hand-edited block is refused rather than guessed at;
+* a table with an unterminated, nested, stray-marker or hand-edited block is refused rather than
+  guessed at (only a line shaped exactly like the job written here may sit in the block);
+* the table is read again just before the write and nothing is written if it changed;
 * values that go into the cron line (paths, the env file) are checked (absolute, no control
   characters, no ``:`` in a ``PATH`` entry), quoted for ``sh`` and have ``%`` escaped (cron turns
   an unescaped ``%`` into a newline); the env file is only named, never read;
@@ -18,6 +20,7 @@ The user's crontab is shared with every other tool, so the rules here are strict
 from __future__ import annotations
 
 import os
+import re
 import stat
 import subprocess
 from dataclasses import dataclass
@@ -52,6 +55,9 @@ def _check_text(value: str, what: str) -> None:
 
 def _absolute(value: str, what: str) -> str:
     _check_text(value, what)
+    if "\\%" in value:
+        # cron's handling of a backslash before an escaped % is unverified, so it is refused
+        raise _failed(f"{what} contains a backslash before '%': {safe_text(value)!r}")
     if not os.path.isabs(value):
         raise _failed(f"{what} is not an absolute path: {safe_text(value)!r}")
     return value
@@ -128,7 +134,9 @@ def build_block(inv: Invocation, interval: int, env_file: str | None) -> list[st
     if env_file is not None:
         # allexport: a plain NAME=value file works like a .env file; the explicit PATH (and the
         # state variables) still come last and win.
-        command = f"set -a && . {shell_quote(env_file)} && set +a && {command}"
+        command = (
+            f"set -a && . {shell_quote(_absolute(env_file, '--env-file'))} && set +a && {command}"
+        )
     line = cron_escape(f"*/{interval} * * * * {command}")
     if len(line.encode("utf-8", "surrogateescape")) > MAX_LINE:
         raise _failed(f"the cron line would be longer than {MAX_LINE} bytes: use shorter paths")
@@ -162,31 +170,57 @@ class Span:
     stop: int
 
 
+_Q = r"'(?:[^']|'\\'')*'"  # one single-quoted shell word, as shell_quote writes it
+_JOB = re.compile(
+    r"\*/\d{1,2} \* \* \* \* "
+    rf"(?:set -a && \. {_Q} && set \+a && )?"
+    rf"(?:XDG_STATE_HOME={_Q} )?(?:XDG_CONFIG_HOME={_Q} )?PATH={_Q} "
+    rf"{_Q} (?:--config {_Q} )?reconcile --quiet"
+)
+
+
+def is_job(line: str) -> bool:
+    """Whether ``line`` has exactly the shape ``build_block`` writes for the job."""
+    return _JOB.fullmatch(line.rstrip(" \t\r")) is not None
+
+
 def find_blocks(lines: list[str]) -> list[Span]:
-    """Every managed block. An unterminated one, or one holding a line that is neither a comment
-    nor a reconcile job (a hand edit), is refused: guessing could swallow someone's job."""
+    """Every managed block, found with a strict walk: a begin marker inside a block, an end
+    marker outside one, an unterminated block, or a line in a block that is neither a comment,
+    blank nor exactly the job written here (a hand edit or a foreign job) is refused: guessing
+    could swallow someone's job."""
     spans: list[Span] = []
-    i = 0
-    while i < len(lines):
-        if _marker(lines[i]) != BEGIN:
-            i += 1
-            continue
-        stop = next((j for j in range(i + 1, len(lines)) if _marker(lines[j]) == END), None)
-        if stop is None:
-            raise _failed(
-                f"the crontab has `{BEGIN}` on line {i + 1} but no `{END}` line after it: "
-                "fix it with `crontab -e`, then run this again"
-            )
-        for j in range(i + 1, stop):
-            body = lines[j].strip()
-            if body and not body.startswith("#") and "reconcile" not in body:
+    start: int | None = None
+    for i, line in enumerate(lines):
+        marker = _marker(line)
+        if marker == BEGIN:
+            if start is not None:
                 raise _failed(
-                    f"line {j + 1} of the crontab is inside the agent-spawn block but is not "
-                    "an agent-spawn job: move it out of the block with `crontab -e`, then run "
-                    "this again"
+                    f"the crontab has `{BEGIN}` on line {i + 1} inside the block that starts on "
+                    f"line {start + 1}: fix it with `crontab -e`, then run this again"
                 )
-        spans.append(Span(i, stop + 1))
-        i = stop + 1
+            start = i
+        elif marker == END:
+            if start is None:
+                raise _failed(
+                    f"the crontab has `{END}` on line {i + 1} without a `{BEGIN}` line before "
+                    "it: fix it with `crontab -e`, then run this again"
+                )
+            for j in range(start + 1, i):
+                body = lines[j].strip()
+                if body and not body.startswith("#") and not is_job(lines[j]):
+                    raise _failed(
+                        f"line {j + 1} of the crontab is inside the agent-spawn block but is "
+                        "not an agent-spawn job: move it out of the block with `crontab -e`, "
+                        "then run this again"
+                    )
+            spans.append(Span(start, i + 1))
+            start = None
+    if start is not None:
+        raise _failed(
+            f"the crontab has `{BEGIN}` on line {start + 1} but no `{END}` line after it: "
+            "fix it with `crontab -e`, then run this again"
+        )
     return spans
 
 
@@ -249,9 +283,14 @@ def read_table() -> str:
     raise _failed(f"`crontab -l` failed ({_problem(done)}): the crontab was not changed")
 
 
-def write_table(lines: list[str]) -> None:
+def write_table(lines: list[str], read_before: str) -> None:
     """Replace the whole crontab. An empty result removes it (an empty install is refused by
-    some implementations)."""
+    some implementations). The table is read again first: if it is no longer what the caller
+    changed, nothing is written (the window left is the time between this read and the write)."""
+    if read_table() != read_before:
+        raise _failed(
+            "the crontab changed while it was being updated; nothing was written, run it again"
+        )
     if not any(line.strip() for line in lines):
         done = _run(["crontab", "-r"])
         action = "crontab -r"
@@ -259,7 +298,9 @@ def write_table(lines: list[str]) -> None:
         done = _run(["crontab", "-"], stdin=join_lines(lines))
         action = "crontab -"
     if done.returncode != 0:
-        raise _failed(f"`{action}` failed ({_problem(done)}): the crontab was not changed")
+        raise _failed(
+            f"`{action}` failed ({_problem(done)}): the crontab may not have been changed"
+        )
 
 
 # --- the commands ---------------------------------------------------------------------------
@@ -272,10 +313,10 @@ def install_command(inv: Invocation) -> Outcome:
     if env_file is not None:
         env_file = check_env_file(env_file, gateway.get_gateway().getuid())
     block = build_block(inv, interval, env_file)
-    lines = split_lines(read_table())
-    action, new_lines = installed(lines, block)
+    text = read_table()
+    action, new_lines = installed(split_lines(text), block)
     if action != "unchanged" and not dry_run:
-        write_table(new_lines)
+        write_table(new_lines, text)
     payload = {
         "action": action,
         "block": "\n".join(block),
@@ -298,10 +339,10 @@ def install_command(inv: Invocation) -> Outcome:
 
 def uninstall_command(inv: Invocation) -> Outcome:
     dry_run = bool(inv.args.dry_run)
-    lines = split_lines(read_table())
-    new_lines, removed = uninstalled(lines)
+    text = read_table()
+    new_lines, removed = uninstalled(split_lines(text))
     if removed is not None and not dry_run:
-        write_table(new_lines)
+        write_table(new_lines, text)
     payload = {
         "action": "unchanged" if removed is None else "removed",
         "block": None if removed is None else "\n".join(removed),

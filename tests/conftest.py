@@ -55,6 +55,22 @@ def no_real_crontab(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def crontab_tripwire(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``crontab`` stub first on ``PATH`` for every test, so that a call that gets past the
+    in-process guard (a child process, a test that builds its own environment from this one)
+    still cannot reach the real program. Tests that need a crontab put the fake in front."""
+    stub_dir = tmp_path_factory.mktemp("crontab-tripwire")
+    stub = stub_dir / "crontab"
+    stub.write_text(
+        "#!/bin/sh\necho 'crontab: a test reached the real crontab (tripwire stub)' >&2\nexit 70\n"
+    )
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+@pytest.fixture(autouse=True)
 def isolation_env(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[Isolation]:
