@@ -6,6 +6,7 @@ import sys
 from datetime import UTC, datetime
 from typing import NoReturn
 
+from .. import cron as cron_module
 from .. import reconcile as reconcile_module
 from .. import records
 from ..output import CliError, Outcome, PayloadKind, safe_text
@@ -18,14 +19,12 @@ def reconcile(inv: Invocation) -> Outcome:
     return reconcile_module.reconcile_command(inv)
 
 
-def cron_install(inv: Invocation) -> NoReturn:
-    # TODO(#34): cron install.
-    not_implemented("cron install", 34)
+def cron_install(inv: Invocation) -> Outcome:
+    return cron_module.install_command(inv)
 
 
-def cron_uninstall(inv: Invocation) -> NoReturn:
-    # TODO(#34): cron uninstall.
-    not_implemented("cron uninstall", 34)
+def cron_uninstall(inv: Invocation) -> Outcome:
+    return cron_module.uninstall_command(inv)
 
 
 def export(inv: Invocation) -> Outcome:

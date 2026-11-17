@@ -503,10 +503,12 @@ class Store:
         the same way at every level."""
         nested = self._depth > 0
         savepoint = f"nested_{self._depth}"
-        with _mapped():
-            self._conn.execute(f"SAVEPOINT {savepoint}" if nested else "BEGIN IMMEDIATE")
+        # Counted before BEGIN runs: a signal handler that raises right after BEGIN returns must
+        # still reach the rollback below, and `_depth` must be back to its old value afterwards.
         self._depth += 1
         try:
+            with _mapped():
+                self._conn.execute(f"SAVEPOINT {savepoint}" if nested else "BEGIN IMMEDIATE")
             yield
             with _mapped():
                 self._conn.execute(f"RELEASE {savepoint}" if nested else "COMMIT")
@@ -518,7 +520,7 @@ class Store:
                 else:
                     self._conn.execute("ROLLBACK")
             except sqlite3.Error:
-                pass  # a failed COMMIT may have rolled back already
+                pass  # a failed BEGIN/COMMIT may have rolled back (or never begun) already
             mapped = _translate(exc)
             if mapped is exc:
                 raise
@@ -1475,6 +1477,19 @@ class Store:
                 "INSERT INTO events (agent_id, event, payload, created) VALUES (?, ?, ?, ?)",
                 (agent_id, item.event, encode_value("json", dict(item.payload)), now),
             )
+
+    def all_events(self, agent_id: str) -> list[dict[str, Any]]:
+        """Every event of the agent, delivered or not, in one snapshot, oldest first."""
+        with _mapped():
+            rows = self._conn.execute(
+                "SELECT event_id, event, delivered FROM events WHERE agent_id = ? "
+                "ORDER BY event_id",
+                (agent_id,),
+            ).fetchall()
+        return [
+            {"event_id": r["event_id"], "event": r["event"], "delivered": bool(r["delivered"])}
+            for r in rows
+        ]
 
     def pending_events(self, agent_id: str, *, limit: int = 1000) -> list[dict[str, Any]]:
         """Undelivered events of the agent, oldest ``event_id`` first."""

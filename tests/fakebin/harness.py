@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-FAKES = ("claude-session", "termctl", "wtctl", "tmux")
+FAKES = ("claude-session", "termctl", "wtctl", "tmux", "crontab")
 FAKEBIN_DIR = Path(__file__).resolve().parent
 SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
 

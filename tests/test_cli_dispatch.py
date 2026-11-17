@@ -44,6 +44,8 @@ OWNERS = {
 IMPLEMENTED = {
     "attach",
     "ack",
+    "cron install",
+    "cron uninstall",
     "export",
     "label add",
     "label remove",

@@ -1861,3 +1861,49 @@ def test_lifecycle_event_after_object_carries_the_stored_updated(store: Store) -
     assert events
     for event in events:
         assert event["payload"]["agent"]["updated"] == ts(parked["updated"])
+
+
+class _InterruptAfter:
+    """A connection proxy whose ``execute`` raises KeyboardInterrupt right after the statement
+    that starts with ``prefix`` ran (what a signal handler can do between two bytecodes)."""
+
+    def __init__(self, conn: sqlite3.Connection, prefix: str) -> None:
+        self.conn = conn
+        self.prefix = prefix
+        self.fired = False
+
+    def execute(self, sql: str, *args: Any) -> sqlite3.Cursor:
+        cursor = self.conn.execute(sql, *args)
+        if not self.fired and sql.startswith(self.prefix):
+            self.fired = True
+            raise KeyboardInterrupt
+        return cursor
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.conn, name)
+
+
+def test_an_interrupt_right_after_begin_leaves_the_store_usable(store: Store) -> None:
+    real = store._conn
+    store._conn = _InterruptAfter(real, "BEGIN")  # type: ignore[assignment]
+    with pytest.raises(KeyboardInterrupt), store.transaction():
+        pass
+    assert not store.in_transaction and not real.in_transaction
+    with store.transaction():  # would fail "cannot start a transaction within a transaction"
+        new_agent(store)
+    assert store._conn.execute("SELECT count(*) FROM agents").fetchone()[0] == 1
+
+
+def test_an_interrupt_right_after_a_savepoint_leaves_the_outer_transaction_usable(
+    store: Store,
+) -> None:
+    real = store._conn
+    with store.transaction():
+        store._conn = _InterruptAfter(real, "SAVEPOINT")  # type: ignore[assignment]
+        with pytest.raises(KeyboardInterrupt), store.transaction():
+            pass
+        store._conn = real
+        assert store._depth == 1
+        new_agent(store)
+    assert store._depth == 0 and not real.in_transaction
+    assert real.execute("SELECT count(*) FROM agents").fetchone()[0] == 1
