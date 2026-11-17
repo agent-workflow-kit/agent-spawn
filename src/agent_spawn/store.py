@@ -869,6 +869,7 @@ class Store:
             if values.get("promotion_pending") is True:
                 raise ValueError("a park always sets promotion_pending to false")
             values["promotion_pending"] = False
+            values["supervisor_lost"] = False  # it clears when the run is final
         if touch and "updated" not in values:
             values["updated"] = self._now()  # a caller may pass it so its events match it
         if not values:

@@ -40,7 +40,7 @@ from . import teardown as teardown_module
 from .agent_view import outcome_object, ts
 from .chain import Final, RunCtx
 from .config import Config, load_config
-from .outcome_table import CANCEL_END_REASONS, park_row
+from .outcome_table import CANCEL_END_REASONS, LAUNCH_PHASE_OUTCOMES, park_row
 from .output import CliError, Outcome, PayloadKind, error_outcome
 from .records import RecordsError, append_log, parse_record_ts
 from .session_backend import RunOutcome, SessionBackend
@@ -64,9 +64,6 @@ FORWARDED = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 FORWARDED_INTERACTIVE = (signal.SIGTERM, signal.SIGHUP)
 #: The relay states that make a window ask for attention.
 ATTENTION_STATES = frozenset({"needs-input", "idle"})
-#: Outcomes a run can end with in its launch phase (a supervisor-initiated run that does so
-#: stops the chain early).
-LAUNCH_PHASE_OUTCOMES = frozenset({"not-started", "vetoed", "escalated"})
 
 
 class Signals:

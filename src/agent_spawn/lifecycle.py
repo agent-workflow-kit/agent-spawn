@@ -7,7 +7,7 @@ No lower tool and no hook runs while the lease is held.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from .agent_view import agent_object, lifecycle_events
@@ -15,6 +15,10 @@ from .procs import ProcessIdentity
 from .store import CasLost, Store
 
 LEASE_WAIT = 30.0  # seconds a lifecycle write waits for another live holder of the lease
+
+#: A guard is judged on the agent's fresh row under its lease: ``False`` abandons the write (the
+#: liveness check names the process and the run it judged, so a row that moved meanwhile is left).
+Guard = Callable[[dict[str, Any]], bool]
 
 
 def lease_key(agent_id: str) -> str:
@@ -61,14 +65,18 @@ def park(
     changes: Mapping[str, object] | None = None,
     outcome: Mapping[str, Any] | None = None,
     chain_failure: Mapping[str, Any] | None = None,
+    guard: Guard | None = None,
+    runs: Mapping[int, Mapping[str, object]] | None = None,
 ) -> dict[str, Any] | None:
-    """Park the agent; ``None`` when another process already did (the compare-and-set lost)."""
+    """Park the agent; ``None`` when another process already did (the compare-and-set lost) or
+    the ``guard`` refuses the fresh row. ``runs`` (run number -> fields) are written to the run
+    rows in the same transaction."""
     with store.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
         row = store.get_agent(agent_id)
         if row is None:
             return None
         wanted = (from_status,) if isinstance(from_status, str) else tuple(from_status)
-        if row["status"] not in wanted:
+        if row["status"] not in wanted or (guard is not None and not guard(row)):
             return None
         now = store.gateway.wall_time()
         all_changes: dict[str, object] = {
@@ -90,28 +98,36 @@ def park(
             chain_failure=chain_failure,
         )
         try:
-            return store.park(
-                lease,
-                agent_id,
-                park_reason=park_reason,
-                needs_attention=needs_attention,
-                escalated_by=escalated_by,
-                from_status=wanted,
-                changes={**(changes or {}), "updated": now, "pre_resume": None},
-                events=events,
-            )
+            with store.transaction():
+                for number, fields in (runs or {}).items():
+                    store.put_run(lease, agent_id, number, fields)
+                return store.park(
+                    lease,
+                    agent_id,
+                    park_reason=park_reason,
+                    needs_attention=needs_attention,
+                    escalated_by=escalated_by,
+                    from_status=wanted,
+                    changes={**(changes or {}), "updated": now, "pre_resume": None},
+                    events=events,
+                )
         except CasLost:
             return None
 
 
 def go_live(
-    store: Store, agent_id: str, *, run: int, changes: Mapping[str, object] | None = None
+    store: Store,
+    agent_id: str,
+    *,
+    run: int,
+    changes: Mapping[str, object] | None = None,
+    guard: Guard | None = None,
 ) -> dict[str, Any] | None:
     """``launching`` → ``live`` when the run is started: clears ``needs_attention``, records
     ``post-launch`` (and the status change). ``None`` when the agent is no longer launching."""
     with store.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
         row = store.get_agent(agent_id)
-        if row is None or row["status"] != "launching":
+        if row is None or row["status"] != "launching" or (guard is not None and not guard(row)):
             return None
         all_changes: dict[str, object] = {
             **(changes or {}),
@@ -273,3 +289,84 @@ def refuse_ephemeral_teardown(
             )
         except CasLost:
             return None
+
+
+def set_supervisor_lost(
+    store: Store, agent_id: str, *, guard: Guard | None = None
+) -> dict[str, Any] | None:
+    """A ``live`` agent whose supervisor is dead and whose session is still live: the flag is
+    set and ``needs_attention`` becomes ``lost`` (``post-escalate`` and ``post-state-change``),
+    once: ``None`` when the flag is set already, the agent is not ``live`` or the ``guard``
+    refuses the fresh row."""
+    with store.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
+        row = store.get_agent(agent_id)
+        if (
+            row is None
+            or row["status"] != "live"
+            or row.get("supervisor_lost")
+            or (guard is not None and not guard(row))
+        ):
+            return None
+        all_changes: dict[str, object] = {
+            "updated": store.gateway.wall_time(),
+            "supervisor_lost": True,
+            "needs_attention": "lost",
+        }
+        before = agent_object(store, row)
+        after = agent_object(store, {**row, **all_changes})
+        events = lifecycle_events(before, after, reads_third_party=reads_third_party_of(store, row))
+        try:
+            return store.compare_and_set(
+                lease, agent_id, expect_status="live", changes=all_changes, events=events
+            )
+        except CasLost:
+            return None
+
+
+def restore_pre_resume(
+    store: Store, agent_id: str, *, guard: Guard | None = None
+) -> dict[str, Any] | None:
+    """A plain resume whose launcher died before its run existed: ``launching`` → ``parked``
+    with the saved park fields, without hooks. ``None`` when the agent is not such a resume any
+    more or the ``guard`` refuses the fresh row."""
+    with store.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
+        row = store.get_agent(agent_id)
+        if (
+            row is None
+            or row["status"] != "launching"
+            or row.get("pre_resume") is None
+            or (guard is not None and not guard(row))
+        ):
+            return None
+        try:
+            return store.restore_pre_resume(lease, agent_id)
+        except CasLost:
+            return None
+
+
+def record_session(
+    store: Store,
+    agent_id: str,
+    *,
+    session: str,
+    run: int,
+    run_fields: Mapping[str, object],
+    guard: Guard | None = None,
+) -> dict[str, Any] | None:
+    """A session found by its ``agent=<id>`` label after a crash between ``start`` and its
+    recording: ``csession_id`` and the run are recorded (status unchanged). ``None`` when the
+    agent has a session already or the ``guard`` refuses the fresh row."""
+    with store.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
+        row = store.get_agent(agent_id)
+        if (
+            row is None
+            or row["status"] != "launching"
+            or row.get("csession_id") is not None
+            or (guard is not None and not guard(row))
+        ):
+            return None
+        with store.transaction():
+            store.put_run(lease, agent_id, run, run_fields)
+            return store.update_agent(
+                lease, agent_id, {"csession_id": session, "run": run}, touch=False
+            )
