@@ -35,8 +35,8 @@ def kill_exactly(identity: procs.ProcessIdentity) -> None:
 def end_run_killed(flow: Flow, agent_id: str) -> None:
     """The run ends `killed`: `status` answers that (scripted before the signal, so no read can
     see the live script after `exec` ended), then `exec` gets its SIGTERM."""
-    flow.back_to_final_status()
-    flow.fakebin.script("claude-session", "status", outcome="killed")
+    flow.fakebin.script("claude-session", "status", outcome="killed", replace=True)
+    flow.fakebin.clear_script("claude-session", "exec")
     flow.end_live_run(agent_id)
 
 
@@ -139,9 +139,9 @@ def test_a_supervisor_killed_between_runs_is_parked_without_the_automatic_resume
     agent_id = flow.live_launch(proc_tracker)
     row = flow.agent(agent_id)
     kill_exactly(row["supervisor"])
-    flow.back_to_final_status()
     # the run ended unreported while nobody supervised: no automatic report resume happens
-    flow.fakebin.script("claude-session", "status", outcome="exited-unreported")
+    flow.fakebin.script("claude-session", "status", outcome="exited-unreported", replace=True)
+    flow.fakebin.clear_script("claude-session", "exec")
     kill_exactly(row["exec_proc"])  # no outcome file: `status` is the only record of the end
     waited = flow.cli(schema("wait"), "wait", agent_id, "--json")
     assert waited.code == 14, (waited.stdout, waited.stderr)

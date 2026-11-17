@@ -285,7 +285,11 @@ class Liveness:
 
     def _logged_pending(self, ctx: _Ctx, run: int) -> bool:
         """Whether ``pending_run`` was logged for this run already (the recent log is read:
-        a pending run is checked on every poll and is logged once, not on every call)."""
+        a pending run is checked on every poll and is logged once, not on every call).
+
+        Best effort: only the last ``_LOG_TAIL`` bytes (256KB) of the log are read, so the line
+        is repeated once per 256KB of other log writes while the run stays pending, and two
+        concurrent checks may both log it. Duplicate lines are harmless."""
         path = os.path.join(self.state_dir, LOG_NAME)
         try:
             with open(path, "rb") as handle:
