@@ -124,7 +124,9 @@ def test_list_unknown_forked_from_and_bad_choices(env: Env) -> None:
 
 
 def test_list_never_calls_claude_session_or_delivers_hooks(env: Env, fakebin: Fakebin) -> None:
-    seed_agent(env, A1, status="live", csession_id=SESSION, session_state="working")
+    with Store.open(env.state_dir) as store:
+        me = store.holder_identity()  # alive: the liveness check has nothing to look up
+    seed_agent(env, A1, status="live", csession_id=SESSION, session_state="working", supervisor=me)
     body = out(env.run("list", "--json"), LIST)
     assert body["agents"][0]["session_state"] == "working"
     assert fakebin.argvs("claude-session") == []
@@ -210,7 +212,9 @@ def test_show_session_not_found_is_a_warning_and_null(env: Env, fakebin: Fakebin
     )  # fmt: skip
     body = out(env.run("show", A1, "--json"), SHOW)
     assert body["session"] is None
-    assert body["agent"]["status"] == "live"  # TODO(#31) parks it; not this issue
+    assert body["agent"]["status"] == "parked"
+    assert body["agent"]["park_reason"] == "session_missing"
+    assert body["agent"]["needs_attention"] == "session_missing"
     assert any("not found" in w for w in body["warnings"])
 
 

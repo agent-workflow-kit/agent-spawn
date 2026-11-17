@@ -388,10 +388,24 @@ def test_a_sigkilled_window_supervisor_leaves_a_live_agent_for_liveness(
     supervisor = wenv.agent(agent_id)["supervisor"]
     send_signal(supervisor, signal.SIGKILL)
     wenv.wait_for(lambda: not procs.is_alive(supervisor), "the supervisor to die")
-    # Nothing else parks the agent: it stays `live` with a dead supervisor (spike B9). Setting
-    # `supervisor_lost` is the liveness check's job.  TODO(#31): assert supervisor_lost here.
+    # Nothing else parks the agent: it stays `live` with a dead supervisor (spike B9) until the
+    # liveness check looks: the session is still live, so it is flagged, once, and not parked.
     row = wenv.agent(agent_id)
     assert row["status"] == "live" and row["park_reason"] is None
+    assert row["supervisor_lost"] is False
+    for command in ("show", "show"):  # the second look changes nothing and queues nothing more
+        shown = result_json(wenv.run(command, agent_id, "--json"))
+        assert shown["agent"]["status"] == "live"
+        assert shown["agent"]["supervisor_lost"] is True
+        assert shown["agent"]["needs_attention"] == "lost"
+        assert shown["supervisor"]["alive"] is False
+    row = wenv.agent(agent_id)
+    assert row["status"] == "live" and row["supervisor_lost"] is True
+    with wenv.store() as store:
+        escalations = [e for e in store.pending_events(agent_id) if e["event"] == "post-escalate"]
+    assert len(escalations) == 1
+    # liveness never stops the run (the remedy is `agent-spawn stop`)
+    assert [a for a in fakebin.argvs("claude-session") if a[0] == "stop"] == []
 
 
 def test_a_window_supervisor_that_fails_writes_nothing_to_its_terminal(

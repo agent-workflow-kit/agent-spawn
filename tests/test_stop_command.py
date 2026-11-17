@@ -288,10 +288,16 @@ def test_claude_sessions_refusal_passes_through_and_is_audited(env: Env, fakebin
 
 
 def test_an_unknown_session_exits_10_through_claude_session(env: Env, fakebin: Fakebin) -> None:
+    # The liveness check parks the agent `session_missing`; nothing is left to stop.
     seed(env, fakebin, csession_id="cs-zzzzzzzz")
     done = env.run("stop", AGENT, "--json")
-    assert done.returncode == 10
-    check_error(result_json(done))
+    assert done.returncode == 0, done.stderr
+    body = result_json(done)
+    check_stop(body)
+    assert body["action"] == "none" and body["already_parked"] is True
+    assert body["agent"]["park_reason"] == "session_missing"
+    assert body["agent"]["needs_attention"] == "session_missing"
+    assert stop_calls(fakebin) == []
 
 
 def test_dry_run_reports_the_action_and_changes_nothing(env: Env, fakebin: Fakebin) -> None:
@@ -342,7 +348,7 @@ def test_supervisor_lost_agent_is_stopped_and_parked_per_the_outcome_table(
     attention: str | None,
 ) -> None:
     fakebin.seed_session(SESSION, adopted=True, final=False)
-    script_live_run(fakebin, times=1)
+    script_live_run(fakebin, times=2)  # the liveness check's look, then stop's
     fakebin.script(
         "claude-session", "status", outcome=outcome, merge={"run": {"end_reason": end_reason}}
     )
@@ -662,7 +668,7 @@ def drive_act(
         assert row is not None
         plan_queue = iter(plans_to_make)
 
-        def next_plan(_row: object) -> Plan:
+        def next_plan(_row: object, checked: bool = False) -> Plan:
             made.append(1)
             if next(plan_queue) == "none":
                 return Plan("none", row)
