@@ -27,7 +27,8 @@ or escalation of ``create``, a ``creating`` record and a record in another state
 
 An interactive resume with placement ``window`` runs launch step 7 for its window
 (``Launch.place_window``): the window preflight follows the pre-start checks, the termctl
-``--override-escalation`` goes to the real ``open`` only. TODO(#30): ``--placement here``.
+``--override-escalation`` goes to the real ``open`` only. ``--placement here`` runs the
+supervisor in the resuming process (``Launch.place_here``).
 TODO(#31): the liveness check that precedes the lifecycle entry.
 """
 
@@ -314,10 +315,6 @@ class Resume(Launch):
         if self.mode == "headless":
             if a.placement is not None:
                 self.warnings.append("--placement is ignored for a headless resume")
-        elif a.placement == "here":
-            raise CliError.of(
-                "internal", "--placement here is not implemented yet (issue #30)"
-            )  # TODO(#30): --placement here.
         if self.windowed:
             self.termctl_backend()  # tool resolution: exit 12 tool_missing before any change
         self.plan_override(row)

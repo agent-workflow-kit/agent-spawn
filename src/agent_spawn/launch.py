@@ -439,10 +439,6 @@ class Launch:
         if mode == "headless":
             if args.placement is not None:
                 self.warnings.append("--placement is ignored for a headless launch")
-        elif args.placement == "here":
-            raise CliError.of(
-                "internal", "--placement here is not implemented yet (issue #30)"
-            )  # TODO(#30): --placement here.
 
     def worktree_usage(self, worktree: str) -> None:
         """Grammars and containment of the worktree flags (exit 2, nothing created)."""
@@ -483,6 +479,17 @@ class Launch:
 
     def tool_argv(self, name: str, command: Sequence[str]) -> list[str]:
         return resolve_tool(command, name)
+
+    @property
+    def here(self) -> bool:
+        """The supervisor runs in this process, in the foreground (interactive, ``--placement
+        here``)."""
+        return self.mode == "interactive" and self.args.placement == "here"
+
+    @property
+    def waits(self) -> bool:
+        """``--wait``; ``--placement here`` implies it."""
+        return bool(self.args.wait) or self.here
 
     @property
     def windowed(self) -> bool:
@@ -619,7 +626,7 @@ class Launch:
             "plugin_dirs": [os.path.abspath(p) for p in (a.plugin_dir or [])],
             "promote": a.promote,
             "ephemeral": bool(a.ephemeral),
-            "wait": bool(a.wait),
+            "wait": self.waits,
             "wait_timeout": a.wait_timeout,
         }
 
@@ -795,7 +802,7 @@ class Launch:
             "plugin_dirs": settings["plugin_dirs"],
             "promote": a.promote,
             "ephemeral": bool(a.ephemeral),
-            "wait": bool(a.wait),
+            "wait": self.waits,
             "settings": settings,
             "pass_throughs": self.pass_throughs(),
             "actor": self.inv.actor,
@@ -1541,6 +1548,8 @@ class Launch:
         assert row is not None
         if self.windowed:
             return self.place_window(result, row)
+        if self.here:
+            return self.place_here(result, row)
         supervise_dir = os.path.join(self.state_dir, "supervise")
         os.makedirs(supervise_dir, mode=0o700, exist_ok=True)
         argv = [
@@ -1575,6 +1584,63 @@ class Launch:
             raise  # placement_failed raises; unreachable
         self.log("launch", message="supervisor started", pid=identity.pid)
         return self.wait()
+
+    def place_here(self, result: StartResult, row: dict[str, Any]) -> Outcome:
+        """Launch step 7, interactive ``--placement here``: this process is the supervisor, in
+        the foreground, with the terminal as ``exec``'s stdio (implied ``--wait``).
+
+        The launcher's signal rows apply until ``exec`` is spawned (an interrupt cancels the
+        pending run and parks it: this process is then the only one that could, so exactly one
+        process parks); ``Supervisor.spawn_exec`` swaps in the supervisor's handlers when it
+        spawns ``exec``. Nothing is written to the terminal while ``exec`` owns it: the result
+        goes to the output after ``exec`` ended and to ``--result-file``."""
+        from .supervise import Signals, Supervisor  # late: supervise imports this module
+
+        assert self.store is not None and self.agent_id is not None
+        store, agent_id = self.store, self.agent_id
+        with store.lease(lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT) as lease:
+            # Recorded before `exec` can adopt the run (the supervisor is this process).
+            store.update_agent(lease, agent_id, {"supervisor": store.holder_identity()})
+        restore_quit = procs.install_signal_handlers(
+            {signal.SIGQUIT: signal.SIG_IGN}, gateway=self.gateway
+        )
+        supervisor = Supervisor(
+            self.inv,
+            Signals(interactive=True),
+            agent_id=agent_id,
+            state_dir=self.state_dir,
+            in_process=True,
+        )
+        self.log("launch", message="in-process supervisor started", pid=os.getpid())
+        try:
+            supervisor.run_in_process(store, row)
+        except StoreError:
+            if supervisor.child is not None:
+                # `exec` was started (and stopped again by the supervisor): this process was its
+                # supervisor, so only the agent record is left for the liveness check.
+                # TODO(#31): the liveness check parks a live agent whose supervisor died.
+                raise CliError(
+                    "failed",
+                    "the supervisor failed before the agent parked (see reconcile)",
+                    agent_id=agent_id,
+                ) from None
+            raise  # no `exec` yet: `store_failed` cancels the pending run and parks the agent
+        finally:
+            self.sig.raising = False  # a late signal is recorded, never raised
+            if supervisor.restore_handlers is not None:
+                supervisor.restore_handlers()
+            restore_quit()
+        self.supervised = True
+        final = store.get_agent(agent_id)
+        if final is None:
+            raise CliError("failed", "the agent record disappeared", agent_id=agent_id)
+        if final["status"] in ("launching", "live"):
+            raise CliError(
+                "failed",
+                "the supervisor ended before the agent parked (see reconcile)",
+                agent_id=agent_id,
+            )
+        return self.result(final, final=True)
 
     def window_cwd(self, row: dict[str, Any], result: StartResult) -> str | None:
         """The window's cwd (launch step 7): the run's cwd; for ``session-dir`` the realpath of
@@ -1823,7 +1889,7 @@ class Launch:
     def wait(self) -> Outcome:
         assert self.store is not None and self.agent_id is not None
         store, agent_id, args = self.store, self.agent_id, self.args
-        wait = bool(args.wait)
+        wait = self.waits
         deadline = None
         if wait and args.wait_timeout is not None:
             deadline = time.monotonic() + _seconds(args.wait_timeout)
@@ -1910,7 +1976,7 @@ class Launch:
     def forward_signal(self, received: int) -> Outcome | None:
         """Handle a flagged signal: forward SIGTERM to the supervisor and keep waiting, or (a
         waiter whose run started) stop waiting on SIGHUP and SIGINT."""
-        if received != signal.SIGTERM and self.started and self.args.wait:
+        if received != signal.SIGTERM and self.started and self.waits:
             return Outcome(EXIT_SIGINT, None, PayloadKind.NONE)
         if self.forwarder is not None:
             outcome = self.forwarder.forward(signal.SIGTERM)
