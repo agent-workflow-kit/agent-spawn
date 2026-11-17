@@ -223,9 +223,7 @@ def test_here_forwards_sigterm_and_sighup_to_exec(
     end_reason: str,
 ) -> None:
     result_file = tmp_path / "r.json"
-    run, row = _hang_and_wait(
-        env, fakebin, proc_tracker, "--result-file", str(result_file)
-    )
+    run, row = _hang_and_wait(env, fakebin, proc_tracker, "--result-file", str(result_file))
     assert row["supervisor"].pid == run.proc.pid
     run.signal(signum)
     code, terminal, _err = run.finish()
