@@ -177,10 +177,6 @@ class Resume(Launch):
                 a.cwd = os.path.realpath(a.cwd)  # launch resolves a relative --cwd the same way
         if a.prompt is not None and a.prompt_file is not None:
             raise CliError.usage("--prompt cannot be combined with --prompt-file")
-        if a.placement == "here" and not _tty_pair():
-            raise CliError.usage("--placement here needs a terminal on stdin and stdout")
-        if a.placement == "here" and a.wait_timeout is not None:
-            raise CliError.usage("--wait-timeout cannot be combined with --placement here")
         for value in a.hook or []:
             if value.partition("=")[0] == "pre-launch":
                 raise CliError.usage(
@@ -315,6 +311,11 @@ class Resume(Launch):
         if self.mode == "headless":
             if a.placement is not None:
                 self.warnings.append("--placement is ignored for a headless resume")
+        elif self.here:  # the resolved mode is interactive: the here-specific usage checks
+            if a.wait_timeout is not None:
+                raise CliError.usage("--wait-timeout cannot be combined with --placement here")
+            if not a.dry_run and not _tty_pair():
+                raise CliError.usage("--placement here needs a terminal on stdin and stdout")
         if self.windowed:
             self.termctl_backend()  # tool resolution: exit 12 tool_missing before any change
         self.plan_override(row)
@@ -831,7 +832,7 @@ class Resume(Launch):
                 "plugin_dirs": list(self.plugin_dirs),
                 "promote": a.promote if a.promote is not None else row.get("promote"),
                 "ephemeral": False,
-                "wait": bool(a.wait),
+                "wait": self.waits,
                 "wait_timeout": a.wait_timeout,
             }
         )
@@ -1735,7 +1736,7 @@ class Resume(Launch):
                 "plugin_dirs": list(self.plugin_dirs),
                 "promote": a.promote if a.promote is not None else row.get("promote"),
                 "ephemeral": False if self.fork else bool(row.get("ephemeral")),
-                "wait": bool(a.wait),
+                "wait": self.waits,
                 "wait_timeout": a.wait_timeout,
             }
         )

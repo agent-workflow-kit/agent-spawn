@@ -423,10 +423,11 @@ class Launch:
         if worktree != "none":
             self.worktree_usage(worktree)
         mode = self.mode
-        if args.placement == "here" and args.wait_timeout is not None:
-            raise CliError.usage("--wait-timeout cannot be combined with --placement here")
-        if args.placement == "here" and mode == "interactive" and not _tty_pair():
-            raise CliError.usage("--placement here needs a terminal on stdin and stdout")
+        if self.here:  # interactive only: headless ignores --placement (with a warning)
+            if args.wait_timeout is not None:
+                raise CliError.usage("--wait-timeout cannot be combined with --placement here")
+            if not args.dry_run and not _tty_pair():
+                raise CliError.usage("--placement here needs a terminal on stdin and stdout")
         if mode == "headless" and not (args.skill or args.prompt is not None or args.prompt_file):
             raise CliError.usage("a headless launch needs --skill or a prompt")
         hook_values = hooklib.parse_invocation_hooks(args.hook or [], ("pre-launch", "post-launch"))
@@ -1352,8 +1353,10 @@ class Launch:
                 )
 
     def run_placement(self) -> str | None:
-        """The run's placement: ``window`` or null (``here`` is #30)."""
-        return "window" if self.windowed else None
+        """The run's placement: ``window``, ``here`` or null (headless)."""
+        if self.windowed:
+            return "window"
+        return "here" if self.here else None
 
     def fail_start(self, error: StartError, row: dict[str, Any]) -> None:
         """Park after a failed ``start`` (launch step 6) and raise the pass-through error."""
@@ -1598,9 +1601,8 @@ class Launch:
 
         assert self.store is not None and self.agent_id is not None
         store, agent_id = self.store, self.agent_id
-        with store.lease(lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT) as lease:
-            # Recorded before `exec` can adopt the run (the supervisor is this process).
-            store.update_agent(lease, agent_id, {"supervisor": store.holder_identity()})
+        # SIGQUIT is ignored from the moment this process becomes the supervisor, before the
+        # (possibly long) wait for the lease that records it.
         restore_quit = procs.install_signal_handlers(
             {signal.SIGQUIT: signal.SIG_IGN}, gateway=self.gateway
         )
@@ -1611,10 +1613,13 @@ class Launch:
             state_dir=self.state_dir,
             in_process=True,
         )
-        self.log("launch", message="in-process supervisor started", pid=os.getpid())
         try:
+            with store.lease(lifecycle.lease_key(agent_id), wait=lifecycle.LEASE_WAIT) as lease:
+                # Recorded before `exec` can adopt the run (the supervisor is this process).
+                store.update_agent(lease, agent_id, {"supervisor": store.holder_identity()})
+            self.log("launch", message="in-process supervisor started", pid=os.getpid())
             supervisor.run_in_process(store, row)
-        except StoreError:
+        except (StoreError, CliError, OSError) as error:
             if supervisor.child is not None:
                 # `exec` was started (and stopped again by the supervisor): this process was its
                 # supervisor, so only the agent record is left for the liveness check.
@@ -1624,7 +1629,24 @@ class Launch:
                     "the supervisor failed before the agent parked (see reconcile)",
                     agent_id=agent_id,
                 ) from None
-            raise  # no `exec` yet: `store_failed` cancels the pending run and parks the agent
+            if isinstance(error, StoreError):
+                raise  # no `exec` yet: `store_failed` cancels the pending run and parks the agent
+            # No `exec` yet, and no other process can adopt the run: cancel it and park.
+            self.sig.raising = False
+            try:
+                self.cancel_pending(agent_id)
+            except (CliError, StoreError):
+                pass  # TODO(#31): the liveness check parks an agent that stayed launching.
+            if isinstance(error, CliError):
+                if error.agent_id is None:
+                    error.agent_id = agent_id
+                raise
+            raise CliError(
+                "launch_failed",
+                f"the supervisor could not be started ({type(error).__name__})",
+                agent_id=agent_id,
+                decision_ids=list(self.decision_ids),
+            ) from None
         finally:
             self.sig.raising = False  # a late signal is recorded, never raised
             if supervisor.restore_handlers is not None:

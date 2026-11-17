@@ -167,13 +167,14 @@ def test_dry_run_of_a_missing_session_exits_10_without_parking(
     assert len(env.agents()) == 1
 
 
-# --- R4: --placement here needs a terminal whatever the mode -----------------------------
+# --- R4: --placement here needs a terminal for an interactive resume -----------------------
+# (a headless resume ignores --placement with a warning: tests/test_placement_here.py)
 
 
-def test_placement_here_without_a_terminal_exits_2_for_a_headless_resume(env: Env) -> None:
+def test_placement_here_without_a_terminal_exits_2_for_an_interactive_resume(env: Env) -> None:
     agent_id = launched(env)
     before = env.agent(agent_id)
-    done = env.run("resume", agent_id, "--placement", "here", "--json")
+    done = env.run("resume", agent_id, "--mode", "interactive", "--placement", "here", "--json")
     assert done.returncode == 2, (done.stdout, done.stderr)
     assert env.agent(agent_id) == before
 
