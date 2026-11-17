@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import chain, handoff, lifecycle, procs, third_party
 from .chain import Final, RunCtx
-from .launch import resolve_stored_tool
+from .launch import resolve_stored_tool, stored_self
 from .output import CliError
 from .session_backend import SessionBackend
 from .store import StoreError
@@ -126,7 +126,7 @@ def start(sup: Supervisor, backend: SessionBackend, session: str, trigger: Final
                     labels=labels,
                     placement=row.get("term_placement"),
                     cwd=_plain_directory(trigger_row.get("cwd")),
-                    argv=[row["agent_spawn_path"], "supervise"],
+                    argv=[stored_self(row), "supervise"],
                 )
             except CliError as error:
                 raise chain.failure_of(error) from None
@@ -206,7 +206,7 @@ def _window_cwd(sup: Supervisor, backend: SessionBackend, session: str, cwd: obj
 def host_argv(sup: Supervisor, row: dict[str, Any], socket_path: str) -> list[str]:
     """The window's command: absolute paths only, no secret and no agent text."""
     return [
-        row["agent_spawn_path"],
+        stored_self(row),
         "supervise",
         sup.agent_id,
         "--host",

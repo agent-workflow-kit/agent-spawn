@@ -33,7 +33,7 @@ from collections.abc import Callable, Iterator
 from types import FrameType
 from typing import Any
 
-from . import chain, handoff, lifecycle, procs, promotion
+from . import chain, handoff, launch, lifecycle, procs, promotion
 from . import gateway as gw
 from . import hooks as hooklib
 from . import teardown as teardown_module
@@ -266,7 +266,7 @@ class Supervisor:
         if self.collect_signals():
             return  # told to stop before exec ran: the supervisor cancels the pending run
         argv = [
-            *shlex.split(row["claude_session_path"]),
+            *self.stored_cs(row),
             "exec",
             "--session-id",
             row["csession_id"],
@@ -326,10 +326,20 @@ class Supervisor:
         self.config = loaded.config
         return None
 
+    def stored_cs(self, row: dict[str, Any]) -> list[str]:
+        """claude-session as stored with the agent; the configured command when the stored one
+        no longer runs (an upgrade removed it)."""
+        stored = row.get("claude_session_path")
+        return launch.stored_tool(
+            stored if isinstance(stored, str) else None,
+            self.config.claude_session_cmd,
+            "claude-session",
+        )
+
     def backend(self, row: dict[str, Any], *, timeout: float | None = None) -> SessionBackend:
         extra: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
         return SessionBackend(
-            shlex.split(row["claude_session_path"]),
+            self.stored_cs(row),
             actor=SUPERVISOR_ACTOR,
             decision_ids=row.get("decision_ids") or [],
             gateway=self.gateway,
@@ -461,7 +471,7 @@ class Supervisor:
 
     def spawn_exec(self, row: dict[str, Any], session: str) -> subprocess.Popen[bytes]:
         assert self.store is not None
-        argv = [*shlex.split(row["claude_session_path"]), "exec", "--session-id", session]
+        argv = [*self.stored_cs(row), "exec", "--session-id", session]
         # A window: `exec` is in the pane's foreground process group with the terminal as its
         # stdin, stdout and stderr (a closed window hangs up only this process). `--placement
         # here` is the same with the launcher's terminal.
@@ -865,10 +875,26 @@ class Supervisor:
                 ).timestamp()
             except ValueError:
                 pass
+        final_state = outcome.get("state")
         with self.store.lease(lifecycle.lease_key(self.agent_id), wait=30.0) as lease:
             with self.store.transaction():
                 # The run is over: the agent row never names a dead `exec` between runs.
-                self.store.update_agent(lease, self.agent_id, {"exec_proc": None})
+                changes: dict[str, object] = {"exec_proc": None}
+                run_row = self.store.get_run(self.agent_id, ctx.run) or {}
+                if isinstance(final_state, str) and run_row.get("session_state") != final_state:
+                    # Relay events were lost (an older schema, a failed hook): the final state
+                    # comes from the outcome. The relay's own record of it is never rewritten.
+                    fields.update(
+                        {"session_state": final_state, "activity": None, "needs_input_reason": None}
+                    )
+                    changes.update(
+                        {
+                            "session_state": final_state,
+                            "activity": None,
+                            "needs_input_reason": None,
+                        }
+                    )
+                self.store.update_agent(lease, self.agent_id, changes)
                 self.store.put_run(lease, self.agent_id, ctx.run, fields)
 
     # -- the end of the chain ------------------------------------------------------------------

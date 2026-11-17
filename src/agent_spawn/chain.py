@@ -566,7 +566,9 @@ def _start(
         raise ChainCanceled  # no run exists yet (a hold taken stays: teardown releases it)
     outcome_file = new_outcome_file(sup.state_dir, agent_id)
     token = os.path.basename(outcome_file).removesuffix(".json")
-    relay = relay_hook(row["agent_spawn_path"], sup.state_dir, row["config_path"])
+    from .launch import stored_self  # late: launch is a big module, this is all we need
+
+    relay = relay_hook(stored_self(row), sup.state_dir, row["config_path"])
     try:
         started = backend.start(spec, outcome_file=outcome_file, hook=relay)
     except StartError as error:
