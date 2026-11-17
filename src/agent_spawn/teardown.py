@@ -5,8 +5,8 @@ entry), 4 (worktrees), 5 (windows), 6 (forget the session) and 7 (the tombstone)
 (``teardown_step``) make a retry continue where a dead teardown process stopped. The supervisor of
 an ephemeral agent runs the same steps from step 3 (``ephemeral``).
 
-TODO(#32): the ``pre-teardown`` hooks (step 3); until then an agent that has any configured or
-given ``pre-teardown`` hook is refused before anything changes (a veto must never be skipped).
+Step 3 runs the ``pre-teardown`` hooks (veto 11, escalation 13, ``--override-escalation``);
+both return the agent to ``parked`` unchanged.
 Step 5 closes the dead panes labeled ``agent=<agent_id>`` of every server the agent's runs used;
 a failure there is a warning, never a refusal.
 
@@ -56,8 +56,6 @@ POST_TEARDOWN = "post-teardown"
 TEARDOWN_HOOKS = (PRE_TEARDOWN, POST_TEARDOWN)
 SUPERVISOR_ACTOR = "auto:agent-spawn"
 MAX_TREE_DEPTH = 32
-# Stable refusal reasons the supervisor records in its log when an ephemeral teardown is refused.
-UNSUPPORTED = "teardown_unsupported"
 
 
 class GuardSkip(Exception):
@@ -371,24 +369,12 @@ class Teardown:
             self.deliver(agent_id)
         return checked.row
 
-    def unsupported(self, row: Mapping[str, Any]) -> CliError | None:
-        """The pieces of teardown not implemented yet, refused before any change."""
-        agent_id = row["agent_id"]
-        what: str | None = None
-        if not reached(row, "hooks_done") and self.pre_hook_entries():
-            what = "pre-teardown hooks"  # TODO(#32)
-        if what is None:
-            return None
-        return CliError(
-            "internal",
-            f"teardown with {what} is not implemented yet (tracked in issue #32)",
-            agent_id=agent_id,
-        )
-
-    def pre_hook_entries(self) -> list[hooklib.HookEntry]:
+    def pre_hook_entries(self, row: Mapping[str, Any]) -> list[hooklib.HookEntry]:
+        """Config entries, then the ``--hook`` entries stored on the agent (the entry wrote this
+        call's, which replace an earlier invocation's; without any the first invocation's stay)."""
         return [
             *hooklib.config_entries(self.config.hooks, PRE_TEARDOWN),
-            *hooklib.invocation_entries(self.hooks, PRE_TEARDOWN),
+            *hooklib.invocation_entries(row.get("hooks"), PRE_TEARDOWN),
         ]
 
     # -- the lifecycle ----------------------------------------------------------------------
@@ -443,9 +429,6 @@ class Teardown:
                 retry_from = self.dead_teardown_process(row)
             elif row["status"] in ("launching", "live") or row.get("promotion_pending"):
                 raise self.refuse("live", "the agent is live", agent_id, status=row["status"])
-            unsupported = self.unsupported(row)
-            if unsupported is not None:
-                raise unsupported
             if self.live_reason(row) is not None:
                 raise self.refuse("live", "the agent's session has a pending or live run", agent_id)
             try:
@@ -610,17 +593,71 @@ class Teardown:
         return self.step_tombstone(agent_id)
 
     def step_hooks(self, row: Mapping[str, Any], *, abort_on_refusal: bool) -> None:
-        """Step 3. TODO(#32): run the ``pre-teardown`` hooks (veto 11, escalation 13) here;
-        ``unsupported`` refuses any agent that has one until then. The live checks run again."""
+        """Step 3: the ``pre-teardown`` hooks, then the live checks again (a slow hook may have
+        let a run start). A veto (11), an escalation (13) or a live refusal returns the agent to
+        ``parked`` unchanged (``abort``); no lease is held while a hook runs."""
         agent_id = row["agent_id"]
         try:
-            if self.live_reason(row) is not None:
+            fresh = self.store.get_agent(agent_id)
+            if fresh is None or not self.mine(fresh):
+                raise CliError(
+                    "failed", "this teardown no longer owns the agent", agent_id=agent_id
+                )
+            entries = self.pre_hook_entries(fresh)
+            if entries:
+                self.run_pre_teardown(fresh, entries)
+            after = self.store.get_agent(agent_id)
+            if after is None or not self.mine(after):
+                raise CliError(
+                    "failed", "this teardown no longer owns the agent", agent_id=agent_id
+                )
+            if self.live_reason(after) is not None:
                 raise self.refuse("live", "the agent's session has a pending or live run", agent_id)
         except CliError:
             if abort_on_refusal:
                 self.abort(agent_id)
             raise
         self.set_step(agent_id, "hooks_done")
+
+    def run_pre_teardown(
+        self, row: Mapping[str, Any], entries: list[hooklib.HookEntry]
+    ) -> None:
+        agent_id = row["agent_id"]
+        agent = agent_object(self.store, row)
+        body = hooklib.common_fields(agent, reads_third_party_of(self.store, row))
+        body.update(
+            agent=agent,
+            merged_head=self.merged_head,
+            force=self.force,
+            actor=self.actor,
+            decision_ids=list(self.decision_ids),
+            override_escalation=self.override_escalation,
+        )
+        verdict = hooklib.run_pre_hooks(
+            PRE_TEARDOWN,
+            body,
+            entries,
+            state_dir=self.state_dir,
+            agent_id=agent_id,
+            gateway=self.gateway,
+        )
+        for decision in verdict.decision_ids:
+            if decision not in self.decision_ids and len(self.decision_ids) < 32:
+                self.decision_ids.append(decision)
+        if verdict.verdict == "ok":
+            return
+        if verdict.verdict == "escalate" and self.override_escalation:
+            self.log(
+                "escalation_overridden",
+                level="warn",
+                agent_id=agent_id,
+                message="--override-escalation overrode a pre-teardown escalation",
+            )
+            return
+        error = hooklib.verdict_error(verdict, agent_id=agent_id)
+        assert error is not None
+        error.decision_ids = list(self.decision_ids)
+        raise error
 
     # -- step 4: worktrees ------------------------------------------------------------------
 
@@ -1026,10 +1063,6 @@ def dry_run_outcome(td: Teardown, agent_id: str) -> Outcome:
             would_refuse = error.reason
     if would_refuse is None:
         would_refuse = td.live_reason(row)
-    if would_refuse is None:  # a refusal the live checks report wins over "not implemented"
-        unsupported = td.unsupported(row)
-        if unsupported is not None:
-            raise unsupported
     worktrees, predicted = _dry_run_worktrees(td, row, ask_wtctl=would_refuse is None)
     would_refuse = would_refuse or predicted
     payload: dict[str, Any] = {
@@ -1211,14 +1244,13 @@ def ephemeral(
         if not td.mine(row) or row is None:
             log("warning", level="warn", message="ephemeral teardown: the agent is not ours")
             return None
-        refusal = td.unsupported(row)
-        if refusal is not None:
-            return UNSUPPORTED
         td.run_from_step_3(row, retry=False, abort_on_refusal=False)
     except CliError as error:
         if td.step4_refused is not None:  # a worktree call refused: nothing of that record changed
             log("warning", level="warn", message=f"ephemeral teardown refused: {error.message}")
             return td.step4_refused
+        if error.code in ("vetoed", "escalated") and not td.past_refusals:
+            return error.code  # a pre-teardown veto or escalation: the supervisor parks it
         if error.code == "refused" and not td.past_refusals:
             return error.reason or error.code
         log("warning", level="warn", message=f"ephemeral teardown stopped: {error.message}")

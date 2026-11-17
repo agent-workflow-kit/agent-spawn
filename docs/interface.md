@@ -220,7 +220,7 @@ A claude-session `start` exit 13 (an escalation; agent-spawn's own pre-launch ho
 
 - `launch --override-escalation`: overrides agent-spawn's own `pre-launch` hooks (exit 13 from any of them counts as allow; a veto still vetoes). There is no agent yet, so nothing else is overridden.
 - `resume --override-escalation`, by the agent's `escalated_by`: `wtctl` → `wtctl create --override-escalation` (step 5); `termctl` → `termctl open --override-escalation`; `claude-session` → `claude-session start --resume --override-escalation`, only when the session's last run ended `escalated`. Without a target (`escalated_by` null, as after a `needs-input` park, or `claude-session` while the last run did not end `escalated`) the flag exits 2.
-- `resume --fork --override-escalation` ignores the source's `escalated_by`: the override is passed only to the fork's `termctl open` (the call that can have escalated on the human's previous attempt, which left no fork; `wtctl adopt` never escalates), never to claude-session (which refuses `--override-escalation` with `--fork`).
+- `resume --fork --override-escalation` ignores the source's `escalated_by`: the override is passed only to the fork's `termctl open` (the call that can have escalated on the human's previous attempt, which left no fork; `wtctl adopt` never escalates), never to claude-session (which refuses `--override-escalation` with `--fork`). A fork without a window (headless, or `--placement here`) has no `termctl open`, so the flag then exits 2 (no target).
 - `teardown --override-escalation`: overrides agent-spawn's `pre-teardown` hooks and is passed to `wtctl remove`.
 
 Every pre-hook payload of an overriding invocation has `override_escalation: true`, so a policy can veto it. The override is not bound to the escalation the human saw ([Residual risks](#residual-risks)).
@@ -532,13 +532,12 @@ With `--dry-run`, `torn_down` means "would be torn down"; nothing is changed and
 | `skipped` | `too_new` | `agent-spawn` | the age is not over the threshold on fresh state |
 | `skipped` | `tearing_down` | `agent-spawn` | a teardown process of the agent is alive |
 | `skipped` | `worktree_partial` | `wtctl` | the marker is set and its record is missing or not a tombstone; decided before the agent is entered, so its row is untouched |
-| `skipped` | `teardown_unsupported` | `agent-spawn` | a `pre-teardown` hook is configured or given, which teardown does not run yet (temporary, until #32) |
 | `skipped` | `gone` | `agent-spawn` | the agent disappeared or was torn down meanwhile |
 | `skipped` | `changed` | `agent-spawn` | the agent changed status between the listing and the entry |
 | `skipped` | `lease_held` | `agent-spawn` | another process holds the agent's lease; tried again next run |
 | `failed` | `internal` | `agent-spawn` | an unexpected error for this agent (`details.error` is the exception name) |
 
-Engine and wtctl refusals (`live`, `dirty`, `unpushed`, ...) are `refused` with their own reason and `tool`.
+Engine and wtctl refusals (`live`, `dirty`, `unpushed`, ...) are `refused` with their own reason and `tool`. A `pre-teardown` hook that vetoes or escalates ([Teardown order](#teardown-order) step 3) is `refused` with reason `vetoed` or `escalated`, `tool: agent-spawn`, `details: {"hook": "pre-teardown"}`; the agent is `parked` again.
 
 ### `reconcile`
 

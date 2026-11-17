@@ -26,7 +26,7 @@
               "string",
               "null"
             ],
-            "description": "Why refused, skipped or failed; null for torn_down. prune's own skip reasons: protected, needs_attention, not_parked, too_new, tearing_down, worktree_partial, teardown_unsupported (temporary), gone, changed, lease_held; failed: internal. Engine and lower-tool refusals pass their own reason through (e.g. live, dirty). See docs/interface.md, prune."
+            "description": "Why refused, skipped or failed; null for torn_down. prune's own skip reasons: protected, needs_attention, not_parked, too_new, tearing_down, worktree_partial, gone, changed, lease_held; failed: internal. Engine and lower-tool refusals pass their own reason through (e.g. live, dirty, vetoed and escalated for a pre-teardown hook). See docs/interface.md, prune."
           },
           "tool": {
             "oneOf": [
