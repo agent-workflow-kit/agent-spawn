@@ -158,6 +158,28 @@ def test_the_decision_ids_of_an_error_are_capped_at_32(env: Env, fakebin: Fakebi
     assert body["error"]["decision_ids"] == [f"c-{n}" for n in range(32)]
 
 
+def test_a_veto_record_after_several_hooks_caps_its_decision_ids_at_32(
+    fakebin: Fakebin, isolation_env: Isolation
+) -> None:
+    def hook(prefix: str, code: int) -> str:
+        payload = json.dumps({"decision_id": [f"{prefix}-{n}" for n in range(20)]})
+        loop = f"echo '{payload}'"
+        return f"    - cmd: |\n        {loop}; exit {code}\n"
+
+    cfg = "hooks:\n  pre-teardown:\n" + hook("a", 0) + hook("b", 11)
+    cfg_env = Env(fakebin, isolation_env, cfg)
+    agent_id = seed(cfg_env, fakebin)
+    done = td(cfg_env, agent_id)
+    body = result_json(done)
+    assert done.returncode == 11, (done.stdout, done.stderr)
+    assert len(body["error"]["decision_ids"]) == 32
+    logged = [
+        json.loads(line) for line in (cfg_env.state_dir / "log.jsonl").read_text().splitlines()
+    ]
+    (veto,) = [r for r in logged if r["event"] == "hook_veto"]
+    assert len(veto["decision_ids"]) == 32
+
+
 # --- the override --------------------------------------------------------------------------------
 
 

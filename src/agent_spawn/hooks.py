@@ -917,7 +917,7 @@ def run_pre_hooks(
                 agent_id=agent_id,
                 hook=hook,
                 details=details,
-                decision_ids=decided,
+                decision_ids=decided[:MAX_DECISION_IDS],
             )
             if escalated is None:
                 escalated = PreHookVerdict(
@@ -940,7 +940,7 @@ def run_pre_hooks(
             agent_id=agent_id,
             hook=hook,
             details=details,
-            decision_ids=decided,
+            decision_ids=decided[:MAX_DECISION_IDS],
         )
         stderr = result.stderr or (result.error or "").encode()
         return PreHookVerdict("veto", hook, stderr, cause, result.exit_code, decided)
