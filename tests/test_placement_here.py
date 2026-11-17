@@ -20,7 +20,13 @@ from agent_spawn import procs
 from tests import schema_registry
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
-from tests.launch_support import Env, script_done_run, script_hung_exec, script_live_run
+from tests.launch_support import (
+    Env,
+    result_json,
+    script_done_run,
+    script_hung_exec,
+    script_live_run,
+)
 from tests.procguard import ProcTracker
 
 LAUNCH = ("launch", "--mode", "interactive", "--skill", "do-it", "--placement", "here", "--json")
@@ -659,7 +665,8 @@ def test_a_store_failure_after_exec_started_reports_failed_and_stops_exec(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Mid-run ``StoreError`` (after ``exec`` was recorded): ``failed``, ``exec`` stopped by the
-    supervisor's ``watch``; the parked state is left to the liveness check (TODO(#31))."""
+    supervisor's ``watch``; the parked state is left to the liveness check, which judges it once
+    the launcher (the recorded supervisor) is gone."""
     from agent_spawn.output import CliError  # noqa: PLC0415
     from agent_spawn.store import StoreError  # noqa: PLC0415
     from agent_spawn.supervise import Supervisor  # noqa: PLC0415
@@ -676,7 +683,25 @@ def test_a_store_failure_after_exec_started_reports_failed_and_stops_exec(
         _launch_in_process()
     assert excinfo.value.code == "failed"
     assert _exec_signals(fakebin) == [int(signal.SIGTERM)]  # stopped, by the supervisor
-    assert env.agents()[0]["status"] in ("launching", "live")  # not parked: see TODO(#31)
+    row = env.agents()[0]
+    assert row["status"] in ("launching", "live")  # not parked by the failing launcher
+    # The launcher is the recorded supervisor: while it lives the check leaves the agent alone;
+    # once it is gone, the check settles the agent from the session's state.
+    shown = result_json(env.run("show", row["agent_id"], "--json"))
+    assert shown["agent"]["status"] in ("launching", "live")
+    from agent_spawn.procs import ProcessIdentity  # noqa: PLC0415
+
+    mine = row["supervisor"]
+    with env.store() as store:
+        with store.lease(f"agent:{row['agent_id']}", wait=5) as lease:
+            store.update_agent(
+                lease,
+                row["agent_id"],
+                {"supervisor": ProcessIdentity(mine.pid, mine.start_time + 1, mine.boot_id)},
+            )
+    shown = result_json(env.run("show", row["agent_id"], "--json"))
+    # the scripted `status` still reports the run live: flagged, not parked, nothing signaled
+    assert shown["agent"]["supervisor_lost"] is True
 
 
 @pytest.mark.parametrize("failure", ["cli", "os"])

@@ -261,7 +261,7 @@ LIVE_LAUNCH_PHASE = {
 }
 
 
-def test_a_dead_supervisor_of_a_launching_agent_is_parked_by_the_launcher(
+def test_a_dead_supervisor_of_a_launching_agent_is_settled_by_the_launchers_liveness_check(
     env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
 ) -> None:
     script_hung_exec(fakebin)
@@ -274,13 +274,27 @@ def test_a_dead_supervisor_of_a_launching_agent_is_parked_by_the_launcher(
     track_agent(env, proc_tracker, row["agent_id"])
     assert row["status"] == "launching"
     procs.forward_signal(row["supervisor"], signal.SIGKILL)
+    env.wait_for(lambda: not procs.is_alive(row["supervisor"]), "the supervisor to die")
+    # The run is adopted and still in its launch phase: the agent stays `launching` and the
+    # launcher keeps waiting (nothing is stopped, nothing is set).
+    assert launcher.poll() is None
+    assert env.agent(row["agent_id"])["status"] == "launching"
+    # claude-session's own expiry ends the run `never_adopted`: the launcher's next poll applies
+    # the outcome table (a launch failure), without stopping anything itself.
+    fakebin.clear_script("claude-session", "status")
+    fakebin.script(
+        "claude-session",
+        "status",
+        outcome="not-started",
+        merge={"run": {"end_reason": "never_adopted"}},
+    )
     out, _err = launcher.communicate(timeout=60)
     body = json.loads(out)
     assert launcher.returncode == 12 and body["error"]["code"] == "launch_failed"
     parked = env.agent(row["agent_id"])
     assert parked["status"] == "parked" and parked["park_reason"] == "launch_failed"
     assert parked["needs_attention"] == "launch_failed"
-    assert stops(fakebin)
+    assert stops(fakebin) == []
 
 
 # --- M9: a classification cancel that failed is reported -----------------------------------

@@ -32,6 +32,7 @@ from .config import Config
 from .hooks import agent_event
 from .ids import is_agent_id, resolve_agent_id
 from .lifecycle import LEASE_WAIT, lease_key, reads_third_party_of
+from .liveness import Liveness
 from .output import CliError, Outcome, PayloadKind
 from .records import RecordsError, append_audit, append_log
 from .session_backend import SessionBackend, SessionStatus
@@ -326,15 +327,49 @@ class Teardown:
         return CliError("refused", message, reason=reason, agent_id=agent_id, details=details)
 
     def live_reason(self, row: Mapping[str, Any]) -> str | None:
-        """``live`` when nothing may tear the agent down (the checks no flag overrides).
-
-        TODO(#31): the liveness check of step 2 (``lost``, ``session_missing``) runs here once
-        issue #31 lands; until then only the status, the promotion and the session's run count."""
+        """``live`` when nothing may tear the agent down (the checks no flag overrides): the
+        status, a pending promotion and the session's current run. The liveness check itself
+        (``lost``, ``session_missing``) ran before the lifecycle entry (``check_liveness``), so
+        an agent whose supervisor died is already parked here; a session that is missing counts
+        as having no run."""
         if row["status"] in ("launching", "live") or row.get("promotion_pending"):
             return "live"
         if self.run_is_live(self.session_status(row)):
             return "live"
         return None
+
+    def check_liveness(self, agent_id: str, *, dry_run: bool = False) -> dict[str, Any] | None:
+        """Step 2's liveness check, before the live checks and the compare-and-set: it may park
+        a ``live`` agent whose supervisor died (the events are delivered here). Returns the row
+        afterwards (the predicted one in a dry run), ``None`` when the record is gone."""
+        from .launch import resolve_tool  # the tool resolution launch uses
+
+        row = self.store.get_agent(agent_id)
+        if row is None or row["status"] not in ("launching", "live"):
+            return row
+        try:
+            fallback = resolve_tool(self.config.claude_session_cmd, TOOL)
+        except CliError:
+            fallback = None  # an agent whose row stores a path still works
+
+        def wtctl_for(stored: Mapping[str, Any]) -> WtctlBackend | None:
+            try:
+                return self.wtctl(stored)
+            except CliError:
+                return None
+
+        checked = Liveness(
+            self.store,
+            state_dir=self.state_dir,
+            fallback_command=fallback,
+            wtctl_for=wtctl_for,
+            dry_run=dry_run,
+            gateway=self.gateway,
+        ).check(agent_id)
+        self.warnings.extend(w for w in checked.warnings if w not in self.warnings)
+        if checked.changes and not dry_run:
+            self.deliver(agent_id)
+        return checked.row
 
     def unsupported(self, row: Mapping[str, Any]) -> CliError | None:
         """The pieces of teardown not implemented yet, refused before any change."""
@@ -400,7 +435,7 @@ class Teardown:
         """Step 2: the live checks, then the compare-and-set into ``tearing_down`` (or, over a
         dead teardown process, the retry). Returns the row and whether it is a retry."""
         for _ in range(3):
-            row = self.store.get_agent(agent_id)
+            row = self.check_liveness(agent_id)
             if row is None or row["status"] == "torn_down":
                 raise self.torn_down(agent_id, row is None)
             retry_from: procs.ProcessIdentity | None = None
@@ -976,10 +1011,9 @@ class Teardown:
 
 
 def dry_run_outcome(td: Teardown, agent_id: str) -> Outcome:
-    """Steps 1 and 2 without the compare-and-set; the liveness check only reports.
-
-    TODO(#31): the liveness check of step 2 is reported here once issue #31 lands."""
-    row = td.store.get_agent(agent_id)
+    """Steps 1 and 2 without the compare-and-set; the liveness check only reports (it parks
+    nothing: the row it judges is the one a real run would reach)."""
+    row = td.check_liveness(agent_id, dry_run=True)
     if row is None or row["status"] == "torn_down":
         raise td.torn_down(agent_id, row is None)
     would_refuse: str | None = None
@@ -991,7 +1025,7 @@ def dry_run_outcome(td: Teardown, agent_id: str) -> Outcome:
                 raise
             would_refuse = error.reason
     if would_refuse is None:
-        would_refuse = td.live_reason(row)  # TODO(#31): includes the liveness check
+        would_refuse = td.live_reason(row)
     if would_refuse is None:  # a refusal the live checks report wins over "not implemented"
         unsupported = td.unsupported(row)
         if unsupported is not None:

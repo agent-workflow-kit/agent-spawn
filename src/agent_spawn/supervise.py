@@ -40,7 +40,7 @@ from . import teardown as teardown_module
 from .agent_view import outcome_object, ts
 from .chain import Final, RunCtx
 from .config import Config, load_config
-from .outcome_table import CANCEL_END_REASONS, park_row
+from .outcome_table import CANCEL_END_REASONS, LAUNCH_PHASE_OUTCOMES, park_row
 from .output import CliError, Outcome, PayloadKind, error_outcome
 from .records import RecordsError, append_log, parse_record_ts
 from .session_backend import RunOutcome, SessionBackend
@@ -64,9 +64,6 @@ FORWARDED = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 FORWARDED_INTERACTIVE = (signal.SIGTERM, signal.SIGHUP)
 #: The relay states that make a window ask for attention.
 ATTENTION_STATES = frozenset({"needs-input", "idle"})
-#: Outcomes a run can end with in its launch phase (a supervisor-initiated run that does so
-#: stops the chain early).
-LAUNCH_PHASE_OUTCOMES = frozenset({"not-started", "vetoed", "escalated"})
 
 
 class Signals:
@@ -809,7 +806,8 @@ class Supervisor:
             result = self.read_outcome(backend, ctx.outcome_file, session, ctx.run)
         except CliError as error:
             self.log("warning", level="error", message=f"error: no outcome: {error.code}")
-            # TODO(#31): the liveness check parks an agent whose outcome cannot be read.
+            # The supervisor ends; the liveness check parks the agent from `status` (the run is
+            # final there even when the outcome file is not).
             raise
         run_row = self.store.get_run(self.agent_id, ctx.run) or {}
         # The relay's first `working` activity, else the run's `recent_events` (filled in by
@@ -845,7 +843,7 @@ class Supervisor:
                 return result
             failure = CliError.of("internal", "exec exited but the run is not final")
         assert failure is not None
-        # TODO(#31): the liveness check parks an agent whose run never became final.
+        # (a run that never became final leaves the agent to the liveness check)
         raise failure
 
     def record_run(self, ctx: RunCtx, result: RunOutcome, outcome: dict[str, Any]) -> None:

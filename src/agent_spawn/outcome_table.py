@@ -8,6 +8,9 @@ from dataclasses import dataclass
 DELIBERATE_END_REASONS = frozenset({"stopped", "forwarded_term", "forwarded_hup", "forwarded_int"})
 #: ``not-started`` end reasons of a deliberate cancel.
 CANCEL_END_REASONS = frozenset({"canceled", "launch_interrupted"})
+#: Outcomes a run can end with in its launch phase (a supervisor-initiated run that does so
+#: stops the chain early).
+LAUNCH_PHASE_OUTCOMES = frozenset({"not-started", "vetoed", "escalated"})
 
 
 @dataclass(frozen=True)

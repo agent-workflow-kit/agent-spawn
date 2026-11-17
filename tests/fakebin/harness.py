@@ -98,9 +98,13 @@ class Fakebin:
         argv_contains: Sequence[str] = (),
         times: int | None = None,
         until_called: str | None = None,
+        replace: bool = False,
         **respond: Any,
     ) -> None:
         """Script the next matching calls of ``tool``'s ``command``.
+
+        ``replace`` disables the rules added so far for the same ``tool``/``command`` in the same
+        script write that adds this one, so a reader never sees the gap between the two.
 
         ``until_called`` (a subcommand name) ends the rule once a call of that subcommand of
         ``tool`` is in the log, so a reply can depend on what happened rather than on a count.
@@ -127,6 +131,10 @@ class Fakebin:
             rule["times"] = times
         if until_called is not None:
             rule["until_called"] = until_called
+        if replace:
+            for old in self._rules:
+                if old["tool"] == tool and old.get("command") == command:
+                    old["tool"] = "__cleared__"
         self._rules.append(rule)
         self._write_script()
 

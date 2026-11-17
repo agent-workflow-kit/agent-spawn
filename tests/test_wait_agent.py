@@ -24,7 +24,7 @@ from tests import schema_registry
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
 from tests.fixtures import sample_outcome
-from tests.launch_support import Env, result_json
+from tests.launch_support import Env, result_json, script_live_run
 from tests.procguard import ProcTracker
 
 pytestmark = pytest.mark.skipif(
@@ -282,7 +282,7 @@ def test_an_ephemeral_agent_torn_down_after_done_exits_0(env: Env) -> None:
 def test_a_pending_promotion_with_a_dead_supervisor_is_reported_not_waited_on_forever(
     env: Env, proc_tracker: ProcTracker, status: str
 ) -> None:
-    # TODO(#31): the liveness check will settle the promotion instead.
+    # Every park clears a pending promotion, so this row is damaged: reported, not waited on.
     agent_id = seed(
         env, status=status, promotion_pending=True, supervisor=dead_identity(proc_tracker)
     )
@@ -342,14 +342,41 @@ def test_wait_returns_once_the_agent_parks_and_the_supervisor_exits(
     assert body["agent"]["status"] == "parked" and body["outcome"] == "done"
 
 
-def test_a_dead_supervisor_of_a_live_agent_is_reported_not_waited_on_forever(
+def seed_live(env: Env, proc_tracker: ProcTracker, **fields: Any) -> str:
+    """A live agent with a session and a dead supervisor."""
+    env.fakebin.seed_session("cs-abcdefgh", adopted=True, final=False)
+    return seed(
+        env,
+        status="live",
+        supervisor=dead_identity(proc_tracker),
+        csession_id="cs-abcdefgh",
+        claude_session_path=str(env.fakebin.bin_dir / "claude-session"),
+        **fields,
+    )
+
+
+def test_a_dead_supervisor_with_a_final_run_is_parked_by_wait(
     env: Env, proc_tracker: ProcTracker
 ) -> None:
-    # TODO(#31): the liveness check will park the agent instead.
-    agent_id = seed(env, status="live", supervisor=dead_identity(proc_tracker))
-    finished = env.run("wait", agent_id, "--json")
-    assert finished.returncode == 12
-    assert result_json(finished)["error"]["code"] == "failed"
+    agent_id = seed_live(env, proc_tracker)
+    finished = env.run("wait", agent_id, "--json")  # the fake's status says: done
+    assert finished.returncode == 0, (finished.stdout, finished.stderr)
+    body = result_json(finished)
+    assert body["agent"]["status"] == "parked" and body["outcome"] == "done"
+    assert env.fakebin.argvs("claude-session") != []
+    assert [a for a in env.fakebin.argvs("claude-session") if a[0] in ("stop", "start")] == []
+
+
+def test_a_dead_supervisor_with_a_live_session_is_flagged_and_waited_on(
+    env: Env, proc_tracker: ProcTracker
+) -> None:
+    script_live_run(env.fakebin)
+    agent_id = seed_live(env, proc_tracker)
+    finished = env.run("wait", agent_id, "--timeout", "2500ms", "--json")
+    assert finished.returncode == 22  # the agent stays live: `stop` is the remedy
+    row = env.agent(agent_id)
+    assert row["status"] == "live" and row["supervisor_lost"] is True
+    assert row["needs_attention"] == "lost"
 
 
 def test_a_launching_agent_without_launcher_or_supervisor_is_reported(env: Env) -> None:

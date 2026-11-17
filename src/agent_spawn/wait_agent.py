@@ -17,9 +17,11 @@ from typing import Any, cast
 
 from . import gateway as gw
 from . import launch, lifecycle, procs, third_party
+from .agent_lookup import liveness_for
 from .agent_view import agent_object, chain_first_working_at
 from .commands.base import Invocation
 from .ids import resolve_agent_id
+from .liveness import row_moved, unreadable
 from .output import (
     EXIT_SIGINT,
     EXIT_SIGTERM,
@@ -34,7 +36,8 @@ from .store import Store, StoreError, StoreMissing, default_state_dir
 from .validate import GrammarError, parse_duration
 
 POLL = launch.POLL  # seconds between looks at the record
-DEAD_SUPERVISOR_POLLS = launch.DEAD_SUPERVISOR_POLLS
+DEAD_SUPERVISOR_POLLS = 5  # looks at a damaged row (a pending promotion, no live agent)
+LIVENESS_EVERY = 1.0  # seconds between liveness checks of an agent nothing drives
 
 
 class _Signals:
@@ -174,6 +177,7 @@ class _Wait:
         resolved = resolve_agent_id(text, store)
         agent_id = resolved.agent_id
         dead_looks = 0
+        next_liveness = 0.0
         handle: procs.ProcHandle | None = None
         handle_identity: procs.ProcessIdentity | None = None
         try:
@@ -187,20 +191,35 @@ class _Wait:
                 if stopped is not None:
                     return stopped
                 holder = self.holder(row)
-                alive = holder is not None and procs.is_alive(holder, gateway=self.gateway)
+                try:
+                    alive = holder is not None and procs.is_alive(holder, gateway=self.gateway)
+                except procs.ProcessIdentityError:
+                    # unreadable is an error, never "dead" (interface.md, Liveness)
+                    raise unreadable(agent_id, "supervisor") from None
                 if lifecycle.run_settled(row, supervisor_alive=alive):
                     return self.final(store, row)
-                if not alive and (
-                    row["status"] in ("launching", "live") or row.get("promotion_pending")
-                ):
+                if not alive and row["status"] in ("launching", "live"):
+                    # Nothing drives the agent: the liveness check decides (it records its
+                    # changes, delivers no hook and never signals). Rate limited: it calls
+                    # claude-session.
+                    now = self.gateway.monotonic()
+                    if now >= next_liveness:
+                        next_liveness = now + LIVENESS_EVERY
+                        checked = liveness_for(self.inv, store).check(agent_id)
+                        self.warnings.extend(w for w in checked.warnings if w not in self.warnings)
+                        if checked.row is None:
+                            raise CliError.of("not_found", f"agent {agent_id} no longer exists")
+                        if row_moved(row, checked.row):
+                            continue  # a real transition: look at the new row once, at once
+                elif not alive and row.get("promotion_pending"):
+                    # A pending promotion on an agent that is not live cannot be (every park
+                    # clears it): a damaged row. Report it instead of waiting for ever.
                     dead_looks += 1
                     if dead_looks >= DEAD_SUPERVISOR_POLLS:
-                        # TODO(#31): the liveness check parks an agent whose supervisor died
-                        # and settles its promotion; until it exists a dead supervisor of a
-                        # running agent, or of a pending promotion, is an error.
                         raise CliError.of(
                             "failed",
-                            "the supervisor exited before the agent parked (see reconcile)",
+                            "the agent's record is inconsistent (a pending promotion without "
+                            "a live agent)",
                             agent_id=agent_id,
                         )
                 else:

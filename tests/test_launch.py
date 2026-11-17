@@ -190,6 +190,14 @@ def _agents(env: Env) -> list[dict[str, Any]]:
         return []
 
 
+def _wait_exec_hanging(env: Env, fakebin: Fakebin, agent_id: str) -> None:
+    """The supervisor recorded its `exec` and the fake `exec` reached its hang (its signal
+    handlers are installed), so a signal sent now cannot beat the chain being up: under load the
+    `live` status can come before either."""
+    env.wait_for(lambda: env.agent(agent_id).get("exec_proc") is not None, "the supervisor's exec")
+    fakebin.wait_for_hang(env.agent(agent_id)["exec_proc"].pid, timeout=60)
+
+
 # The fake `exec` has no child of its own here; the chain down to a real child of `exec` is
 # test_supervise_chain.py::test_sigterm_chain_reaches_exec_and_its_child_even_when_exec_is_stopped.
 def test_sigterm_chain_launcher_supervisor_exec(
@@ -207,8 +215,9 @@ def test_sigterm_chain_launcher_supervisor_exec(
     env.wait_for(lambda: any(a["status"] == "live" for a in _agents(env)), "a live agent")
     agent_id = env.agents()[0]["agent_id"]
     track_agent(env, proc_tracker, agent_id)
+    _wait_exec_hanging(env, fakebin, agent_id)  # its handlers are installed: the chain is up
     waiter.send_signal(signal.SIGTERM)  # the exact Popen child
-    out, _err = waiter.communicate(timeout=30)
+    out, _err = waiter.communicate(timeout=120)
     body = json.loads(out)
     assert waiter.returncode == 15  # the run's outcome code: killed
     assert body["outcome"] == "killed" and body["end_reason"] == "forwarded_term"
@@ -234,8 +243,9 @@ def test_wait_waiter_sighup_exits_130_and_leaves_agent(
     env.wait_for(lambda: any(a["status"] == "live" for a in _agents(env)), "a live agent")
     agent_id = env.agents()[0]["agent_id"]
     track_agent(env, proc_tracker, agent_id)
+    _wait_exec_hanging(env, fakebin, agent_id)
     waiter.send_signal(signal.SIGHUP)
-    out, _err = waiter.communicate(timeout=30)
+    out, _err = waiter.communicate(timeout=120)
     assert waiter.returncode == 130 and out == b""
     assert started(env, agent_id)
 

@@ -869,6 +869,7 @@ class Store:
             if values.get("promotion_pending") is True:
                 raise ValueError("a park always sets promotion_pending to false")
             values["promotion_pending"] = False
+            values["supervisor_lost"] = False  # it clears when the run is final
         if touch and "updated" not in values:
             values["updated"] = self._now()  # a caller may pass it so its events match it
         if not values:
@@ -921,7 +922,8 @@ class Store:
         events: Sequence[OutboxEvent] = (),
     ) -> dict[str, Any]:
         """Plain resume: ``parked`` → ``launching``, recording the launcher and
-        ``expect_run_after`` and saving the park fields for ``restore_pre_resume``."""
+        ``expect_run_after`` and saving the park fields for ``restore_pre_resume``. The
+        previous run's ``supervisor``, ``exec_proc`` and ``supervisor_lost`` are cleared."""
         with self.transaction():
             self._require_lease(lease, f"agent:{agent_id}")
             current = self._get_agent(agent_id)
@@ -938,6 +940,11 @@ class Store:
                     "launcher": launcher,
                     "expect_run_after": expect_run_after,
                     "pre_resume": saved,
+                    # the previous run's processes are history: a resume in flight is judged
+                    # by its launcher, never by a stale (dead) supervisor of the run before
+                    "supervisor": None,
+                    "exec_proc": None,
+                    "supervisor_lost": False,
                 },
                 events=events,
             )

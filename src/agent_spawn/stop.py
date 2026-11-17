@@ -26,15 +26,17 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import gateway as gw
+from . import hooks as hooklib
 from . import lifecycle, procs
-from .agent_view import agent_object, outcome_object
+from .agent_lookup import liveness_for
+from .agent_view import agent_object
 from .ids import resolve_agent_id
 from .launch import resolve_tool
-from .outcome_table import park_row
+from .liveness import Liveness
 from .output import CliError, Outcome, PayloadKind
 from .procs import ProcessIdentity
 from .records import RecordsError, append_audit, append_log
-from .session_backend import SessionBackend, SessionStatus
+from .session_backend import SessionBackend
 from .store import LeaseHeld, Store, StoreError, StoreMissing, default_state_dir
 
 WAIT_MARGIN = 30.0  # seconds added to the grace
@@ -72,6 +74,8 @@ class Stop:
         self.action = "none"  # the planned action, for the audit record
         self.result = "error"  # the audit result if the command ends without finish()
         self.audited = False
+        self.removed = False  # the liveness check removed an abandoned fork
+        self.fallback: list[str] | None = None
 
     # -- records ------------------------------------------------------------------------------
 
@@ -166,6 +170,7 @@ class Stop:
             if isinstance(stored, str) and stored
             else resolve_tool(self.inv.config.claude_session_cmd, "claude-session")
         )
+        self.fallback = list(argv)
         return SessionBackend(
             argv,
             actor=self.inv.actor,
@@ -177,7 +182,16 @@ class Stop:
         assert self.backend is not None and self.store is not None
         grace = self.args.grace
         budget = (self.grace_seconds(grace) if grace else DEFAULT_GRACE) + WAIT_MARGIN
-        plan = self.plan(row)
+        if row["status"] in IN_PROGRESS:
+            fresh = self.check(row)
+            if fresh is None:
+                if self.removed:  # an abandoned fork: the liveness check deleted its record
+                    return self.finish(Plan("signal_launcher", row), None, None, removed=True)
+                raise CliError.of(
+                    "failed", "the agent record disappeared", exit_code=1, agent_id=self.agent_id
+                )
+            row = fresh
+        plan = self.plan(row, checked=True)
         self.action = plan.action
         session_stop: dict[str, Any] | None = None
         settled = False
@@ -234,6 +248,35 @@ class Stop:
 
         return parse_duration(grace)
 
+    def liveness(self, *, dry_run: bool = False) -> Liveness:
+        assert self.store is not None
+        # wtctl as the fork's row (or its source) recorded it: an abandoned fork's holds
+        live = liveness_for(self.inv, self.store, dry_run=dry_run)
+        if self.fallback is not None:
+            live.fallback_command = list(self.fallback)
+        return live
+
+    def check(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        """The liveness check of the agent (parking events are delivered: ``stop`` is a
+        mutating command; a dry run only reports). The row afterwards, ``None`` when the
+        record is gone."""
+        assert self.store is not None
+        checked = self.liveness(dry_run=self.dry_run).check(row["agent_id"])
+        self.warnings.extend(w for w in checked.warnings if w not in self.warnings)
+        self.removed = self.removed or checked.removed
+        if checked.changes and not self.dry_run:
+            try:
+                hooklib.deliver_outbox(
+                    self.store,
+                    self.agent_id,
+                    self.inv.config.hooks,
+                    state_dir=self.state_dir,
+                    gateway=self.gateway,
+                )
+            except (StoreError, OSError):
+                pass  # hook failures never change the command's result
+        return checked.row
+
     # -- choosing the action ------------------------------------------------------------------
 
     def alive(self, identity: object) -> bool:
@@ -241,44 +284,45 @@ class Stop:
             identity, gateway=self.gateway
         )
 
-    def plan(self, row: dict[str, Any], depth: int = 0) -> Plan:
+    def plan(self, row: dict[str, Any], *, checked: bool = False) -> Plan:
         assert self.backend is not None and self.store is not None
+        if row["status"] in IN_PROGRESS and not checked:
+            fresh = self.check(row)
+            if fresh is None:
+                raise CliError.of(
+                    "failed", "the agent record disappeared", exit_code=1, agent_id=self.agent_id
+                )
+            row = fresh
         status = row["status"]
         if status == "torn_down":
             raise CliError.of("not_found", "agent is torn down", agent_id=self.agent_id)
         if status == "parked":
             return Plan("none", row)
         session = row.get("csession_id")
-        current: SessionStatus | None = None
         if isinstance(session, str):
-            # TODO(#31): exit 10 (the session is missing) blocks stop with not_found for an
-            # existing agent; the liveness check parks it as session_missing instead.
-            current = self.backend.status(session)
+            try:
+                current = self.backend.status(session)
+            except CliError as error:
+                if error.tool != "claude-session" or error.exit_code != 10:
+                    raise
+                # The session is missing: the liveness check parks the agent `session_missing`
+                # (a dry run only reports), and there is no run left to stop.
+                parked = self.liveness(dry_run=self.dry_run).session_missing(self.agent_id, session)
+                after = parked.row or row
+                if after["status"] in IN_PROGRESS:
+                    # Still launching or live: another process holds the agent's lease (or won
+                    # the race), so it is not parked and "nothing to stop" would be a lie.
+                    raise CliError.of(
+                        "failed",
+                        "the agent changed while it was being stopped (try again)",
+                        exit_code=12,
+                        agent_id=self.agent_id,
+                    ) from None
+                return Plan("none", after)
             if current.run.outcome is None:  # pending or live
                 return Plan("session_stop", row, session=session)
         if status == "tearing_down":
             return Plan("none", row)  # no pending or live run left to stop
-        if self.orphan_applies(row, current):
-            assert current is not None
-            if self.dry_run:
-                return Plan("none", row)  # a real run would park it
-            parked = self.park_orphan(row, current)
-            if parked is not None:
-                return Plan("none", parked)
-            # Another process changed the agent first: plan again from what is true now.
-            fresh = self.store.get_agent(self.agent_id)
-            if fresh is None:
-                raise CliError.of(
-                    "failed", "the agent record disappeared", exit_code=1, agent_id=self.agent_id
-                )
-            if depth + 1 >= ATTEMPTS:
-                raise CliError.of(
-                    "failed",
-                    "the agent changed while it was being stopped (try again)",
-                    exit_code=12,
-                    agent_id=self.agent_id,
-                )
-            return self.plan(fresh, depth + 1)
         supervisor = row.get("supervisor")
         if self.alive(supervisor):
             return Plan("signal_supervisor", row, target=supervisor, field="supervisor")
@@ -291,44 +335,6 @@ class Stop:
             exit_code=12,
             agent_id=self.agent_id,
         )
-
-    def orphan_applies(self, row: dict[str, Any], current: SessionStatus | None) -> bool:
-        """A final run with no live supervisor (and, while ``launching``, no live launcher)."""
-        if current is None or current.run.outcome is None or current.run.exit_code is None:
-            return False
-        if self.alive(row.get("supervisor")):
-            return False
-        return not (row["status"] == "launching" and self.alive(row.get("launcher")))
-
-    def park_orphan(self, row: dict[str, Any], current: SessionStatus) -> dict[str, Any] | None:
-        """The liveness rule for a run that is final while nothing is left to bookkeep it: park
-        per the outcome table, without the automatic report resume or promotion. ``None`` when
-        another process parked the agent first.
-
-        TODO(#31): this belongs to the liveness check; remove it when that lands.
-        """
-        assert self.store is not None
-        result = current.outcome()
-        table = park_row(result.outcome or "failed", result.end_reason)
-        outcome = outcome_object(self.agent_id, result, current.raw.get("run"))
-        changes: dict[str, object] = {
-            "last_outcome": outcome,
-            "last_end_reason": result.end_reason,
-            "last_live_at": self.gateway.wall_time(),
-            "exec_proc": None,
-            "supervisor_lost": False,
-        }
-        parked = lifecycle.park(
-            self.store,
-            self.agent_id,
-            park_reason=table.park_reason,
-            needs_attention=table.needs_attention,
-            escalated_by=table.escalated_by,
-            from_status=row["status"],
-            changes=changes,
-            outcome=outcome,
-        )
-        return parked
 
     # -- signaling ----------------------------------------------------------------------------
 
@@ -383,13 +389,14 @@ class Stop:
                     return row
             elif status in IN_PROGRESS and now >= next_status:
                 next_status = now + STATUS_EVERY
-                session = row.get("csession_id")
-                if isinstance(session, str):
-                    current = self.backend.status(session)
-                    if self.orphan_applies(row, current):
-                        parked = self.park_orphan(row, current)
-                        if parked is not None:
-                            return parked
+                if not self.alive(row.get("supervisor")):
+                    # Nothing drives the agent any more: the liveness check settles it (it
+                    # parks a run that ended, flags a live one).
+                    settled = self.check(row)
+                    if settled is None:
+                        return None
+                    if settled["status"] not in IN_PROGRESS:
+                        return settled
             if now >= deadline:
                 raise CliError.of(
                     "failed",

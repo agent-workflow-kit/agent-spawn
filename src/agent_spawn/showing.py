@@ -12,7 +12,13 @@ from typing import Any
 
 from . import gateway as gw
 from . import procs
-from .agent_lookup import backend_for, open_existing, resolve_existing, store_failed
+from .agent_lookup import (
+    backend_for,
+    liveness_for,
+    open_existing,
+    resolve_existing,
+    store_failed,
+)
 from .agent_view import CORRUPT_ROW, agent_object, ts, unusable_row
 from .commands.base import Invocation
 from .launch import resolve_wtctl
@@ -103,6 +109,10 @@ def supervisor_object(row: Mapping[str, Any]) -> dict[str, Any] | None:
     }
 
 
+class _SessionMissing(Exception):
+    """claude-session reports the agent's session not found (exit 10)."""
+
+
 def _session(inv: Invocation, row: Mapping[str, Any], warnings: list[str]) -> dict[str, Any] | None:
     session_id = row.get("csession_id")
     if not isinstance(session_id, str):
@@ -111,10 +121,9 @@ def _session(inv: Invocation, row: Mapping[str, Any], warnings: list[str]) -> di
         status = backend_for(inv, row).status(session_id)
     except CliError as error:
         if error.exit_code == 10:
-            # TODO(#31): park the agent `session_missing` (the liveness check owns the park).
             warnings.append("claude-session reports the session not found")
-        else:
-            warnings.append(f"claude-session status failed ({safe_text(error.code)})")
+            raise _SessionMissing from None
+        warnings.append(f"claude-session status failed ({safe_text(error.code)})")
         return None
     if status.csession_id != session_id:
         warnings.append("claude-session answered for another session")
@@ -198,11 +207,30 @@ def show(inv: Invocation) -> Outcome:
         raise
     assert store is not None
     warnings: list[str] = []
+    session = supervisor = config_changed = third = None
     try:
         with store:
             row = store.get_agent(resolved.agent_id)
             if row is None:
                 raise CliError.of("not_found", "no such agent")
+            live = liveness_for(inv, store)
+            if row["status"] != "torn_down":
+                # The inline liveness check runs first: it may park the agent, and the reads below
+                # use the row it leaves. It records its changes and delivers no hook.
+                checked = live.check(resolved.agent_id)
+                warnings.extend(checked.warnings)
+                if checked.row is None:
+                    raise CliError.of("not_found", "no such agent")
+                row = checked.row
+            if row["status"] not in ("torn_down",):
+                supervisor = supervisor_object(row)
+                try:
+                    session = _session(inv, row, warnings)
+                except _SessionMissing:
+                    parked = live.session_missing(resolved.agent_id, row["csession_id"])
+                    if parked.row is not None:
+                        row = parked.row
+                    supervisor = supervisor_object(row)
             try:
                 agent = agent_object(store, row)
                 runs = run_objects(store, row)
@@ -210,13 +238,7 @@ def show(inv: Invocation) -> Outcome:
                 raise unusable_row(resolved.agent_id) from None
     except StoreError as error:
         raise store_failed(error) from None
-    if row["status"] == "torn_down":
-        session = supervisor = config_changed = None
-        third = None
-    else:
-        # TODO(#31): the inline liveness check of a live or launching agent runs first.
-        supervisor = supervisor_object(row)
-        session = _session(inv, row, warnings)
+    if row["status"] != "torn_down":
         third = third_party_run(inv, row, warnings)
         config_changed = repo_config_changed(inv, row, warnings)
     payload = {

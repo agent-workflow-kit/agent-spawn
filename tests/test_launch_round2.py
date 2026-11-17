@@ -49,35 +49,6 @@ def fake_launch(store: Store, **extra: Any) -> Any:
     )
 
 
-# --- 1: park before stopping ------------------------------------------------------------------
-
-
-def test_a_stale_launching_row_does_not_stop_a_live_agents_session(
-    isolation_env: Isolation, tmp_path: Path
-) -> None:
-    with Store.open(tmp_path / "state") as store:
-        agent_id = insert(store, "live")  # the supervisor made it live after the stale read
-        fake = fake_launch(store)
-        stale = {"agent_id": agent_id, "csession_id": "cs-abcdefgh", "status": "launching"}
-        launch.Launch.park_unsupervised(fake, stale)
-        assert fake.backend.stopped == []
-        assert (store.get_agent(agent_id) or {})["status"] == "live"
-
-
-def test_a_launching_agent_is_parked_then_its_session_stopped(
-    isolation_env: Isolation, tmp_path: Path
-) -> None:
-    with Store.open(tmp_path / "state") as store:
-        agent_id = insert(store, "launching")
-        fake = fake_launch(store)
-        row = {"agent_id": agent_id, "csession_id": "cs-abcdefgh"}
-        with pytest.raises(CliError) as caught:
-            launch.Launch.park_unsupervised(fake, row)
-        assert caught.value.code == "launch_failed"
-        assert fake.backend.stopped == ["cs-abcdefgh"]
-        assert (store.get_agent(agent_id) or {})["status"] == "parked"
-
-
 # --- 2: handlers are restored for in-process callers --------------------------------------------
 
 

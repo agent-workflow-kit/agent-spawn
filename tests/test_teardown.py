@@ -51,6 +51,11 @@ def seed(env: Env, fakebin: Fakebin, *, session: bool = True, **fields: Any) -> 
         if session:
             row["csession_id"] = fakebin.seed_session(SESSION)
         row.update(fields)
+        if row["status"] in ("launching", "live") and not (
+            row.get("supervisor") or row.get("launcher")
+        ):
+            # a process that is alive (this one): a live agent without any is judged dead
+            row["supervisor"] = store.holder_identity()
         store.insert_agent(agent_id, row)
     for sub, name in (("prompts", "prompt"), ("outcomes", "tok.json")):
         directory = state / sub / agent_id
