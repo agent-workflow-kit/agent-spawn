@@ -6,6 +6,7 @@ import sys
 from datetime import UTC, datetime
 from typing import NoReturn
 
+from .. import reconcile as reconcile_module
 from .. import records
 from ..output import CliError, Outcome, PayloadKind, safe_text
 from ..store import default_state_dir
@@ -13,9 +14,8 @@ from ..validate import GrammarError, parse_since
 from .base import Invocation, not_implemented
 
 
-def reconcile(inv: Invocation) -> NoReturn:
-    # TODO(#33): reconcile.
-    not_implemented("reconcile", 33)
+def reconcile(inv: Invocation) -> Outcome:
+    return reconcile_module.reconcile_command(inv)
 
 
 def cron_install(inv: Invocation) -> NoReturn:

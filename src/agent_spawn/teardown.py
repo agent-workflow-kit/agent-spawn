@@ -19,8 +19,10 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import signal
 import stat
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -110,6 +112,12 @@ def _remove_at(dir_fd: int, name: str, depth: int = 0) -> None:
     os.rmdir(name, dir_fd=dir_fd)
 
 
+def remove_tree_at(dir_fd: int, name: str) -> None:
+    """``_remove_at`` for ``reconcile``'s housekeeping: delete ``name`` below ``dir_fd``, never
+    following a symlink, and refusing a directory that changed while it was being emptied."""
+    _remove_at(dir_fd, name)
+
+
 def remove_agent_files(state_dir: str, agent_id: str) -> list[str]:
     """Delete ``<state>/prompts/<agent_id>`` and ``<state>/outcomes/<agent_id>``.
 
@@ -147,6 +155,53 @@ def remove_agent_files(state_dir: str, agent_id: str) -> list[str]:
     finally:
         os.close(base)
     return problems
+
+
+class _Terminated(BaseException):
+    """A SIGTERM or SIGHUP arrived while a pre-teardown hook ran (``_terminate_hook_on_signal``)."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+@contextmanager
+def _terminate_hook_on_signal(gateway: gw.Gateway) -> Iterator[None]:
+    """While a pre-teardown hook runs, a SIGTERM or SIGHUP stops the hook's process group.
+
+    The hook has a session of its own, and the default action of these signals would end this
+    process at once and leave the hook running, with the agent ``tearing_down`` at ``started``.
+    Instead the signal is turned into an exception, so the hook runner's cleanup terminates the
+    hook's verified group (SIGINT already raises ``KeyboardInterrupt``); then the signal is sent
+    again with its default action, so this process still ends by that signal. Handlers that
+    someone else installed (the supervisor's) are never replaced, and off the main thread nothing
+    is installed. A SIGKILL cannot be handled: ``reconcile`` reports ``hook_may_be_running`` then.
+    """
+    installed: dict[int, Any] = {}
+
+    def raiser(signum: int, _frame: object) -> None:
+        raise _Terminated(signum)
+
+    try:
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            previous = gateway.install_signal_handler(sig, raiser)
+            if previous is signal.SIG_DFL:
+                installed[sig] = previous
+            else:
+                gateway.install_signal_handler(sig, previous)
+    except ValueError:  # not the main thread
+        pass
+    try:
+        yield
+    except _Terminated as caught:
+        for sig, previous in installed.items():
+            gateway.install_signal_handler(sig, previous)
+        installed.clear()
+        os.kill(os.getpid(), caught.signum)  # the default action: this process ends by it
+        raise
+    finally:
+        for sig, previous in installed.items():
+            gateway.install_signal_handler(sig, previous)
 
 
 # --- the engine -----------------------------------------------------------------------------------
@@ -631,18 +686,15 @@ class Teardown:
             decision_ids=list(self.decision_ids),
             override_escalation=self.override_escalation,
         )
-        # todo(#33): SIGTERM/SIGINT of this teardown during a slow hook leaves the hook running
-        # (its own process group) and the agent tearing_down/started; reconcile and retry must
-        # terminate or account for the orphaned pre-teardown hook of a dead teardown before
-        # running the hook again.
-        verdict = hooklib.run_pre_hooks(
-            PRE_TEARDOWN,
-            body,
-            entries,
-            state_dir=self.state_dir,
-            agent_id=agent_id,
-            gateway=self.gateway,
-        )
+        with _terminate_hook_on_signal(self.gateway):
+            verdict = hooklib.run_pre_hooks(
+                PRE_TEARDOWN,
+                body,
+                entries,
+                state_dir=self.state_dir,
+                agent_id=agent_id,
+                gateway=self.gateway,
+            )
         for decision in verdict.decision_ids:
             if decision not in self.decision_ids and len(self.decision_ids) < 32:
                 self.decision_ids.append(decision)

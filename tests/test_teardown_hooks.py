@@ -5,6 +5,9 @@ retry rule, the live re-check after a slow hook, and the supervisor's ephemeral 
 from __future__ import annotations
 
 import json
+import os
+import signal
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -426,3 +429,48 @@ def test_a_veto_queues_state_changes_but_no_post_teardown(env: Env, fakebin: Fak
     assert "post-teardown" not in names
     states = [p["agent"]["status"] for n, p in events(env, agent_id) if n == "post-state-change"]
     assert states == ["tearing_down", "parked"]
+
+
+# --- a signal during a slow hook (#33) ---
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP])
+def test_a_signal_during_a_hook_terminates_the_hook_and_leaves_the_agent_retryable(
+    env: Env, fakebin: Fakebin, tmp_path: Path, sig: signal.Signals
+) -> None:
+    from agent_spawn import procs
+
+    agent_id = seed(env, fakebin)
+    pidfile = tmp_path / "hook-pid"
+    gate = tmp_path / "gate"
+    hook = (
+        f"pre-teardown=echo $$ > {pidfile}.tmp; mv {pidfile}.tmp {pidfile}; "
+        f"while [ ! -e {gate} ]; do sleep 0.1; done"
+    )
+    proc = subprocess.Popen(
+        env.argv("teardown", agent_id, "--json", "--hook", hook),
+        env=env.env(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    hook_identity = None
+    try:
+        env.wait_for(pidfile.exists, "the hook to start")
+        hook_identity = procs.read_identity(int(pidfile.read_text()))
+        assert hook_identity is not None
+        os.kill(proc.pid, sig)  # exactly the process this test started
+        proc.communicate(timeout=60)
+        assert proc.returncode == -sig  # it still ended by the signal
+        env.wait_for(lambda: not procs.is_alive(hook_identity), "the hook's group to be stopped")
+    finally:
+        if hook_identity is not None and procs.is_alive(hook_identity):
+            os.kill(hook_identity.pid, signal.SIGKILL)
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    row = env.agent(agent_id)
+    assert (row["status"], row["teardown_step"]) == ("tearing_down", "started")
+    gate.write_text("")
+    again = td(env, agent_id)  # the retry: the stored hook runs again and passes
+    assert again.returncode == 0, (again.stdout, again.stderr)
