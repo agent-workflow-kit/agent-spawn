@@ -47,7 +47,13 @@ from typing import Any
 from . import gateway as gw
 from . import handoff, procs
 from . import hooks as hooklib
-from .agent_lookup import backend_for, liveness_for, open_existing, state_dir_of
+from .agent_lookup import (
+    backend_for,
+    liveness_for,
+    open_existing,
+    state_dir_of,
+    store_failed,
+)
 from .agent_view import ts
 from .annotate import mirror_labels
 from .commands.base import Invocation
@@ -98,20 +104,21 @@ class _Pass:
     # -- plumbing ----------------------------------------------------------------------------
 
     def run(self) -> None:
-        for step in (
-            self.session_reconcile,
-            self.liveness,
-            self.deliver,
-            self.teardown_incomplete,
-            self.labels,
-            self.leftover_files,
-            self.tombstones,
-            self.handoffs,
-        ):
+        steps = (
+            ("claude-session reconcile", "session_reconcile"),
+            ("liveness", "liveness"),
+            ("hook delivery", "deliver"),
+            ("teardown report", "teardown_incomplete"),
+            ("label re-sync", "labels"),
+            ("leftover files", "leftover_files"),
+            ("tombstones", "tombstones"),
+            ("handoff directories", "handoffs"),
+        )
+        for label, method in steps:
             try:
-                step()
+                getattr(self, method)()
             except Exception as error:  # noqa: BLE001 - a step never stops the later ones
-                self.warnings.append(f"{step.__name__} failed ({type(error).__name__})")
+                self.warnings.append(f"{label} failed ({type(error).__name__})")
 
     def change(self, agent_id: str, kind: str, **details: Any) -> None:
         self.changes.append({"agent_id": agent_id, "kind": kind, "details": details})
@@ -428,6 +435,8 @@ def reconcile_command(inv: Invocation) -> Outcome:
                 lease = store.acquire_lease(LEASE)
             except LeaseHeld:
                 return _outcome([], warnings, True, dry_run)
+            except StoreError as error:  # e.g. a lease row whose holder cannot be parsed
+                raise store_failed(error) from None
             try:
                 run.run()
             finally:

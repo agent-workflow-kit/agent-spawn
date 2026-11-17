@@ -50,6 +50,7 @@ IMPLEMENTED = {
     "launch",
     "list",
     "prune",
+    "reconcile",
     "resume",
     "show",
     "stop",

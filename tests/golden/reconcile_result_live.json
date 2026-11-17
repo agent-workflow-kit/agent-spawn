@@ -1,0 +1,55 @@
+{
+  "changes": [
+    {
+      "agent_id": "ag-aaaaaaaa",
+      "kind": "launch_failed",
+      "details": {
+        "cause": "launcher_died"
+      }
+    },
+    {
+      "agent_id": "ag-aaaaaaaa",
+      "kind": "events_delivered",
+      "details": {
+        "count": 3,
+        "hooks_failed": 0
+      }
+    },
+    {
+      "agent_id": "ag-cccccccc",
+      "kind": "events_delivered",
+      "details": {
+        "count": 1,
+        "hooks_failed": 0
+      }
+    },
+    {
+      "agent_id": "ag-dddddddd",
+      "kind": "teardown_incomplete",
+      "details": {
+        "teardown_step": "hooks_done",
+        "teardown_alive": false
+      }
+    },
+    {
+      "agent_id": "ag-cccccccc",
+      "kind": "labels_resynced",
+      "details": {
+        "added": [
+          "team=a"
+        ],
+        "removed": []
+      }
+    },
+    {
+      "agent_id": "ag-bbbbbbbb",
+      "kind": "tombstone_deleted",
+      "details": {
+        "torn_down_at": "2026-01-01T00:00:00.000Z"
+      }
+    }
+  ],
+  "warnings": [],
+  "already_running": false,
+  "dry_run": false
+}
