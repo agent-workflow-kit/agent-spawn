@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.fakebin.harness import FAKES, Fakebin, flag_values
+from tests.fakebin.harness import FAKES, Fakebin, flag_values, read_log_records
 
 HEADLESS = ("--mode", "headless", "--skill", "implement-issue")
 
@@ -285,3 +285,16 @@ def test_corrupt_termctl_and_wtctl_state_is_a_harness_error(
 ) -> None:
     Path(str(fakebin.log) + suffix).write_text("[1]")
     assert_harness_error(fakebin.run(tool, *args, "--json"))
+
+
+def test_reading_the_log_ignores_a_record_still_being_appended(tmp_path: Path) -> None:
+    log = tmp_path / "log.jsonl"
+    log.write_text('{"event": "invoke", "id": "1"}\n{"event": "exit", "id": "1", "env": {"A": "b')
+    assert read_log_records(log) == [{"event": "invoke", "id": "1"}]
+
+
+def test_reading_the_log_still_raises_on_a_malformed_complete_line(tmp_path: Path) -> None:
+    log = tmp_path / "log.jsonl"
+    log.write_text('{"event": "invoke"}\n{"event": "exit", "env": {"A": "b\n')
+    with pytest.raises(json.JSONDecodeError):
+        read_log_records(log)
