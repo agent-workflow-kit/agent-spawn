@@ -199,9 +199,7 @@ def test_the_payload_matches_its_schema_and_travels_on_stdin(
     assert payload["override_escalation"] is False
     assert payload["decision_ids"] == ["d-1"] and payload["actor"].startswith("auto:")
     assert payload["status"] == "tearing_down"
-    variables = dict(
-        line.split("=", 1) for line in envdump.read_text().splitlines() if "=" in line
-    )
+    variables = dict(line.split("=", 1) for line in envdump.read_text().splitlines() if "=" in line)
     assert variables["AGENT_SPAWN_HOOK"] == "pre-teardown"
     assert variables["AGENT_SPAWN_ID"] == agent_id
 
@@ -215,7 +213,7 @@ def test_a_selector_that_does_not_match_skips_the_entry(
     assert td(cfg_env, agent_id).returncode == 0
 
 
-# --- retries -------------------------------------------------------------------------------------
+# --- retries ---
 
 
 def test_a_retry_that_never_completed_the_hooks_runs_them(env: Env, fakebin: Fakebin) -> None:
@@ -253,7 +251,7 @@ def test_a_retry_without_hook_flags_runs_the_stored_hook(env: Env, fakebin: Fake
     assert td(env, agent_id).returncode == 11
 
 
-# --- liveness after a slow hook --------------------------------------------------------------------
+# --- liveness after a slow hook ---
 
 
 def test_a_run_that_went_live_during_the_hook_returns_the_agent_to_parked(
@@ -275,7 +273,7 @@ def test_a_run_that_went_live_during_the_hook_returns_the_agent_to_parked(
     assert forget_calls(fakebin) == []
 
 
-# --- events --------------------------------------------------------------------------------------
+# --- events ---
 
 
 def test_a_veto_queues_state_changes_but_no_post_teardown(env: Env, fakebin: Fakebin) -> None:

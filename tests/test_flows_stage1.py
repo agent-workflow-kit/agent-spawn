@@ -16,7 +16,7 @@ import pytest
 from agent_spawn import procs
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
-from tests.flow_support import HOOKS, LIVE_LAUNCH_PHASE, Flow, schema
+from tests.flow_support import LIVE_LAUNCH_PHASE, Flow, schema
 from tests.launch_support import script_hung_exec
 from tests.procguard import ProcTracker
 

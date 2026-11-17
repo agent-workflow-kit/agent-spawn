@@ -325,7 +325,7 @@ def test_a_pre_teardown_hook_runs_for_each_agent_and_a_veto_refuses_only_that_on
 ) -> None:
     gate = tmp_path / "veto-this"
     cmd = f'[ "$AGENT_SPAWN_ID" = "$(cat {gate})" ] && exit 1; exit 0'
-    hooked = Env(fakebin, isolation_env, f'hooks:\n  pre-teardown:\n    - cmd: {json.dumps(cmd)}\n')
+    hooked = Env(fakebin, isolation_env, f"hooks:\n  pre-teardown:\n    - cmd: {json.dumps(cmd)}\n")
     vetoed, passed = old(hooked, fakebin), old(hooked, fakebin)
     gate.write_text(vetoed)
     body = prune(hooked, "--older-than", "7d")

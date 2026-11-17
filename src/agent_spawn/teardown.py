@@ -619,9 +619,7 @@ class Teardown:
             raise
         self.set_step(agent_id, "hooks_done")
 
-    def run_pre_teardown(
-        self, row: Mapping[str, Any], entries: list[hooklib.HookEntry]
-    ) -> None:
+    def run_pre_teardown(self, row: Mapping[str, Any], entries: list[hooklib.HookEntry]) -> None:
         agent_id = row["agent_id"]
         agent = agent_object(self.store, row)
         body = hooklib.common_fields(agent, reads_third_party_of(self.store, row))

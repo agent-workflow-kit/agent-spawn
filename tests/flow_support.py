@@ -248,7 +248,9 @@ class Flow:
         fired = {p["hook"] for p in payloads}
         missing = set(expect_hooks) - fired
         assert not missing, f"hooks that never fired: {sorted(missing)} (fired: {sorted(fired)})"
-        event_ids = [p["event_id"] for p in payloads if p["hook"] not in ("pre-launch", "pre-teardown")]
+        event_ids = [
+            p["event_id"] for p in payloads if p["hook"] not in ("pre-launch", "pre-teardown")
+        ]
         assert len(event_ids) == len(set(event_ids)), "an event was delivered twice"
         log, audit = self.log(), self.audit()
         assert len(log) >= expect_log, f"expected {expect_log} log records, found {len(log)}"
