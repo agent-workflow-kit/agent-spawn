@@ -428,7 +428,7 @@ def reconcile_command(inv: Invocation) -> Outcome:
     """The handler of ``reconcile`` (``commands.maintenance``)."""
     dry_run = bool(inv.args.dry_run)
     state_dir = state_dir_of(inv)
-    store = open_existing(inv)
+    store = open_existing(inv, migrate=not dry_run)  # a dry run never migrates
     warnings = list(inv.warnings)
     if store is None:  # no state.db: no agents, nothing to reconcile, nothing is created
         return _outcome(inv, [], warnings, False, dry_run)

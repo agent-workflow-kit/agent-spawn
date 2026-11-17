@@ -1071,3 +1071,16 @@ def test_quiet_prints_no_summary_but_a_warning_still_reaches_stderr(
     assert "claude-session reconcile failed" in done.stderr
     quiet_json = env.run("reconcile", "--quiet", "--json")
     assert json.loads(quiet_json.stdout)["already_running"] is False  # --json still prints
+
+
+def test_a_dry_run_never_migrates_an_older_database(env: Env, fakebin: Fakebin) -> None:
+    seed(env, fakebin)
+    db = sqlite3.connect(env.state_dir / "state.db")
+    try:
+        with db:
+            db.execute("UPDATE meta SET value = '0' WHERE key = 'schema_version'")
+    finally:
+        db.close()
+    done = env.run("reconcile", "--dry-run", "--json")
+    assert done.returncode == 12 and "older schema" in result_json(done)["error"]["message"]
+    assert db_rows(env, "SELECT value FROM meta WHERE key = 'schema_version'") == [("0",)]
