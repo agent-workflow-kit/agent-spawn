@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import os
 import shutil
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from agent_spawn import gateway
 from tests import isolation
 from tests.fakebin.harness import Fakebin
 from tests.private_tmux import PrivateTmux
@@ -31,6 +33,25 @@ class Isolation:
     cache: Path
     tmux_tmpdir: Path
     env: dict[str, str]
+
+
+@pytest.fixture(autouse=True)
+def no_real_crontab(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail any in-process ``crontab`` call that would reach the real program: the user's crontab
+    is their real scheduled-jobs file. Only the fake in ``tests/fakebin`` may answer."""
+    real_run = gateway.SystemGateway.run
+    fakes = Path(__file__).resolve().parent / "fakebin"
+
+    def guarded(self: gateway.SystemGateway, argv: Sequence[str], **kwargs: Any) -> Any:
+        if argv and os.path.basename(argv[0]) == "crontab":
+            env = kwargs.get("env")
+            search = (env if env is not None else os.environ).get("PATH", "")
+            found = argv[0] if os.sep in argv[0] else shutil.which(argv[0], path=search)
+            if found is not None and not Path(found).resolve().is_relative_to(fakes):
+                raise AssertionError(f"a test would run the real crontab: {found}")
+        return real_run(self, argv, **kwargs)
+
+    monkeypatch.setattr(gateway.SystemGateway, "run", guarded)
 
 
 @pytest.fixture(autouse=True)

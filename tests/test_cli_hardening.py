@@ -200,10 +200,10 @@ def _scratch_env(tmp_path: Path) -> dict[str, str]:
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [
-        (["cron", "install", "--json"], 1),
+        (["browse", "--json"], 1),
         (["--json", "launch", "--bogus"], 2),
         (["--help"], 0),
-        (["cron", "install"], 1),
+        (["browse"], 1),
     ],
 )
 def test_a_closed_stdout_keeps_the_exit_code(

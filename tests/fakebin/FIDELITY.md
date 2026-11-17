@@ -1,10 +1,10 @@
 # Fake binaries: fidelity notes
 
-The fakes in this directory stand in for `claude-session`, `termctl`, `wtctl` and `tmux` in agent-spawn's tests. They are a test aid, not a re-implementation: where a fake is simpler than the real program it says so here, and anything not checked against the real program is listed under "Unverified".
+The fakes in this directory stand in for `claude-session`, `termctl`, `wtctl`, `tmux` and `crontab` in agent-spawn's tests. They are a test aid, not a re-implementation: where a fake is simpler than the real program it says so here, and anything not checked against the real program is listed under "Unverified".
 
 ## How a fake behaves
 
-- Standard-library Python only, run through the stubs in this directory (`claude-session`, `termctl`, `wtctl`, `tmux`). The fixture puts a `python3` symlink to the test interpreter first on `PATH` (the stubs start with `#!/usr/bin/env python3`), so the 3.12/3.13 test matrix runs the fakes under the version it tests; every `invoke` record in the log names the Python version. A fake refuses to run (exit 70) unless `FAKEBIN_LOG` is set to an absolute path in an existing directory, so it cannot be used by accident outside the `fakebin` fixture.
+- Standard-library Python only, run through the stubs in this directory (`claude-session`, `termctl`, `wtctl`, `tmux`, `crontab`). The fixture puts a `python3` symlink to the test interpreter first on `PATH` (the stubs start with `#!/usr/bin/env python3`), so the 3.12/3.13 test matrix runs the fakes under the version it tests; every `invoke` record in the log names the Python version. A fake refuses to run (exit 70) unless `FAKEBIN_LOG` is set to an absolute path in an existing directory, so it cannot be used by accident outside the `fakebin` fixture.
 - A broken test setup (a corrupt or wrongly shaped state, counts or script file, an unknown `on_signal` name, a non-numeric or negative `sleep`, a non-integer `exit`, a scripted `error` with `exit: 0`) is one `fakebin: ...` line on stderr and exit 70, never a traceback. A scripted `error` without `exit` exits with the code the siblings give that error code (`usage` 2, `not_found` 10, `refused` 20, ...), else 1.
 - A scripted `hang` never outlives its test: it ends with exit 124 after `FAKEBIN_HANG_SECONDS` (default 120) and when its parent process is gone (the harness passes its PID in `FAKEBIN_PARENT_PID`; without it the fake watches its parent PID, unless that is 1). A hung fake logs a `hang_ready` record once it is waiting, which tests poll for before signaling.
 - Every call is logged to `FAKEBIN_LOG` (JSON lines): an `invoke` record before anything happens (argv, cwd, PID, a few environment variables) and an `exit` record (exit code, signals handled, stdin read). A call killed by an unhandled signal has no `exit` record.
@@ -56,6 +56,13 @@ wtctl:
 tmux:
 
 - Only the client options, `-V`, `;` splitting, command aliases and the "no server" failure are modeled; every other command needs a scripted reply. A rule for a command also answers its alias (`ls` for `list-sessions`; the table is tmux 3.5a's), and a rule with an empty response is still a rule. `start-server` succeeds silently; `list-commands` is `fake_unsupported`. For real tmux behavior use the `private_tmux` fixture (a real server on `-S <tmp>/sock -f /dev/null` with a private `HOME`).
+
+crontab:
+
+- Models `-l`, `-` (install from stdin, replacing the whole table) and `-r`; every other option exits 1 (`-e`, `-u`, a file argument are `fake_unsupported`, no argument prints the usage). The table is the file `<FAKEBIN_LOG>.crontab`: the fake never reads or writes any real crontab, and `tests/conftest.py` fails any in-process `crontab` call that would reach a program outside `tests/fakebin`. No table: `no crontab for fakeuser` on stderr, exit 1, for `-l` and `-r`.
+- An installed table is checked in a simplified form of the real check: it must end with a newline (or be empty), and each line must be blank, a comment, `NAME=value`, an `@macro` job, or five fields plus a command; otherwise exit 1 (`errors in crontab file, can't install.`) and the old table stays. The real check is stricter (field ranges, names). An empty stdin installs an empty table (vixie-cron and cronie do; **unverified** for macOS, which is why agent-spawn runs `crontab -r` rather than installing an empty table).
+- A rule for `list`, `install` or `remove` answers that call instead and leaves the table alone (`respond.stdout`, `respond.stderr`, `respond.exit`); the stdin of `install` is logged either way.
+- Not verified against any real implementation (the real crontab is the user's own scheduled-jobs file and no test or probe touches it): the exact `no crontab for <user>` wording and the exit 1 on vixie-cron, cronie and macOS, localized messages (agent-spawn runs `crontab` with `LC_ALL=C`), whether `crontab -l` adds header comments, and the line-length limit (agent-spawn keeps its line under 1000 bytes).
 
 ## Known fake leniencies (claude-session)
 

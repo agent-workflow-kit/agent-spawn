@@ -1,0 +1,5 @@
+{
+  "action": "removed",
+  "block": "# agent-spawn managed\n*/5 * * * * XDG_STATE_HOME='<STATE>' XDG_CONFIG_HOME='<CONFIG>' PATH='<BIN>:<HOME>/.local/bin:/usr/local/bin:/usr/bin:/bin' '<AGENT_SPAWN>' reconcile --quiet\n# agent-spawn managed end",
+  "dry_run": false
+}
