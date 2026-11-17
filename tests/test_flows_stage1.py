@@ -247,8 +247,7 @@ def test_launch_wait_under_sigterm_during_the_prelaunch_hooks_parks_killed_with_
     flow.fakebin.wait_for_hang(row["exec_proc"].pid)
     assert flow.agent(agent_id)["status"] == "launching"
     # the cancellation arrives: the run ends in its launch phase, never started
-    flow.fakebin.clear_script("claude-session", "status")
-    flow.fakebin.script("claude-session", "status", outcome="not-started")
+    flow.fakebin.script("claude-session", "status", replace=True, outcome="not-started")
     job.send_signal(signal.SIGTERM)  # the jobs runner's SIGTERM to the launcher
     done = flow.finish(schema("launch"), job)
     assert done.code == 12, (done.stdout, done.stderr)

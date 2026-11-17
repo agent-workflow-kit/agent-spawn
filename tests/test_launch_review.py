@@ -132,7 +132,12 @@ def test_interrupt_sends_sigterm_to_the_in_flight_start(
     fakebin.script("claude-session", "start", hang=True, on_signal={"SIGTERM": {"exit": 143}})
     launcher = popen_launcher(env, proc_tracker, *LAUNCH)
     env.wait_for(lambda: bool(non_dry(fakebin, "start")), "the real start")
-    time.sleep(1.0)  # the fake installs its handlers
+    real_start = next(
+        i
+        for i in fakebin.invocations("claude-session")
+        if i.argv[0] == "start" and "--dry-run" not in i.argv
+    )
+    fakebin.wait_for_hang(real_start.pid)  # its SIGTERM handler is installed
     launcher.send_signal(signal.SIGTERM)
     launcher.communicate(timeout=30)
     (start,) = [i for i in fakebin.invocations("claude-session") if i.argv[0] == "start"][-1:]
@@ -281,10 +286,10 @@ def test_a_dead_supervisor_of_a_launching_agent_is_settled_by_the_launchers_live
     assert env.agent(row["agent_id"])["status"] == "launching"
     # claude-session's own expiry ends the run `never_adopted`: the launcher's next poll applies
     # the outcome table (a launch failure), without stopping anything itself.
-    fakebin.clear_script("claude-session", "status")
     fakebin.script(
         "claude-session",
         "status",
+        replace=True,
         outcome="not-started",
         merge={"run": {"end_reason": "never_adopted"}},
     )

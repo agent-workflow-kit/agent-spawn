@@ -304,10 +304,10 @@ def test_a_pending_run_is_left_to_claude_sessions_expiry(
     assert agent["needs_attention"] is None
     assert calls(fakebin, "stop", "start", "resume") == []
     # once claude-session expired it (`never_adopted`), the next check settles it by the chain rule
-    fakebin.clear_script("claude-session", "status")
     fakebin.script(
         "claude-session",
         "status",
+        replace=True,
         outcome="not-started",
         merge={"run": {"end_reason": "never_adopted", "run": 2}, "current_run": 2},
     )
@@ -434,10 +434,10 @@ def test_a_dead_launcher_with_a_pending_run_is_left_to_never_adopted(
     assert agent["status"] == "launching" and agent["needs_attention"] is None
     assert calls(fakebin, "stop") == []
     # claude-session's expiry ends the run `never_adopted`: a launch failure
-    fakebin.clear_script("claude-session", "status")
     fakebin.script(
         "claude-session",
         "status",
+        replace=True,
         outcome="not-started",
         merge={"run": {"end_reason": "never_adopted"}},
     )
