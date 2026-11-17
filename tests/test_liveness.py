@@ -534,7 +534,7 @@ def test_an_abandoned_fork_is_removed_with_its_holds_and_prompt_copies(
     assert calls(fakebin, "stop") == []
 
 
-# -- dry runs only report ---------------------------------------------------------------------------
+# -- dry runs only report ------------------------------------------------------------------
 
 
 def test_a_dry_run_reports_and_changes_nothing(
