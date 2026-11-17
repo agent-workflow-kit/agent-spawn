@@ -792,9 +792,10 @@ def test_resume_and_a_real_stop_race_for_a_dead_supervisors_agent(
     assert len(logged(env, "reconcile_change", kind="parked")) == 1
     # one snapshot of every post-park event (delivered or not): reading the undelivered ones and
     # the hook marker at two moments would count an event twice while a supervisor delivers it
+    # the marker is read first: an event delivered before this read exists by the later snapshot
+    delivered = marker.read_text().count("parked") if marker.exists() else 0
     with Store.open(env.state_dir) as store:
         parks = [e for e in store.all_events(AGENT) if e["event"] == "post-park"]
-    delivered = marker.read_text().count("parked") if marker.exists() else 0
     assert 1 <= len(parks) <= 2  # the liveness park, then possibly the resumed run's own
     assert delivered <= len(parks)  # a hook runs at most once per event
 
