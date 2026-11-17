@@ -5,6 +5,9 @@ retry rule, the live re-check after a slow hook, and the supervisor's ephemeral 
 from __future__ import annotations
 
 import json
+import os
+import signal
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -426,3 +429,161 @@ def test_a_veto_queues_state_changes_but_no_post_teardown(env: Env, fakebin: Fak
     assert "post-teardown" not in names
     states = [p["agent"]["status"] for n, p in events(env, agent_id) if n == "post-state-change"]
     assert states == ["tearing_down", "parked"]
+
+
+# --- a signal during a slow hook (#33) ---
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP])
+def test_a_signal_during_a_hook_terminates_the_hook_and_leaves_the_agent_retryable(
+    env: Env, fakebin: Fakebin, tmp_path: Path, sig: signal.Signals
+) -> None:
+    from agent_spawn import procs
+
+    agent_id = seed(env, fakebin)
+    pidfile = tmp_path / "hook-pid"
+    gate = tmp_path / "gate"
+    hook = (
+        f"pre-teardown=[ -e {gate} ] || {{ sleep 300 & echo $! > {pidfile}.child; }}; "
+        f"echo $$ > {pidfile}.tmp; mv {pidfile}.tmp {pidfile}; "
+        f"while [ ! -e {gate} ]; do wait; done"
+    )
+    proc = subprocess.Popen(
+        env.argv("teardown", agent_id, "--json", "--hook", hook),
+        env=env.env(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    hook_identity = None
+    try:
+        env.wait_for(pidfile.exists, "the hook to start")
+        hook_identity = procs.read_identity(int(pidfile.read_text()))
+        assert hook_identity is not None
+        os.kill(proc.pid, sig)  # exactly the process this test started
+        proc.communicate(timeout=60)
+        assert proc.returncode == -sig  # it still ended by the signal
+        env.wait_for(lambda: not procs.is_alive(hook_identity), "the hook's group to be stopped")
+        child = procs.read_identity(int((tmp_path / "hook-pid.child").read_text()))
+        assert child is None or not procs.is_alive(child)  # the hook's children went with it
+    finally:
+        if hook_identity is not None and procs.is_alive(hook_identity):
+            os.kill(hook_identity.pid, signal.SIGKILL)
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    row = env.agent(agent_id)
+    assert (row["status"], row["teardown_step"]) == ("tearing_down", "started")
+    gate.write_text("")
+    again = td(env, agent_id)  # the retry: the stored hook runs again and passes
+    assert again.returncode == 0, (again.stdout, again.stderr)
+
+
+# --- the signal-to-exception context, in process (#33) ---
+
+
+class _SignalStub:
+    """The signal-handler part of the gateway: records installs, serves canned previous handlers
+    (``unsettable`` signals raise ``ValueError``, as off the main thread)."""
+
+    def __init__(self, previous: dict[int, Any], *, main_thread: bool = True) -> None:
+        self.current = dict(previous)
+        self.main_thread = main_thread
+        self.installs: list[tuple[int, Any]] = []
+
+    def install_signal_handler(self, sig: int, handler: Any) -> Any:
+        if not self.main_thread:
+            raise ValueError("signal only works in main thread of the main interpreter")
+        if handler is None:
+            raise TypeError("signal handler must be signal.SIG_IGN, signal.SIG_DFL, or a callable")
+        self.installs.append((sig, handler))
+        previous = self.current[sig]
+        self.current[sig] = handler
+        return previous
+
+
+def _context(stub: _SignalStub) -> Any:
+    from agent_spawn import teardown
+
+    return teardown._terminate_hook_on_signal(stub)  # pyright: ignore[reportPrivateUsage,reportArgumentType]
+
+
+def test_a_foreign_signal_handler_is_left_alone_and_restored() -> None:
+    def foreign(signum: int, frame: object) -> None:  # the supervisor's own
+        pass
+
+    stub = _SignalStub({signal.SIGTERM: foreign, signal.SIGHUP: signal.SIG_DFL})
+    with _context(stub):
+        assert stub.current[signal.SIGTERM] is foreign  # put back at once, never replaced
+        assert stub.current[signal.SIGHUP] is not signal.SIG_DFL  # ours
+    assert stub.current[signal.SIGTERM] is foreign and stub.current[signal.SIGHUP] is signal.SIG_DFL
+
+
+def test_a_normal_exit_restores_the_previous_handlers() -> None:
+    stub = _SignalStub({signal.SIGTERM: signal.SIG_DFL, signal.SIGHUP: signal.SIG_DFL})
+    with _context(stub):
+        assert callable(stub.current[signal.SIGTERM]) and callable(stub.current[signal.SIGHUP])
+    assert stub.current == {signal.SIGTERM: signal.SIG_DFL, signal.SIGHUP: signal.SIG_DFL}
+
+
+def test_off_the_main_thread_the_body_still_runs() -> None:
+    stub = _SignalStub({signal.SIGTERM: signal.SIG_DFL, signal.SIGHUP: signal.SIG_DFL})
+    stub.main_thread = False
+    ran: list[bool] = []
+    with _context(stub):
+        ran.append(True)
+    assert ran == [True] and stub.installs == []
+
+
+def test_a_handler_the_interpreter_cannot_report_is_not_reinstalled() -> None:
+    """``signal.signal`` returns ``None`` for a handler installed from C: it cannot be put back,
+    so it is treated as foreign, and the context neither fails nor loses the other signal."""
+    stub = _SignalStub({signal.SIGTERM: None, signal.SIGHUP: signal.SIG_DFL})
+    with _context(stub):
+        pass
+    assert stub.current[signal.SIGHUP] is signal.SIG_DFL
+    assert all(handler is not None for _, handler in stub.installs)
+
+
+def test_a_failure_while_installing_still_restores_what_was_installed() -> None:
+    class Failing(_SignalStub):
+        def install_signal_handler(self, sig: int, handler: Any) -> Any:
+            if sig == signal.SIGHUP and callable(handler):
+                raise ValueError("no")
+            return super().install_signal_handler(sig, handler)
+
+    stub = Failing({signal.SIGTERM: signal.SIG_DFL, signal.SIGHUP: signal.SIG_DFL})
+    with _context(stub):
+        pass
+    assert stub.current[signal.SIGTERM] is signal.SIG_DFL
+
+
+def test_a_second_signal_during_the_shutdown_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_spawn import teardown
+
+    stub = _SignalStub({signal.SIGTERM: signal.SIG_DFL, signal.SIGHUP: signal.SIG_DFL})
+    resent: list[tuple[int, int]] = []
+    monkeypatch.setattr(teardown.os, "kill", lambda pid, sig: resent.append((pid, sig)))
+    with pytest.raises(teardown._Terminated):  # pyright: ignore[reportPrivateUsage]
+        with _context(stub):
+            stub.current[signal.SIGTERM](signal.SIGTERM, None)  # the first signal
+    # between the raise and the cleanup both signals were ignored (the shutdown is not
+    # interrupted by a second one); the default action is back before the signal is re-sent
+    ignored = [(s, h) for s, h in stub.installs if h is signal.SIG_IGN]
+    assert {s for s, _ in ignored} == {signal.SIGTERM, signal.SIGHUP}
+    assert stub.current == {signal.SIGTERM: signal.SIG_DFL, signal.SIGHUP: signal.SIG_DFL}
+    assert resent == [(os.getpid(), signal.SIGTERM)]
+
+
+def test_a_failure_between_installing_the_two_signals_restores_the_first() -> None:
+    class Failing(_SignalStub):
+        def install_signal_handler(self, sig: int, handler: Any) -> Any:
+            if sig == signal.SIGHUP and callable(handler):
+                raise RuntimeError("boom")
+            return super().install_signal_handler(sig, handler)
+
+    stub = Failing({signal.SIGTERM: signal.SIG_DFL, signal.SIGHUP: signal.SIG_DFL})
+    with pytest.raises(RuntimeError):
+        with _context(stub):
+            pass
+    assert stub.current == {signal.SIGTERM: signal.SIG_DFL, signal.SIGHUP: signal.SIG_DFL}

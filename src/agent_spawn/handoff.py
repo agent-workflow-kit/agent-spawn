@@ -32,8 +32,8 @@ Users and seams of later issues:
   its config again from the received environment, so the launcher's ``AGENT_SPAWN_*`` overrides
   apply (``supervise.Supervisor.adopt_handoff``).
 * ``supervise --host`` (a promotion window, ``supervise.Supervisor.run_host``) uses the same client.
-* TODO(#33): ``reconcile`` removes handoff directories whose ``owner`` is dead (``read_owner``
-  and ``handoff_root`` are the helpers for it).
+* ``sweep_dead`` is ``reconcile``'s housekeeping: it removes the handoff directories whose
+  ``owner`` is dead (a listener killed before its ``close``).
 """
 
 from __future__ import annotations
@@ -46,6 +46,7 @@ import secrets
 import socket
 import stat
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,7 @@ __all__ = [
     "parse_payload",
     "read_owner",
     "receive_environment",
+    "sweep_dead",
 ]
 
 #: At most this many bytes of payload, enforced by the writer and by the reader.
@@ -491,6 +493,129 @@ def _remove_tree(directory: Path) -> None:
         os.rmdir(directory)
     except OSError:
         pass
+
+
+# --- the sweep of dead listeners ---------------------------------------------------------------
+
+#: A directory without a readable ``owner`` (a listener that died between its ``mkdir`` and the
+#: write of the file) is removed only when it is older than this: a live listener writes the file
+#: within milliseconds.
+OWNERLESS_AGE = 3600.0
+_NAME = re.compile(r"[0-9a-f]{12}")  # what ``HandoffListener.create`` names its directories
+_OWNER_LIMIT = 4096
+
+
+@dataclass
+class Sweep:
+    """What ``sweep_dead`` removed (or, in a dry run, would remove), and what it could not judge."""
+
+    removed: list[str] = field(default_factory=lambda: [])
+    warnings: list[str] = field(default_factory=lambda: [])
+
+
+def _owner_at(dir_fd: int) -> procs.ProcessIdentity | None:
+    """``owner`` of the directory open as ``dir_fd``, read without following a symlink."""
+    try:
+        fd = os.open(OWNER_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        data = os.read(fd, _OWNER_LIMIT + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > _OWNER_LIMIT:
+        return None
+    try:
+        return procs.ProcessIdentity.from_dict(json.loads(data.decode("utf-8")))
+    except (ValueError, AttributeError, TypeError, KeyError):
+        return None
+
+
+def _owner_dead(owner: procs.ProcessIdentity, gw: Gateway) -> bool:
+    """Whether the recorded listener is gone: another boot id, or no process with that PID,
+    start time and boot id that is not a zombie. Raises ``ProcessIdentityError`` when the process
+    entry cannot be read (never "dead")."""
+    if owner.boot_id != procs.read_boot_id(gateway=gw):
+        return True
+    return not procs.is_alive(owner, gateway=gw)
+
+
+def sweep_dead(
+    state_dir: str | os.PathLike[str], *, dry_run: bool = False, gateway: Gateway | None = None
+) -> Sweep:
+    """Remove the handoff directories of dead listeners (``reconcile``, step 6).
+
+    A directory goes only when it is a real directory of ours named like the ones ``create``
+    makes, its ``owner`` file names a process that is verifiably dead (PID, start time and boot
+    id), and it holds nothing but ``s`` and ``owner``; only those two files and the directory
+    are removed, through descriptors opened without following symlinks. A live listener's
+    directory, one whose owner cannot be judged, and one with anything else in it stay. A
+    directory without a readable ``owner`` is judged by its age (``OWNERLESS_AGE``).
+    """
+    gw = gateway or get_gateway()
+    sweep = Sweep()
+    try:
+        root = os.open(
+            handoff_root(state_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+    except FileNotFoundError:
+        return sweep
+    except OSError as exc:
+        sweep.warnings.append(f"cannot open the handoff directory ({exc.strerror})")
+        return sweep
+    try:
+        if os.fstat(root).st_uid != gw.getuid():
+            sweep.warnings.append("the handoff directory belongs to another user: not swept")
+            return sweep
+        for name in sorted(os.listdir(root)):
+            if _NAME.fullmatch(name) is None:
+                continue
+            try:
+                if _sweep_one(root, name, gw, dry_run, sweep):
+                    sweep.removed.append(name)
+            except procs.ProcessIdentityError:
+                sweep.warnings.append(f"handoff {name}: its owner could not be judged: kept")
+            except OSError as exc:
+                sweep.warnings.append(f"handoff {name}: not removed ({exc.strerror})")
+    finally:
+        os.close(root)
+    return sweep
+
+
+def _sweep_one(root: int, name: str, gw: Gateway, dry_run: bool, sweep: Sweep) -> bool:
+    info = os.lstat(name, dir_fd=root)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != gw.getuid():
+        return False
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root)
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            return False  # swapped while it was being looked at
+        owner = _owner_at(fd)
+        if owner is None:
+            if gw.wall_time() - opened.st_mtime <= OWNERLESS_AGE:
+                return False
+        elif not _owner_dead(owner, gw):
+            return False
+        if set(os.listdir(fd)) - {SOCKET_NAME, OWNER_NAME}:
+            sweep.warnings.append(f"handoff {name}: holds other files: kept")
+            return False
+        if dry_run:
+            return True
+        for leaf in (SOCKET_NAME, OWNER_NAME):
+            try:
+                os.unlink(leaf, dir_fd=fd)  # a symlink is unlinked itself, never followed
+            except FileNotFoundError:
+                pass
+    finally:
+        os.close(fd)
+    os.rmdir(name, dir_fd=root)
+    return True
 
 
 # --- the client ----------------------------------------------------------------------------------

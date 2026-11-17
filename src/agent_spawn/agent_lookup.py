@@ -95,9 +95,14 @@ def backend_for(inv: Invocation, row: Mapping[str, Any] | None = None) -> Sessio
     )
 
 
-def liveness_for(inv: Invocation, store: Store, *, dry_run: bool = False) -> Liveness:
+def liveness_for(
+    inv: Invocation, store: Store, *, dry_run: bool = False, actor: str | None = None
+) -> Liveness:
     """The inline liveness check of a command (interface.md, Liveness): claude-session as each
-    agent recorded it (else as the config names it), wtctl for an abandoned fork's holds."""
+    agent recorded it (else as the config names it), wtctl for an abandoned fork's holds.
+
+    With ``actor`` (the supervisor's, for ``reconcile``) the hold release is audited as that actor
+    with the decision ids stored with the fork; without, wtctl is called without audit flags."""
     assert inv.config is not None
     config = inv.config
     fallback: list[str] | None
@@ -118,7 +123,12 @@ def liveness_for(inv: Invocation, store: Store, *, dry_run: bool = False) -> Liv
             argv = resolve_wtctl(config.wtctl_cmd, stored if isinstance(stored, str) else None)
         except CliError:
             return None
-        return WtctlBackend(argv)
+        ids = row.get("decision_ids") if actor is not None else None
+        return WtctlBackend(
+            argv,
+            actor=actor,
+            decision_ids=[i for i in ids if isinstance(i, str)] if isinstance(ids, list) else (),  # pyright: ignore[reportUnknownVariableType]
+        )
 
     return Liveness(
         store,
