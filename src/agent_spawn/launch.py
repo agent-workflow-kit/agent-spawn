@@ -45,6 +45,7 @@ from .config import Config
 from .handoff import HandoffFailed, HandoffListener
 from .ids import IdEntry, new_agent_id
 from .labels import LabelSet, job_label, parse_run_labels
+from .liveness import Liveness
 from .output import (
     EXIT_SIGINT,
     EXIT_SIGTERM,
@@ -74,7 +75,7 @@ from .worktrees import CreatePlan, WtctlBackend, WtctlError, WtRecord
 POLL = 0.1  # seconds between looks at the state while waiting
 PRE_LAUNCH_BODY_LABEL_CAP = 64
 ACK_TIMEOUT = 60.0
-DEAD_SUPERVISOR_POLLS = 5  # looks at an agent whose supervisor is dead before giving up
+LIVENESS_EVERY = 1.0  # seconds between liveness checks of an agent nothing drives
 WORKTREE_FLAGS = ("branch", "base", "ref", "worktree_name")
 WORKTREE_SWITCHES = ("detach", "no_bootstrap", "copy_env")
 PASS_THROUGH_FLAGS = (
@@ -1623,7 +1624,8 @@ class Launch:
             if supervisor.child is not None:
                 # `exec` was started (and stopped again by the supervisor): this process was its
                 # supervisor, so only the agent record is left for the liveness check.
-                # TODO(#31): the liveness check parks a live agent whose supervisor died.
+                # The record stays for the liveness check: once this process (the recorded
+                # supervisor) is gone, the next check applies the outcome table or flags it.
                 raise CliError(
                     "failed",
                     "the supervisor failed before the agent parked (see reconcile)",
@@ -1636,7 +1638,7 @@ class Launch:
             try:
                 self.cancel_pending(agent_id)
             except (CliError, StoreError):
-                pass  # TODO(#31): the liveness check parks an agent that stayed launching.
+                pass  # the agent stays `launching`: the liveness check settles it (dead launcher)
             if isinstance(error, CliError):
                 if error.agent_id is None:
                     error.agent_id = agent_id
@@ -1892,7 +1894,7 @@ class Launch:
         try:
             lifecycle.park(self.store, agent_id, from_status="launching", **fields)
         except StoreError:
-            # TODO(#31): the liveness check parks an agent that stayed launching.
+            # the agent stays `launching`: the liveness check settles it (dead launcher)
             self.log("warning", level="warn", message="could not park the agent")
         self.log("status_change", level="warn", details={"to": "parked", **fields})
         if isinstance(error, CliError):
@@ -1915,7 +1917,7 @@ class Launch:
         deadline = None
         if wait and args.wait_timeout is not None:
             deadline = time.monotonic() + _seconds(args.wait_timeout)
-        dead_looks = 0
+        next_liveness = 0.0
         while True:
             row = store.get_agent(agent_id)
             if row is None:
@@ -1937,19 +1939,21 @@ class Launch:
             elif lifecycle.run_settled(row, supervisor_alive=alive):
                 return self.result(row, final=True)
             if not alive and status in ("launching", "live"):
-                dead_looks += 1
-                if dead_looks >= DEAD_SUPERVISOR_POLLS and status == "launching":
-                    self.park_unsupervised(row)  # raises once it parked the agent
-                    continue
-                if dead_looks >= DEAD_SUPERVISOR_POLLS:
-                    # TODO(#31): the liveness check parks a live agent whose supervisor died.
-                    raise CliError(
-                        "failed",
-                        "the supervisor exited before the agent parked (see reconcile)",
-                        agent_id=agent_id,
-                    )
-            else:
-                dead_looks = 0
+                # Nothing drives the agent: the liveness check decides on each poll (it never
+                # signals, never stops the run and delivers no hook; it is rate limited because
+                # it calls claude-session).
+                now = time.monotonic()
+                if now >= next_liveness:
+                    next_liveness = now + LIVENESS_EVERY
+                    checked = Liveness(
+                        store,
+                        state_dir=self.state_dir,
+                        fallback_command=self.backend.command if self.backend else None,
+                        gateway=self.gateway,
+                    ).check(agent_id)
+                    if checked.changes:
+                        next_liveness = 0.0
+                        continue  # the row changed: look at it again
             if deadline is not None and time.monotonic() >= deadline:
                 payload = result_object(
                     agent=agent_object(store, row, warnings=self.warnings),
@@ -1959,37 +1963,6 @@ class Launch:
                 )
                 return Outcome(EXIT_TIMED_OUT, payload, PayloadKind.RESULT)
             self.gateway.sleep(POLL)
-
-    def park_unsupervised(self, row: dict[str, Any]) -> None:
-        """The supervisor died while the agent was still ``launching``: the run was never
-        adopted, so cancel it and park ``launch_failed`` with attention. False when the agent
-        parked meanwhile (the next look reports it); else raises ``launch_failed``."""
-        assert self.store is not None and self.backend is not None
-        agent_id = row["agent_id"]
-        session = row.get("csession_id")
-        # Park first (a compare-and-swap from `launching`): the row read may be stale, and a
-        # supervisor that made the agent live meanwhile must keep its session.
-        parked = lifecycle.park(
-            self.store,
-            agent_id,
-            park_reason="launch_failed",
-            needs_attention="launch_failed",
-            from_status="launching",
-        )
-        if parked is None:
-            return
-        if isinstance(session, str):
-            try:
-                self.backend.stop(session)
-            except CliError:
-                pass
-        self.log("status_change", level="warn", details={"to": "parked", "cause": "supervisor"})
-        raise CliError(
-            "launch_failed",
-            "the supervisor exited before the agent started",
-            agent_id=agent_id,
-            decision_ids=list(self.decision_ids),
-        )
 
     def first_working_at(self, row: dict[str, Any], run: int | None = None) -> str | None:
         assert self.store is not None
@@ -2097,7 +2070,7 @@ class Launch:
             try:
                 self.cancel_pending(agent_id)
             except (CliError, StoreError):
-                pass  # TODO(#31): the liveness check parks an agent that stayed launching.
+                pass  # the agent stays `launching`: the liveness check settles it (dead launcher)
             if self.csession_id is not None and self.copies is not None:
                 remove_copies(self.copies.directory)
         self.log("warning", level="warn", message=f"state error ({type(error).__name__})")

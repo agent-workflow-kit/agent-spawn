@@ -29,7 +29,7 @@ An interactive resume with placement ``window`` runs launch step 7 for its windo
 (``Launch.place_window``): the window preflight follows the pre-start checks, the termctl
 ``--override-escalation`` goes to the real ``open`` only. ``--placement here`` runs the
 supervisor in the resuming process (``Launch.place_here``).
-TODO(#31): the liveness check that precedes the lifecycle entry.
+The liveness check of the agent precedes the lifecycle entry (``Resume.liveness``).
 """
 
 from __future__ import annotations
@@ -61,6 +61,7 @@ from .launch import (
     resolve_self,
     run_command,
 )
+from .liveness import Liveness
 from .output import (
     EXIT_SIGINT,
     EXIT_SIGTERM,
@@ -731,6 +732,7 @@ class Resume(Launch):
             decision_ids=self.inv.decision_ids,
             gateway=self.gateway,
         )
+        row = self.liveness(row, cs_argv)
         if row["status"] == "tearing_down" and not self.args.dry_run:
             raise _refusal("tearing_down", "the agent is being torn down", row["agent_id"])
         self.plan_run(store, row)
@@ -740,6 +742,53 @@ class Resume(Launch):
             return self.dry_run_resume(row, cs_argv)
         proposed = new_agent_id(store) if self.fork else row["agent_id"]
         return self.resume_run(row, proposed, cs_argv, self_path)
+
+    def liveness(self, row: dict[str, Any], cs_argv: Sequence[str]) -> dict[str, Any]:
+        """Step 3: the liveness check of the agent, before the lifecycle entry (it may park an
+        agent whose supervisor died, restore an interrupted resume or remove an abandoned
+        fork). Returns the row afterwards. A session claude-session does not know exits 10
+        (``details.status: session_missing``). Its parking events are delivered here (resume is
+        a mutating command); a dry run only reports."""
+        assert self.store is not None
+        agent_id = row["agent_id"]
+
+        def wtctl_for(stored: Mapping[str, Any]) -> WtctlBackend | None:
+            try:
+                return self.wtctl_backend(stored.get("wtctl_path"))
+            except CliError:
+                return None
+
+        checked = Liveness(
+            self.store,
+            state_dir=self.state_dir,
+            fallback_command=cs_argv,
+            wtctl_for=wtctl_for,
+            dry_run=bool(self.args.dry_run),
+            gateway=self.gateway,
+        ).check(agent_id)
+        self.warnings.extend(w for w in checked.warnings if w not in self.warnings)
+        if checked.changes and not self.args.dry_run:
+            try:
+                hooklib.deliver_outbox(
+                    self.store,
+                    agent_id,
+                    self.config.hooks,
+                    state_dir=self.state_dir,
+                    gateway=self.gateway,
+                )
+            except (StoreError, OSError):
+                pass  # hook failures never change the command's result
+        if checked.row is None:
+            raise CliError.of("not_found", f"no agent {agent_id}", agent_id=agent_id)
+        if checked.session_missing:
+            raise CliError.of(
+                "not_found",
+                "the agent's session is missing",
+                agent_id=agent_id,
+                details={"status": "session_missing"},
+                decision_ids=list(self.decision_ids),
+            )
+        return checked.row
 
     def resume_run(
         self, row: dict[str, Any], proposed: str, cs_argv: Sequence[str], self_path: str
@@ -933,6 +982,8 @@ class Resume(Launch):
                 name=self.args.name or source_row["name"],
                 term_placement=source_row.get("term_placement"),
             )
+        if self.fork:
+            self.update_cwd(run_id, cwd)  # an abandoned fork's holds are found by its cwd
         self.take_holds(run_id, cwd)  # step 6
         # The session (step 7).
         spec = self.build_spec(run_id, None, cwd, copies)
@@ -1522,7 +1573,7 @@ class Resume(Launch):
             else:
                 self.restore(agent_id)
         except (StoreError, CliError):
-            # TODO(#31): the liveness check restores a launching agent whose launcher died.
+            # the entry stays: the liveness check restores it once this launcher is gone
             self.log("warning", level="warn", message="could not undo the resume's entry")
 
     def cleanup_failed(self, failure: CliError) -> CliError:
@@ -1582,7 +1633,7 @@ class Resume(Launch):
                 try:
                     self.cancel_pending(agent_id)
                 except (CliError, StoreError):
-                    pass  # TODO(#31): the liveness check parks an agent that stayed launching.
+                    pass  # the agent stays `launching`: the liveness check settles it
             else:
                 self.undo_entry(interrupted=False)
         self.log("warning", level="warn", message=f"state error ({type(error).__name__})")

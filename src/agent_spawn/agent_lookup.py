@@ -13,14 +13,17 @@ from typing import Any
 from . import gateway as gw
 from .commands.base import Invocation
 from .ids import ResolvedId, check_agent_id_text, resolve_agent_id
-from .launch import resolve_tool
+from .launch import resolve_tool, resolve_wtctl
+from .liveness import Liveness
 from .output import CliError
 from .session_backend import SessionBackend
 from .store import SchemaOlder, Store, StoreBusy, StoreError, StoreMissing, default_state_dir
 from .validate import GrammarError
+from .worktrees import WtctlBackend
 
 __all__ = [
     "backend_for",
+    "liveness_for",
     "open_existing",
     "resolve_existing",
     "state_dir_of",
@@ -89,4 +92,39 @@ def backend_for(inv: Invocation, row: Mapping[str, Any] | None = None) -> Sessio
         command = resolve_tool(inv.config.claude_session_cmd, "claude-session")
     return SessionBackend(
         command, actor=inv.actor, decision_ids=inv.decision_ids, gateway=gw.get_gateway()
+    )
+
+
+def liveness_for(inv: Invocation, store: Store, *, dry_run: bool = False) -> Liveness:
+    """The inline liveness check of a command (interface.md, Liveness): claude-session as each
+    agent recorded it (else as the config names it), wtctl for an abandoned fork's holds."""
+    assert inv.config is not None
+    config = inv.config
+    fallback: list[str] | None
+    try:
+        fallback = resolve_tool(config.claude_session_cmd, "claude-session")
+    except CliError:
+        fallback = None  # an agent whose row stores a path still works
+
+    def wtctl_for(row: Mapping[str, Any]) -> WtctlBackend | None:
+        if config.wtctl_cmd is None:
+            return None
+        stored = row.get("wtctl_path")
+        if not isinstance(stored, str) or not stored:
+            source = row.get("forked_from")
+            parent = store.get_agent(source) if isinstance(source, str) else None
+            stored = parent.get("wtctl_path") if parent is not None else None
+        try:
+            argv = resolve_wtctl(config.wtctl_cmd, stored if isinstance(stored, str) else None)
+        except CliError:
+            return None
+        return WtctlBackend(argv)
+
+    return Liveness(
+        store,
+        state_dir=state_dir_of(inv),
+        fallback_command=fallback,
+        wtctl_for=wtctl_for,
+        dry_run=dry_run,
+        gateway=gw.get_gateway(),
     )

@@ -15,8 +15,10 @@ A bulk-destructive command, so every decision is conservative:
 * over ``worktree_partial`` only a tombstone continues (``retry_partial_remove=False``);
 * one agent's failure, whatever it is, is reported for that agent and never stops the others.
 
-TODO(#31): the liveness check (``lost``, ``session_missing``) joins the engine's live checks in
-``Teardown.live_reason``; prune inherits it.
+Liveness. Prune only enters ``parked`` agents and ``tearing_down`` ones with a dead teardown
+process, which the liveness check (``launching`` and ``live`` agents only) never touches; the
+engine's live checks, and the liveness check it runs when it enters an agent, still apply. A
+``live`` or ``launching`` agent is skipped as ``not_parked``.
 """
 
 from __future__ import annotations

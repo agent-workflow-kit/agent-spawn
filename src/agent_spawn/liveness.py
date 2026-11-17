@@ -163,6 +163,22 @@ class Liveness:
             ctx.warnings.append(f"agent {agent_id} is busy: its liveness was not judged")
         return self._result(ctx)
 
+    def session_missing(self, agent_id: str, session: str) -> Checked:
+        """A command's own ``claude-session`` call found ``session`` unknown (exit 10): park the
+        agent ``session_missing`` (a no-op unless it is ``launching`` or ``live`` and still has
+        that session)."""
+        row = self.store.get_agent(agent_id)
+        if row is None or row["status"] not in ("launching", "live"):
+            return Checked(row)
+        if row.get("csession_id") != session:
+            return Checked(row)
+        ctx = _Ctx(row)
+        try:
+            self.park_session_missing(ctx)
+        except LeaseHeld:
+            ctx.warnings.append(f"agent {agent_id} is busy: it was not parked")
+        return self._result(ctx)
+
     def check_all(self, rows: Sequence[Mapping[str, Any]] | None = None) -> list[Checked]:
         """Check every ``launching`` or ``live`` agent (of ``rows``, else of the store)."""
         found = rows if rows is not None else self.store.list_agents()

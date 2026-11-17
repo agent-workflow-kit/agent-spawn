@@ -806,7 +806,8 @@ class Supervisor:
             result = self.read_outcome(backend, ctx.outcome_file, session, ctx.run)
         except CliError as error:
             self.log("warning", level="error", message=f"error: no outcome: {error.code}")
-            # TODO(#31): the liveness check parks an agent whose outcome cannot be read.
+            # The supervisor ends; the liveness check parks the agent from `status` (the run is
+            # final there even when the outcome file is not).
             raise
         run_row = self.store.get_run(self.agent_id, ctx.run) or {}
         # The relay's first `working` activity, else the run's `recent_events` (filled in by
@@ -842,7 +843,7 @@ class Supervisor:
                 return result
             failure = CliError.of("internal", "exec exited but the run is not final")
         assert failure is not None
-        # TODO(#31): the liveness check parks an agent whose run never became final.
+        # (a run that never became final leaves the agent to the liveness check)
         raise failure
 
     def record_run(self, ctx: RunCtx, result: RunOutcome, outcome: dict[str, Any]) -> None:

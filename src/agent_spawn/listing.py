@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from .agent_lookup import open_existing, resolve_existing, store_failed
+from .agent_lookup import liveness_for, open_existing, resolve_existing, store_failed
 from .agent_view import CORRUPT_ROW, agent_object, unusable_row
 from .commands.base import Invocation
 from .ids import ID_CHARS, check_agent_id_text
@@ -98,7 +98,7 @@ def list_agents(inv: Invocation) -> Outcome:
     if store is not None:
         try:
             with store:
-                agents = _select(store, args, statuses, session_states, labels, since)
+                agents = _select(inv, store, args, statuses, session_states, labels, since)
         except StoreError as error:
             raise store_failed(error) from None
     human = "\n".join(human_line(agent) for agent in agents) if agents else "no agents"
@@ -106,6 +106,7 @@ def list_agents(inv: Invocation) -> Outcome:
 
 
 def _select(
+    inv: Invocation,
     store: Store,
     args: Any,
     statuses: list[str],
@@ -137,9 +138,16 @@ def _select(
         "since": since,
     }
     try:
+        # The inline liveness check of the live and launching rows runs first (it may park an
+        # agent); it records its changes and delivers no hook. A row whose process entry cannot
+        # be read is listed as it is: unreadable is an error, never "dead".
+        live = liveness_for(inv, store)
+        for row in store.list_agents(statuses=("launching", "live")):
+            try:
+                live.check(row["agent_id"])
+            except CliError:
+                continue
         rows = [row for row in store.list_agents() if _matches(row, ids, wanted)]
-        # TODO(#31): run the inline liveness check for the live and launching rows here (it may
-        # park an agent), then re-read them; it records its changes and delivers no hook.
         rows.sort(key=lambda row: row["agent_id"])
         rows.sort(key=lambda row: row["created"], reverse=True)
     except CORRUPT_ROW:

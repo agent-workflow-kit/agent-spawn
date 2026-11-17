@@ -18,6 +18,7 @@ from . import gateway as gw
 from . import hooks as hooklib
 from .agent_lookup import (
     backend_for,
+    liveness_for,
     open_existing,
     resolve_existing,
     state_dir_of,
@@ -111,7 +112,7 @@ def ack(inv: Invocation) -> Outcome:
     warnings: list[str] = []
     try:
         with store:
-            # TODO(#31): the inline liveness check of the agent runs before the write.
+            _liveness(inv, store, agent_id, warnings)  # before the write (it may park the agent)
             with agent_lease(store, agent_id) as lease:
                 row = _live_row(store, agent_id)
                 before = agent_object(store, row)
@@ -146,6 +147,21 @@ def ack(inv: Invocation) -> Outcome:
         f"{agent_id}: needs_attention cleared" if changed else f"{agent_id}: nothing to acknowledge"
     )
     return Outcome(0, {"agent": after, "changed": changed}, PayloadKind.COMMAND, human)
+
+
+def _liveness(
+    inv: Invocation, store: Store, agent_id: str, warnings: list[str], *, dry_run: bool = False
+) -> None:
+    """The inline liveness check before a write; its parking events are delivered by the
+    command (best effort) once the write is done. An agent that is gone is reported by the
+    command's own lookup."""
+    row = store.get_agent(agent_id)
+    if row is None or row["status"] not in ("launching", "live"):
+        return
+    checked = liveness_for(inv, store, dry_run=dry_run).check(agent_id)
+    warnings.extend(checked.warnings)
+    if checked.changes and not dry_run:
+        _deliver(inv, store, agent_id)
 
 
 def _deliver(inv: Invocation, store: Store, agent_id: str) -> None:
@@ -310,7 +326,7 @@ def label_edit(inv: Invocation, direction: Direction) -> Outcome:
     key = "added" if direction == "add" else "removed"
     try:
         with store:
-            # TODO(#31): the inline liveness check of the agent runs before the write.
+            _liveness(inv, store, agent_id, warnings, dry_run=bool(args.dry_run))
             if args.dry_run:
                 row = _live_row(store, agent_id)
                 change = _plan(store.get_labels(agent_id), direction, pairs)
