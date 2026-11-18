@@ -634,6 +634,41 @@ class Store:
             if taken == 1:
                 return Lease(key, me, took_over_from=current)
 
+    def reset_unparseable_lease(
+        self, key: str, *, holder: ProcessIdentity | None = None
+    ) -> tuple[Lease, object] | None:
+        """Take lease ``key`` for ``holder`` (default this process) when its stored holder
+        cannot be parsed; return the lease and the raw stored value that was replaced.
+
+        Only for an operator's explicit repair ([interface.md](reconcile)): an unparseable
+        holder cannot be proven dead, so ``acquire_lease`` never takes it over. ``None`` (and
+        nothing written) when there is no row, when the holder parses (the ordinary takeover
+        rules then apply, a live holder is never touched), or when the row changed since it was
+        judged: the replacement is a compare-and-set on the exact stored value, so a healthy
+        holder that took the lease meanwhile is never clobbered. Idempotent: once replaced, the
+        holder parses. Never inside an open transaction (``StoreError``)."""
+        self._no_transaction("reset_unparseable_lease")
+        if _LEASE_KEY.fullmatch(key) is None:
+            raise ValueError(f"invalid lease key {key!r}")
+        me = holder or self.holder_identity()
+        with _mapped():
+            row = self._conn.execute("SELECT holder FROM leases WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return None
+        stored = row["holder"]
+        try:
+            _decode_holder(key, stored)
+        except StoreCorrupt:
+            pass
+        else:
+            return None
+        with self.transaction():
+            replaced = self._conn.execute(
+                "UPDATE leases SET holder = ?, acquired = ? WHERE key = ? AND holder = ?",
+                (encode_value("proc", me), self._now(), key, stored),
+            ).rowcount
+        return (Lease(key, me), stored) if replaced == 1 else None
+
     def _holder_alive(self, holder: ProcessIdentity) -> bool:
         """Another boot id is dead without reading ``/proc``; an unreadable or unparseable
         process entry is a ``StoreError``, never "dead"."""

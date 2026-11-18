@@ -65,7 +65,7 @@ from .lifecycle import LEASE_WAIT, lease_key
 from .output import CliError, Outcome, PayloadKind, safe_text
 from .panes import scan_dead, sockets_to_search, termctl_for
 from .records import RecordsError, append_log
-from .store import LeaseHeld, Store, StoreError
+from .store import Lease, LeaseHeld, Store, StoreError
 from .teardown import SUPERVISOR_ACTOR, remove_agent_files, remove_tree_at
 from .term import TermBackend
 
@@ -566,6 +566,50 @@ def _outcome(
     return Outcome(0, payload, PayloadKind.COMMAND, human, quiet=quiet)
 
 
+#: Characters of an unparseable holder kept in the log and the warning.
+HOLDER_TEXT_LIMIT = 200
+
+
+def _bounded(raw: object) -> tuple[str, bool]:
+    """The raw stored holder as bounded, escaped text, and whether it was cut."""
+    text = raw if isinstance(raw, str) else repr(raw)
+    cut = len(text) > HOLDER_TEXT_LIMIT
+    return safe_text(text[:HOLDER_TEXT_LIMIT]), cut
+
+
+def _take_lease(inv: Invocation, store: Store, state_dir: str, run: _Pass) -> Lease:
+    """Take the ``reconcile`` lease. With ``--reset-lease`` a holder that cannot be parsed is
+    replaced first (compare-and-set on the exact row; a parseable holder, live or dead, is left
+    to the ordinary rules), logged with its raw text and reported as a warning."""
+    if bool(inv.args.reset_lease):
+        taken = store.reset_unparseable_lease(LEASE)
+        if taken is not None:
+            lease, raw = taken
+            text, cut = _bounded(raw)
+            try:
+                append_log(
+                    state_dir,
+                    "reconcile_change",
+                    level="warn",
+                    actor=inv.actor,
+                    details={
+                        "kind": "lease_reset",
+                        "lease": LEASE,
+                        "holder": text,
+                        "truncated": cut,
+                    },
+                )
+            except (RecordsError, ValueError, OSError):
+                pass
+            run.warn(
+                None,
+                f"the {LEASE} lease holder could not be parsed and was replaced: {text}"
+                + (" (cut)" if cut else ""),
+            )
+            return lease
+    return store.acquire_lease(LEASE)
+
+
 def reconcile_command(inv: Invocation) -> Outcome:
     """The handler of ``reconcile`` (``commands.maintenance``)."""
     dry_run = bool(inv.args.dry_run)
@@ -581,7 +625,7 @@ def reconcile_command(inv: Invocation) -> Outcome:
             run.run()
         else:
             try:
-                lease = store.acquire_lease(LEASE)
+                lease = _take_lease(inv, store, state_dir, run)
             except LeaseHeld:
                 return _outcome(inv, [], warnings, True, dry_run)
             except StoreError as error:  # e.g. a lease row whose holder cannot be parsed

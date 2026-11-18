@@ -1205,6 +1205,116 @@ def test_a_lease_row_that_cannot_be_parsed_is_an_error_and_is_left_alone(
     assert db_rows(env, "SELECT holder FROM leases WHERE key = 'reconcile'") == [("garbage",)]
 
 
+HUMAN = ("--actor", "human:tester")
+
+
+def put_holder(env: Env, raw: object) -> None:
+    db = sqlite3.connect(env.state_dir / "state.db")
+    try:
+        with db:
+            db.execute("DELETE FROM leases WHERE key = 'reconcile'")
+            db.execute(
+                "INSERT INTO leases (key, holder, acquired) VALUES ('reconcile', ?, 0)", (raw,)
+            )
+    finally:
+        db.close()
+
+
+def test_reset_lease_recovers_an_unparseable_holder_runs_the_pass_and_logs_it(
+    env: Env, fakebin: Fakebin
+) -> None:
+    old = tombstone(env, fakebin, 40.0)
+    put_holder(env, "garbage")
+    body = reconcile(env, "--reset-lease", *HUMAN)
+    assert body["already_running"] is False
+    assert (old, "tombstone_deleted") in kinds(body)  # the pass ran after the repair
+    assert any("garbage" in w and "lease" in w for w in body["warnings"])
+    assert db_rows(env, "SELECT key FROM leases") == []  # released like any other pass
+    (entry,) = [
+        x for x in log_events(env, "reconcile_change") if x["details"]["kind"] == "lease_reset"
+    ]
+    assert entry["level"] == "warn" and entry["actor"] == "human:tester"
+    assert entry["details"]["lease"] == "reconcile"
+    assert entry["details"]["holder"] == "garbage" and entry["details"]["truncated"] is False
+    # a second pass has nothing to repair: idempotent, nothing more is logged
+    again = reconcile(env, "--reset-lease", *HUMAN)
+    assert again["warnings"] == []
+    assert [
+        x for x in log_events(env, "reconcile_change") if x["details"]["kind"] == "lease_reset"
+    ] == [entry]
+
+
+def test_without_the_flag_an_unparseable_holder_still_exits_12_and_is_untouched(
+    env: Env, fakebin: Fakebin
+) -> None:
+    seed(env, fakebin)
+    put_holder(env, "garbage")
+    done = env.run("reconcile", "--json", *HUMAN)
+    assert done.returncode == 12, (done.stdout, done.stderr)
+    assert db_rows(env, "SELECT holder FROM leases WHERE key = 'reconcile'") == [("garbage",)]
+    assert log_events(env, "reconcile_change") == []
+
+
+def test_reset_lease_is_human_only(env: Env, fakebin: Fakebin) -> None:
+    seed(env, fakebin)
+    put_holder(env, "garbage")
+    for extra in ((), ("--actor", "auto:cron")):
+        done = env.run("reconcile", "--json", "--reset-lease", *extra)
+        assert done.returncode == 2, (done.stdout, done.stderr)
+    assert db_rows(env, "SELECT holder FROM leases WHERE key = 'reconcile'") == [("garbage",)]
+
+
+def test_reset_lease_with_dry_run_is_a_usage_error(env: Env, fakebin: Fakebin) -> None:
+    seed(env, fakebin)
+    put_holder(env, "garbage")
+    done = env.run("reconcile", "--json", "--reset-lease", "--dry-run", *HUMAN)
+    assert done.returncode == 2, (done.stdout, done.stderr)
+    assert db_rows(env, "SELECT holder FROM leases WHERE key = 'reconcile'") == [("garbage",)]
+
+
+def test_reset_lease_never_takes_a_live_holders_lease(env: Env, fakebin: Fakebin) -> None:
+    old = tombstone(env, fakebin, 40.0)
+    with Store.open(env.state_dir) as store:
+        lease = store.acquire_lease("reconcile")  # this process: alive
+        try:
+            body = reconcile(env, "--reset-lease", *HUMAN)
+        finally:
+            store.release_lease(lease)
+    assert body["already_running"] is True and body["changes"] == []
+    assert log_events(env, "reconcile_change") == []
+    with Store.open(env.state_dir) as store:
+        assert store.get_agent(old) is not None
+
+
+def test_reset_lease_takes_over_a_dead_parseable_holder_as_before(
+    env: Env, fakebin: Fakebin
+) -> None:
+    seed(env, fakebin)
+    with Store.open(env.state_dir) as store:
+        store.acquire_lease("reconcile", holder=dead_identity())
+    body = reconcile(env, "--reset-lease", *HUMAN)
+    assert body["already_running"] is False and body["warnings"] == []
+    assert [
+        x for x in log_events(env, "reconcile_change") if x["details"]["kind"] == "lease_reset"
+    ] == []
+
+
+def test_reset_lease_logs_a_hostile_holder_escaped_and_bounded(env: Env, fakebin: Fakebin) -> None:
+    seed(env, fakebin)
+    hostile = "\x1b[2J\u202e\n" + "x" * 5000
+    put_holder(env, hostile)
+    body = reconcile(env, "--reset-lease", *HUMAN)
+    (entry,) = [
+        x for x in log_events(env, "reconcile_change") if x["details"]["kind"] == "lease_reset"
+    ]
+    logged = entry["details"]["holder"]
+    assert entry["details"]["truncated"] is True and len(logged) < 600
+    assert "\x1b" not in logged and "\u202e" not in logged and "\n" not in logged
+    assert "\\x1b" in logged
+    warning = next(w for w in body["warnings"] if "lease" in w)
+    assert len(warning) < 800 and "\x1b" not in warning and "\n" not in warning
+
+
 # --- dry run, isolation of steps, idempotence ----------------------------------------------------
 
 

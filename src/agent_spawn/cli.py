@@ -69,6 +69,7 @@ HUMAN_ONLY_FLAGS = (
     ("force", "--force"),
     ("override_escalation", "--override-escalation"),
     ("allow_tainted", "--allow-tainted"),
+    ("reset_lease", "--reset-lease"),
 )
 
 
@@ -319,6 +320,11 @@ def _add_dry_run(parser: Any) -> None:
     parser.add_argument("--dry-run", action="store_true")
 
 
+def _add_reconcile(parser: Any) -> None:
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--reset-lease", action="store_true")
+
+
 def _add_cron_install(parser: Any) -> None:
     parser.add_argument("--interval", type=_interval, metavar="MINUTES", help="1 to 59")
     parser.add_argument("--env-file", metavar="PATH")
@@ -368,7 +374,7 @@ def build_parser() -> SpawnParser:
     add(commands, "stop", "stop", _add_stop, "end an agent's current run")
     add(commands, "teardown", "teardown", _add_teardown, "tear an agent down")
     add(commands, "prune", "prune", _add_prune, "tear down old parked agents")
-    add(commands, "reconcile", "reconcile", _add_dry_run, "recover from crashes and races")
+    add(commands, "reconcile", "reconcile", _add_reconcile, "recover from crashes and races")
     add(commands, "export", "export", _add_export, "print audit records")
     add(commands, "browse", "browse", _add_browse, "browse agents in a TUI")
     add(commands, "supervise", "supervise", _add_supervise, None)
@@ -442,6 +448,9 @@ def _check_usage(args: argparse.Namespace, key: str) -> None:
         raise ValueError("resume needs exactly one of AGENT_ID or --select")
     if key in ("launch", "resume"):
         parse_run_labels(args.label or [])  # the cap over distinct non-job pairs
+
+    if key == "reconcile" and args.reset_lease and args.dry_run:
+        raise ValueError("reconcile --reset-lease takes no --dry-run")
 
     if key == "supervise" and (args.handoff is None) != (args.handoff_timeout is None):
         raise ValueError("supervise needs --handoff and --handoff-timeout together")
