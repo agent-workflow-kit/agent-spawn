@@ -83,3 +83,78 @@ def run_app(
             await script(app, pilot)
 
     asyncio.run(main())
+
+
+class PtyRun:
+    """A child on a pseudo-terminal, driven with bounded waits (never sleeps for a fixed time)."""
+
+    def __init__(self, argv: Sequence[str], env: dict[str, str]) -> None:
+        import fcntl
+        import os
+        import pty
+        import struct
+        import subprocess
+        import termios
+
+        self.master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 140, 0, 0))
+        self.buffer = ""
+        self._os = os
+        self.proc = subprocess.Popen(
+            list(argv),
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            env={**env, "TERM": "xterm-256color", "COLUMNS": "140", "LINES": "30"},
+            start_new_session=True,
+        )
+        os.close(slave)
+
+    def _pump(self, wait: float) -> bool:
+        import select
+
+        ready, _, _ = select.select([self.master], [], [], wait)
+        if not ready:
+            return True
+        try:
+            data = self._os.read(self.master, 65536)
+        except OSError:
+            return False
+        if not data:
+            return False
+        self.buffer += data.decode("utf-8", errors="replace")
+        return True
+
+    def read_until(self, needle: str, timeout: float = 60.0) -> None:
+        import time
+
+        deadline = time.monotonic() + timeout
+        while needle not in self.buffer:
+            if time.monotonic() > deadline or not self._pump(0.1):
+                raise AssertionError(f"{needle!r} never appeared; saw {self.buffer[-500:]!r}")
+
+    def send(self, data: str) -> None:
+        self._os.write(self.master, data.encode())
+
+    def finish(self, timeout: float = 60.0) -> int:
+        import subprocess
+        import time
+
+        deadline = time.monotonic() + timeout
+        try:
+            while self.proc.poll() is None:
+                if time.monotonic() > deadline:
+                    raise AssertionError(f"still running; saw {self.buffer[-500:]!r}")
+                self._pump(0.1)
+            while self._pump(0.05) and time.monotonic() < deadline:
+                if not self._os.isatty(self.master):
+                    break
+                break
+        except subprocess.SubprocessError:  # pragma: no cover
+            raise
+        finally:
+            if self.proc.poll() is None:
+                self.proc.terminate()  # the exact child this object started
+                self.proc.wait(timeout=10)
+            self._os.close(self.master)
+        return int(self.proc.returncode)

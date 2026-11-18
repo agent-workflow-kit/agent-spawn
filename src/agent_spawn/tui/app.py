@@ -138,7 +138,7 @@ class BrowseApp(App[None]):
         self.intent: tuple[str, list[str]] | None = None
         self.filters = FilterState()
         self.agents: list[dict[str, Any]] = []
-        self.visible: list[dict[str, Any]] = []
+        self.rows: list[dict[str, Any]] = []
         self.marked: set[str] = set()
         self.details: dict[str, dict[str, Any]] = {}
         self.detail_errors: dict[str, str] = {}
@@ -162,7 +162,8 @@ class BrowseApp(App[None]):
         yield Footer()
 
     async def on_mount(self) -> None:
-        self.theme = "textual-ansi"  # the terminal's own colors
+        if "ansi-dark" in self.available_themes:  # the terminal's own colors, no fixed background
+            self.theme = "ansi-dark"
         table = self.query_one("#table", DataTable)
         for label in COLUMNS:
             table.add_column(label)
@@ -179,24 +180,24 @@ class BrowseApp(App[None]):
 
     def _current(self) -> dict[str, Any] | None:
         table = self.query_one("#table", DataTable)
-        if not self.visible or not 0 <= table.cursor_row < len(self.visible):
+        if not self.rows or not 0 <= table.cursor_row < len(self.rows):
             return None
-        return self.visible[table.cursor_row]
+        return self.rows[table.cursor_row]
 
     def _render_table(self, keep: str | None = None) -> None:
         table = self.query_one("#table", DataTable)
         empty = self.query_one("#empty", Static)
-        self.visible = [a for a in self.agents if self.filters.matches(a)]
+        self.rows = [a for a in self.agents if self.filters.matches(a)]
         now = self.clock()
         table.clear()
-        for agent in self.visible:
+        for agent in self.rows:
             cells = agent_cells(agent, now, marked=agent["agent_id"] in self.marked)
             table.add_row(*(Text(cell) for cell in cells), key=agent["agent_id"])
         if self.list_error is not None:
             message = f"Could not list agents: {self.list_error}"
         elif not self.agents:
             message = "No agents yet. Start one with `agent-spawn launch`."
-        elif not self.visible:
+        elif not self.rows:
             message = "No agent matches the filters (esc clears them)."
         else:
             message = ""
@@ -204,12 +205,12 @@ class BrowseApp(App[None]):
         empty.display = bool(message)
         table.display = not message
         if keep is not None:
-            for index, agent in enumerate(self.visible):
+            for index, agent in enumerate(self.rows):
                 if agent["agent_id"] == keep:
                     table.move_cursor(row=index)
                     break
         self.query_one("#filters", Static).update(
-            f"filters: {self.filters.summary()}  ({len(self.visible)}/{len(self.agents)} shown)"
+            f"filters: {self.filters.summary()}  ({len(self.rows)}/{len(self.agents)} shown)"
         )
         self._render_detail()
 
@@ -236,7 +237,7 @@ class BrowseApp(App[None]):
 
     # --- loading -----------------------------------------------------------------------------
 
-    async def _reload(self, *, initial: bool = False) -> None:
+    async def _reload(self, *, initial: bool = False, announce: bool = True) -> None:
         keep = self._current()
         keep_id = keep["agent_id"] if keep else None
         result = await asyncio.to_thread(self.backend.call, ["list"])
@@ -246,7 +247,8 @@ class BrowseApp(App[None]):
             self.marked &= {a["agent_id"] for a in self.agents}
             self.details.clear()
             self.detail_errors.clear()
-            self.status(f"{len(self.agents)} agent(s)")
+            if announce:
+                self.status(f"{len(self.agents)} agent(s)")
         else:
             self.list_error = result.describe()
             self.status(f"list failed, {self.list_error}")
@@ -372,7 +374,7 @@ class BrowseApp(App[None]):
             self.intent = ("attach", targets)
             self.exit()
             return
-        self._start(f"attach {targets[0]}", self._attach(targets[0]))
+        self._start(f"attach {targets[0]}", self._do_attach(targets[0]))
 
     def action_resume(self) -> None:
         targets = self._targets()
@@ -401,12 +403,12 @@ class BrowseApp(App[None]):
             await work
         finally:
             self._busy = None
-        await self._reload()
+        await self._reload(announce=False)
 
     async def _call(self, command: list[str], *, timeout: float | None = None) -> CliResult:
         return await asyncio.to_thread(self.backend.call, command, acting=True, timeout=timeout)
 
-    async def _attach(self, agent_id: str) -> None:
+    async def _do_attach(self, agent_id: str) -> None:
         result = await self._call(["attach", agent_id])
         payload = result.payload if isinstance(result.payload, dict) else {}
         if not result.ok:
@@ -505,4 +507,4 @@ class BrowseApp(App[None]):
                 f"wait {agent_id}: {shown(payload.get('phase'), 40)}"  # pyright: ignore[reportUnknownMemberType]
                 f" outcome={shown(payload.get('outcome') or '-', 40)} (exit {result.exit_code})"  # pyright: ignore[reportUnknownMemberType]
             )
-        await self._reload()
+        await self._reload(announce=False)
