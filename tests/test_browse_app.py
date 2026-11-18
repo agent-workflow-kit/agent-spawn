@@ -632,3 +632,49 @@ def test_quit_never_waits_for_a_read_only_command() -> None:
         assert app.intent == ("back", [])
 
     run_app(make(backend, record_intent=True), script)
+
+
+def test_a_hung_attach_json_ends_in_an_error_notice() -> None:
+    import sys
+
+    from agent_spawn.tui.model import SubprocessBackend
+
+    code = "import time;time.sleep(60)"
+    real = SubprocessBackend(
+        config_path=None, actor="human:me", prefix=[sys.executable, "-I", "-c", code]
+    )
+    backend = FakeBackend(three())
+    original = backend.call
+
+    def call(
+        command: Any, *, acting: bool = False, timeout: Any = None, terminal: bool = False
+    ) -> Any:
+        if command[0] == "attach":
+            return real.call(command, acting=acting, timeout=timeout)
+        return original(command, acting=acting, timeout=timeout, terminal=terminal)
+
+    backend.call = call  # type: ignore[method-assign]
+
+    async def script(app: BrowseApp, pilot: Any) -> None:
+        await pilot.press("a")
+        await settle(app, pilot)
+        assert "took too long" in text_of(app, "#status")
+        assert backend.terminal == []
+
+    try:
+        run_app(no_suspend(make(backend, attach_timeout=0.5)), script)
+    finally:
+        real.close()
+
+
+def test_a_signal_after_a_chosen_intent_keeps_that_intent() -> None:
+    backend = FakeBackend(three())
+    app = make(backend, record_intent=True)
+
+    async def script(app: BrowseApp, pilot: Any) -> None:
+        await pilot.press("a")
+        assert app.intent == ("attach", [IDS[0]])
+        app._leave()  # what a SIGTERM schedules
+        assert app.intent == ("attach", [IDS[0]])
+
+    run_app(app, script)

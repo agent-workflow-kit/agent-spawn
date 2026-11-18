@@ -131,12 +131,14 @@ class BrowseApp(App[None]):
         *,
         focus: str | None = None,
         record_intent: bool = False,
+        attach_timeout: float = READ_TIMEOUT,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         super().__init__()
         self.backend = backend
         self.focus_id = focus
         self.record_intent = record_intent
+        self.attach_timeout = attach_timeout
         self.clock = clock
         self.intent: tuple[str, list[str]] | None = None
         self.filters = FilterState()
@@ -375,7 +377,7 @@ class BrowseApp(App[None]):
         self._leave()
 
     def _leave(self) -> None:
-        if self.record_intent:
+        if self.record_intent and self.intent is None:  # a chosen attach or resume stays
             self.intent = ("back", [])
         self.exit()
 
@@ -453,7 +455,9 @@ class BrowseApp(App[None]):
         # termctl decides by isatty whether the user is at a terminal, so `attach --json` runs
         # with this process's own stdin and stderr, and the argv it returns then owns the terminal
         def work() -> tuple[CliResult, int | None]:
-            result = self.backend.call(["attach", agent_id], acting=True, terminal=True)
+            result = self.backend.call(
+                ["attach", agent_id], acting=True, terminal=True, timeout=self.attach_timeout
+            )
             payload = result.payload if isinstance(result.payload, dict) else {}
             argv = payload.get("argv")  # pyright: ignore[reportUnknownMemberType]
             if (
