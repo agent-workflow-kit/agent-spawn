@@ -20,7 +20,10 @@ from tests.launch_support import Env
 
 RESULT = "agent-spawn/cli/browse-result.json"
 ERROR = "agent-spawn/cli/error.json"
-NO_TEXTUAL = "import sys;sys.modules['textual']=None;from agent_spawn.cli import main;raise SystemExit(main(sys.argv[1:]))"
+NO_TEXTUAL = (
+    "import sys;sys.modules['textual']=None;"
+    "from agent_spawn.cli import main;raise SystemExit(main(sys.argv[1:]))"
+)
 
 
 @pytest.fixture
@@ -36,8 +39,13 @@ def test_without_textual_it_exits_2_with_the_install_hint(env: Env, tmp_path: Pa
     path = tmp_path / "r.json"
     done = subprocess.run(
         [sys.executable, "-c", NO_TEXTUAL, "--json", "browse", "--result-file", str(path)],
-        capture_output=True, text=True, env=env.env(), stdin=subprocess.DEVNULL, timeout=60, check=False,
-    )  # fmt: skip
+        capture_output=True,
+        text=True,
+        env=env.env(),
+        stdin=subprocess.DEVNULL,
+        timeout=60,
+        check=False,
+    )
     assert done.returncode == 2
     body = json.loads(done.stdout)
     schema_registry.validate(body, ERROR)
@@ -51,8 +59,13 @@ def test_without_a_terminal_it_exits_2_and_writes_nothing(env: Env, tmp_path: Pa
     path = tmp_path / "r.json"
     done = subprocess.run(
         browse_argv("--result-file", str(path)),
-        capture_output=True, text=True, env=env.env(), stdin=subprocess.DEVNULL, timeout=60, check=False,
-    )  # fmt: skip
+        capture_output=True,
+        text=True,
+        env=env.env(),
+        stdin=subprocess.DEVNULL,
+        timeout=60,
+        check=False,
+    )
     assert done.returncode == 2 and "terminal" in done.stderr
     assert not path.exists()
     assert not env.state_dir.exists()
@@ -69,7 +82,9 @@ def read_intent(path: Path) -> dict[str, object]:
     return body
 
 
-def test_it_lists_real_agents_and_q_without_a_result_file_writes_nothing(env: Env, tmp_path: Path) -> None:
+def test_it_lists_real_agents_and_q_without_a_result_file_writes_nothing(
+    env: Env, tmp_path: Path
+) -> None:
     seed_agent(env, A1, name="first one")
     seed_agent(env, A2, name="second [one]")
     before = sorted(p.name for p in tmp_path.iterdir())

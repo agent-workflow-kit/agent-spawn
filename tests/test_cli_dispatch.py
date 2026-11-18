@@ -43,6 +43,7 @@ OWNERS = {
 
 IMPLEMENTED = {
     "attach",
+    "browse",
     "ack",
     "cron install",
     "cron uninstall",

@@ -216,7 +216,11 @@ def parse_agents(payload: Any) -> list[dict[str, Any]]:
         if not isinstance(agent, dict):
             continue
         agent_id = agent.get("agent_id")  # pyright: ignore[reportUnknownMemberType]
-        if isinstance(agent_id, str) and is_agent_id(agent_id) and isinstance(agent.get("status"), str):  # pyright: ignore[reportUnknownMemberType]
+        if (
+            isinstance(agent_id, str)
+            and is_agent_id(agent_id)
+            and isinstance(agent.get("status"), str)
+        ):  # pyright: ignore[reportUnknownMemberType]
             usable.append(agent)  # pyright: ignore[reportUnknownArgumentType]
     return usable
 
@@ -348,7 +352,9 @@ def detail_text(agent: Mapping[str, Any], show: Mapping[str, Any] | None) -> str
 def _ref_text(value: Any) -> str | None:
     if not isinstance(value, dict):
         return None
-    parts = [str(v) for v in value.values() if isinstance(v, (str, int)) and not isinstance(v, bool)]  # pyright: ignore[reportUnknownVariableType]
+    parts = [
+        str(v) for v in value.values() if isinstance(v, (str, int)) and not isinstance(v, bool)
+    ]  # pyright: ignore[reportUnknownVariableType]
     return " ".join(parts) or None
 
 
@@ -361,7 +367,10 @@ def _show_sections(show: Mapping[str, Any]) -> list[str]:
             lines.append(f"  {shown(key, 40)}: {shown(value)}")
     supervisor = show.get("supervisor")
     if isinstance(supervisor, dict):
-        lines.append("supervisor: " + " ".join(f"{shown(k, 20)}={shown(v, 40)}" for k, v in supervisor.items()))  # pyright: ignore[reportUnknownVariableType]
+        lines.append(
+            "supervisor: "
+            + " ".join(f"{shown(k, 20)}={shown(v, 40)}" for k, v in supervisor.items())
+        )  # pyright: ignore[reportUnknownVariableType]
     for key in ("third_party_run", "repo_config_changed"):
         if key in show:
             _field(lines, key, show[key])

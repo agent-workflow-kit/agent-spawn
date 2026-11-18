@@ -200,10 +200,10 @@ def _scratch_env(tmp_path: Path) -> dict[str, str]:
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [
-        (["browse", "--json"], 1),
+        (["browse", "--json"], 2),
         (["--json", "launch", "--bogus"], 2),
         (["--help"], 0),
-        (["browse"], 1),
+        (["browse"], 2),
     ],
 )
 def test_a_closed_stdout_keeps_the_exit_code(
@@ -234,7 +234,7 @@ def test_browse_errors_leave_its_result_file_absent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     path = tmp_path / "r.json"
-    assert cli.main(["browse", "--result-file", str(path)]) == 1  # the stub handler
+    assert cli.main(["browse", "--result-file", str(path)]) == 2  # no terminal under pytest
     assert not path.exists()
 
     def failing(inv: Invocation) -> Outcome:

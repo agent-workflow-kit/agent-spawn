@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from textual.coordinate import Coordinate
 from textual.widgets import DataTable, Input, Static
 
 from agent_spawn.tui.app import BrowseApp, ConfirmScreen, HelpScreen
@@ -163,7 +164,9 @@ def test_empty_and_error_states() -> None:
     run_app(make(empty), check_empty)
 
     failing = FakeBackend([])
-    failing.list_result = CliResult(12, {"error": {"code": "failed", "message": "state.db is busy"}})
+    failing.list_result = CliResult(
+        12, {"error": {"code": "failed", "message": "state.db is busy"}}
+    )
 
     async def check_error(app: BrowseApp, pilot: Any) -> None:
         assert "Could not list agents: exit 12: state.db is busy" in text_of(app, "#empty")
@@ -187,7 +190,9 @@ def test_ack_runs_the_cli_command_as_a_changing_call() -> None:
 
 
 def test_error_of_an_action_is_shown() -> None:
-    backend = FakeBackend(three(), ack=CliResult(20, {"error": {"code": "refused", "message": "no"}}))
+    backend = FakeBackend(
+        three(), ack=CliResult(20, {"error": {"code": "refused", "message": "no"}})
+    )
 
     async def script(app: BrowseApp, pilot: Any) -> None:
         await pilot.press("k")
@@ -275,7 +280,9 @@ def test_wait_timeout_and_error() -> None:
         assert "still running" in text_of(app, "#status")
 
     run_app(make(backend), script)
-    backend = FakeBackend(three(), wait=CliResult(10, {"error": {"code": "not_found", "message": "gone"}}))
+    backend = FakeBackend(
+        three(), wait=CliResult(10, {"error": {"code": "not_found", "message": "gone"}})
+    )
 
     async def script2(app: BrowseApp, pilot: Any) -> None:
         await pilot.press("w")
@@ -299,7 +306,9 @@ def test_resume_is_interactive_in_a_window() -> None:
 
 
 def test_resume_of_marked_agents_runs_each_and_reports_failures() -> None:
-    backend = FakeBackend(three(), resume=CliResult(20, {"error": {"code": "refused", "message": "live"}}))
+    backend = FakeBackend(
+        three(), resume=CliResult(20, {"error": {"code": "refused", "message": "live"}})
+    )
 
     async def script(app: BrowseApp, pilot: Any) -> None:
         await pilot.press("space", "down", "down", "space", "r")
@@ -343,7 +352,9 @@ def test_attach_switched_does_not_touch_the_terminal() -> None:
 
 
 def test_attach_failure_and_multiple_marks() -> None:
-    backend = FakeBackend(three(), attach=CliResult(10, {"error": {"code": "not_found", "message": "not live"}}))
+    backend = FakeBackend(
+        three(), attach=CliResult(10, {"error": {"code": "not_found", "message": "not live"}})
+    )
 
     async def script(app: BrowseApp, pilot: Any) -> None:
         await pilot.press("a")
@@ -427,11 +438,21 @@ def test_intent_mode_quit_is_back_and_empty_list_records_nothing_to_attach() -> 
 
 
 def test_untrusted_strings_render_literally_and_without_control_characters() -> None:
-    hostile = agent(IDS[0], name=HOSTILE, kind=HOSTILE, labels=[HOSTILE, "[/]"], needs_attention=None)
+    hostile = agent(
+        IDS[0], name=HOSTILE, kind=HOSTILE, labels=[HOSTILE, "[/]"], needs_attention=None
+    )
     backend = FakeBackend(
         [hostile],
-        show=CliResult(0, {"agent": hostile, "runs": [{"run": 1, "mode": HOSTILE}], "session": None,
-                           "supervisor": None, "warnings": [HOSTILE]}),
+        show=CliResult(
+            0,
+            {
+                "agent": hostile,
+                "runs": [{"run": 1, "mode": HOSTILE}],
+                "session": None,
+                "supervisor": None,
+                "warnings": [HOSTILE],
+            },
+        ),
     )
 
     async def script(app: BrowseApp, pilot: Any) -> None:
@@ -440,7 +461,7 @@ def test_untrusted_strings_render_literally_and_without_control_characters() -> 
         detail = text_of(app, "#detail-text")
         assert "[bold red]x[/]" in detail and "\x1b" not in detail and "\x07" not in detail
         table = app.query_one("#table", DataTable)
-        cells = [str(table.get_cell_at((0, c))) for c in range(8)]
+        cells = [str(table.get_cell_at(Coordinate(0, c))) for c in range(8)]
         assert "[bold red]x[/]" in cells[5] and all("\x1b" not in c for c in cells)
         # a hostile CLI error is escaped on the status line too
         backend.answers["ack"] = CliResult(1, {"error": {"code": "internal", "message": HOSTILE}})
@@ -466,4 +487,6 @@ def test_a_huge_name_does_not_break_the_layout() -> None:
 def test_json_roundtrip_of_intent_matches_schema() -> None:
     from agent_spawn.tui.model import intent_text
 
-    schema_registry.validate(json.loads(intent_text("resume", IDS)), "agent-spawn/cli/browse-result.json")
+    schema_registry.validate(
+        json.loads(intent_text("resume", IDS)), "agent-spawn/cli/browse-result.json"
+    )

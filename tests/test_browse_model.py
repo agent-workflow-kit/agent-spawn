@@ -62,7 +62,9 @@ HOSTILE = "[bold red]x[/] \x1b[2J\x1b]0;title\x07‮\x00 \udc80 " + "y" * 5000
 def test_hostile_text_is_escaped_and_bounded_in_cells_and_detail() -> None:
     a = agent("ag-aaaaaaaa", name=HOSTILE, labels=[HOSTILE], kind=HOSTILE, cwd=HOSTILE)
     cells = model.agent_cells(a, NOW, marked=False)
-    detail = model.detail_text(a, {"agent": a, "warnings": [HOSTILE], "runs": [{"run": 1, "mode": HOSTILE}]})
+    detail = model.detail_text(
+        a, {"agent": a, "warnings": [HOSTILE], "runs": [{"run": 1, "mode": HOSTILE}]}
+    )
     for text in [*cells, detail]:
         assert "\x1b" not in text and "\x00" not in text and "\x07" not in text
         assert "‮" not in text
@@ -73,19 +75,32 @@ def test_hostile_text_is_escaped_and_bounded_in_cells_and_detail() -> None:
 
 def test_parse_agents_skips_malformed_entries() -> None:
     good = agent("ag-aaaaaaaa")
-    payload = {"agents": [good, 5, {"agent_id": "nope", "status": "x"}, {"agent_id": "ag-bbbbbbbb"}]}
+    payload = {
+        "agents": [good, 5, {"agent_id": "nope", "status": "x"}, {"agent_id": "ag-bbbbbbbb"}]
+    }
     assert model.parse_agents(payload) == [good]
     assert model.parse_agents([]) == []
     assert model.parse_agents({"agents": "x"}) == []
 
 
 def test_intent_text_validates_against_the_schema() -> None:
-    for intent, selected in [("attach", ["ag-aaaaaaaa"]), ("resume", ["ag-aaaaaaaa", "ag-bbbbbbbb"]), ("back", [])]:
+    for intent, selected in [
+        ("attach", ["ag-aaaaaaaa"]),
+        ("resume", ["ag-aaaaaaaa", "ag-bbbbbbbb"]),
+        ("back", []),
+    ]:
         schema_registry.validate(json.loads(model.intent_text(intent, selected)), SCHEMA)
-    for intent, selected in [("attach", []), ("attach", ["ag-aaaaaaaa", "ag-bbbbbbbb"]), ("resume", []), ("x", [])]:
+    for intent, selected in [
+        ("attach", []),
+        ("attach", ["ag-aaaaaaaa", "ag-bbbbbbbb"]),
+        ("resume", []),
+        ("x", []),
+    ]:
         with pytest.raises(ValueError):
             model.intent_text(intent, selected)
-    assert json.loads(model.intent_text("resume", ["ag-aaaaaaaa"] * 2))["selected"] == ["ag-aaaaaaaa"]
+    assert json.loads(model.intent_text("resume", ["ag-aaaaaaaa"] * 2))["selected"] == [
+        "ag-aaaaaaaa"
+    ]
 
 
 def test_write_intent_is_private_atomic_and_refuses_a_symlink(tmp_path: Path) -> None:
@@ -102,28 +117,40 @@ def test_write_intent_is_private_atomic_and_refuses_a_symlink(tmp_path: Path) ->
     assert warning is not None and other.read_text() == "keep"
 
 
-PRINT_ARGV = (
-    "import json,sys;print(json.dumps({'argv': sys.argv[1:]}));sys.exit(0)"
-)
+PRINT_ARGV = "import json,sys;print(json.dumps({'argv': sys.argv[1:]}));sys.exit(0)"
 
 
 def test_subprocess_backend_builds_global_flags_and_parses_json() -> None:
     backend = model.SubprocessBackend(
-        config_path="/c.yaml", actor="human:me", decision_ids=["d1"],
+        config_path="/c.yaml",
+        actor="human:me",
+        decision_ids=["d1"],
         prefix=[sys.executable, "-c", PRINT_ARGV],
     )
     plain = backend.call(["list"])
     assert plain.ok and plain.payload == {"argv": ["--json", "--config", "/c.yaml", "list"]}
     acting = backend.call(["teardown", "ag-aaaaaaaa", "--yes"], acting=True)
     assert acting.payload == {
-        "argv": ["--json", "--config", "/c.yaml", "--actor", "human:me", "--decision-id", "d1",
-                 "teardown", "ag-aaaaaaaa", "--yes"]
+        "argv": [
+            "--json",
+            "--config",
+            "/c.yaml",
+            "--actor",
+            "human:me",
+            "--decision-id",
+            "d1",
+            "teardown",
+            "ag-aaaaaaaa",
+            "--yes",
+        ]
     }
 
 
 def test_subprocess_backend_reports_errors_and_junk() -> None:
     code = "import sys;print('not json');sys.stderr.write('boom\\n');sys.exit(12)"
-    backend = model.SubprocessBackend(config_path=None, actor="human:me", prefix=[sys.executable, "-c", code])
+    backend = model.SubprocessBackend(
+        config_path=None, actor="human:me", prefix=[sys.executable, "-c", code]
+    )
     result = backend.call(["list"])
     assert result.exit_code == 12 and result.payload is None
     assert result.describe() == "exit 12: boom"
@@ -133,7 +160,9 @@ def test_subprocess_backend_reports_errors_and_junk() -> None:
 
 def test_subprocess_backend_times_out_and_close_stops_children() -> None:
     backend = model.SubprocessBackend(
-        config_path=None, actor="human:me", prefix=[sys.executable, "-c", "import time;time.sleep(60)"]
+        config_path=None,
+        actor="human:me",
+        prefix=[sys.executable, "-c", "import time;time.sleep(60)"],
     )
     assert backend.call(["list"], timeout=0.5).exit_code == 124
     backend.close()
@@ -145,4 +174,3 @@ def test_error_description_prefers_the_envelope_and_escapes() -> None:
     text = result.describe()
     assert text.startswith("exit 10: ") and "\x1b" not in text and len(text) < 400
     assert result.error_code == "not_found"
-

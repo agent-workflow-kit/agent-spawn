@@ -50,8 +50,16 @@ class FakeBackend:
         if word in self.answers:
             return self.answers[word]
         if word == "show":
-            return CliResult(0, {"agent": next(a for a in self.agents if a["agent_id"] == command[1]),
-                                 "runs": [], "session": None, "supervisor": None, "warnings": []})
+            return CliResult(
+                0,
+                {
+                    "agent": next(a for a in self.agents if a["agent_id"] == command[1]),
+                    "runs": [],
+                    "session": None,
+                    "supervisor": None,
+                    "warnings": [],
+                },
+            )
         return CliResult(0, {"agent": None})
 
     def run_on_terminal(self, argv: Sequence[str]) -> int:
@@ -75,7 +83,9 @@ async def settle(app: BrowseApp, pilot: Any) -> None:
 
 
 def run_app(
-    app: BrowseApp, script: Callable[[BrowseApp, Any], Awaitable[None]], size: tuple[int, int] = (140, 30)
+    app: BrowseApp,
+    script: Callable[[BrowseApp, Any], Awaitable[None]],
+    size: tuple[int, int] = (140, 30),
 ) -> None:
     async def main() -> None:
         async with app.run_test(size=size) as pilot:
@@ -137,7 +147,6 @@ class PtyRun:
         self._os.write(self.master, data.encode())
 
     def finish(self, timeout: float = 60.0) -> int:
-        import subprocess
         import time
 
         deadline = time.monotonic() + timeout
@@ -146,12 +155,9 @@ class PtyRun:
                 if time.monotonic() > deadline:
                     raise AssertionError(f"still running; saw {self.buffer[-500:]!r}")
                 self._pump(0.1)
-            while self._pump(0.05) and time.monotonic() < deadline:
-                if not self._os.isatty(self.master):
+            for _ in range(100):  # the output left in the pty after the child exited
+                if not self._pump(0.02):
                     break
-                break
-        except subprocess.SubprocessError:  # pragma: no cover
-            raise
         finally:
             if self.proc.poll() is None:
                 self.proc.terminate()  # the exact child this object started
