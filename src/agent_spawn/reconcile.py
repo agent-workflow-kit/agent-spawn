@@ -12,7 +12,9 @@ One caller at a time (lease ``reconcile``: a second live caller exits 0 with
    continued: ``prune`` and ``teardown`` continue them);
 5. the pending label mirror changes, replayed to sessions and live panes
    (``annotate.mirror_labels``: the queue holds the latest op per pair, so a replay converges);
-6. housekeeping: leftover files of torn-down agents and orphaned prompt copies, tombstones past
+6. dead panes of parked agents (``panes``: reported, closed only under
+   ``reconcile.close_dead_panes_after`` and never while ``needs_attention`` is set);
+7. housekeeping: leftover files of torn-down agents and orphaned prompt copies, tombstones past
    ``tombstone_days`` (the id stays reserved), handoff directories of dead listeners.
 
 Safety, because steps 6 deletes:
@@ -61,6 +63,7 @@ from .ids import is_agent_id
 from .labels import Label
 from .lifecycle import LEASE_WAIT, lease_key
 from .output import CliError, Outcome, PayloadKind, safe_text
+from .panes import sockets_to_search, termctl_for
 from .records import RecordsError, append_log
 from .store import LeaseHeld, Store, StoreError
 from .teardown import SUPERVISOR_ACTOR, remove_agent_files, remove_tree_at
@@ -74,6 +77,7 @@ TEARDOWN_INCOMPLETE = "teardown_incomplete"
 LABELS_RESYNCED = "labels_resynced"
 EVENTS_DELIVERED = "events_delivered"
 TOMBSTONE_DELETED = "tombstone_deleted"
+DEAD_PANE = "dead_pane"
 
 
 def _internal(inv: Invocation, row: Mapping[str, Any] | None = None) -> Invocation:
@@ -110,6 +114,7 @@ class _Pass:
             ("hook delivery", "deliver"),
             ("teardown report", "teardown_incomplete"),
             ("label re-sync", "labels"),
+            ("dead panes", "dead_panes"),
             ("leftover files", "leftover_files"),
             ("tombstones", "tombstones"),
             ("handoff directories", "handoffs"),
@@ -292,7 +297,75 @@ class _Pass:
         self.change(agent_id, LABELS_RESYNCED, added=added, removed=removed)
         self.log(agent_id, LABELS_RESYNCED, added=len(added), removed=len(removed))
 
-    # -- 6: housekeeping ----------------------------------------------------------------------
+    # -- 6: dead panes ------------------------------------------------------------------------
+
+    def dead_panes(self) -> None:
+        """Dead panes labeled ``agent=<id>`` of parked agents: reported always; closed only when
+        ``reconcile.close_dead_panes_after`` is set, the agent has no ``needs_attention`` (a failure
+        nobody acknowledged is kept for reading) and has been unchanged that long. Never a
+        pane of a live, launching or tearing-down agent; never forced."""
+        after = self.config.reconcile.close_dead_panes_after
+        now = self.gateway.wall_time()
+        for row in self.store.list_agents(statuses=("parked",)):
+            agent_id = row["agent_id"]
+            try:
+                self._dead_panes_of(row, after, now)
+            except Exception as error:  # noqa: BLE001 - one agent never stops the others
+                self.warn(agent_id, f"dead pane check failed ({type(error).__name__})")
+
+    def _dead_panes_of(self, row: Mapping[str, Any], after: float | None, now: float) -> None:
+        agent_id = row["agent_id"]
+        targets = sockets_to_search(self.store.get_runs(agent_id))
+        if not targets:
+            return
+        inv = _internal(self.inv, row)
+        term = termctl_for(
+            self.config,
+            row,
+            actor=inv.actor,
+            decision_ids=inv.decision_ids,
+            gateway=self.gateway,
+        )
+        if term is None:
+            self.warn(agent_id, "termctl could not be found: dead panes not checked")
+            return
+        updated = row.get("updated")
+        idle = now - float(updated) if isinstance(updated, (int, float)) else None
+        for target in targets:
+            try:
+                dead = term.find_dead(agent_id, target)
+            except CliError as error:
+                if error.exit_code != 10:
+                    self.warn(agent_id, f"termctl list failed (exit {error.exit_code})")
+                continue
+            for term_id, socket_path in dead:
+                if row.get("needs_attention"):
+                    reason = "attention"
+                elif after is None:
+                    reason = "report_only"
+                elif idle is None or idle < after:
+                    reason = "too_new"
+                else:
+                    reason = None
+                details: dict[str, Any] = {"term_id": term_id, "socket_path": socket_path}
+                if reason is not None:
+                    self.change(agent_id, DEAD_PANE, **details, action="kept", reason=reason)
+                    continue
+                if self.dry_run:
+                    self.change(agent_id, DEAD_PANE, **details, action="would_close")
+                    continue
+                try:
+                    term.close(term_id, socket_path)
+                except CliError as error:
+                    if error.exit_code != 10 and not (
+                        error.exit_code == 20 and error.reason == "running"
+                    ):
+                        self.warn(agent_id, f"termctl close failed (exit {error.exit_code})")
+                    continue
+                self.change(agent_id, DEAD_PANE, **details, action="closed")
+                self.log(agent_id, "pane_closed", **details)
+
+    # -- 7: housekeeping ----------------------------------------------------------------------
 
     def leftover_files(self) -> None:
         """Prompt copies and outcome files: a tombstone's, whatever their age, and the prompt

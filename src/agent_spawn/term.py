@@ -438,6 +438,29 @@ class TermBackend:
             found.append(term_id)
         return found
 
+    def find_dead(self, agent_id: str, socket_path: str | None) -> list[tuple[str, str]]:
+        """``(id, socket path)`` of every dead pane labeled ``agent=<agent_id>`` on one server
+        (the default one when ``socket_path`` is None). A pane whose socket path is unknown (none
+        given and none reported) is left out: ``close`` needs one."""
+        args = ["list", _flag("--label", f"agent={agent_id}"), "--dead"]
+        if socket_path is not None:
+            args.append(_flag("--socket", socket_path))
+        reply = self.call([*args, "--json"], timeout=QUICK_TIMEOUT)
+        if reply.code != 0:
+            raise self.fail(reply)
+        panes = reply.data.get("panes") if reply.data is not None else None
+        if not isinstance(panes, list):
+            raise CliError("failed", "termctl printed unusable output", tool=TOOL)
+        found: list[tuple[str, str]] = []
+        for pane in panes:  # pyright: ignore[reportUnknownVariableType]
+            term_id = pane.get("id") if isinstance(pane, dict) else None  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+            if not isinstance(term_id, str) or TERM_ID.fullmatch(term_id) is None:
+                raise CliError("failed", "termctl printed unusable output", tool=TOOL)
+            where = pane.get("socket_path", socket_path)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+            if isinstance(where, str) and where.startswith("/") and "\0" not in where:
+                found.append((term_id, where))
+        return found
+
     def find_panes(self, agent_id: str, socket_path: str | None) -> list[tuple[str, str]]:
         """``(id, socket path)`` of every pane labeled ``agent=<agent_id>`` (dead or running) on
         one server (the default one when ``socket_path`` is None): how a pane whose ``open`` did

@@ -168,6 +168,12 @@ class Prune(_Model):
     protect_labels: list[LabelKeyOrLabel] = ["owner"]
 
 
+class ReconcileSettings(_Model):
+    #: ``reconcile`` closes a dead pane of a parked agent without attention once the agent has
+    #: been unchanged this long; null: it only reports such panes.
+    close_dead_panes_after: Duration | None = None
+
+
 class KindSettings(_Model):
     promote: bool = False
 
@@ -225,6 +231,7 @@ class Config(_Model):
     auto_report_resume: bool = True
     tombstone_days: int = Field(default=30, ge=0)
     prune: Prune = Field(default_factory=Prune)
+    reconcile: ReconcileSettings = Field(default_factory=ReconcileSettings)
     kinds: dict[Kind, KindSettings] = {}
     repos: dict[RepoId, RepoSettings] = {}
     hooks: Hooks = Field(default_factory=Hooks)

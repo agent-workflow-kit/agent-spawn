@@ -35,6 +35,7 @@ from .ids import is_agent_id, resolve_agent_id
 from .lifecycle import LEASE_WAIT, lease_key, reads_third_party_of
 from .liveness import Liveness
 from .output import CliError, Outcome, PayloadKind
+from .panes import sockets_to_search, termctl_for
 from .records import RecordsError, append_audit, append_log
 from .session_backend import SessionBackend, SessionStatus
 from .store import CasLost, Store, StoreError, StoreMissing, default_state_dir
@@ -955,53 +956,40 @@ class Teardown:
 
     # -- step 5: windows --------------------------------------------------------------------
 
-    def window_sockets(self, agent_id: str) -> list[str]:
-        """The distinct socket paths of the agent's runs' windows, in run order."""
-        found: list[str] = []
-        for run in self.store.get_runs(agent_id):
-            socket_path = run.get("socket_path")
-            if isinstance(socket_path, str) and socket_path and socket_path not in found:
-                found.append(socket_path)
-        return found
-
     def termctl(self, row: Mapping[str, Any]) -> TermBackend | None:
-        from .launch import resolve_stored_tool  # the tool resolution launch uses
-
-        stored = row.get("termctl_path")
-        try:
-            argv = resolve_stored_tool(
-                self.config.termctl_cmd, "termctl", stored if isinstance(stored, str) else None
-            )
-        except CliError:
-            return None
-        return TermBackend(
-            argv, actor=self.actor, decision_ids=self.decision_ids, gateway=self.gateway
+        return termctl_for(
+            self.config,
+            row,
+            actor=self.actor,
+            decision_ids=self.decision_ids,
+            gateway=self.gateway,
         )
 
     def step_windows(self, row: Mapping[str, Any]) -> bool:
         """Step 5 (skipped, False, when no run of the agent had a window): for each distinct
-        socket path ``termctl list --label agent=<id> --dead``, then ``termctl close`` for each
-        dead pane listed. Exit 10 and 20 ``running`` are no-ops; any other failure is a warning
-        (a window left behind never blocks a teardown). Returns whether the step is done: it is
-        not when termctl could not be found or a ``list`` failed, so a retry looks again."""
+        recorded socket path, then termctl's default server (a pane no run recorded), ``termctl
+        list --label agent=<id> --dead``, then ``termctl close`` for each dead pane listed. Exit
+        10 and 20 ``running`` are no-ops; any other failure is a warning (a window left behind
+        never blocks a teardown). Returns whether the step is done: it is not when termctl could
+        not be found or a ``list`` failed, so a retry looks again."""
         agent_id = row["agent_id"]
-        sockets = self.window_sockets(agent_id)
-        if not sockets:
+        targets = sockets_to_search(self.store.get_runs(agent_id))
+        if not targets:
             return False
         term = self.termctl(row)
         if term is None:
             self.warnings.append("termctl could not be found: the agent's dead windows stay open")
             return False
         complete = True
-        for socket_path in sockets:
+        for target in targets:
             try:
-                dead = term.list_dead(agent_id, socket_path)
+                dead = term.find_dead(agent_id, target)
             except CliError as error:
                 if error.exit_code != 10:
                     self.warnings.append(f"termctl list failed (exit {error.exit_code})")
                     complete = False
                 continue
-            for term_id in dead:
+            for term_id, socket_path in dead:
                 try:
                     term.close(term_id, socket_path)
                 except CliError as error:
