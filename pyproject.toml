@@ -13,6 +13,11 @@ dependencies = [
 [project.scripts]
 agent-spawn = "agent_spawn.cli:main"
 
+[project.optional-dependencies]
+tui = [
+    "textual>=8,<9",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -28,6 +33,7 @@ dev = [
     "pymarkdownlnt>=0.9.41",
     "jsonschema>=4.26.0",
     "referencing>=0.37.0",
+    "textual>=8,<9",
 ]
 
 [tool.ruff]

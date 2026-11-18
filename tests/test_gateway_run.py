@@ -264,3 +264,22 @@ def test_a_failed_exec_restores_the_signal_state(monkeypatch: pytest.MonkeyPatch
         signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
         signal.signal(signal.SIGINT, old_int)
         signal.signal(signal.SIGTERM, old_term)
+
+
+def test_run_does_not_wait_for_a_grandchild_that_holds_the_pipes(tmp_path: Path) -> None:
+    import os
+    import signal
+
+    from agent_spawn.gateway import SystemGateway
+
+    pidfile = tmp_path / "grandchild.pid"
+    script = f"sleep 60 & echo $! > {pidfile}; echo done"
+    try:
+        done = SystemGateway().run(["/bin/sh", "-c", script], timeout=30)
+        assert (done.returncode, done.stdout) == (0, "done\n")
+    finally:
+        if pidfile.exists():
+            try:
+                os.kill(int(pidfile.read_text()), signal.SIGKILL)  # the exact sleep it started
+            except ProcessLookupError:
+                pass

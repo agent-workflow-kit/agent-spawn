@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import sys
 from datetime import UTC, datetime
-from typing import NoReturn
 
 from .. import cron as cron_module
 from .. import reconcile as reconcile_module
@@ -12,7 +11,7 @@ from .. import records
 from ..output import CliError, Outcome, PayloadKind, safe_text
 from ..store import default_state_dir
 from ..validate import GrammarError, parse_since
-from .base import Invocation, not_implemented
+from .base import Invocation
 
 
 def reconcile(inv: Invocation) -> Outcome:
@@ -66,8 +65,7 @@ def export(inv: Invocation) -> Outcome:
     return Outcome(0, selected, PayloadKind.COMMAND, human)
 
 
-def browse(inv: Invocation) -> NoReturn:
-    # TODO(#38): the Textual TUI.
-    # TODO(#38): browse writes its own intent file (schemas/cli/browse-result.json); the
-    # generic --result-file handling of cli.py covers only launch, resume and wait.
-    not_implemented("browse", 38)
+def browse(inv: Invocation) -> Outcome:
+    from ..tui.launcher import browse as run_browse
+
+    return run_browse(inv)
