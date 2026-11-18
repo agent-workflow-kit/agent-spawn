@@ -190,6 +190,33 @@ def test_a_late_event_of_an_earlier_run_does_not_roll_the_agent_back(rig: Rig) -
     assert event["run"] == 1 and event["agent"]["run"] == 2
 
 
+def test_a_redelivered_older_event_does_not_overwrite_the_recorded_final_state(rig: Rig) -> None:
+    """The supervisor's final bookkeeping (the run has an outcome) stands: a late event of the
+    same run is deduplicated and announced, but rewrites no state."""
+    assert rig.send(payload(event_id=1)).returncode == 0
+    with Store.open(rig.state, create=False) as store:
+        with store.lease(f"agent:{AGENT}") as lease:
+            final = {"session_state": "exited", "activity": None, "needs_input_reason": None}
+            store.update_agent(lease, AGENT, final)
+            store.put_run(lease, AGENT, 1, {**final, "outcome": {"outcome": "done"}})
+    late = payload(event_id=2, state="working", activity="working", needs_input_reason="permission")
+    assert rig.send(late).returncode == 0
+    row = rig.row()
+    assert (row["session_state"], row["activity"], row["needs_input_reason"]) == (
+        "exited",
+        None,
+        None,
+    )
+    run = rig.run_row(1)
+    assert run is not None
+    assert (run["session_state"], run["activity"], run["needs_input_reason"]) == (
+        "exited",
+        None,
+        None,
+    )
+    assert rig.relay_count() == 2 and len(rig.outbox()) == 2  # recorded and announced as before
+
+
 def test_an_event_of_a_newer_run_advances_the_agent(rig: Rig) -> None:
     assert rig.send(payload(run=2, event_id=9)).returncode == 0
     assert rig.row()["run"] == 2

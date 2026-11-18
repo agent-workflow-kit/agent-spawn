@@ -338,8 +338,15 @@ class Supervisor:
 
     def backend(self, row: dict[str, Any], *, timeout: float | None = None) -> SessionBackend:
         extra: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
+        try:
+            first = self.stored_cs(row)
+        except CliError:
+            # Neither the stored nor the configured command runs now: the calls re-resolve and
+            # report tool_missing, which the supervisor parks on (it never raises out of run).
+            first = list(self.config.claude_session_cmd)
         return SessionBackend(
-            self.stored_cs(row),
+            first,
+            resolve=lambda: self.stored_cs(row),
             actor=SUPERVISOR_ACTOR,
             decision_ids=row.get("decision_ids") or [],
             gateway=self.gateway,
@@ -385,10 +392,16 @@ class Supervisor:
             else:
                 try:
                     child = self.spawn_exec(row, session)
-                except (OSError, StoreError) as error:
+                except (OSError, StoreError, CliError) as error:
                     # `exec` could not be started (or was stopped again because it could not be
                     # recorded): the run it should have adopted must not stay pending.
                     self.log("warning", level="error", message=f"could not start exec: {error}")
+                    if isinstance(error, CliError) and error.code == "tool_missing":
+                        # claude-session is gone (an upgrade removed it) and nothing else runs.
+                        if previous is None:
+                            return self.park_tool_missing(error, "launch_failed")
+                        failure = chain.ChainFailure("agent-spawn", "tool_missing", run=ctx.run)
+                        return self.park_chain_failure(previous, failure)
                     if previous is None:
                         return self.park_canceled(backend, session, ctx)
                     run_row = store.get_run(self.agent_id, ctx.run) or {}
@@ -409,7 +422,12 @@ class Supervisor:
                     return self.park_chain_failure(previous, failure)
                 self.watch(child, poller, session, ctx)
                 self.collect_signals()
-            final = self.end_of_run(backend, session, ctx)
+            try:
+                final = self.end_of_run(backend, session, ctx)
+            except CliError as error:
+                if error.code != "tool_missing":
+                    raise
+                return self.park_tool_missing(error, "failed")
             if previous is not None and self.ended_in_launch(final):
                 if final.result.outcome == "not-started" and (
                     (self.terminated and final.result.end_reason in CANCEL_END_REASONS)
@@ -808,6 +826,15 @@ class Supervisor:
             return DONE
         return self.park_final(final)
 
+    def park_tool_missing(self, error: CliError, reason: str) -> Outcome:
+        """claude-session cannot be run (neither the stored nor the configured command): nothing
+        can be read or cancelled, so the agent parks with attention instead of the supervisor
+        raising out with the agent left ``launching``."""
+        assert self.store is not None
+        self.log("warning", level="error", message=f"error: {error.code}: {error}")
+        lifecycle.park(self.store, self.agent_id, park_reason=reason, needs_attention=reason)
+        return self.finish()
+
     def end_of_run(self, backend: SessionBackend, session: str, ctx: RunCtx) -> Final:
         """Read the run's outcome, record the run in the agent's history (and mark it started
         when it ended in its session phase). Raises when no final outcome can be read."""
@@ -884,16 +911,17 @@ class Supervisor:
                 if isinstance(final_state, str) and run_row.get("session_state") != final_state:
                     # Relay events were lost (an older schema, a failed hook): the final state
                     # comes from the outcome. The relay's own record of it is never rewritten.
-                    fields.update(
-                        {"session_state": final_state, "activity": None, "needs_input_reason": None}
-                    )
-                    changes.update(
-                        {
-                            "session_state": final_state,
-                            "activity": None,
-                            "needs_input_reason": None,
-                        }
-                    )
+                    state_fields: dict[str, object] = {
+                        "session_state": final_state,
+                        "activity": None,
+                        "needs_input_reason": None,
+                    }
+                    fields.update(state_fields)
+                    agent_row = self.store.get_agent(self.agent_id) or {}
+                    if agent_row.get("run") == ctx.run:
+                        # Only the agent's current run speaks for the agent row: an earlier
+                        # run's final state never overwrites a newer run's.
+                        changes.update(state_fields)
                 self.store.update_agent(lease, self.agent_id, changes)
                 self.store.put_run(lease, self.agent_id, ctx.run, fields)
 

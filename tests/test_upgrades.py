@@ -5,23 +5,30 @@ while a supervisor is running, final bookkeeping after lost relay events, an old
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from agent_spawn import launch, promotion
+from agent_spawn import chain, launch, procs, promotion
+from agent_spawn.agent_lookup import backend_for
+from agent_spawn.liveness import Liveness
 from agent_spawn.output import CliError
+from agent_spawn.session_backend import RunOutcome
+from agent_spawn.stop import Stop
 from agent_spawn.store import Store
 from agent_spawn.store_schema import MIGRATIONS
+from agent_spawn.supervise import RunCtx
+from agent_spawn.teardown import Teardown
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
-from tests.test_supervise_inprocess import Rig, SpawnGateway
+from tests.test_supervise_inprocess import Rig, SpawnGateway, final_of
 
 # --- a later, additive schema, as a future release would ship it -------------------------------
 
@@ -90,10 +97,68 @@ def test_a_live_agent_survives_a_migration_and_its_supervisor_finishes(
         db.close()
 
 
+Layout = dict[str, Any]
+
+
+def layout_of(db: sqlite3.Connection) -> Layout:
+    """What an older process depends on: each table's columns (type, NOT NULL, default) and its
+    CHECK count, every index (unique or not) and every trigger."""
+    master = db.execute("SELECT type, name, tbl_name, sql FROM sqlite_master").fetchall()
+    tables = {r[1]: r[3] or "" for r in master if r[0] == "table"}
+    unique = {
+        row[1]: bool(row[2])
+        for table in tables
+        for row in db.execute(f"PRAGMA index_list('{table}')")
+    }
+    return {
+        "columns": {
+            table: {r[1]: (r[2], r[3], r[4]) for r in db.execute(f"PRAGMA table_info('{table}')")}
+            for table in tables
+        },
+        "checks": {table: sql.upper().count("CHECK") for table, sql in tables.items()},
+        "indexes": {r[1]: (unique.get(r[1], False), r[3], r[2]) for r in master if r[0] == "index"},
+        "triggers": {r[1]: r[3] for r in master if r[0] == "trigger"},
+    }
+
+
+def additivity_problems(before: Layout, after: Layout) -> list[str]:
+    """Why ``after`` is not an additive change of ``before`` (empty when it is)."""
+    problems: list[str] = []
+    for table, columns in before["columns"].items():
+        if table not in after["columns"]:
+            problems.append(f"{table} was dropped")
+            continue
+        for name, (kind, _notnull, _default) in columns.items():
+            if name not in after["columns"][table]:
+                problems.append(f"{table}.{name} was dropped")
+            elif after["columns"][table][name][0] != kind:
+                problems.append(f"{table}.{name} changed type")
+        for name, (_kind, notnull, default) in after["columns"][table].items():
+            if name not in columns and notnull and default is None:
+                problems.append(f"{table}.{name} needs a default")
+    for table, count in after["checks"].items():
+        if count > before["checks"].get(table, 0):
+            problems.append(f"{table} gained a CHECK constraint")
+    for name, (is_unique, sql, table) in after["indexes"].items():
+        if name not in before["indexes"] and is_unique and table in before["columns"]:
+            # (a new table's own keys constrain nobody's older writes)
+            problems.append(f"{name} is a new UNIQUE index")
+        if name in before["indexes"] and before["indexes"][name] != (is_unique, sql, table):
+            problems.append(f"{name} changed")
+    for name in before["indexes"]:
+        if name not in after["indexes"]:
+            problems.append(f"index {name} was dropped")
+    for name, sql in after["triggers"].items():
+        if before["triggers"].get(name) != sql:
+            problems.append(f"trigger {name} is new or changed")
+    return problems
+
+
 def test_every_migration_is_additive(tmp_path: Path) -> None:
     """A shipped schema stays readable and writable by the older agent-spawn processes that live
-    agents keep running: nothing is dropped or retyped, and a new column is nullable or has a
-    default (an older INSERT does not name it)."""
+    agents keep running: nothing is dropped or retyped, a new column is nullable or has a
+    default (an older INSERT does not name it), and no new UNIQUE index, trigger or CHECK can
+    reject an older process's write."""
     state = tmp_path / "state"
     with Store.open(state, migrations=MIGRATIONS[:1]):
         pass
@@ -102,28 +167,60 @@ def test_every_migration_is_additive(tmp_path: Path) -> None:
         with Store.open(state, migrations=MIGRATIONS_V2[:upto]):
             pass
         after = _layout(state)
-        for table, columns in before.items():
-            assert table in after, f"{table} was dropped"
-            for name, (kind, _notnull, _default) in columns.items():
-                assert name in after[table], f"{table}.{name} was dropped"
-                assert after[table][name][0] == kind, f"{table}.{name} changed type"
-            for name, (_kind, notnull, default) in after[table].items():
-                if name not in columns:
-                    assert not notnull or default is not None, f"{table}.{name} needs a default"
+        assert additivity_problems(before, after) == []
         before = after
 
 
-def _layout(state: Path) -> dict[str, dict[str, tuple[str, int, Any]]]:
+BASE = "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)"
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        ("ALTER TABLE t DROP COLUMN b", "t.b was dropped"),
+        ("DROP TABLE t", "t was dropped"),
+        (
+            "ALTER TABLE t DROP COLUMN b; ALTER TABLE t ADD COLUMN b INTEGER",
+            "t.b changed type",
+        ),
+        ("ALTER TABLE t ADD COLUMN c TEXT NOT NULL", "t.c needs a default"),
+        ("CREATE UNIQUE INDEX t_b ON t (b)", "t_b is a new UNIQUE index"),
+        (
+            "CREATE TRIGGER t_ins BEFORE INSERT ON t BEGIN SELECT RAISE(ABORT, 'no'); END",
+            "trigger t_ins is new or changed",
+        ),
+        ("ALTER TABLE t ADD COLUMN c INTEGER CHECK (c > 0)", "t gained a CHECK constraint"),
+    ],
+)
+def test_the_additivity_check_catches_a_breaking_change(change: str, expected: str) -> None:
+    db = sqlite3.connect(":memory:")
+    db.execute(BASE)
+    before = layout_of(db)
+    db.executescript(change)
+    assert expected in additivity_problems(before, layout_of(db))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "ALTER TABLE t ADD COLUMN c TEXT",
+        "ALTER TABLE t ADD COLUMN c INTEGER NOT NULL DEFAULT 0",
+        "CREATE INDEX t_b ON t (b)",
+        "CREATE TABLE u (x TEXT)",
+    ],
+)
+def test_the_additivity_check_accepts_an_additive_change(change: str) -> None:
+    db = sqlite3.connect(":memory:")
+    db.execute(BASE)
+    before = layout_of(db)
+    db.executescript(change)
+    assert additivity_problems(before, layout_of(db)) == []
+
+
+def _layout(state: Path) -> Layout:
     db = sqlite3.connect(f"file:{state / 'state.db'}?mode=ro", uri=True)
     try:
-        tables = [
-            r[0]
-            for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
-        ]
-        return {
-            table: {r[1]: (r[2], r[3], r[4]) for r in db.execute(f"PRAGMA table_info('{table}')")}
-            for table in tables
-        }
+        return layout_of(db)
     finally:
         db.close()
 
@@ -201,6 +298,15 @@ def test_final_bookkeeping_keeps_what_the_relay_already_recorded(
 # --- an older _session-event against another schema --------------------------------------------
 
 
+def table_counts(state: Path) -> dict[str, int]:
+    db = sqlite3.connect(f"file:{state / 'state.db'}?mode=ro", uri=True)
+    try:
+        names = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+        return {n: db.execute(f'SELECT COUNT(*) FROM "{n}"').fetchone()[0] for n in names}
+    finally:
+        db.close()
+
+
 def relay_payload() -> bytes:
     return json.dumps({"object_id": "cs-abcdefgh"}).encode()
 
@@ -210,7 +316,10 @@ def test_an_older_relay_drops_the_event_against_a_migrated_database(
 ) -> None:
     rig = rig_for()
     migrate_to_v2(rig.state)
+    wal = rig.state / "state.db-wal"
+    assert not wal.exists() or wal.stat().st_size == 0
     before = (rig.state / "state.db").read_bytes()
+    counts_before = table_counts(rig.state)
     done = subprocess.run(
         [
             sys.executable,
@@ -237,6 +346,9 @@ def test_an_older_relay_drops_the_event_against_a_migrated_database(
     schema = [r for r in log if r["event"] == "schema_older"]
     assert len(schema) == 1 and schema[0]["details"] == {"found": 2, "expected": 1}
     assert (rig.state / "state.db").read_bytes() == before  # not even a checkpoint
+    # opening a WAL database may create the -wal and -shm files, but nothing is written to them
+    assert not wal.exists() or wal.stat().st_size == 0
+    assert table_counts(rig.state) == counts_before  # no relay row, no event, no run written
 
 
 # --- stored paths that went stale --------------------------------------------------------------
@@ -285,7 +397,6 @@ def test_a_non_executable_stored_self_path_counts_as_stale(
     plain.chmod(0o644)
     monkeypatch.setattr(launch, "resolve_self", lambda: "/replacement")
     assert launch.stored_self({"agent_spawn_path": str(plain)}) == "/replacement"
-    assert os.path.isdir(tmp_path)
 
 
 def test_a_stored_tool_is_used_while_it_runs_else_the_configured_command(
@@ -345,3 +456,267 @@ def test_the_host_argv_survives_a_stale_stored_self_path(
     monkeypatch.setattr(launch, "resolve_self", lambda: live)
     row = {**rig.agent(), "agent_spawn_path": str(tmp_path / "gone")}
     assert promotion.host_argv(rig.supervisor, row, "/run/socket")[0] == live
+
+
+# --- claude-session itself going stale under a running supervisor ---------------------------------
+
+
+def wrapper_for(fakebin: Fakebin, path: Path) -> str:
+    """A stored claude-session path that runs the fake, and can be removed like an old install."""
+    path.write_text(f'#!/bin/sh\nexec {fakebin.bin_dir / "claude-session"} "$@"\n')
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_a_claude_session_removed_after_exec_started_falls_back_to_the_configured_one(
+    rig_for: Callable[..., Rig], fakebin: Fakebin, tmp_path: Path
+) -> None:
+    stored = Path(wrapper_for(fakebin, tmp_path / "old-claude-session"))
+    rig = rig_for(claude_session_path=str(stored))
+    rig.supervisor.config.claude_session_cmd = [str(fakebin.bin_dir / "claude-session")]
+
+    class Gateway(SpawnGateway):
+        def spawn(self, argv: Sequence[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+            child = super().spawn(argv, **kwargs)
+            stored.unlink()  # the upgrade removes the old path while `exec` runs
+            return child
+
+    rig.supervisor.gateway = Gateway(fakebin)
+    outcome = rig.supervisor.run()
+    assert outcome.exit_code == 0 and not stored.exists()
+    row = rig.agent()
+    assert row["status"] == "parked" and row["park_reason"] == "done"
+    assert row["last_outcome"]["outcome"] == "done"
+
+
+def test_neither_claude_session_running_at_start_parks_instead_of_raising(
+    rig_for: Callable[..., Rig], tmp_path: Path
+) -> None:
+    rig = rig_for(claude_session_path=str(tmp_path / "gone" / "claude-session"))
+    rig.supervisor.config.claude_session_cmd = [str(tmp_path / "also-gone")]
+    outcome = rig.supervisor.run()
+    assert outcome.exit_code == 0
+    row = rig.agent()
+    assert row["status"] == "parked" and row["park_reason"] == "launch_failed"
+    assert row["needs_attention"] == "launch_failed"
+
+
+def test_neither_claude_session_running_after_exec_parks_instead_of_raising(
+    rig_for: Callable[..., Rig], fakebin: Fakebin, tmp_path: Path
+) -> None:
+    stored = Path(wrapper_for(fakebin, tmp_path / "old-claude-session"))
+    rig = rig_for(claude_session_path=str(stored))
+    rig.supervisor.config.claude_session_cmd = [str(tmp_path / "also-gone")]
+
+    class Gateway(SpawnGateway):
+        def spawn(self, argv: Sequence[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+            child = super().spawn(argv, **kwargs)
+            stored.unlink()
+            return child
+
+    rig.supervisor.gateway = Gateway(fakebin)
+    outcome = rig.supervisor.run()
+    assert outcome.exit_code == 0
+    row = rig.agent()
+    assert row["status"] == "parked" and row["park_reason"] == "failed"
+
+
+def test_a_chain_run_with_no_runnable_agent_spawn_fails_before_anything_is_taken(
+    rig_for: Callable[..., Rig],
+    fakebin: Fakebin,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing() -> str:
+        raise CliError("tool_missing", "agent-spawn cannot find its own executable path")
+
+    monkeypatch.setattr(launch, "resolve_self", missing)
+    rig = rig_for(agent_spawn_path=str(tmp_path / "gone" / "agent-spawn"))
+    sup = rig.supervisor
+    sup.store = Store.open(rig.state, create=False)
+    try:
+        backend = sup.backend(rig.agent())
+        with pytest.raises(chain.ChainFailure) as caught:
+            chain.start_report_resume(sup, backend, rig.agent(), rig.session, final_of())
+    finally:
+        sup.store.close()
+    assert (caught.value.tool, caught.value.reason) == ("agent-spawn", "tool_missing")
+    fakebin.assert_not_called("claude-session")  # no dry run, no hold, no run
+
+
+# --- the other readers of the stored claude-session path -----------------------------------------
+
+
+class StaleSession:
+    """A stored claude-session path that no longer exists, and a configured one that runs."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.gone = str(tmp_path / "uv-cache" / "claude-session")
+        self.configured = executable(tmp_path / "configured-claude-session")
+
+
+@pytest.fixture
+def stale(tmp_path: Path) -> StaleSession:
+    return StaleSession(tmp_path)
+
+
+def test_liveness_falls_back_when_the_stored_claude_session_is_gone(
+    tmp_path: Path, stale: StaleSession
+) -> None:
+    with Store.open(tmp_path / "state") as store:
+        liveness = Liveness(
+            store, state_dir=str(tmp_path / "state"), fallback_command=[stale.configured]
+        )
+        backend = liveness.backend({"claude_session_path": stale.gone})
+        assert backend is not None and backend.command == [stale.configured]
+        kept = liveness.backend({"claude_session_path": f"{stale.configured} --x"})
+        assert kept is not None and kept.command == [stale.configured, "--x"]
+
+
+def test_the_lookup_backend_falls_back_when_the_stored_claude_session_is_gone(
+    stale: StaleSession,
+) -> None:
+    inv = SimpleNamespace(
+        config=SimpleNamespace(claude_session_cmd=[stale.configured]), actor=None, decision_ids=[]
+    )
+    backend = backend_for(inv, {"claude_session_path": stale.gone})  # type: ignore[arg-type]
+    assert backend.command == [stale.configured]
+
+
+def test_stop_falls_back_when_the_stored_claude_session_is_gone(
+    tmp_path: Path, stale: StaleSession
+) -> None:
+    inv = SimpleNamespace(
+        config=SimpleNamespace(claude_session_cmd=[stale.configured]),
+        args=SimpleNamespace(dry_run=False),
+        state_dir=str(tmp_path),
+        warnings=[],
+        actor=None,
+        decision_ids=[],
+    )
+    backend = Stop(inv).make_backend({"claude_session_path": stale.gone})
+    assert backend.command == [stale.configured]
+
+
+def test_teardown_falls_back_when_the_stored_claude_session_is_gone(
+    tmp_path: Path, stale: StaleSession
+) -> None:
+    config = SimpleNamespace(claude_session_cmd=[stale.configured])
+    with Store.open(tmp_path / "state") as store:
+        teardown = Teardown(store, config, state_dir=str(tmp_path / "state"), actor="x")  # type: ignore[arg-type]
+        backend = teardown.session_backend({"claude_session_path": stale.gone})
+    assert backend.command == [stale.configured]
+
+
+def test_the_final_state_of_an_earlier_run_does_not_overwrite_the_current_runs_agent_row(
+    rig_for: Callable[..., Rig],
+) -> None:
+    rig = rig_for()
+    seed_stale_state(rig, run=2, session_state="working", activity="working")
+    rig.put_run(2, session_state="working", activity="working")
+    sup = rig.supervisor
+    sup.store = Store.open(rig.state, create=False)
+    try:
+        result = RunOutcome("cs-abcdefgh", 1, "session", "done", "normal", 0, None, None, "file")
+        sup.record_run(
+            RunCtx(1, "/x/o.json"), result, {"state": "exited", "first_working_at": None}
+        )
+    finally:
+        sup.store.close()
+    row = rig.agent()
+    assert (row["run"], row["session_state"], row["activity"]) == (2, "working", "working")
+    with Store.open(rig.state, create=False) as store:
+        run = store.get_run(rig.agent_id, 1)
+    assert run is not None and run["session_state"] == "exited"  # the run row is unconditional
+
+
+# --- a real supervisor process across a migration -------------------------------------------------
+
+GATE = """#!/bin/sh
+# gate.sh <file> <command...>: wait (bounded) for <file> to exist, then become <command>.
+gate="$1"; shift
+i=0
+while [ ! -e "$gate" ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done
+exec "$@"
+"""
+
+
+def wait_for_marker(path: Path, proc: subprocess.Popen[bytes], timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        assert proc.poll() is None, f"the supervisor exited early ({proc.returncode})"
+        time.sleep(0.02)
+    raise AssertionError(f"{path.name} did not appear in {timeout}s")
+
+
+def test_a_real_supervisor_process_finishes_after_the_database_is_migrated_under_it(
+    rig_for: Callable[..., Rig],
+    fakebin: Fakebin,
+    isolation_env: Isolation,
+    tmp_path: Path,
+) -> None:
+    """The supervisor runs `exec` (blocked on a file barrier), a newer agent-spawn migrates the
+    database from another process, `exec` is released, and the supervisor's final bookkeeping
+    lands in the migrated database and the process exits 0."""
+    work = tmp_path / "gates"
+    work.mkdir()
+    started, release, go = work / "exec-started", work / "release", work / "go"
+    gate = work / "gate.sh"
+    gate.write_text(GATE)
+    gate.chmod(0o755)
+    # claude-session as stored with the agent: `exec` announces itself and waits for the barrier
+    stored = work / "claude-session"
+    stored.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = exec ]; then : > {started}; {gate} {release} true; fi\n'
+        f'exec {fakebin.bin_dir / "claude-session"} "$@"\n'
+    )
+    stored.chmod(0o755)
+    rig = rig_for(claude_session_path=str(stored))
+    log = (work / "supervisor.log").open("wb")
+    # The supervisor waits for `go` as a gate shell, which then becomes `agent-spawn supervise`:
+    # same PID and start time, so the identity recorded below is the supervisor's own.
+    proc = subprocess.Popen(
+        [
+            str(gate),
+            str(go),
+            sys.executable,
+            "-m",
+            "agent_spawn",
+            "supervise",
+            rig.agent_id,
+            "--state-dir",
+            str(rig.state),
+            "--config",
+            str(tmp_path / "config.yaml"),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=log,
+        env=fakebin.env(),
+    )
+    try:
+        identity = procs.read_identity(proc.pid)
+        assert identity is not None
+        with Store.open(rig.state, create=False) as store:
+            with store.lease(f"agent:{rig.agent_id}") as lease:
+                store.update_agent(lease, rig.agent_id, {"supervisor": identity})
+        go.touch()
+        wait_for_marker(started, proc)
+        migrate_to_v2(rig.state)  # the supervisor is running with its schema-1 connection
+        release.touch()
+        assert proc.wait(timeout=60) == 0, (work / "supervisor.log").read_text()
+    finally:
+        if proc.poll() is None:
+            proc.kill()  # exactly the process this test started
+            proc.wait(timeout=10)
+        log.close()
+    with Store.open(rig.state, create=False, migrations=MIGRATIONS_V2) as store:
+        row = store.get_agent(rig.agent_id)
+        run = store.get_run(rig.agent_id, 1)
+    assert row is not None and run is not None
+    assert row["status"] == "parked" and row["park_reason"] == "done"
+    assert row["last_outcome"]["outcome"] == "done" and row["exec_proc"] is None
+    assert run["outcome"]["outcome"] == "done" and run["session_state"] == "exited"

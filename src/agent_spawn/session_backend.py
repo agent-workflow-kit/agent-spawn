@@ -759,10 +759,14 @@ class SessionBackend:
         gateway: gw.Gateway | None = None,
         timeout: float | None = DEFAULT_TIMEOUT,
         kill_grace: float = 30.0,
+        resolve: Callable[[], Sequence[str]] | None = None,
     ) -> None:
         if not command:
             raise ValueError("an empty claude-session command")
         self.command = list(command)
+        # A long-lived caller re-resolves the tool on every call (an upgrade can remove the path
+        # it started with); a CliError ``tool_missing`` from it propagates from the call.
+        self._resolve = resolve
         self.actor = actor
         self.decision_ids = list(decision_ids)
         self._gateway = gateway
@@ -789,7 +793,8 @@ class SessionBackend:
         """Run one command. Lower-tool exit codes are returned, not raised; a missing tool, a
         timeout and an unusable (huge or non-JSON) output are the only failures raised here
         or reported as ``data=None``."""
-        argv = [*self.command, *args]
+        command = list(self._resolve()) if self._resolve is not None else self.command
+        argv = [*command, *args]
         try:
             done = self.gateway.run(argv, stdin=stdin, timeout=self._timeout_for(timeout))
         except FileNotFoundError:

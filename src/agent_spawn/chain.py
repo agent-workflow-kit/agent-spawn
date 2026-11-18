@@ -550,6 +550,17 @@ def _start(
     assert sup.store is not None
     agent_id = sup.agent_id
     promoted = preflight is not None
+    # Resolved first: a failure here must not leave holds taken or a run allocated. (A late
+    # import: launch imports liveness, which imports this module.)
+    from .launch import stored_self
+
+    try:
+        relay = relay_hook(stored_self(row), sup.state_dir, row["config_path"])
+    except CliError as error:
+        failure = failure_of(error)
+        if error.tool is None:
+            failure.tool = "agent-spawn"  # its own executable path
+        raise failure from None
     spec = RunSpec(
         agent_id=agent_id,
         mode="interactive" if promoted else "headless",
@@ -566,9 +577,6 @@ def _start(
         raise ChainCanceled  # no run exists yet (a hold taken stays: teardown releases it)
     outcome_file = new_outcome_file(sup.state_dir, agent_id)
     token = os.path.basename(outcome_file).removesuffix(".json")
-    from .launch import stored_self  # late: launch is a big module, this is all we need
-
-    relay = relay_hook(stored_self(row), sup.state_dir, row["config_path"])
     try:
         started = backend.start(spec, outcome_file=outcome_file, hook=relay)
     except StartError as error:

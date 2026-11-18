@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
 import signal
 import stat
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -352,13 +351,11 @@ class Teardown:
 
     def session_backend(self, row: Mapping[str, Any]) -> SessionBackend:
         if self.backend is None:
-            from .launch import resolve_tool  # the tool resolution launch uses
+            from .launch import stored_tool  # the tool resolution launch uses
 
             stored = row.get("claude_session_path")
-            argv = (
-                shlex.split(stored)
-                if isinstance(stored, str) and stored
-                else resolve_tool(self.config.claude_session_cmd, TOOL)
+            argv = stored_tool(
+                stored if isinstance(stored, str) else None, self.config.claude_session_cmd, TOOL
             )
             self.backend = SessionBackend(
                 argv, actor=self.actor, decision_ids=self.decision_ids, gateway=self.gateway
