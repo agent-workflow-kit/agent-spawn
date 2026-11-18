@@ -17,7 +17,7 @@ One caller at a time (lease ``reconcile``: a second live caller exits 0 with
 7. housekeeping: leftover files of torn-down agents and orphaned prompt copies, tombstones past
    ``tombstone_days`` (the id stays reserved), handoff directories of dead listeners.
 
-Safety, because steps 6 deletes:
+Safety, because step 7 deletes:
 
 * every file removal goes through descriptors opened without following symlinks, inside the
   state directory, on real directories owned by this user (``teardown.remove_tree_at``, the
@@ -63,10 +63,11 @@ from .ids import is_agent_id
 from .labels import Label
 from .lifecycle import LEASE_WAIT, lease_key
 from .output import CliError, Outcome, PayloadKind, safe_text
-from .panes import sockets_to_search, termctl_for
+from .panes import scan_dead, sockets_to_search, termctl_for
 from .records import RecordsError, append_log
 from .store import LeaseHeld, Store, StoreError
 from .teardown import SUPERVISOR_ACTOR, remove_agent_files, remove_tree_at
+from .term import TermBackend
 
 __all__ = ["LEASE", "reconcile_command"]
 
@@ -104,6 +105,7 @@ class _Pass:
         self.gateway = gw.get_gateway()
         self.changes: list[dict[str, Any]] = []
         self.warnings: list[str] = []
+        self._termctl: dict[str | None, list[str] | None] = {}  # termctl resolved once per pass
 
     # -- plumbing ----------------------------------------------------------------------------
 
@@ -313,6 +315,19 @@ class _Pass:
             except Exception as error:  # noqa: BLE001 - one agent never stops the others
                 self.warn(agent_id, f"dead pane check failed ({type(error).__name__})")
 
+    @staticmethod
+    def _keep_reason(row: Mapping[str, Any], after: float | None, now: float) -> str | None:
+        """Why a dead pane of this agent stays open (None: it may be closed). The clock is the
+        agent's ``updated`` time (idle time), not the time the pane died."""
+        if row.get("needs_attention"):
+            return "attention"
+        if after is None:
+            return "report_only"
+        updated = row.get("updated")
+        if isinstance(updated, bool) or not isinstance(updated, (int, float)):
+            return "too_new"
+        return "too_new" if now - float(updated) < after else None
+
     def _dead_panes_of(self, row: Mapping[str, Any], after: float | None, now: float) -> None:
         agent_id = row["agent_id"]
         targets = sockets_to_search(self.store.get_runs(agent_id))
@@ -325,45 +340,51 @@ class _Pass:
             actor=inv.actor,
             decision_ids=inv.decision_ids,
             gateway=self.gateway,
+            cache=self._termctl,
         )
         if term is None:
             self.warn(agent_id, "termctl could not be found: dead panes not checked")
             return
-        updated = row.get("updated")
-        idle = now - float(updated) if isinstance(updated, (int, float)) else None
-        for target in targets:
-            try:
-                dead = term.find_dead(agent_id, target)
-            except CliError as error:
-                if error.exit_code != 10:
-                    self.warn(agent_id, f"termctl list failed (exit {error.exit_code})")
-                continue
-            for term_id, socket_path in dead:
-                if row.get("needs_attention"):
-                    reason = "attention"
-                elif after is None:
-                    reason = "report_only"
-                elif idle is None or idle < after:
-                    reason = "too_new"
-                else:
-                    reason = None
-                details: dict[str, Any] = {"term_id": term_id, "socket_path": socket_path}
+        scan = scan_dead(term, agent_id, targets)
+        for text in scan.warnings:
+            self.warn(agent_id, text)
+        reason = self._keep_reason(row, after, now)
+        for term_id, socket_path in scan.panes:
+            details: dict[str, Any] = {"term_id": term_id, "socket_path": socket_path}
+            if reason is not None:
+                self.change(agent_id, DEAD_PANE, **details, action="kept", reason=reason)
+            elif self.dry_run:
+                self.change(agent_id, DEAD_PANE, **details, action="would_close")
+            else:
+                self._close_pane(term, agent_id, details, after)
+
+    def _close_pane(
+        self, term: TermBackend, agent_id: str, details: dict[str, Any], after: float | None
+    ) -> None:
+        """Close one dead pane under the agent's lease, judged again on the fresh row: the
+        listing is a snapshot, and the agent may have resumed, failed or been acknowledged since.
+        A busy lease or an agent no longer parked skips the pane (a later pass looks again)."""
+        try:
+            with self.store.lease(lease_key(agent_id), wait=LEASE_WAIT):
+                fresh = self.store.get_agent(agent_id)
+                if fresh is None or fresh["status"] != "parked":
+                    return
+                reason = self._keep_reason(fresh, after, self.gateway.wall_time())
                 if reason is not None:
                     self.change(agent_id, DEAD_PANE, **details, action="kept", reason=reason)
-                    continue
-                if self.dry_run:
-                    self.change(agent_id, DEAD_PANE, **details, action="would_close")
-                    continue
+                    return
                 try:
-                    term.close(term_id, socket_path)
+                    term.close(details["term_id"], details["socket_path"])
                 except CliError as error:
                     if error.exit_code != 10 and not (
                         error.exit_code == 20 and error.reason == "running"
                     ):
                         self.warn(agent_id, f"termctl close failed (exit {error.exit_code})")
-                    continue
+                    return
                 self.change(agent_id, DEAD_PANE, **details, action="closed")
                 self.log(agent_id, "pane_closed", **details)
+        except LeaseHeld:
+            return
 
     # -- 7: housekeeping ----------------------------------------------------------------------
 

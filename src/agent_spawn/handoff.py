@@ -548,7 +548,7 @@ def _owner_dead(owner: procs.ProcessIdentity, gw: Gateway) -> bool:
 def sweep_dead(
     state_dir: str | os.PathLike[str], *, dry_run: bool = False, gateway: Gateway | None = None
 ) -> Sweep:
-    """Remove the handoff directories of dead listeners (``reconcile``, step 6).
+    """Remove the handoff directories of dead listeners (``reconcile``, step 7).
 
     A directory goes only when it is a real directory of ours named like the ones ``create``
     makes, its ``owner`` file names a process that is verifiably dead (PID, start time and boot

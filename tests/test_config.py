@@ -698,3 +698,29 @@ def test_error_message_does_not_echo_secret_looking_values(tmp_path: Path) -> No
 def test_nul_in_path_is_config_invalid() -> None:
     with pytest.raises(CliError):
         load_config("/a\0b", environ={})
+
+
+# --- reconcile.close_dead_panes_after ---------------------------------------------------------
+
+
+def test_close_dead_panes_after_defaults_to_null(tmp_path: Path) -> None:
+    assert load(tmp_path).reconcile.close_dead_panes_after is None
+
+
+def test_close_dead_panes_after_null_is_accepted(tmp_path: Path) -> None:
+    cfg = load(tmp_path, "reconcile: {close_dead_panes_after: null}\n")
+    assert cfg.reconcile.close_dead_panes_after is None
+
+
+@pytest.mark.parametrize(
+    ("text", "seconds"), [("1h", 3600.0), ("90", 90.0), ("30m", 1800.0), ("45", 45.0)]
+)
+def test_close_dead_panes_after_takes_a_duration(tmp_path: Path, text: str, seconds: float) -> None:
+    cfg = load(tmp_path, f"reconcile: {{close_dead_panes_after: {text}}}\n")
+    assert cfg.reconcile.close_dead_panes_after == seconds
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "-1h", "soon", "'0s'"])
+def test_close_dead_panes_after_refuses_zero_negative_and_text(tmp_path: Path, value: str) -> None:
+    message = invalid(tmp_path, f"reconcile: {{close_dead_panes_after: {value}}}\n")
+    assert "close_dead_panes_after" in message

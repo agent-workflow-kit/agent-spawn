@@ -35,7 +35,7 @@ from .ids import is_agent_id, resolve_agent_id
 from .lifecycle import LEASE_WAIT, lease_key, reads_third_party_of
 from .liveness import Liveness
 from .output import CliError, Outcome, PayloadKind
-from .panes import sockets_to_search, termctl_for
+from .panes import scan_dead, sockets_to_search, termctl_for
 from .records import RecordsError, append_audit, append_log
 from .session_backend import SessionBackend, SessionStatus
 from .store import CasLost, Store, StoreError, StoreMissing, default_state_dir
@@ -971,7 +971,8 @@ class Teardown:
         list --label agent=<id> --dead``, then ``termctl close`` for each dead pane listed. Exit
         10 and 20 ``running`` are no-ops; any other failure is a warning (a window left behind
         never blocks a teardown). Returns whether the step is done: it is not when termctl could
-        not be found or a ``list`` failed, so a retry looks again."""
+        not be found, a recorded server's ``list`` failed or a listed pane had no socket path, so a
+        retry looks again (a failed sweep of the default server only warns)."""
         agent_id = row["agent_id"]
         targets = sockets_to_search(self.store.get_runs(agent_id))
         if not targets:
@@ -980,27 +981,18 @@ class Teardown:
         if term is None:
             self.warnings.append("termctl could not be found: the agent's dead windows stay open")
             return False
-        complete = True
-        for target in targets:
+        scan = scan_dead(term, agent_id, targets)
+        self.warnings.extend(scan.warnings)
+        for term_id, socket_path in scan.panes:
             try:
-                dead = term.find_dead(agent_id, target)
+                term.close(term_id, socket_path)
             except CliError as error:
-                if error.exit_code != 10:
-                    self.warnings.append(f"termctl list failed (exit {error.exit_code})")
-                    complete = False
-                continue
-            for term_id, socket_path in dead:
-                try:
-                    term.close(term_id, socket_path)
-                except CliError as error:
-                    if error.exit_code == 10 or (
-                        error.exit_code == 20 and error.reason == "running"
-                    ):
-                        continue
-                    self.warnings.append(f"termctl close failed (exit {error.exit_code})")
+                if error.exit_code == 10 or (error.exit_code == 20 and error.reason == "running"):
                     continue
-                self.windows_closed.append(term_id)
-        return complete
+                self.warnings.append(f"termctl close failed (exit {error.exit_code})")
+                continue
+            self.windows_closed.append(term_id)
+        return scan.complete
 
     def step_session(self, row: Mapping[str, Any]) -> None:
         """Step 6: ``claude-session forget``; exit 10 counts as done, any other failure stops
