@@ -17,7 +17,9 @@ concurrency:
 
 jobs:
   ci:
-    uses: agent-workflow-kit/awkit-ci/.github/workflows/python-ci.yml@v0.1.0
+    uses: agent-workflow-kit/awkit-ci/.github/workflows/python-ci.yml@v0.2.0
+    with:
+      verify-timeout-minutes: 35
 
   release:
     needs: ci
