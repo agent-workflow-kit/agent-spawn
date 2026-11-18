@@ -504,7 +504,22 @@ def test_neither_claude_session_running_at_start_parks_instead_of_raising(
 def test_neither_claude_session_running_after_exec_parks_instead_of_raising(
     rig_for: Callable[..., Rig], fakebin: Fakebin, tmp_path: Path
 ) -> None:
-    stored = Path(wrapper_for(fakebin, tmp_path / "old-claude-session"))
+    # The stored wrapper must not start its work before the upgrade has removed it: otherwise the
+    # shell may already have read it, and the fake `exec` runs to the end (a done run) whenever the
+    # test thread is descheduled between the spawn and the unlink. The wrapper therefore waits on a
+    # gate file that is created only after the unlink, then does what a removed install does: it is
+    # gone, so `exec` cannot start (exit 127).
+    stored = tmp_path / "old-claude-session"
+    gate = tmp_path / "removed"
+    stored.write_text(
+        "#!/bin/sh\n"
+        "n=0\n"  # the gate is the barrier; the cap only keeps an orphan from spinning forever
+        f'while [ ! -e "{gate}" ]; do n=$((n+1)); '
+        '[ "$n" -lt 20000000 ] || { echo "gate never opened" >&2; exit 99; }; done\n'
+        '[ -e "$0" ] || exit 127\n'
+        f'exec {fakebin.bin_dir / "claude-session"} "$@"\n'
+    )
+    stored.chmod(0o755)
     rig = rig_for(claude_session_path=str(stored))
     rig.supervisor.config.claude_session_cmd = [str(tmp_path / "also-gone")]
 
@@ -512,6 +527,7 @@ def test_neither_claude_session_running_after_exec_parks_instead_of_raising(
         def spawn(self, argv: Sequence[str], **kwargs: Any) -> subprocess.Popen[bytes]:
             child = super().spawn(argv, **kwargs)
             stored.unlink()
+            gate.touch()  # now the wrapper may continue, and finds itself gone
             return child
 
     rig.supervisor.gateway = Gateway(fakebin)

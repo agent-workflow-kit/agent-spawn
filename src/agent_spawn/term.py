@@ -32,6 +32,7 @@ from .validate import GrammarError
 __all__ = [
     "MAX_AGENT_LABELS",
     "ATTENTION_MARKER",
+    "DeadPanes",
     "Pane",
     "TermBackend",
     "window_labels",
@@ -159,6 +160,14 @@ def _parse_pane(data: dict[str, Any] | None) -> Pane | None:
     if pid is not None and (not isinstance(pid, int) or isinstance(pid, bool) or pid < 1):
         return None
     return Pane(term_id, socket_path, pid, state)
+
+
+@dataclass(frozen=True)
+class DeadPanes:
+    """The dead panes of one ``list``: ``(id, socket path)`` and how many had no socket path."""
+
+    panes: list[tuple[str, str]]
+    unresolved: int = 0
 
 
 @dataclass
@@ -415,28 +424,36 @@ class TermBackend:
 
     def list_dead(self, agent_id: str, socket_path: str) -> list[str]:
         """The ids of the dead panes labeled ``agent=<agent_id>`` on one server."""
-        reply = self.call(
-            [
-                "list",
-                _flag("--label", f"agent={agent_id}"),
-                "--dead",
-                _flag("--socket", socket_path),
-                "--json",
-            ],
-            timeout=QUICK_TIMEOUT,
-        )
+        return [term_id for term_id, _ in self.find_dead(agent_id, socket_path).panes]
+
+    def find_dead(self, agent_id: str, socket_path: str | None) -> DeadPanes:
+        """The dead panes labeled ``agent=<agent_id>`` on one server (the default one when
+        ``socket_path`` is None), each as ``(id, socket path)``: the pane's own socket path, else
+        the reply's, else the one asked for. A pane with none of them cannot be closed (``close``
+        needs one): it is counted in ``unresolved``, never silently dropped."""
+        args = ["list", _flag("--label", f"agent={agent_id}"), "--dead"]
+        if socket_path is not None:
+            args.append(_flag("--socket", socket_path))
+        reply = self.call([*args, "--json"], timeout=QUICK_TIMEOUT)
         if reply.code != 0:
             raise self.fail(reply)
         panes = reply.data.get("panes") if reply.data is not None else None
         if not isinstance(panes, list):
             raise CliError("failed", "termctl printed unusable output", tool=TOOL)
-        found: list[str] = []
+        top = reply.data.get("socket_path") if reply.data is not None else None
+        found: list[tuple[str, str]] = []
+        unresolved = 0
         for pane in panes:  # pyright: ignore[reportUnknownVariableType]
             term_id = pane.get("id") if isinstance(pane, dict) else None  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
             if not isinstance(term_id, str) or TERM_ID.fullmatch(term_id) is None:
                 raise CliError("failed", "termctl printed unusable output", tool=TOOL)
-            found.append(term_id)
-        return found
+            for where in (pane.get("socket_path"), top, socket_path):  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+                if isinstance(where, str) and where.startswith("/") and "\0" not in where:
+                    found.append((term_id, where))
+                    break
+            else:
+                unresolved += 1
+        return DeadPanes(found, unresolved)
 
     def find_panes(self, agent_id: str, socket_path: str | None) -> list[tuple[str, str]]:
         """``(id, socket path)`` of every pane labeled ``agent=<agent_id>`` (dead or running) on

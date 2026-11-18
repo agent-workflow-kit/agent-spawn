@@ -590,7 +590,7 @@ def test_a_live_agents_pane_gets_the_labels_too(env: Env, fakebin: Fakebin) -> N
     assert pending(env, agent_id) == []
 
 
-# --- step 6: tombstones ---------------------------------------------------------------------------
+# --- step 7: tombstones ---------------------------------------------------------------------------
 
 
 def test_an_old_tombstone_is_deleted_with_everything_it_owns_and_its_id_stays_reserved(
@@ -604,7 +604,7 @@ def test_an_old_tombstone_is_deleted_with_everything_it_owns_and_its_id_stays_re
         with store.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
             store.put_hold(lease, agent_id, "wt-aaaaaaaa", "/x/y", owned=False)
     body = reconcile(env)
-    # the event is delivered (step 3) before the tombstone goes (step 6)
+    # the event is delivered (step 3) before the tombstone goes (step 7)
     assert kinds(body) == [(agent_id, "events_delivered"), (agent_id, "tombstone_deleted")]
     with Store.open(env.state_dir) as store:
         assert store.get_agent(agent_id) is None and store.is_reserved(agent_id)
@@ -810,7 +810,7 @@ def test_a_row_that_is_not_a_tombstone_is_never_deleted(env: Env, fakebin: Fakeb
     assert (env.state_dir / "prompts" / parked).exists()
 
 
-# --- step 6: prompt copies and outcome files -----------------------------------------------------
+# --- step 7: prompt copies and outcome files -----------------------------------------------------
 
 
 def backdate(path: Path, age: float) -> None:
@@ -971,7 +971,7 @@ def test_names_that_are_not_agent_ids_are_left_alone(env: Env, fakebin: Fakebin)
     assert odd.exists()
 
 
-# --- step 6: handoff directories -----------------------------------------------------------------
+# --- step 7: handoff directories -----------------------------------------------------------------
 
 
 def handoff_dir(env: Env, name: str, owner: Any, extra: tuple[str, ...] = ()) -> Path:
@@ -1084,7 +1084,7 @@ def test_a_second_caller_exits_0_already_running_and_does_nothing(
     hooked, started, gate, sink = hold_gate_env(env, tmp_path)
     busy = seed(hooked, fakebin)
     queue_event(hooked, busy)
-    other = tombstone(hooked, fakebin, 40.0)  # the first pass would delete this at step 6
+    other = tombstone(hooked, fakebin, 40.0)  # the first pass would delete this at step 7
     first = subprocess.Popen(
         hooked.argv("reconcile", "--json"),
         env=hooked.env(),

@@ -24,7 +24,8 @@
               "fork_abandoned",
               "labels_resynced",
               "events_delivered",
-              "tombstone_deleted"
+              "tombstone_deleted",
+              "dead_pane"
             ]
           },
           "details": {

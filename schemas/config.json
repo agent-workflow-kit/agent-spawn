@@ -130,6 +130,26 @@
       "required": [],
       "default": {}
     },
+    "reconcile": {
+      "type": "object",
+      "properties": {
+        "close_dead_panes_after": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/duration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "reconcile closes a dead pane of a parked agent without needs_attention once the agent has been unchanged this long; null: it only reports such panes."
+        }
+      },
+      "additionalProperties": false,
+      "required": [],
+      "default": {}
+    },
     "kinds": {
       "type": "object",
       "propertyNames": {

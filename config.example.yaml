@@ -49,6 +49,12 @@ prune:
   # Label keys or key=value pairs that protect an agent from prune (unless --include-owned).
   protect_labels: [owner]
 
+reconcile:
+  # Dead terminal panes (kept by --keep-on-exit failed) of a parked agent without needs_attention
+  # are closed by reconcile once the agent has been unchanged this long. null: reconcile only
+  # reports them (teardown closes them either way).
+  close_dead_panes_after: null
+
 # Per-kind settings. Kind names follow claude-session's grammar.
 # promote: when a headless run of this kind ends blocked or needs-input, resume it once
 # interactively in a window (default false; --promote/--no-promote override it per agent). Example:

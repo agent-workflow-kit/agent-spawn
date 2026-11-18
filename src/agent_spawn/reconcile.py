@@ -12,10 +12,12 @@ One caller at a time (lease ``reconcile``: a second live caller exits 0 with
    continued: ``prune`` and ``teardown`` continue them);
 5. the pending label mirror changes, replayed to sessions and live panes
    (``annotate.mirror_labels``: the queue holds the latest op per pair, so a replay converges);
-6. housekeeping: leftover files of torn-down agents and orphaned prompt copies, tombstones past
+6. dead panes of parked agents (``panes``: reported, closed only under
+   ``reconcile.close_dead_panes_after`` and never while ``needs_attention`` is set);
+7. housekeeping: leftover files of torn-down agents and orphaned prompt copies, tombstones past
    ``tombstone_days`` (the id stays reserved), handoff directories of dead listeners.
 
-Safety, because steps 6 deletes:
+Safety, because step 7 deletes:
 
 * every file removal goes through descriptors opened without following symlinks, inside the
   state directory, on real directories owned by this user (``teardown.remove_tree_at``, the
@@ -61,9 +63,11 @@ from .ids import is_agent_id
 from .labels import Label
 from .lifecycle import LEASE_WAIT, lease_key
 from .output import CliError, Outcome, PayloadKind, safe_text
+from .panes import scan_dead, sockets_to_search, termctl_for
 from .records import RecordsError, append_log
 from .store import LeaseHeld, Store, StoreError
 from .teardown import SUPERVISOR_ACTOR, remove_agent_files, remove_tree_at
+from .term import TermBackend
 
 __all__ = ["LEASE", "reconcile_command"]
 
@@ -74,6 +78,7 @@ TEARDOWN_INCOMPLETE = "teardown_incomplete"
 LABELS_RESYNCED = "labels_resynced"
 EVENTS_DELIVERED = "events_delivered"
 TOMBSTONE_DELETED = "tombstone_deleted"
+DEAD_PANE = "dead_pane"
 
 
 def _internal(inv: Invocation, row: Mapping[str, Any] | None = None) -> Invocation:
@@ -100,6 +105,7 @@ class _Pass:
         self.gateway = gw.get_gateway()
         self.changes: list[dict[str, Any]] = []
         self.warnings: list[str] = []
+        self._termctl: dict[str | None, list[str] | None] = {}  # termctl resolved once per pass
 
     # -- plumbing ----------------------------------------------------------------------------
 
@@ -110,6 +116,7 @@ class _Pass:
             ("hook delivery", "deliver"),
             ("teardown report", "teardown_incomplete"),
             ("label re-sync", "labels"),
+            ("dead panes", "dead_panes"),
             ("leftover files", "leftover_files"),
             ("tombstones", "tombstones"),
             ("handoff directories", "handoffs"),
@@ -292,7 +299,99 @@ class _Pass:
         self.change(agent_id, LABELS_RESYNCED, added=added, removed=removed)
         self.log(agent_id, LABELS_RESYNCED, added=len(added), removed=len(removed))
 
-    # -- 6: housekeeping ----------------------------------------------------------------------
+    # -- 6: dead panes ------------------------------------------------------------------------
+
+    def dead_panes(self) -> None:
+        """Dead panes labeled ``agent=<id>`` of parked agents: reported always; closed only when
+        ``reconcile.close_dead_panes_after`` is set, the agent has no ``needs_attention`` (a failure
+        nobody acknowledged is kept for reading) and has been unchanged that long. Never a
+        pane of a live, launching or tearing-down agent; never forced."""
+        after = self.config.reconcile.close_dead_panes_after
+        now = self.gateway.wall_time()
+        for row in self.store.list_agents(statuses=("parked",)):
+            agent_id = row["agent_id"]
+            try:
+                self._dead_panes_of(row, after, now)
+            except Exception as error:  # noqa: BLE001 - one agent never stops the others
+                self.warn(agent_id, f"dead pane check failed ({type(error).__name__})")
+
+    @staticmethod
+    def _keep_reason(row: Mapping[str, Any], after: float | None, now: float) -> str | None:
+        """Why a dead pane of this agent stays open (None: it may be closed). The clock is the
+        agent's ``updated`` time (idle time), not the time the pane died."""
+        if row.get("needs_attention"):
+            return "attention"
+        if after is None:
+            return "report_only"
+        updated = row.get("updated")
+        if isinstance(updated, bool) or not isinstance(updated, (int, float)):
+            return "too_new"
+        return "too_new" if now - float(updated) < after else None
+
+    def _dead_panes_of(self, row: Mapping[str, Any], after: float | None, now: float) -> None:
+        agent_id = row["agent_id"]
+        targets = sockets_to_search(self.store.get_runs(agent_id))
+        if not targets:
+            return
+        inv = _internal(self.inv, row)
+        term = termctl_for(
+            self.config,
+            row,
+            actor=inv.actor,
+            decision_ids=inv.decision_ids,
+            gateway=self.gateway,
+            cache=self._termctl,
+        )
+        if term is None:
+            self.warn(agent_id, "termctl could not be found: dead panes not checked")
+            return
+        scan = scan_dead(term, agent_id, targets)
+        for text in scan.warnings:
+            self.warn(agent_id, text)
+        reason = self._keep_reason(row, after, now)
+        busy = False  # the agent's lease was held: its other panes are not tried this pass
+        for term_id, socket_path in scan.panes:
+            details: dict[str, Any] = {"term_id": term_id, "socket_path": socket_path}
+            if reason is not None:
+                self.change(agent_id, DEAD_PANE, **details, action="kept", reason=reason)
+            elif self.dry_run:
+                self.change(agent_id, DEAD_PANE, **details, action="would_close")
+            elif not busy:
+                busy = self._close_pane(term, agent_id, details, after)
+
+    def _close_pane(
+        self, term: TermBackend, agent_id: str, details: dict[str, Any], after: float | None
+    ) -> bool:
+        """Close one dead pane under the agent's lease, judged again on the fresh row: the
+        listing is a snapshot, and the agent may have resumed, failed or been acknowledged since.
+        A busy lease (warned once, and the caller skips the agent's other panes: each wait can take
+        up to ``LEASE_WAIT``; returns True) or an agent no longer parked skips the pane (a later
+        pass looks again)."""
+        try:
+            with self.store.lease(lease_key(agent_id), wait=LEASE_WAIT):
+                fresh = self.store.get_agent(agent_id)
+                if fresh is None or fresh["status"] != "parked":
+                    return False
+                reason = self._keep_reason(fresh, after, self.gateway.wall_time())
+                if reason is not None:
+                    self.change(agent_id, DEAD_PANE, **details, action="kept", reason=reason)
+                    return False
+                try:
+                    term.close(details["term_id"], details["socket_path"])
+                except CliError as error:
+                    if error.exit_code != 10 and not (
+                        error.exit_code == 20 and error.reason == "running"
+                    ):
+                        self.warn(agent_id, f"termctl close failed (exit {error.exit_code})")
+                    return False
+                self.change(agent_id, DEAD_PANE, **details, action="closed")
+                self.log(agent_id, "pane_closed", **details)
+        except LeaseHeld:
+            self.warn(agent_id, "agent busy: dead pane not closed this pass")
+            return True
+        return False
+
+    # -- 7: housekeeping ----------------------------------------------------------------------
 
     def leftover_files(self) -> None:
         """Prompt copies and outcome files: a tombstone's, whatever their age, and the prompt

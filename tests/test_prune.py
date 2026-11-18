@@ -317,7 +317,9 @@ def test_an_agent_with_a_window_is_torn_down_with_its_dead_panes_closed(
     assert by_id(body)[agent_id]["result"] == "torn_down"
     assert status_of(env, agent_id) == "torn_down"
     listing = [a for a in fakebin.argvs("termctl") if a[0] == "list"]
-    assert len(listing) == 1 and "--dead" in listing[0]  # step 5 ran
+    # step 5 ran: the recorded socket, then the default server (panes no run records)
+    assert len(listing) == 2 and all("--dead" in a for a in listing)
+    assert "--socket=/tmp/s" in listing[0] and not any(a.startswith("--socket") for a in listing[1])
 
 
 def test_a_pre_teardown_hook_runs_for_each_agent_and_a_veto_refuses_only_that_one(
