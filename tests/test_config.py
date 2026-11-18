@@ -85,7 +85,7 @@ def test_defaults_equal_the_schema_defaults() -> None:
     for key, spec in SCHEMA["properties"].items():
         if key == "handoff_timeout":
             assert dumped[key] == 30.0
-        elif key in ("me", "prune", "hooks"):
+        elif key in ("me", "prune", "hooks", "reconcile"):
             # nested defaults: the schema's per-property defaults
             for sub, sub_spec in spec["properties"].items():
                 if "default" in sub_spec:

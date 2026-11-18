@@ -707,9 +707,12 @@ def test_teardown_closes_the_dead_panes_of_the_agent_only(
     assert [p["id"] for p in wenv.panes()] == [p["id"] for p in wenv.panes() if p["id"] != term_id]
     remaining = wenv.panes()
     assert len(remaining) == 1 and "agent=ag-zzzzzzzz" in remaining[0]["labels"]
-    (listing,) = term_calls(fakebin, "list")
+    listing, default = term_calls(fakebin, "list")  # the recorded socket, then the default server
     assert f"--label=agent={agent_id}" in listing and "--dead" in listing
     assert f"--socket={wenv.tmux.socket}" in listing
+    assert f"--label=agent={agent_id}" in default and not any(
+        a.startswith("--socket") for a in default
+    )
     assert wenv.agent(agent_id)["status"] == "torn_down"
 
 
@@ -788,9 +791,11 @@ def test_every_distinct_socket_of_the_runs_is_listed_once(
             )
     result_json(wenv.run("teardown", agent_id, "--json"))
     sockets = [
-        next(a for a in call if a.startswith("--socket=")) for call in term_calls(fakebin, "list")
+        next((a for a in call if a.startswith("--socket=")), None)
+        for call in term_calls(fakebin, "list")
     ]
-    assert sockets == [f"--socket={wenv.tmux.socket}", "--socket=/tmp/other-sock"]
+    # each recorded socket once, in run order, then the default server (panes no run records)
+    assert sockets == [f"--socket={wenv.tmux.socket}", "--socket=/tmp/other-sock", None]
 
 
 def test_a_retry_after_the_session_step_does_not_close_windows_again(
@@ -1429,7 +1434,9 @@ def test_a_failed_list_does_not_complete_the_window_step_and_a_retry_closes_the_
     wenv: WindowEnv, fakebin: Fakebin
 ) -> None:
     agent_id = dead_pane_agent(wenv, fakebin)
-    fakebin.script("termctl", "list", times=1, exit=12,
+    # both servers of the step fail (the recorded socket and the default one, which is the same
+    # private server here): the step is not done and nothing is closed
+    fakebin.script("termctl", "list", times=2, exit=12,
                    error={"code": "tmux_missing", "message": "x"})  # fmt: skip
     fakebin.script("claude-session", "forget", times=1, exit=20,
                    error={"code": "refused", "message": "live", "reason": "live"})  # fmt: skip
