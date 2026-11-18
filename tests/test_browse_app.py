@@ -257,7 +257,7 @@ def test_confirmation_text_is_plain_for_hostile_names() -> None:
     run_app(make(backend), script)
 
 
-def test_wait_reports_the_outcome_without_blocking_other_keys() -> None:
+def test_wait_reports_the_outcome() -> None:
     result = {"agent": None, "phase": "ended", "outcome": "done", "timed_out": False}
     backend = FakeBackend(three(), wait=CliResult(0, result))
 
