@@ -758,3 +758,37 @@ def test_a_signal_during_the_result_file_check_exits_via_the_signal(
     with Store.open(env.state_dir) as store:
         outcome = waiter.poll(store, agent_id, None)
     assert outcome.exit_code == 143 and outcome.kind is PayloadKind.NONE
+
+
+def test_wait_falls_back_when_the_stored_claude_session_is_gone(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The result-file check looks the session up with the configured claude-session when the
+    one stored with the agent was removed by an upgrade."""
+    from types import SimpleNamespace
+
+    from agent_spawn import wait_agent
+    from agent_spawn.output import CliError
+
+    configured = tmp_path / "configured-claude-session"
+    configured.write_text("#!/bin/sh\nexit 0\n")
+    configured.chmod(0o755)
+    commands: list[Any] = []
+
+    class Recording:
+        def __init__(self, command: Any, **_kwargs: Any) -> None:
+            commands.append(list(command))
+
+        def status(self, _session: str) -> Any:
+            raise CliError("not_found", "gone")  # exit 10: no directory to protect
+
+    monkeypatch.setattr(wait_agent, "SessionBackend", Recording)
+    agent_id = seed(env)
+    waiter = _inproc(env, agent_id)
+    waiter.inv.config = SimpleNamespace(claude_session_cmd=[str(configured)])
+    row = {
+        "csession_id": "cs-abcdefgh",
+        "claude_session_path": str(tmp_path / "uv-cache" / "claude-session"),
+    }
+    assert waiter.run_directories(row) == []
+    assert commands == [[str(configured)]]

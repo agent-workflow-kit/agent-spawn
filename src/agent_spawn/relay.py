@@ -357,23 +357,28 @@ def record(store: Store, event: Event) -> str:
         if not store.record_relay_event(event.csession_id, str(event.event_id)):
             return "duplicate"
         store.prune_relay_events()
-        store.relay_record_run(
-            event.agent_id,
-            event.run,
-            session_state=event.state,
-            activity=event.activity,
-            needs_input_reason=event.reason,
-            first_working_at=event.first_working_at(),
-        )
-        recorded_run = agent.get("run")
-        if not isinstance(recorded_run, int) or event.run >= recorded_run:
-            store.relay_set_agent(
+        own_run = store.get_run(event.agent_id, event.run)
+        # Once the run's final bookkeeping is recorded (the supervisor derived the final state
+        # from the outcome), a late or redelivered older event must not overwrite it. The event
+        # is still deduplicated above and announced below.
+        if own_run is None or own_run.get("outcome") is None:
+            store.relay_record_run(
                 event.agent_id,
-                run=event.run,
+                event.run,
                 session_state=event.state,
                 activity=event.activity,
                 needs_input_reason=event.reason,
+                first_working_at=event.first_working_at(),
             )
+            recorded_run = agent.get("run")
+            if not isinstance(recorded_run, int) or event.run >= recorded_run:
+                store.relay_set_agent(
+                    event.agent_id,
+                    run=event.run,
+                    session_state=event.state,
+                    activity=event.activity,
+                    needs_input_reason=event.reason,
+                )
         after = store.get_agent(event.agent_id)
         assert after is not None
         run_row = store.get_run(event.agent_id, after["run"]) if after.get("run") else None

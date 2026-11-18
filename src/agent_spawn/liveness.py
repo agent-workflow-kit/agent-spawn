@@ -237,8 +237,21 @@ class Liveness:
 
     def backend(self, row: Mapping[str, Any]) -> SessionBackend | None:
         stored = row.get("claude_session_path")
-        command = shlex.split(stored) if isinstance(stored, str) and stored else None
-        command = command or self.fallback_command
+        command = self.fallback_command
+        if isinstance(stored, str) and stored:
+            # The agent's own claude-session while it still runs; a stale path (an upgrade
+            # removed it) falls back to the configured command.
+            try:
+                argv = shlex.split(stored)
+            except ValueError:
+                argv = []
+            if (
+                argv
+                and os.path.isabs(argv[0])
+                and os.path.isfile(argv[0])
+                and os.access(argv[0], os.X_OK)
+            ):
+                command = argv
         if not command:
             return None
         return SessionBackend(command, gateway=self.gateway)

@@ -20,7 +20,6 @@ a park or a launcher's exit acts on what is true now).
 
 from __future__ import annotations
 
-import shlex
 import signal
 from dataclasses import dataclass
 from typing import Any
@@ -31,7 +30,7 @@ from . import lifecycle, procs
 from .agent_lookup import liveness_for
 from .agent_view import agent_object
 from .ids import resolve_agent_id
-from .launch import resolve_tool
+from .launch import stored_tool
 from .liveness import Liveness
 from .output import CliError, Outcome, PayloadKind
 from .procs import ProcessIdentity
@@ -165,10 +164,10 @@ class Stop:
 
     def make_backend(self, row: dict[str, Any]) -> SessionBackend:
         stored = row.get("claude_session_path")
-        argv = (
-            shlex.split(stored)
-            if isinstance(stored, str) and stored
-            else resolve_tool(self.inv.config.claude_session_cmd, "claude-session")
+        argv = stored_tool(
+            stored if isinstance(stored, str) else None,
+            self.inv.config.claude_session_cmd,
+            "claude-session",
         )
         self.fallback = list(argv)
         return SessionBackend(

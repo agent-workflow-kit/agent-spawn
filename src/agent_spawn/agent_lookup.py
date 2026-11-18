@@ -6,14 +6,13 @@ and exit 10 for the commands that name an agent. Store failures are reported as 
 
 from __future__ import annotations
 
-import shlex
 from collections.abc import Mapping
 from typing import Any
 
 from . import gateway as gw
 from .commands.base import Invocation
 from .ids import ResolvedId, check_agent_id_text, resolve_agent_id
-from .launch import resolve_tool, resolve_wtctl
+from .launch import resolve_tool, resolve_wtctl, stored_tool
 from .liveness import Liveness
 from .output import CliError
 from .session_backend import SessionBackend
@@ -85,11 +84,12 @@ def torn_down_error(agent_id: str) -> CliError:
 def backend_for(inv: Invocation, row: Mapping[str, Any] | None = None) -> SessionBackend:
     """claude-session as the agent recorded it, else as the config names it."""
     stored = None if row is None else row.get("claude_session_path")
-    if isinstance(stored, str) and stored:
-        command = shlex.split(stored)
-    else:
-        assert inv.config is not None
-        command = resolve_tool(inv.config.claude_session_cmd, "claude-session")
+    assert inv.config is not None
+    command = stored_tool(
+        stored if isinstance(stored, str) else None,
+        inv.config.claude_session_cmd,
+        "claude-session",
+    )
     return SessionBackend(
         command, actor=inv.actor, decision_ids=inv.decision_ids, gateway=gw.get_gateway()
     )

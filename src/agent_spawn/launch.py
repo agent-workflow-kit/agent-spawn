@@ -194,6 +194,34 @@ def resolve_self() -> str:
     raise CliError("tool_missing", "agent-spawn cannot find its own executable path")
 
 
+def _runs(path: str) -> bool:
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def stored_self(row: Mapping[str, Any]) -> str:
+    """The agent-spawn path internal argvs of a long-lived process use: the one stored with the
+    agent, or, when that no longer runs (an upgrade or a cleaned `uvx` cache removed it), the
+    path this process resolves for itself (exit 12 ``tool_missing`` when neither runs)."""
+    stored = row.get("agent_spawn_path")
+    if isinstance(stored, str) and os.path.isabs(stored) and _runs(stored):
+        return stored
+    return resolve_self()
+
+
+def stored_tool(stored: str | None, command: Sequence[str], name: str) -> list[str]:
+    """A lower tool as stored with the agent (an absolute path, possibly with arguments); when
+    that no longer runs, the configured command resolved now; exit 12 ``tool_missing`` when
+    neither does. The reverse preference of ``resolve_stored_tool``: a running agent keeps the
+    tool it was launched with."""
+    try:
+        argv = shlex.split(stored) if stored else []
+    except ValueError:
+        argv = []
+    if argv and os.path.isabs(argv[0]) and _runs(argv[0]):
+        return argv
+    return resolve_tool(command, name)
+
+
 _inside = third_party.inside
 
 
