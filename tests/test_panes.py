@@ -79,6 +79,12 @@ def reconcile(env: Env, *flags: str) -> Any:
     return body
 
 
+def result_json_text(out: str) -> Any:
+    body = json.loads(out)
+    schema_registry.validate(body, "agent-spawn/cli/reconcile.json")
+    return body
+
+
 def panes_of(body: Any) -> list[dict[str, Any]]:
     return [c for c in body["changes"] if c["kind"] == "dead_pane"]
 
@@ -246,6 +252,45 @@ def test_a_failing_close_is_a_warning_and_the_pass_goes_on(
 
 def only_default_socket(fakebin: Fakebin) -> str:
     return next(iter(json.loads(Path(str(fakebin.log) + ".panes.json").read_text())))
+
+
+def test_a_busy_agent_lease_skips_all_its_panes_with_one_warning(
+    fakebin: Fakebin,
+    isolation_env: Isolation,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """F1/F2: a held lease skips the close with a warning, once per agent (not per pane, so the
+    wait is paid once); a later pass looks again."""
+    from tests.inspect_support import run_inprocess
+
+    env = Env(fakebin, isolation_env, CONFIG)
+    agent_id = window_agent(env, fakebin)
+    panes = [open_pane(env, fakebin, agent_id), open_pane(env, fakebin, agent_id)]
+    monkeypatch.setattr("agent_spawn.reconcile.LEASE_WAIT", 0.2)
+    waits: list[float] = []
+    original = Store.lease
+
+    def counting(self: Store, key: str, **kwargs: Any) -> Any:
+        if key == lease_key(agent_id):
+            waits.append(kwargs["wait"])
+        return original(self, key, **kwargs)
+
+    with Store.open(env.state_dir) as store:
+        held = store.acquire_lease(lease_key(agent_id))
+        try:
+            monkeypatch.setattr(Store, "lease", counting)
+            code, out, _ = run_inprocess(env, monkeypatch, capsys, "reconcile", "--json")
+            monkeypatch.setattr(Store, "lease", original)
+        finally:
+            store.release_lease(held)
+    assert code == 0
+    body = result_json_text(out)
+    assert body["warnings"] == [f"{agent_id}: agent busy: dead pane not closed this pass"]
+    assert len(waits) == 1 and panes_of(body) == []
+    assert closes(fakebin) == [] and all(p in pane_states(env, fakebin) for p in panes)
+    again = reconcile(env)
+    assert {c["details"]["action"] for c in panes_of(again)} == {"closed"}
 
 
 def test_a_race_between_the_listing_and_the_close_keeps_the_pane(

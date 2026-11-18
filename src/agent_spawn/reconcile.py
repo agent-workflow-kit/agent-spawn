@@ -349,30 +349,33 @@ class _Pass:
         for text in scan.warnings:
             self.warn(agent_id, text)
         reason = self._keep_reason(row, after, now)
+        busy = False  # the agent's lease was held: its other panes are not tried this pass
         for term_id, socket_path in scan.panes:
             details: dict[str, Any] = {"term_id": term_id, "socket_path": socket_path}
             if reason is not None:
                 self.change(agent_id, DEAD_PANE, **details, action="kept", reason=reason)
             elif self.dry_run:
                 self.change(agent_id, DEAD_PANE, **details, action="would_close")
-            else:
-                self._close_pane(term, agent_id, details, after)
+            elif not busy:
+                busy = self._close_pane(term, agent_id, details, after)
 
     def _close_pane(
         self, term: TermBackend, agent_id: str, details: dict[str, Any], after: float | None
-    ) -> None:
+    ) -> bool:
         """Close one dead pane under the agent's lease, judged again on the fresh row: the
         listing is a snapshot, and the agent may have resumed, failed or been acknowledged since.
-        A busy lease or an agent no longer parked skips the pane (a later pass looks again)."""
+        A busy lease (warned once, and the caller skips the agent's other panes: each wait can take
+        up to ``LEASE_WAIT``; returns True) or an agent no longer parked skips the pane (a later
+        pass looks again)."""
         try:
             with self.store.lease(lease_key(agent_id), wait=LEASE_WAIT):
                 fresh = self.store.get_agent(agent_id)
                 if fresh is None or fresh["status"] != "parked":
-                    return
+                    return False
                 reason = self._keep_reason(fresh, after, self.gateway.wall_time())
                 if reason is not None:
                     self.change(agent_id, DEAD_PANE, **details, action="kept", reason=reason)
-                    return
+                    return False
                 try:
                     term.close(details["term_id"], details["socket_path"])
                 except CliError as error:
@@ -380,11 +383,13 @@ class _Pass:
                         error.exit_code == 20 and error.reason == "running"
                     ):
                         self.warn(agent_id, f"termctl close failed (exit {error.exit_code})")
-                    return
+                    return False
                 self.change(agent_id, DEAD_PANE, **details, action="closed")
                 self.log(agent_id, "pane_closed", **details)
         except LeaseHeld:
-            return
+            self.warn(agent_id, "agent busy: dead pane not closed this pass")
+            return True
+        return False
 
     # -- 7: housekeeping ----------------------------------------------------------------------
 

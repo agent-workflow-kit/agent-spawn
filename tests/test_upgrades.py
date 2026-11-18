@@ -513,7 +513,9 @@ def test_neither_claude_session_running_after_exec_parks_instead_of_raising(
     gate = tmp_path / "removed"
     stored.write_text(
         "#!/bin/sh\n"
-        f'while [ ! -e "{gate}" ]; do :; done\n'
+        "n=0\n"  # the gate is the barrier; the cap only keeps an orphan from spinning forever
+        f'while [ ! -e "{gate}" ]; do n=$((n+1)); '
+        '[ "$n" -lt 20000000 ] || { echo "gate never opened" >&2; exit 99; }; done\n'
         '[ -e "$0" ] || exit 127\n'
         f'exec {fakebin.bin_dir / "claude-session"} "$@"\n'
     )
