@@ -521,6 +521,40 @@ def test_neither_claude_session_running_after_exec_parks_instead_of_raising(
     assert row["status"] == "parked" and row["park_reason"] == "failed"
 
 
+def test_claude_session_gone_at_the_end_of_a_chain_run_parks_as_a_chain_failure(
+    rig_for: Callable[..., Rig], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = rig_for()
+    sup = rig.supervisor
+    ended = [final_of()]  # the first run ended exited-unreported: a report resume follows
+
+    def end_of_run(*args: Any, **kwargs: Any) -> Any:
+        if ended:
+            return ended.pop()
+        raise CliError("tool_missing", "claude-session is gone")  # the chain run's end
+
+    monkeypatch.setattr(sup, "end_of_run", end_of_run)
+    monkeypatch.setattr(chain, "start_report_resume", lambda *a, **k: RunCtx(2, "/x/o2.json"))
+    monkeypatch.setattr(sup, "spawn_exec", lambda row, session: SimpleNamespace())
+    monkeypatch.setattr(sup, "watch", lambda *a, **k: None)
+    assert sup.run().exit_code == 0
+    db = sqlite3.connect(f"file:{rig.state / 'state.db'}?mode=ro", uri=True)
+    try:
+        rows = db.execute(
+            "SELECT payload FROM events WHERE agent_id = ? AND event = 'post-park'",
+            (rig.agent_id,),
+        ).fetchall()
+    finally:
+        db.close()
+    assert len(rows) == 1
+    failure = json.loads(rows[0][0])["chain_failure"]
+    assert (failure["tool"], failure["reason"], failure["run"]) == (
+        "claude-session",
+        "tool_missing",
+        2,
+    )
+
+
 def test_a_chain_run_with_no_runnable_agent_spawn_fails_before_anything_is_taken(
     rig_for: Callable[..., Rig],
     fakebin: Fakebin,

@@ -427,7 +427,10 @@ class Supervisor:
             except CliError as error:
                 if error.code != "tool_missing":
                     raise
-                return self.park_tool_missing(error, "failed")
+                if previous is None:
+                    return self.park_tool_missing(error, "failed")
+                failure = chain.ChainFailure("claude-session", "tool_missing", run=ctx.run)
+                return self.park_chain_failure(previous, failure)
             if previous is not None and self.ended_in_launch(final):
                 if final.result.outcome == "not-started" and (
                     (self.terminated and final.result.end_reason in CANCEL_END_REASONS)
