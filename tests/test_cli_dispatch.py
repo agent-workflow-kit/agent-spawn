@@ -42,9 +42,9 @@ OWNERS = {
 
 
 IMPLEMENTED = {
+    "ack",
     "attach",
     "browse",
-    "ack",
     "cron install",
     "cron uninstall",
     "export",

@@ -13,6 +13,7 @@ import json
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -24,6 +25,7 @@ from ..output import ResultFileTarget, render_json, safe_text, write_result_file
 
 __all__ = [
     "ATTENTION_ORDER",
+    "OUTPUT_TOO_LARGE_EXIT",
     "CliResult",
     "Backend",
     "FilterState",
@@ -56,12 +58,19 @@ MAX_VALUE = 300  # characters of one value in the detail pane
 MAX_MESSAGE = 300  # characters of an error shown on the status line
 MAX_LABELS_SHOWN = 50  # labels listed in the detail pane
 MAX_RUNS_SHOWN = 50
-MAX_OUTPUT = 8 * 1024 * 1024  # bytes read from one child command
+OUTPUT_TOO_LARGE_EXIT = 125  # what run_on_terminal returns when the command printed too much
+CLOSE_GRACE = 2.0  # seconds a child gets to act on SIGTERM before it is killed
 
 
 def shown(value: object, limit: int = MAX_VALUE) -> str:
     """``value`` as one escaped, bounded line of plain text (never markup, never raw controls)."""
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=True, default=str)
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=True, default=str)
+        except (ValueError, TypeError, RecursionError):  # circular, too deep, odd keys
+            text = f"<{type(value).__name__}: not displayable>"
     text = safe_text(text[: limit * 4])  # cut before escaping: a huge value costs little
     if len(text) > limit:
         text = text[: limit - 1] + "…"
@@ -105,10 +114,17 @@ class CliResult:
 class Backend(Protocol):
     """How the screen runs agent-spawn commands. ``command`` is the argv after the program name
     (``["ack", "ag-abcdefgh"]``); ``acting`` marks a command that changes something, which then
-    carries the human actor and the decision ids."""
+    carries the human actor and the decision ids. ``terminal`` runs the child with this process's
+    own stdin and stderr (only its stdout is captured), for a command that decides by ``isatty``
+    whether the user is at a terminal; the caller then owns the terminal (``attach``)."""
 
     def call(
-        self, command: Sequence[str], *, acting: bool = False, timeout: float | None = None
+        self,
+        command: Sequence[str],
+        *,
+        acting: bool = False,
+        timeout: float | None = None,
+        terminal: bool = False,
     ) -> CliResult: ...
 
     def run_on_terminal(self, argv: Sequence[str]) -> int: ...
@@ -146,7 +162,12 @@ class SubprocessBackend:
         return [*argv, *command]
 
     def call(
-        self, command: Sequence[str], *, acting: bool = False, timeout: float | None = None
+        self,
+        command: Sequence[str],
+        *,
+        acting: bool = False,
+        timeout: float | None = None,
+        terminal: bool = False,
     ) -> CliResult:
         argv = self.argv_for(command, acting=acting)
         with self._lock:
@@ -155,28 +176,32 @@ class SubprocessBackend:
             try:
                 proc = gw.get_gateway().spawn(
                     argv,
-                    stdin=subprocess.DEVNULL,
+                    stdin=None if terminal else subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=None if terminal else subprocess.PIPE,
                 )
             except OSError as exc:
                 return CliResult(1, None, f"could not run agent-spawn ({exc.strerror})")
             self._children.add(proc)
         try:
-            out, err = proc.communicate(timeout=timeout)
+            # bounded reads; on a timeout or an overflow only this child is killed, and a
+            # grandchild holding the pipes cannot keep this call waiting
+            out, err = gw.communicate(proc, timeout=timeout, argv=argv)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
             return CliResult(124, None, "the command took too long")
+        except gw.OutputTooLarge:
+            return CliResult(1, None, "the command printed too much output")
         finally:
             with self._lock:
                 self._children.discard(proc)
-        return _result_of(proc.returncode, out[:MAX_OUTPUT], err[:4096])
+        return _result_of(proc.returncode, out, err[:4096])
 
     def run_on_terminal(self, argv: Sequence[str]) -> int:
         """Run ``argv`` (what ``attach`` printed) on this terminal and return its exit code."""
         try:
             done = gw.get_gateway().run_on_terminal(argv)
+        except gw.OutputTooLarge:
+            return OUTPUT_TOO_LARGE_EXIT
         except OSError:
             return 127
         return done.returncode
@@ -189,6 +214,12 @@ class SubprocessBackend:
         for proc in children:
             if proc.poll() is None:
                 proc.terminate()
+        deadline = time.monotonic() + CLOSE_GRACE
+        for proc in children:  # a child that ignores SIGTERM is killed after the grace period
+            try:
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 
 def _result_of(code: int, out: bytes, err: bytes) -> CliResult:
@@ -197,7 +228,7 @@ def _result_of(code: int, out: bytes, err: bytes) -> CliResult:
     if text:
         try:
             payload = json.loads(text)
-        except ValueError:
+        except (ValueError, RecursionError):  # junk, or nested too deeply to parse
             payload = None
     stderr_line = err.decode("utf-8", errors="replace").strip().splitlines()
     return CliResult(code, payload, stderr_line[-1] if stderr_line else "")
@@ -212,6 +243,7 @@ def parse_agents(payload: Any) -> list[dict[str, Any]]:
     if not isinstance(agents, list):
         return []
     usable: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for agent in agents:  # pyright: ignore[reportUnknownVariableType]
         if not isinstance(agent, dict):
             continue
@@ -220,7 +252,9 @@ def parse_agents(payload: Any) -> list[dict[str, Any]]:
             isinstance(agent_id, str)
             and is_agent_id(agent_id)
             and isinstance(agent.get("status"), str)
+            and agent_id not in seen  # a duplicate id would crash the table: keep the first
         ):  # pyright: ignore[reportUnknownMemberType]
+            seen.add(agent_id)
             usable.append(agent)  # pyright: ignore[reportUnknownArgumentType]
     return usable
 

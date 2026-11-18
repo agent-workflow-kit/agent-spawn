@@ -59,6 +59,7 @@ DEVNULL = subprocess.DEVNULL
 #: byte kills the child and raises ``OutputTooLarge`` (a runaway child cannot exhaust memory).
 MAX_RUN_OUTPUT = 8 * 1024 * 1024
 _READ_CHUNK = 64 * 1024
+_EXIT_POLL = 0.2  # seconds between checks whether the child has exited while its pipes stay open
 
 
 class OutputTooLarge(Exception):
@@ -162,7 +163,9 @@ def _reset_child_signals() -> None:
 
     Safe despite the usual ``preexec_fn`` warning: it only calls ``signal.signal`` and
     ``signal.pthread_sigmask`` (async-signal-safe system calls, no locks, no allocation of
-    note) and the CLI is single-threaded, so no other thread can hold a lock at fork time.
+    note). The CLI is single-threaded except for ``browse``, which spawns children from worker
+    threads: a lock held by another thread at fork time is then copied locked into the child, so
+    this function must stay free of anything that takes a Python-level lock.
     """
     for sig in _RESET_SIGNALS:
         signal.signal(sig, signal.SIG_DFL)
@@ -224,7 +227,14 @@ def _communicate(
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
                 raise subprocess.TimeoutExpired(list(argv), timeout or 0.0)
-            for key, _ in selector.select(remaining):
+            exited = proc.poll() is not None
+            wait = _EXIT_POLL if remaining is None else min(remaining, _EXIT_POLL)
+            events = selector.select(0 if exited else wait)
+            if not events:
+                if exited:
+                    break  # a grandchild may still hold the pipes: do not wait for their EOF
+                continue
+            for key, _ in events:
                 fd = key.fd
                 if key.data == "in":
                     assert pending is not None and proc.stdin is not None
@@ -273,6 +283,16 @@ def _communicate(
             except OSError:
                 pass
     return b"".join(chunks[out_fd]), b"" if err_fd is None else b"".join(chunks[err_fd])
+
+
+def communicate(
+    proc: subprocess.Popen[bytes], *, timeout: float | None = None, argv: Sequence[str] = ()
+) -> tuple[bytes, bytes]:
+    """Collect stdout and stderr of a child started with ``Gateway.spawn`` (public form of the
+    bounded reader ``run`` uses): at most ``MAX_RUN_OUTPUT`` bytes per stream (``OutputTooLarge``
+    otherwise), ``TimeoutExpired`` after ``timeout``, and no wait for pipe EOF once the child
+    has exited. Only ``proc`` itself is ever killed. A stream that was not piped returns b""."""
+    return _communicate(proc, None, timeout, argv)
 
 
 class SystemGateway:

@@ -41,7 +41,12 @@ class FakeBackend:
         self.list_result: CliResult | None = None
 
     def call(
-        self, command: Sequence[str], *, acting: bool = False, timeout: float | None = None
+        self,
+        command: Sequence[str],
+        *,
+        acting: bool = False,
+        timeout: float | None = None,
+        terminal: bool = False,
     ) -> CliResult:
         self.calls.append((list(command), acting))
         word = command[0]

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import signal
 import sys
 
+from .. import gateway as gw
 from ..commands.base import Invocation
 from ..output import CliError, Outcome, PayloadKind, resolve_result_file, safe_text
 from .model import SubprocessBackend, write_intent
@@ -48,9 +50,18 @@ def browse(inv: Invocation) -> Outcome:
         config_path=inv.config_path, actor=inv.actor, decision_ids=inv.decision_ids
     )
     app = BrowseApp(backend, focus=inv.args.focus, record_intent=raw is not None)
+    # SIGTERM and SIGHUP leave the screen cleanly (alt-screen and mouse mode restored, a `back`
+    # intent written) instead of killing the process with the terminal still in TUI mode
+    gateway = gw.get_gateway()
+    previous = {
+        sig: gateway.install_signal_handler(sig, lambda _signum, _frame: app.request_exit())
+        for sig in (signal.SIGTERM, signal.SIGHUP)
+    }
     try:
         app.run()
     finally:
+        for sig, handler in previous.items():
+            gateway.install_signal_handler(sig, handler)
         backend.close()
     if target is not None:
         intent, selected = app.intent if app.intent is not None else ("back", [])

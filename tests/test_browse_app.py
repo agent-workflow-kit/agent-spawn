@@ -9,7 +9,7 @@ from textual.coordinate import Coordinate
 from textual.widgets import DataTable, Input, Static
 
 from agent_spawn.tui.app import BrowseApp, ConfirmScreen, HelpScreen
-from agent_spawn.tui.model import CliResult
+from agent_spawn.tui.model import OUTPUT_TOO_LARGE_EXIT, CliResult
 from tests import schema_registry
 from tests.browse_support import IDS, NOW, FakeBackend, agent, run_app, settle
 
@@ -26,6 +26,16 @@ def three() -> list[dict[str, Any]]:
 
 def make(backend: FakeBackend, **kwargs: Any) -> BrowseApp:
     return BrowseApp(backend, clock=lambda: NOW, **kwargs)
+
+
+def no_suspend(app: BrowseApp) -> BrowseApp:
+    """The headless driver cannot suspend: run the terminal work in place."""
+
+    async def on_terminal(work: Any) -> Any:
+        return work()
+
+    app._on_terminal = on_terminal  # type: ignore[method-assign]
+    return app
 
 
 def text_of(app: BrowseApp, selector: str) -> str:
@@ -325,10 +335,7 @@ def test_attach_runs_attach_then_hands_the_terminal_to_its_argv() -> None:
     backend = FakeBackend(three(), attach=CliResult(0, answer))
     app = make(backend)
 
-    async def on_terminal(argv: list[str]) -> int:
-        return backend.run_on_terminal(argv)
-
-    app._on_terminal = on_terminal  # type: ignore[method-assign]  # the headless driver cannot suspend
+    no_suspend(app)
 
     async def script(app: BrowseApp, pilot: Any) -> None:
         await pilot.press("a")
@@ -348,7 +355,7 @@ def test_attach_switched_does_not_touch_the_terminal() -> None:
         await settle(app, pilot)
         assert backend.terminal == [] and "switched" in text_of(app, "#status")
 
-    run_app(make(backend), script)
+    run_app(no_suspend(make(backend)), script)
 
 
 def test_attach_failure_and_multiple_marks() -> None:
@@ -364,7 +371,7 @@ def test_attach_failure_and_multiple_marks() -> None:
         assert "attach takes one agent" in text_of(app, "#status")
         assert [c for c in backend.commands() if c[0] == "attach"] == [["attach", IDS[0]]]
 
-    run_app(make(backend), script)
+    run_app(no_suspend(make(backend)), script)
 
 
 def test_a_second_action_while_busy_is_refused() -> None:
@@ -490,3 +497,138 @@ def test_json_roundtrip_of_intent_matches_schema() -> None:
     schema_registry.validate(
         json.loads(intent_text("resume", IDS)), "agent-spawn/cli/browse-result.json"
     )
+
+
+def test_attach_json_runs_with_the_terminal_and_a_huge_argv_output_is_a_notice() -> None:
+    answer = {"agent_id": IDS[0], "action": "attach", "argv": ["tmux", "attach"]}
+    backend = FakeBackend(three(), attach=CliResult(0, answer))
+    calls: list[bool] = []
+    original = backend.call
+
+    def call(
+        command: Any, *, acting: bool = False, timeout: Any = None, terminal: bool = False
+    ) -> Any:
+        calls.append(terminal)
+        return original(command, acting=acting, timeout=timeout, terminal=terminal)
+
+    backend.call = call  # type: ignore[method-assign]
+    backend.run_on_terminal = lambda argv: OUTPUT_TOO_LARGE_EXIT  # type: ignore[method-assign]
+
+    async def script(app: BrowseApp, pilot: Any) -> None:
+        await pilot.press("a")
+        await settle(app, pilot)
+        assert calls.count(True) == 1  # only attach asks for the terminal
+        assert "too much output" in text_of(app, "#status")
+
+    run_app(no_suspend(make(backend)), script)
+
+
+def test_resume_and_attach_skip_marked_agents_hidden_by_a_filter() -> None:
+    backend = FakeBackend(three())
+
+    async def script(app: BrowseApp, pilot: Any) -> None:
+        await pilot.press("space")  # mark IDS[0] (live)
+        await pilot.press("f")  # status filter: launching (nothing)... cycle to live then parked
+        await pilot.press("f")  # live
+        await pilot.press("f")  # parked: IDS[0] is hidden, IDS[1] highlighted
+        assert row_ids(app) == [IDS[1], IDS[2]]
+        await pilot.press("r")
+        await settle(app, pilot)
+        resumed = [c[1] for c in backend.commands() if c[0] == "resume"]
+        assert resumed == [IDS[1]]
+
+    run_app(make(backend), script)
+
+
+def test_attach_with_a_hidden_mark_records_only_the_highlighted_row() -> None:
+    backend = FakeBackend(three())
+
+    async def script(app: BrowseApp, pilot: Any) -> None:
+        await pilot.press("space", "f", "f", "f", "a")
+        assert app.intent == ("attach", [IDS[1]])
+
+    run_app(make(backend, record_intent=True), script)
+
+
+def test_an_unusable_list_answer_is_an_error_and_keeps_the_previous_list() -> None:
+    backend = FakeBackend(three())
+
+    async def script(app: BrowseApp, pilot: Any) -> None:
+        assert row_ids(app) == IDS
+        for body in ({"nope": 1}, [1, 2], None, {"agents": "x"}):
+            backend.list_result = CliResult(0, body)
+            await pilot.press("R")
+            await settle(app, pilot)
+            assert "unusable answer" in text_of(app, "#empty")
+            assert "No agents yet" not in text_of(app, "#empty")
+            assert len(app.agents) == 3
+        backend.list_result = CliResult(0, {"agents": []})
+        await pilot.press("R")
+        await settle(app, pilot)
+        assert "No agents yet" in text_of(app, "#empty")
+
+    run_app(make(backend), script)
+
+
+def test_a_crashing_action_does_not_wedge_the_screen() -> None:
+    backend = FakeBackend(three())
+    boom = {"on": True}
+    original = backend.call
+
+    def call(command: Any, **kwargs: Any) -> Any:
+        if command[0] == "ack" and boom["on"]:
+            raise RuntimeError("kaboom")
+        return original(command, **kwargs)
+
+    backend.call = call  # type: ignore[method-assign]
+
+    async def script(app: BrowseApp, pilot: Any) -> None:
+        await pilot.press("k")
+        await settle(app, pilot)
+        assert app._busy is None
+        assert "kaboom" in text_of(app, "#status")
+        assert backend.commands()[-1] == ["list"]  # the list was reloaded after the failure
+
+    run_app(make(backend), script)
+
+
+def test_quit_while_a_changing_command_runs_warns_first_then_abandons() -> None:
+    import threading
+
+    gate = threading.Event()
+    backend = FakeBackend(three())
+    original = backend.call
+
+    def call(command: Any, **kwargs: Any) -> Any:
+        if command[0] == "ack":
+            gate.wait(timeout=30)
+        return original(command, **kwargs)
+
+    backend.call = call  # type: ignore[method-assign]
+
+    async def script(app: BrowseApp, pilot: Any) -> None:
+        await pilot.press("k")
+        await pilot.pause()
+        await pilot.press("q")
+        assert "ack still running; quit again to abandon it" in text_of(app, "#status")
+        assert app.intent is None and app.is_running
+        await pilot.press("q")  # the second quit goes through
+        await pilot.pause()
+        assert app.intent == ("back", [])
+        gate.set()
+
+    try:
+        run_app(make(backend, record_intent=True), script)
+    finally:
+        gate.set()
+
+
+def test_quit_never_waits_for_a_read_only_command() -> None:
+    backend = FakeBackend(three())
+
+    async def script(app: BrowseApp, pilot: Any) -> None:
+        app._busy = "attach ag-aaaaaaaa"  # an attach json call: not a changing command
+        await pilot.press("q")
+        assert app.intent == ("back", [])
+
+    run_app(make(backend, record_intent=True), script)

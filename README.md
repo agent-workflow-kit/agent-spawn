@@ -4,7 +4,7 @@ Launch, resume, park and tear down Claude Code agents: optional worktree + optio
 
 ## Status
 
-Designed (interface 0.1.0-design); implementation in progress: launch, resume, park, stop, teardown, prune, the read commands and `reconcile` (the maintenance pass) are implemented; the scheduled `cron install|uninstall` is implemented; the `browse` TUI (#38) remains. The interface is [docs/interface.md](docs/interface.md) (normative) with [schemas/](schemas/); decisions and live verification are in [docs/design.md](docs/design.md); the implementation plan is [docs/plan.md](docs/plan.md).
+Designed (interface 0.1.0-design); implementation in progress: launch, resume, park, stop, teardown, prune, the read commands and `reconcile` (the maintenance pass) are implemented; the scheduled `cron install|uninstall` is implemented; the `browse` TUI (needs the `tui` extra, see Install) is implemented. The interface is [docs/interface.md](docs/interface.md) (normative) with [schemas/](schemas/); decisions and live verification are in [docs/design.md](docs/design.md); the implementation plan is [docs/plan.md](docs/plan.md).
 
 ## Layer
 
@@ -59,6 +59,10 @@ A missing sibling fails with an error naming its install command; it is checked 
 ```sh
 uv tool install git+https://github.com/agent-workflow-kit/agent-spawn
 ```
+
+`browse` needs the optional Textual dependency: install with the `tui` extra
+(`uv tool install 'agent-spawn[tui] @ git+https://github.com/agent-workflow-kit/agent-spawn'`,
+or `pip install 'agent-spawn[tui]'` from an index).
 
 ## Documentation
 

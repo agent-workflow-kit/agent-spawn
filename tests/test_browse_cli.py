@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import stat
 import subprocess
 import sys
@@ -162,3 +164,82 @@ def test_it_runs_as_a_foreground_child_of_another_tui(env: Env, tmp_path: Path) 
     run.read_until("PARENT-BACK-0")
     assert run.finish() == 0
     assert read_intent(path) == {"intent": "back", "selected": []}
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP])
+def test_sigterm_and_sighup_leave_the_screen_cleanly_and_record_back(
+    env: Env, tmp_path: Path, sig: signal.Signals
+) -> None:
+    seed_agent(env, A1)
+    path = tmp_path / "out.json"
+    run = run_browse(env, "--result-file", str(path))
+    run.read_until(A1)
+    os.kill(run.proc.pid, sig)  # the exact child this test started
+    assert run.finish() == 0
+    assert "\x1b[?1049l" in run.buffer  # the alternate screen is left again
+    assert read_intent(path) == {"intent": "back", "selected": []}
+
+
+FAKE_ATTACH_APP = textwrap.dedent(
+    """
+    import sys
+    from agent_spawn.tui.app import BrowseApp
+    from agent_spawn.tui.model import CliResult, SubprocessBackend
+
+    ROW = {"agent_id": "ag-aaaaaaaa", "status": "live", "name": "the agent", "labels": []}
+
+    class Backend(SubprocessBackend):
+        def call(self, command, *, acting=False, timeout=None, terminal=False):
+            if command[0] == "list":
+                return CliResult(0, {"agents": [ROW]})
+            if command[0] == "attach":
+                self.terminal_flag = terminal
+                return CliResult(0, {"action": "attach", "argv": ["sh", "-c", "exit 7"]})
+            return CliResult(1, None, "unexpected")
+
+    BrowseApp(Backend(config_path=None, actor="human:test")).run()
+    """
+)
+
+
+def test_attach_suspends_the_screen_and_reports_the_exit_of_the_attach_argv(
+    env: Env, tmp_path: Path
+) -> None:
+    script = tmp_path / "app.py"
+    script.write_text(FAKE_ATTACH_APP)
+    run = PtyRun([sys.executable, "-I", str(script)], env.env())
+    run.read_until("the agent")
+    run.send("a")
+    run.read_until("back (exit 7)")
+    run.send("q")
+    assert run.finish() == 0
+
+
+def test_a_terminal_call_gives_the_child_this_terminals_stdin_and_stderr(
+    env: Env, tmp_path: Path
+) -> None:
+    script = tmp_path / "probe.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            import sys
+            from agent_spawn.tui.model import SubprocessBackend
+
+            code = (
+                "import json,sys;"
+                "print(json.dumps({'in': sys.stdin.isatty(), 'out': sys.stdout.isatty(),"
+                " 'err': sys.stderr.isatty()}))"
+            )
+            backend = SubprocessBackend(
+                config_path=None, actor="human:test", prefix=[sys.executable, "-I", "-c", code]
+            )
+            print("TERMINAL", backend.call(["attach"], terminal=True).payload)
+            print("PLAIN", backend.call(["attach"]).payload)
+            """
+        )
+    )
+    run = PtyRun([sys.executable, "-I", str(script)], env.env())
+    run.read_until("PLAIN")
+    assert run.finish() == 0
+    assert "TERMINAL {'in': True, 'out': False, 'err': True}" in run.buffer
+    assert "PLAIN {'in': False, 'out': False, 'err': False}" in run.buffer

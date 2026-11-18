@@ -174,3 +174,104 @@ def test_error_description_prefers_the_envelope_and_escapes() -> None:
     text = result.describe()
     assert text.startswith("exit 10: ") and "\x1b" not in text and len(text) < 400
     assert result.error_code == "not_found"
+
+
+def test_parse_agents_keeps_the_first_of_a_duplicate_id() -> None:
+    first = agent("ag-aaaaaaaa", name="first")
+    again = agent("ag-aaaaaaaa", name="second")
+    other = agent("ag-bbbbbbbb")
+    parsed = model.parse_agents({"agents": [first, again, other]})
+    assert [a["name"] for a in parsed] == ["first", other["name"]]
+
+
+def test_deeply_nested_json_is_junk_not_a_crash() -> None:
+    body = b"[" * 100000 + b"]" * 100000
+    result = model._result_of(0, body, b"")
+    assert result.exit_code == 0 and result.payload is None
+
+
+def test_shown_survives_values_json_cannot_dump() -> None:
+    circular: dict[str, object] = {}
+    circular["self"] = circular
+    deep: list[object] = []
+    for _ in range(100000):
+        deep = [deep]
+    for odd in (circular, deep, {("tuple", "key"): 1}):
+        text = model.shown(odd)
+        assert isinstance(text, str) and len(text) <= model.MAX_VALUE
+
+
+def make_backend(code: str) -> model.SubprocessBackend:
+    return model.SubprocessBackend(
+        config_path=None, actor="human:me", prefix=[sys.executable, "-I", "-c", code]
+    )
+
+
+def test_a_grandchild_holding_the_pipes_does_not_block_the_call(tmp_path: Path) -> None:
+    pidfile = tmp_path / "grandchild.pid"
+    code = (
+        "import subprocess,sys;"
+        "g=subprocess.Popen([sys.executable,'-I','-c','import time;time.sleep(60)']);"
+        f"open({str(pidfile)!r},'w').write(str(g.pid));"
+        "print('{\"ok\": true}')"
+    )
+    backend = make_backend(code)
+    try:
+        result = backend.call(["list"], timeout=30)
+        assert result.ok and result.payload == {"ok": True}
+    finally:
+        _reap(pidfile)
+
+
+def _reap(pidfile: Path) -> None:
+    import os
+    import signal
+
+    if pidfile.exists():
+        pid = int(pidfile.read_text())  # the exact grandchild this test started
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_close_kills_a_child_that_ignores_sigterm() -> None:
+    import threading
+    import time
+
+    code = (
+        "import signal,sys,time;signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        "print('up', flush=True);time.sleep(60)"
+    )
+    backend = make_backend(code)
+    results: list[model.CliResult] = []
+    thread = threading.Thread(target=lambda: results.append(backend.call(["list"])))
+    thread.start()
+    deadline = time.monotonic() + 30
+    while not backend._children and time.monotonic() < deadline:  # noqa: SLF001
+        time.sleep(0.01)
+    time.sleep(0.5)  # let the child install its handler
+    backend.close()
+    thread.join(timeout=30)
+    assert not thread.is_alive()
+    assert results and not results[0].ok
+
+
+def test_a_huge_output_is_cut_off_and_reported() -> None:
+    code = "import sys;sys.stdout.write('x' * (64 * 1024 * 1024))"
+    result = make_backend(code).call(["list"], timeout=60)
+    assert result.exit_code != 0 and "too much output" in result.message
+
+
+def test_a_timeout_does_not_wait_for_a_grandchild_either(tmp_path: Path) -> None:
+    pidfile = tmp_path / "grandchild.pid"
+    code = (
+        "import subprocess,sys,time;"
+        "g=subprocess.Popen([sys.executable,'-I','-c','import time;time.sleep(60)']);"
+        f"open({str(pidfile)!r},'w').write(str(g.pid));time.sleep(60)"
+    )
+    try:
+        result = make_backend(code).call(["list"], timeout=1)
+        assert result.exit_code == 124
+    finally:
+        _reap(pidfile)

@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
-from typing import Any, ClassVar
+from typing import Any, ClassVar, TypeVar
 
 from rich.text import Text
 from textual import on
@@ -23,6 +23,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Static
 
 from .model import (
+    OUTPUT_TOO_LARGE_EXIT,
     Backend,
     CliResult,
     FilterState,
@@ -36,6 +37,8 @@ __all__ = ["BrowseApp", "ConfirmScreen", "HelpScreen"]
 
 COLUMNS = ("", "id", "status", "attention", "kind", "name", "labels", "age")
 WAIT_TIMEOUT = "60s"
+READ_TIMEOUT = 120.0  # seconds a read-only child (list, show, ack) may run before it is given up
+T = TypeVar("T")
 HELP_TEXT = """\
 up/down   move             enter  load the full detail (show)
 space     mark / unmark    a      attach (one agent)
@@ -144,7 +147,11 @@ class BrowseApp(App[None]):
         self.detail_errors: dict[str, str] = {}
         self.list_error: str | None = None
         self._busy: str | None = None
+        self._changing: str | None = None  # label of a running command that changes something
+        self._quit_warned = False
         self._waiting: str | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._stop_requested = False
 
     # --- layout ------------------------------------------------------------------------------
 
@@ -162,6 +169,10 @@ class BrowseApp(App[None]):
         yield Footer()
 
     async def on_mount(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        if self._stop_requested:  # a SIGTERM/SIGHUP arrived before the screen was up
+            self.exit()
+            return
         if "ansi-dark" in self.available_themes:  # the terminal's own colors, no fixed background
             self.theme = "ansi-dark"
         table = self.query_one("#table", DataTable)
@@ -240,7 +251,9 @@ class BrowseApp(App[None]):
     async def _reload(self, *, initial: bool = False, announce: bool = True) -> None:
         keep = self._current()
         keep_id = keep["agent_id"] if keep else None
-        result = await asyncio.to_thread(self.backend.call, ["list"])
+        result = await asyncio.to_thread(self.backend.call, ["list"], timeout=READ_TIMEOUT)
+        if result.ok and not _usable_list(result.payload):
+            result = CliResult(1, None, "unusable answer from list")
         if result.ok:
             self.agents = parse_agents(result.payload)
             self.list_error = None
@@ -268,7 +281,9 @@ class BrowseApp(App[None]):
 
     async def _load_detail(self, agent_id: str) -> None:
         self.status(f"show {agent_id}...")
-        result = await asyncio.to_thread(self.backend.call, ["show", agent_id])
+        result = await asyncio.to_thread(
+            self.backend.call, ["show", agent_id], timeout=READ_TIMEOUT
+        )
         if result.ok and isinstance(result.payload, dict):
             self.details[agent_id] = result.payload  # pyright: ignore[reportUnknownMemberType]
             self.detail_errors.pop(agent_id, None)
@@ -350,13 +365,33 @@ class BrowseApp(App[None]):
     # --- actions: quit and intents -----------------------------------------------------------
 
     def action_quit_browse(self) -> None:
+        if self._changing is not None and not self._quit_warned:
+            # quitting SIGTERMs the running child, which can cancel a launch or leave a teardown
+            # half done: the first quit only warns, the second abandons it
+            self._quit_warned = True
+            verb = self._changing.split(" ", 1)[0]
+            self.status(f"{verb} still running; quit again to abandon it")
+            return
+        self._leave()
+
+    def _leave(self) -> None:
         if self.record_intent:
             self.intent = ("back", [])
         self.exit()
 
+    def request_exit(self) -> None:
+        """Leave at once, from a signal handler (SIGTERM, SIGHUP): safe on any thread."""
+        self._stop_requested = True
+        loop = self._loop
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(self._leave)
+            except RuntimeError:  # the loop is already closed: the app is leaving anyway
+                pass
+
     def _targets(self) -> list[str]:
-        """Marked agents in list order, else the highlighted one."""
-        marked = [a["agent_id"] for a in self.agents if a["agent_id"] in self.marked]
+        """Marked agents that are shown, in list order, else the highlighted one."""
+        marked = [a["agent_id"] for a in self.rows if a["agent_id"] in self.marked]
         if marked:
             return marked
         current = self._current()
@@ -374,7 +409,7 @@ class BrowseApp(App[None]):
             self.intent = ("attach", targets)
             self.exit()
             return
-        self._start(f"attach {targets[0]}", self._do_attach(targets[0]))
+        self._start(f"attach {targets[0]}", self._do_attach(targets[0]), changing=False)
 
     def action_resume(self) -> None:
         targets = self._targets()
@@ -389,46 +424,68 @@ class BrowseApp(App[None]):
 
     # --- actions that run the CLI ------------------------------------------------------------
 
-    def _start(self, label: str, work: Coroutine[Any, Any, None]) -> None:
+    def _start(self, label: str, work: Coroutine[Any, Any, None], *, changing: bool = True) -> None:
         if self._busy is not None:
             work.close()
             self.status(f"busy: {self._busy}")
             return
         self._busy = label
+        self._changing = label if changing else None
+        self._quit_warned = False
         self.status(f"{label}...")
         self.run_worker(self._guarded(work), group="action")
 
     async def _guarded(self, work: Coroutine[Any, Any, None]) -> None:
         try:
             await work
+        except Exception as exc:  # a bug in an action must not leave the screen stuck
+            self.status(f"{self._busy or 'action'} failed: {shown(exc, 200)}")
         finally:
             self._busy = None
-        await self._reload(announce=False)
+            self._changing = None
+            self._quit_warned = False
+            await self._reload(announce=False)
 
     async def _call(self, command: list[str], *, timeout: float | None = None) -> CliResult:
         return await asyncio.to_thread(self.backend.call, command, acting=True, timeout=timeout)
 
     async def _do_attach(self, agent_id: str) -> None:
-        result = await self._call(["attach", agent_id])
-        payload = result.payload if isinstance(result.payload, dict) else {}
+        # termctl decides by isatty whether the user is at a terminal, so `attach --json` runs
+        # with this process's own stdin and stderr, and the argv it returns then owns the terminal
+        def work() -> tuple[CliResult, int | None]:
+            result = self.backend.call(["attach", agent_id], acting=True, terminal=True)
+            payload = result.payload if isinstance(result.payload, dict) else {}
+            argv = payload.get("argv")  # pyright: ignore[reportUnknownMemberType]
+            if (
+                result.ok
+                and payload.get("action") == "attach"  # pyright: ignore[reportUnknownMemberType]
+                and isinstance(argv, list)  # pyright: ignore[reportUnknownArgumentType]
+                and argv
+            ):
+                return result, self.backend.run_on_terminal([str(part) for part in argv])  # pyright: ignore[reportUnknownVariableType]
+            return result, None
+
+        done = await self._on_terminal(work)
+        if done is None:
+            return
+        result, code = done
         if not result.ok:
             self.status(f"attach {agent_id} failed, {result.describe()}")
-            return
-        argv = payload.get("argv")  # pyright: ignore[reportUnknownMemberType]
-        if payload.get("action") == "attach" and isinstance(argv, list) and argv:  # pyright: ignore[reportUnknownMemberType]
-            code = await self._on_terminal([str(part) for part in argv])  # pyright: ignore[reportUnknownVariableType]
-            self.status(f"attach {agent_id}: back (exit {code})")
-        else:
+        elif code is None:
             self.status(f"attach {agent_id}: switched")
+        elif code == OUTPUT_TOO_LARGE_EXIT:
+            self.status(f"attach {agent_id}: back (the command printed too much output)")
+        else:
+            self.status(f"attach {agent_id}: back (exit {code})")
 
-    async def _on_terminal(self, argv: list[str]) -> int:
-        """Give the terminal to ``argv`` (tmux attach) and take it back afterwards."""
+    async def _on_terminal(self, work: Callable[[], T]) -> T | None:
+        """Give the terminal to ``work`` (it runs blocking) and take it back afterwards."""
         try:
             with self.suspend():
-                return self.backend.run_on_terminal(argv)
+                return work()
         except SuspendNotSupported:
             self.status("this terminal cannot be suspended; attach from a shell instead")
-            return 1
+            return None
 
     async def _resume(self, targets: list[str]) -> None:
         notes: list[str] = []
@@ -441,7 +498,7 @@ class BrowseApp(App[None]):
 
     def _simple(self, verb: str, command: list[str], agent_id: str) -> None:
         async def work() -> None:
-            result = await self._call(command)
+            result = await self._call(command, timeout=READ_TIMEOUT if verb == "ack" else None)
             self.status(f"{verb} {agent_id}: " + ("ok" if result.ok else result.describe()))
 
         self._start(f"{verb} {agent_id}", work())
@@ -508,3 +565,8 @@ class BrowseApp(App[None]):
                 f" outcome={shown(payload.get('outcome') or '-', 40)} (exit {result.exit_code})"  # pyright: ignore[reportUnknownMemberType]
             )
         await self._reload(announce=False)
+
+
+def _usable_list(payload: Any) -> bool:
+    """Whether ``list --json`` answered with ``{"agents": [...]}`` (an empty list is usable)."""
+    return isinstance(payload, dict) and isinstance(payload.get("agents"), list)  # pyright: ignore[reportUnknownMemberType]
