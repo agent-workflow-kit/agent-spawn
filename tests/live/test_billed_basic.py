@@ -19,6 +19,7 @@ from .billed import (
     bsetup,
     cs_status,
     expect_parked,
+    expected_park_after_hangup,
     launch_headless,
     launch_window,
     pid_gone,
@@ -182,8 +183,10 @@ def test_interactive_launch_in_a_real_window_and_window_close(billed_world: Worl
     check(killed.returncode == 0, "kill-window works", "design.md B3", killed.stderr)
     parked = expect_parked(world, aid, 90)
     check(
-        parked["park_reason"] == "killed" and parked["needs_attention"] is None,
-        "closing the window parks the agent killed without attention",
+        parked["park_reason"] == expected_park_after_hangup(world, csid)
+        and parked["needs_attention"] is None,
+        "closing the window parks the agent killed (done when the session had already reported) "
+        "without attention",
         "issue: window close parks killed / D13 D17",
         {k: parked[k] for k in ("park_reason", "needs_attention", "last_end_reason")},
     )
@@ -224,25 +227,34 @@ def test_no_implicit_done_run_and_the_automatic_report_resume_carry_the_flag(
     )
     aid = done["agent"]["agent_id"]
     runs = show(world, aid)["runs"]
-    world.observe("report-resume.runs", [(r["run"], r["auto_resumed"], r["outcome"]) for r in runs])
-    if runs and runs[0]["outcome"] not in (None, "exited-unreported"):
-        world.observe("report-resume.run1-reported-anyway", runs[0]["outcome"])
+
+    def outcome_of(entry: dict) -> object:
+        # a runs[] entry holds the run's outcome object under "outcome" (observed live), whose own
+        # "outcome" is the string
+        value = entry["outcome"]
+        return value.get("outcome") if isinstance(value, dict) else value
+
+    world.observe(
+        "report-resume.runs", [(r["run"], r["auto_resumed"], outcome_of(r)) for r in runs]
+    )
+    if runs and outcome_of(runs[0]) not in (None, "exited-unreported"):
+        world.observe("report-resume.run1-reported-anyway", outcome_of(runs[0]))
         world.spawn_json("teardown", aid, ok=(0, 20))
         pytest.skip(
             "report-resume-chain: the model filed a report in run 1 despite the prompt "
-            f"(outcome {runs[0]['outcome']}): the chain was not exercised"
+            f"(outcome {outcome_of(runs[0])}): the chain was not exercised"
         )
     check(
         len(runs) == 2 and runs[1]["auto_resumed"] is True,
         "run 1 ended unreported and agent-spawn started its automatic report resume (run 2)",
         "interface.md Supervision (automatic report resume) / #36 #88",
-        [(r["run"], r["auto_resumed"], r["outcome"]) for r in runs],
+        [(r["run"], r["auto_resumed"], outcome_of(r)) for r in runs],
     )
     check(
-        runs[0]["outcome"] == "exited-unreported",
+        outcome_of(runs[0]) == "exited-unreported",
         "--no-implicit-done: a headless run with a result and no report ends exited-unreported",
         "#36 #88 (no_report)",
-        runs[0]["outcome"],
+        outcome_of(runs[0]),
     )
     status = world.json_tool("claude-session", "status", done["agent"]["csession_id"], "--run", "2")
     check(

@@ -362,9 +362,23 @@ def check_launch_flags(ctx: Context, p: Parsed) -> None:
     if (turns := p.get("--max-turns")) is not None:
         if not 1 <= python_int(ctx, "--max-turns", turns) <= MAX_INTEGER:
             ctx.usage(f"--max-turns must be between 1 and {MAX_INTEGER}")
+    # Real 0.45.2: exit 2 "invalid flag value" (a model must be non-empty, without control
+    # characters; a profile name is ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ unless it is file-like).
+    # Name grammar only: the real tool also refuses a grammar-valid profile name that no built-in
+    # or configured profile defines (usage `invalid flag value`); that is not modeled.
     model = p.get("--model")
-    if model is not None and model.startswith("-"):
-        ctx.usage("--model must not start with '-'")
+    if model is not None and (
+        model == "" or model.startswith("-") or re.search(r"[\x00-\x1f\x7f-\x9f]", model)
+    ):
+        ctx.usage(f"invalid flag value: --model {model!r}")
+    profile = p.get("--permission-profile")
+    if (
+        profile is not None
+        and "/" not in profile
+        and not profile.endswith((".json", ".yaml", ".yml"))
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", profile) is None
+    ):
+        ctx.usage(f"invalid flag value: --permission-profile {profile!r}")
     hook_names: list[str] = []
     for hook in p.multi("--hook"):
         name, eq, _cmd = hook.partition("=")

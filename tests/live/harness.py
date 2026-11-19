@@ -913,9 +913,15 @@ class World:
         """Mark directories trusted in the private ``~/.claude.json`` (and approve the key)."""
         api_key = self.auth.api_key if self.auth else None
         path = self.home / ".claude.json"
+        trusted = list(paths)
+        try:
+            with open(os.open(path, os.O_RDONLY | os.O_NOFOLLOW)) as handle:
+                trusted = [Path(p) for p in json.load(handle).get("projects", {})] + trusted
+        except FileNotFoundError:
+            pass
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w") as handle:
-            json.dump(claude_json(list(paths), api_key=api_key), handle)
+            json.dump(claude_json(trusted, api_key=api_key), handle)
 
     def wtctl_config(self, repos: Mapping[str, Repo], extra: str = "") -> Path:
         lines = [f"root: {self.root / 'wtctl'}\n", "repos:\n"]

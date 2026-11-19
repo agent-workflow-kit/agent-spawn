@@ -220,6 +220,30 @@ CASES: dict[str, list[Case]] = {
             "usage",
             True,
         ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--model", ""],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--model=\t"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--permission-profile=-x"],
+            2,
+            "usage",
+            True,
+        ),
+        (
+            ["start", "--json", "--skill", "x", "--mode", "headless", "--permission-profile="],
+            2,
+            "usage",
+            True,
+        ),
         (["start", "--json", "--resume", "cs-abcdefgh", "--reset", "kind"], 2, "usage", True),
         (["--version"], 0, None, True),
     ],
@@ -360,12 +384,13 @@ CASES: dict[str, list[Case]] = {
 
 #: argv whose argument checks the real program passes (it goes on to fail later, or succeeds):
 #: neither the real program nor the fake may answer these with exit 2. Real claude-session
-#: 0.38.4 failed with ``ModuleNotFoundError`` (exit 1) right after its argv checks.
+#: 0.38.4 failed with ``ModuleNotFoundError`` right after its argv checks, so rows only proved
+#: "not exit 2" there; two rows (an empty ``--model``, ``--permission-profile=-x``) were wrong and
+#: moved to ``CASES`` after 0.45.2 refused them with ``usage`` (flag value validation).
 _HEADLESS = ["start", "--json", "--skill", "x", "--mode", "headless"]
 ACCEPTED: dict[str, list[list[str]]] = {
     "claude-session": [
         [*_HEADLESS, "--env-allowlist-only", ""],
-        [*_HEADLESS, "--model", ""],
         [*_HEADLESS, "--max-turns", "+5"],
         [*_HEADLESS, "--max-turns", " 5"],
         [*_HEADLESS, "--max-turns", "\u0665"],
@@ -375,7 +400,6 @@ ACCEPTED: dict[str, list[list[str]]] = {
         [*_HEADLESS, "--timeout", "none"],
         [*_HEADLESS, "--setting-sources", ""],
         [*_HEADLESS, "--setting-sources", "user,project"],
-        [*_HEADLESS, "--permission-profile=-x"],
         [*_HEADLESS, "--hook", "pre-launch="],
         ["forget", "--json", "--older-than", "0"],
         ["forget", "--json", "--older-than", "1.5h"],
