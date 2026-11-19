@@ -154,13 +154,10 @@ def test_reset_together_with_the_flag_is_claude_sessions_usage_error(env: Env) -
     assert done.returncode == 2, (done.stdout, done.stderr)
 
 
-def test_the_flag_is_stored_for_a_sessionless_resume(env: Env, fakebin: Fakebin) -> None:
-    # A launch that never reached `start` stores its pass-throughs; the re-run lays the flags
-    # given now over them, so the stored override still applies (as for every pass-through).
+def test_the_flag_is_stored_with_the_launch_pass_throughs(env: Env) -> None:
+    # A sessionless resume re-runs the launch from these (stored flags under the ones given now).
     agent_id = launched(env, "--no-implicit-done")
-    with env.store() as store:
-        stored = store.get_agent(agent_id)["settings"]["pass_throughs"]
-    assert stored == {"implicit_done": False}
+    assert env.agent(agent_id)["settings"]["pass_throughs"] == {"implicit_done": False}
 
 
 def test_the_automatic_report_resume_passes_no_override(env: Env, fakebin: Fakebin) -> None:
