@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from agent_spawn import procs
+from agent_spawn import store as store_module
 from agent_spawn.ids import resolve_agent_id
 from agent_spawn.labels import GrammarError, Label, LabelSet, parse_label
 from agent_spawn.output import CliError
@@ -635,6 +636,123 @@ def test_release_only_deletes_the_holders_own_lease(
     assert store.lease_holder("reconcile") == me(store)
     assert store.release_lease(fresh)
     assert store.lease_holder("reconcile") is None
+
+
+def put_raw_holder(state_dir: Path, key: str, raw: object) -> None:
+    db = sqlite3.connect(state_dir / "state.db")
+    try:
+        with db:
+            db.execute("DELETE FROM leases WHERE key = ?", (key,))
+            db.execute("INSERT INTO leases (key, holder, acquired) VALUES (?, ?, 0)", (key, raw))
+    finally:
+        db.close()
+
+
+UNPARSEABLE_HOLDERS = [
+    "garbage",
+    "",
+    "[]",
+    "null",
+    '{"pid": 1}',
+    '{"pid": "1", "start_time": 1, "boot_id": "b"}',
+    '{"pid": 0, "start_time": 1, "boot_id": "b"}',
+    "{" * 5000,
+    "\u202e\x1b[2J\n",
+    b"\xff\xfe",
+    "[" * 200000,  # json.loads raises RecursionError
+    '{"pid": 1, "start_time": 1, "boot_id": "b", "x": ' + "[" * 200000,
+    "5",  # an integer inserted into the TEXT column is stored as text
+    b"{}",
+]
+
+
+@pytest.mark.parametrize("raw", UNPARSEABLE_HOLDERS, ids=range(len(UNPARSEABLE_HOLDERS)))
+def test_reset_replaces_an_unparseable_holder_and_returns_the_raw_text(
+    store: Store, state_dir: Path, raw: object
+) -> None:
+    put_raw_holder(state_dir, "reconcile", raw)
+    with pytest.raises(StoreCorrupt):
+        store.acquire_lease("reconcile")  # the default path never repairs it
+    taken = store.reset_unparseable_lease("reconcile")
+    assert taken is not None
+    lease, previous = taken
+    assert lease.holder == me(store) and lease.took_over_from is None
+    assert previous == raw
+    assert store.lease_holder("reconcile") == me(store)
+    assert store.release_lease(lease)  # an ordinary lease from then on
+
+
+def test_reset_replaces_a_text_holder_that_is_not_utf8(store: Store, state_dir: Path) -> None:
+    db = sqlite3.connect(state_dir / "state.db")
+    try:
+        with db:
+            db.execute(
+                "INSERT INTO leases (key, holder, acquired) VALUES "
+                "('reconcile', CAST(X'ff61' AS TEXT), 0)"
+            )
+    finally:
+        db.close()
+    with pytest.raises(StoreCorrupt):
+        store.acquire_lease("reconcile")
+    taken = store.reset_unparseable_lease("reconcile")
+    assert taken is not None
+    lease, previous = taken
+    assert isinstance(previous, str) and "\\xff" in previous  # escaped, never raised
+    assert store.lease_holder("reconcile") == me(store)
+    assert store.release_lease(lease)
+
+
+def test_reset_does_nothing_for_a_parseable_or_absent_holder(
+    store: Store, proc_tracker: ProcTracker
+) -> None:
+    assert store.reset_unparseable_lease("reconcile") is None  # no row
+    dead = dead_identity(proc_tracker)
+    store.acquire_lease("reconcile", holder=dead)
+    assert store.reset_unparseable_lease("reconcile") is None  # parses: takeover rules apply
+    assert store.lease_holder("reconcile") == dead
+
+
+def test_reset_never_takes_the_lease_of_a_live_holder(
+    store: Store, proc_tracker: ProcTracker
+) -> None:
+    proc_tracker.popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    live = proc_tracker.identities[-1]
+    store.acquire_lease("reconcile", holder=live)
+    assert store.reset_unparseable_lease("reconcile") is None
+    assert store.lease_holder("reconcile") == live
+
+
+def test_reset_is_idempotent(store: Store, state_dir: Path) -> None:
+    put_raw_holder(state_dir, "reconcile", "garbage")
+    first = store.reset_unparseable_lease("reconcile")
+    assert first is not None
+    assert store.reset_unparseable_lease("reconcile") is None  # now a parseable (this) holder
+    assert store.lease_holder("reconcile") == me(store)
+
+
+def test_reset_loses_to_a_holder_that_appears_after_the_row_was_judged(
+    store: Store, state_dir: Path, proc_tracker: ProcTracker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proc_tracker.popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    live = proc_tracker.identities[-1]
+    put_raw_holder(state_dir, "reconcile", "garbage")
+    real = store_module._decode_holder
+
+    def decode_then_a_healthy_holder_takes_over(key: str, raw: object) -> ProcessIdentity:
+        try:
+            return real(key, raw)
+        finally:  # the row is judged unparseable, then a healthy process takes the lease
+            put_raw_holder(state_dir, key, json.dumps(live.to_dict()))
+
+    monkeypatch.setattr(store_module, "_decode_holder", decode_then_a_healthy_holder_takes_over)
+    assert store.reset_unparseable_lease("reconcile") is None
+    monkeypatch.setattr(store_module, "_decode_holder", real)
+    assert store.lease_holder("reconcile") == live
+
+
+def test_reset_validates_the_key(store: Store) -> None:
+    with pytest.raises(ValueError):
+        store.reset_unparseable_lease("nope")
 
 
 @pytest.mark.parametrize(

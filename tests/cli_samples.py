@@ -114,7 +114,7 @@ FLAGS: dict[str, dict[str, str | None]] = {
         "--include-attention": None,
         "--dry-run": None,
     },
-    "reconcile": {"--dry-run": None},
+    "reconcile": {"--dry-run": None, "--reset-lease": None},
     "cron install": {"--interval": "10", "--env-file": "/tmp/env", "--dry-run": None},
     "cron uninstall": {"--dry-run": None},
     "export": {"--since": "1d", "--action": "stop"},

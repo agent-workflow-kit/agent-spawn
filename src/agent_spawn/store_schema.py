@@ -199,7 +199,7 @@ def decode_value(kind: str, raw: object) -> object:
             if not isinstance(data, dict):
                 raise ValueError("not an object")
             return ProcessIdentity.from_dict(data)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:  # deep nesting raises RecursionError
         raise ValueDecodeError(f"stored {kind} value does not decode: {exc}") from exc
     raise ValueError(f"unknown column kind {kind!r}")
 

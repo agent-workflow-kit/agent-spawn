@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "agent-spawn/log.json",
   "title": "agent-spawn log.jsonl record",
-  "description": "Never contains environment values, secrets, prompt text, report summaries or reasons.",
+  "description": "Never contains environment values, secrets, prompt text, report summaries or reasons (the one exception: a reconcile_change lease_reset record holds the raw stored lease holder text, cut and escaped).",
   "type": "object",
   "properties": {
     "ts": {

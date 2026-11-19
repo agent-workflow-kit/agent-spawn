@@ -1,4 +1,4 @@
-"""The human-only gate: --force, --override-escalation and --allow-tainted."""
+"""The human-only gate: --force, --override-escalation, --allow-tainted and --reset-lease."""
 
 import json
 import os
@@ -21,6 +21,7 @@ GATED = {
     "launch --override-escalation": ["launch", "--skill", "s", "--override-escalation"],
     "resume --override-escalation": ["resume", "ag-abcdefgh", "--override-escalation"],
     "resume --allow-tainted": ["resume", "ag-abcdefgh", "--allow-tainted"],
+    "reconcile --reset-lease": ["reconcile", "--reset-lease"],
     "resume --fork --allow-tainted": ["resume", "ag-abcdefgh", "--fork", "--allow-tainted"],
 }
 
@@ -122,7 +123,11 @@ def test_ungated_commands_never_need_a_human(
     argv: list[str], reached: list[Invocation], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _tty(monkeypatch, False)
-    plain = [a for a in argv if a not in ("--force", "--override-escalation", "--allow-tainted")]
+    plain = [
+        a
+        for a in argv
+        if a not in ("--force", "--override-escalation", "--allow-tainted", "--reset-lease")
+    ]
     assert cli.main(plain) == 0
     assert len(reached) == 1
 
