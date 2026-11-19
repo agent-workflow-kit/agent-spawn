@@ -73,7 +73,9 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         if selected is not None and marker.args[0] not in selected:
             deselected.append(item)
             continue
-        if not opted:
+        if ENVIRON.get("CI"):
+            pass  # tests/conftest.py skips every live test in CI with its own reason
+        elif not opted:
             item.add_marker(
                 pytest.mark.skip(reason=f"live tests need {harness.OPT_IN_ENV}=1 (make live)")
             )

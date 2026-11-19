@@ -2,6 +2,8 @@
 
 The fakes in this directory stand in for `claude-session`, `termctl`, `wtctl`, `tmux` and `crontab` in agent-spawn's tests. They are a test aid, not a re-implementation: where a fake is simpler than the real program it says so here, and anything not checked against the real program is listed under "Unverified".
 
+Pointers to the live suite (#36, `docs/live-testing.md`): `tests/live/test_fidelity.py` (scenario `fidelity-argv`) holds the argument-grammar rows; the other live scenarios re-check the behaviors listed under "Unverified" and "Known fake leniencies" below against the real programs, and name the item they confirm in their docstrings. After a live run, move a confirmed item to "Verified" and correct the fake where the run showed a difference (the first unbilled run's differences are in `docs/live-testing.md`, "First unbilled run").
+
 ## How a fake behaves
 
 - Standard-library Python only, run through the stubs in this directory (`claude-session`, `termctl`, `wtctl`, `tmux`, `crontab`). The fixture puts a `python3` symlink to the test interpreter first on `PATH` (the stubs start with `#!/usr/bin/env python3`), so the 3.12/3.13 test matrix runs the fakes under the version it tests; every `invoke` record in the log names the Python version. A fake refuses to run (exit 70) unless `FAKEBIN_LOG` is set to an absolute path in an existing directory, so it cannot be used by accident outside the `fakebin` fixture.

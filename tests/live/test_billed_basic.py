@@ -37,8 +37,10 @@ def test_headless_launch_wait_end_to_end(billed_world: World) -> None:
     fields (taint, reads_third_party, csession_dir, csession_id, labels, session ids, turns, cost)
     and the labels on the session. Confirms #36 #9, #14, #15 and design.md D1, D43."""
     world = billed_world
-    wt = bsetup(world)
     hook_out = world.root / "post-park.json"
+    wt = bsetup(
+        world, spawn_extra=f'hooks:\n  post-park:\n    - cmd: "cat > {hook_out}"\n'
+    )
     result_file = world.root / "out" / "result.json"
     result_file.parent.mkdir()
     done = launch_headless(
@@ -51,8 +53,6 @@ def test_headless_launch_wait_end_to_end(billed_world: World) -> None:
         str(wt.repo.clone),
         "--label",
         "ticket=LIVE-1",
-        "--hook",
-        f"post-park=cat > {hook_out}",
         "--result-file",
         str(result_file),
         ok=(0,),

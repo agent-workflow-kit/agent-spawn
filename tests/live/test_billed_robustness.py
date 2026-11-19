@@ -226,12 +226,13 @@ def test_killing_the_supervisor_only_and_exec_only(billed_world: World) -> None:
     ``agent-spawn reconcile`` do not deliver ``post-park`` twice. Signals go to exact PIDs
     recorded by agent-spawn and claude-session, after an identity check."""
     world = billed_world
-    wt = bsetup(world)
     hook_log = world.root / "post-park.log"
+    wt = bsetup(
+        world,
+        spawn_extra=f'hooks:\n  post-park:\n    - cmd: "cat >> {hook_log}; echo >> {hook_log}"\n',
+    )
     for label, victim in (("supervisor", "supervisor"), ("exec", "wrapper")):
-        launched = long_headless(
-            world, wt, "--hook", f"post-park=cat >> {hook_log}; echo >> {hook_log}"
-        )
+        launched = long_headless(world, wt)
         aid = launched["agent"]["agent_id"]
         csid = launched["agent"]["csession_id"]
         state = wait_agent(
