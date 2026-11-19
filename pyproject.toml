@@ -50,7 +50,10 @@ pythonVersion = "3.12"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["live: needs real models/hosts/credentials; never run in CI"]
+markers = [
+    "live: needs real models/hosts/credentials; never run in CI",
+    "live_scenario(name): the scenario of tests/live/scenarios.py a live test belongs to",
+]
 addopts = "-m 'not live'"
 
 [tool.semantic_release]

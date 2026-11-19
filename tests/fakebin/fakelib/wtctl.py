@@ -351,10 +351,10 @@ def do_create(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
     def create(data: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], bool]:
         # wtctl's Create order: a refusal (branch_in_use, branch_exists, path_exists) that names
         # an active record the holder holds is a retry after a crash and returns that record
-        # (`reused`); a dry run applies the refusals and never reuses. An explicit --name is
-        # never suffixed.
+        # (`reused`); a dry run answers the same (wtctl interface.md, Create order, "Retry after a
+        # crash": "also under --dry-run"). An explicit --name is never suffixed.
         def refuse_or_reuse(existing: dict[str, Any], reason: str, **extra: Any) -> Any:
-            if reason != "branch_exists" and not dry:
+            if reason != "branch_exists":
                 if existing["state"] == "active" and holder in existing["holders"]:
                     return existing, True  # retry after a crash: the record, unchanged
             ctx.fail(
