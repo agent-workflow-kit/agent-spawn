@@ -322,7 +322,11 @@ def _add_dry_run(parser: Any) -> None:
 
 def _add_reconcile(parser: Any) -> None:
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--reset-lease", action="store_true")
+    parser.add_argument(
+        "--reset-lease",
+        action="store_true",
+        help="human only; replace an unparseable reconcile lease holder",
+    )
 
 
 def _add_cron_install(parser: Any) -> None:

@@ -65,7 +65,7 @@ from .lifecycle import LEASE_WAIT, lease_key
 from .output import CliError, Outcome, PayloadKind, safe_text
 from .panes import scan_dead, sockets_to_search, termctl_for
 from .records import RecordsError, append_log
-from .store import Lease, LeaseHeld, Store, StoreError
+from .store import Lease, LeaseHeld, Store, StoreCorrupt, StoreError
 from .teardown import SUPERVISOR_ACTOR, remove_agent_files, remove_tree_at
 from .term import TermBackend
 
@@ -571,7 +571,8 @@ HOLDER_TEXT_LIMIT = 200
 
 
 def _bounded(raw: object) -> tuple[str, bool]:
-    """The raw stored holder as bounded, escaped text, and whether it was cut."""
+    """The raw stored holder as bounded, escaped text, and whether it was cut. The cut comes
+    before the escaping, which can lengthen a character up to ten times."""
     text = raw if isinstance(raw, str) else repr(raw)
     cut = len(text) > HOLDER_TEXT_LIMIT
     return safe_text(text[:HOLDER_TEXT_LIMIT]), cut
@@ -599,15 +600,27 @@ def _take_lease(inv: Invocation, store: Store, state_dir: str, run: _Pass) -> Le
                         "truncated": cut,
                     },
                 )
+                logged = True
             except (RecordsError, ValueError, OSError):
-                pass
+                logged = False  # best effort: the warning says so
             run.warn(
                 None,
                 f"the {LEASE} lease holder could not be parsed and was replaced: {text}"
-                + (" (cut)" if cut else ""),
+                + (" (cut)" if cut else "")
+                + ("" if logged else " (the log record could not be written)"),
             )
             return lease
-    return store.acquire_lease(LEASE)
+    try:
+        return store.acquire_lease(LEASE)
+    except StoreCorrupt:
+        if bool(inv.args.reset_lease):
+            raise
+        raise CliError(
+            "failed",
+            f"the {LEASE} lease holder cannot be parsed; after confirming that no reconcile "
+            "is running, a human can repair it with `agent-spawn reconcile --reset-lease`",
+            details={"hint": "a human runs `agent-spawn reconcile --reset-lease`"},
+        ) from None
 
 
 def reconcile_command(inv: Invocation) -> Outcome:

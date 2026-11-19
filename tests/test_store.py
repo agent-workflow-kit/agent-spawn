@@ -659,6 +659,10 @@ UNPARSEABLE_HOLDERS = [
     "{" * 5000,
     "\u202e\x1b[2J\n",
     b"\xff\xfe",
+    "[" * 200000,  # json.loads raises RecursionError
+    '{"pid": 1, "start_time": 1, "boot_id": "b", "x": ' + "[" * 200000,
+    "5",  # an integer inserted into the TEXT column is stored as text
+    b"{}",
 ]
 
 
@@ -676,6 +680,26 @@ def test_reset_replaces_an_unparseable_holder_and_returns_the_raw_text(
     assert previous == raw
     assert store.lease_holder("reconcile") == me(store)
     assert store.release_lease(lease)  # an ordinary lease from then on
+
+
+def test_reset_replaces_a_text_holder_that_is_not_utf8(store: Store, state_dir: Path) -> None:
+    db = sqlite3.connect(state_dir / "state.db")
+    try:
+        with db:
+            db.execute(
+                "INSERT INTO leases (key, holder, acquired) VALUES "
+                "('reconcile', CAST(X'ff61' AS TEXT), 0)"
+            )
+    finally:
+        db.close()
+    with pytest.raises(StoreCorrupt):
+        store.acquire_lease("reconcile")
+    taken = store.reset_unparseable_lease("reconcile")
+    assert taken is not None
+    lease, previous = taken
+    assert isinstance(previous, str) and "\\xff" in previous  # escaped, never raised
+    assert store.lease_holder("reconcile") == me(store)
+    assert store.release_lease(lease)
 
 
 def test_reset_does_nothing_for_a_parseable_or_absent_holder(

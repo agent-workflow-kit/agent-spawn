@@ -640,34 +640,57 @@ class Store:
         """Take lease ``key`` for ``holder`` (default this process) when its stored holder
         cannot be parsed; return the lease and the raw stored value that was replaced.
 
-        Only for an operator's explicit repair ([interface.md](reconcile)): an unparseable
-        holder cannot be proven dead, so ``acquire_lease`` never takes it over. ``None`` (and
-        nothing written) when there is no row, when the holder parses (the ordinary takeover
-        rules then apply, a live holder is never touched), or when the row changed since it was
-        judged: the replacement is a compare-and-set on the exact stored value, so a healthy
-        holder that took the lease meanwhile is never clobbered. Idempotent: once replaced, the
-        holder parses. Never inside an open transaction (``StoreError``)."""
+        Only for an operator's explicit repair (docs/interface.md, `reconcile`): an unparseable
+        holder cannot be proven dead, so ``acquire_lease`` never takes it over. A holder is
+        unparseable when it is not TEXT, is TEXT that is not valid UTF-8, or does not decode to a
+        process entry (deep nesting included).
+        ``None`` (and nothing written) when there is no row, when the holder parses (the
+        ordinary takeover rules then apply, a live holder is never touched), or when the row
+        changed since it was judged: the replacement is a compare-and-set on the exact stored
+        type and bytes, so a healthy holder that took the lease meanwhile is never clobbered.
+        Idempotent: once replaced, the holder parses.
+        Never inside an open transaction (``StoreError``)."""
         self._no_transaction("reset_unparseable_lease")
         if _LEASE_KEY.fullmatch(key) is None:
             raise ValueError(f"invalid lease key {key!r}")
         me = holder or self.holder_identity()
+        # Read the bytes and the storage type, never the TEXT value itself: a TEXT holder that
+        # is not valid UTF-8 would raise on read, and it is exactly what this repair is for.
         with _mapped():
-            row = self._conn.execute("SELECT holder FROM leases WHERE key = ?", (key,)).fetchone()
+            row = self._conn.execute(
+                "SELECT typeof(holder) AS kind, CAST(holder AS BLOB) AS raw, "
+                "CASE WHEN typeof(holder) = 'text' THEN NULL ELSE holder END AS other "
+                "FROM leases WHERE key = ?",
+                (key,),
+            ).fetchone()
         if row is None:
             return None
-        stored = row["holder"]
-        try:
-            _decode_holder(key, stored)
-        except StoreCorrupt:
-            pass
+        kind: str = row["kind"]
+        raw: bytes = row["raw"]
+        shown: object
+        parses = False
+        if kind == "text":
+            try:
+                shown = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                shown = raw.decode("utf-8", errors="backslashreplace")
+            else:
+                try:
+                    _decode_holder(key, shown)
+                    parses = True
+                except (StoreCorrupt, RecursionError):
+                    pass
         else:
+            shown = row["other"]  # an integer, a real or a blob: never a process entry
+        if parses:
             return None
         with self.transaction():
             replaced = self._conn.execute(
-                "UPDATE leases SET holder = ?, acquired = ? WHERE key = ? AND holder = ?",
-                (encode_value("proc", me), self._now(), key, stored),
+                "UPDATE leases SET holder = ?, acquired = ? "
+                "WHERE key = ? AND typeof(holder) = ? AND CAST(holder AS BLOB) = ?",
+                (encode_value("proc", me), self._now(), key, kind, raw),
             ).rowcount
-        return (Lease(key, me), stored) if replaced == 1 else None
+        return (Lease(key, me), shown) if replaced == 1 else None
 
     def _holder_alive(self, holder: ProcessIdentity) -> bool:
         """Another boot id is dead without reading ``/proc``; an unreadable or unparseable

@@ -1315,6 +1315,125 @@ def test_reset_lease_logs_a_hostile_holder_escaped_and_bounded(env: Env, fakebin
     assert len(warning) < 800 and "\x1b" not in warning and "\n" not in warning
 
 
+def lease_reset_entries(env: Env) -> list[dict[str, Any]]:
+    return [x for x in log_events(env, "reconcile_change") if x["details"]["kind"] == "lease_reset"]
+
+
+def test_a_cut_holder_is_reported_with_the_exact_cut_suffix(env: Env, fakebin: Fakebin) -> None:
+    seed(env, fakebin)
+    put_holder(env, "y" * 201)
+    body = reconcile(env, "--reset-lease", *HUMAN)
+    expected = f"the reconcile lease holder could not be parsed and was replaced: {'y' * 200} (cut)"
+    assert expected in body["warnings"]
+    (entry,) = lease_reset_entries(env)
+    assert entry["details"]["holder"] == "y" * 200 and entry["details"]["truncated"] is True
+
+
+def test_an_exactly_200_character_holder_is_not_cut(env: Env, fakebin: Fakebin) -> None:
+    seed(env, fakebin)
+    put_holder(env, "y" * 200)
+    body = reconcile(env, "--reset-lease", *HUMAN)
+    expected = f"the reconcile lease holder could not be parsed and was replaced: {'y' * 200}"
+    assert expected in body["warnings"]
+
+
+def test_an_expanding_holder_stays_bounded_after_escaping(env: Env, fakebin: Fakebin) -> None:
+    seed(env, fakebin)
+    put_holder(env, "\U000e0001" * 5000)  # a format character: escaped as \UXXXXXXXX
+    body = reconcile(env, "--reset-lease", *HUMAN)
+    (entry,) = lease_reset_entries(env)
+    logged = entry["details"]["holder"]
+    assert 0 < len(logged) <= 2000 and entry["details"]["truncated"] is True
+    warning = next(w for w in body["warnings"] if "lease" in w)
+    assert len(warning) <= 2000 + 200 and all(c.isprintable() for c in warning)  # + fixed text
+    assert all(c.isprintable() for c in logged)
+
+
+def test_a_holder_that_is_not_utf8_text_is_replaced_and_shown_escaped(
+    env: Env, fakebin: Fakebin
+) -> None:
+    seed(env, fakebin)
+    db = sqlite3.connect(env.state_dir / "state.db")
+    try:
+        with db:
+            db.execute("DELETE FROM leases WHERE key = 'reconcile'")
+            db.execute(
+                "INSERT INTO leases (key, holder, acquired) "
+                "VALUES ('reconcile', CAST(X'ff61' AS TEXT), 0)"
+            )
+    finally:
+        db.close()
+    done = env.run("reconcile", "--json")
+    assert done.returncode == 12, (done.stdout, done.stderr)
+    body = reconcile(env, "--reset-lease", *HUMAN)
+    assert any("\\xff" in w for w in body["warnings"])
+    (entry,) = lease_reset_entries(env)
+    assert "\\xff" in entry["details"]["holder"]
+
+
+def test_a_failed_audit_write_is_reported_in_the_warning(
+    env: Env,
+    fakebin: Fakebin,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from agent_spawn import reconcile as reconcile_module
+    from agent_spawn.records import RecordsError
+    from tests.inspect_support import run_inprocess
+
+    seed(env, fakebin)
+    put_holder(env, "garbage")
+    real = reconcile_module.append_log
+
+    def failing(state_dir: Any, event: str, **kwargs: Any) -> Any:
+        if (kwargs.get("details") or {}).get("kind") == "lease_reset":
+            raise RecordsError("secret path /nope")
+        return real(state_dir, event, **kwargs)
+
+    monkeypatch.setattr(reconcile_module, "append_log", failing)
+    code, out, err = run_inprocess(
+        env, monkeypatch, capsys, "reconcile", "--json", "--reset-lease", *HUMAN
+    )
+    assert code == 0, (out, err)
+    warning = next(w for w in json.loads(out)["warnings"] if "lease" in w)
+    assert warning.endswith("(the log record could not be written)")
+    assert "secret" not in warning and "/nope" not in warning
+    assert lease_reset_entries(env) == []
+
+
+def test_exit_12_for_an_unparseable_holder_names_the_repair(env: Env, fakebin: Fakebin) -> None:
+    seed(env, fakebin)
+    put_holder(env, "garbage")
+    done = env.run("reconcile", "--json", *HUMAN)
+    assert done.returncode == 12, (done.stdout, done.stderr)
+    error = result_json(done)["error"]
+    assert error["code"] == "failed"
+    assert "--reset-lease" in error["message"]
+    assert "--reset-lease" in error["details"]["hint"]
+    assert "garbage" not in done.stdout  # the raw holder is never echoed
+    schema_registry.validate(result_json(done), "agent-spawn/cli/error.json")
+
+
+def test_other_exit_12_causes_carry_no_reset_hint(
+    env: Env,
+    fakebin: Fakebin,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from agent_spawn.store import StoreError
+    from tests.inspect_support import run_inprocess
+
+    seed(env, fakebin)
+
+    def broken(self: Store, key: str, **kwargs: Any) -> Any:
+        raise StoreError("boom")
+
+    monkeypatch.setattr(Store, "acquire_lease", broken)
+    code, out, _ = run_inprocess(env, monkeypatch, capsys, "reconcile", "--json", *HUMAN)
+    assert code == 12
+    assert "--reset-lease" not in out
+
+
 # --- dry run, isolation of steps, idempotence ----------------------------------------------------
 
 
