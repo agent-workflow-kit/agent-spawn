@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from .billed import (
+    _diagnose,
     MAX_TURNS,
     adopt,
     bsetup,
@@ -219,6 +220,9 @@ def test_fork_into_a_throwaway(billed_world: World) -> None:
         "haiku",
         "--max-turns",
         MAX_TURNS,
+        "--reads-third-party",
+        "--sandbox",
+        "preferred",
         "--prompt",
         "Reply with the single word ok.",
         "--wait",
@@ -358,15 +362,33 @@ def test_headless_needs_input_is_promoted_into_a_window_and_continues(billed_wor
     )
     panes = world.json_tool("termctl", "list", "--label", f"agent={aid}")["panes"]
     check(len(panes) == 1, "the promotion opened one window", "design.md D30", panes)
-    host = wait_agent(
-        world, aid, lambda s: s["agent"]["status"] == "live", "the promoted run to start", 120
-    )
+    # The recorded supervisor stays the headless run's one (observed live); the window's process is
+    # the promoted run's host (``supervise --host``), whose identity is the run's ``pane_proc`` (not
+    # in ``show``). The host verifies it is that pane process before it runs anything (exit 2
+    # otherwise), so a live promoted run on the pane proves the identity; check that the pane
+    # process really is the host.
+    world.track(panes[0]["pid"], tree=True)
+    try:
+        host = wait_agent(
+            world,
+            aid,
+            lambda s: s["agent"]["status"] == "live"
+            and (s.get("session") or {}).get("run") == 2
+            and (s.get("session") or {}).get("state") in {"idle", "working", "reported"},
+            "the promoted run (run 2) to be live in the window",
+            120,
+        )
+    except LiveError as err:
+        raise LiveError(f"{err}; pane pid {panes[0]['pid']}; {_diagnose(world, aid)}") from err
+    cmdline = Path(f"/proc/{panes[0]['pid']}/cmdline").read_bytes().split(b"\0")
     check(
-        host["supervisor"]["pid"] == panes[0]["pid"],
-        "the host's pane process equals the recorded supervisor (pane_proc identity)",
+        b"supervise" in cmdline and b"--host" in cmdline,
+        "the pane process is the promoted run's host (supervise --host) and stayed alive "
+        "(pane_proc identity accepted by the host's own check)",
         "#36 #29 (A) pane PID under tmux's default-shell wrapping",
-        (host["supervisor"], panes[0]["pid"]),
+        [c.decode(errors="replace") for c in cmdline if not c.startswith(b"/")][:8],
     )
+    world.observe("promotion.host.recorded-supervisor", host["supervisor"])
     status = cs_status(world, launched["agent"]["csession_id"])
     check(
         len(status["claude_session_ids"]) == 1,
