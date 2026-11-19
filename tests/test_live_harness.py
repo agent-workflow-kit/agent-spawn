@@ -794,6 +794,47 @@ def test_termination_signals_raise_keyboard_interrupt_and_the_handlers_are_resto
     assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP)) == before
 
 
+def test_the_conftest_installs_the_handlers_from_pytest_configure_and_restores_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.live import conftest as live_conftest
+
+    before = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP))
+    monkeypatch.setitem(live_conftest.ENVIRON, harness.OPT_IN_ENV, "1")
+    monkeypatch.setitem(live_conftest._state, "restore_signals", None)
+
+    class _Config:
+        def addinivalue_line(self, name: str, line: str) -> None:
+            pass
+
+    try:
+        live_conftest.pytest_configure(_Config())  # type: ignore[arg-type]
+        assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP)) != before
+        first = live_conftest._state["restore_signals"]
+        live_conftest.pytest_configure(_Config())  # type: ignore[arg-type]
+        assert live_conftest._state["restore_signals"] is first  # installed only once
+        live_conftest.pytest_unconfigure(_Config())  # type: ignore[arg-type]
+        assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP)) == before
+        assert live_conftest._state["restore_signals"] is None
+    finally:
+        restore = live_conftest._state.get("restore_signals")
+        if restore is not None:
+            restore()
+
+
+def test_the_conftest_leaves_the_handlers_alone_without_the_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.live import conftest as live_conftest
+
+    before = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP))
+    monkeypatch.delitem(live_conftest.ENVIRON, harness.OPT_IN_ENV, raising=False)
+    monkeypatch.setitem(live_conftest._state, "restore_signals", None)
+    live_conftest._install_signal_handlers()
+    assert live_conftest._state["restore_signals"] is None
+    assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP)) == before
+
+
 @pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
 def test_make_repo_builds_a_wired_bare_origin_and_clone() -> None:
     root = harness.new_root()

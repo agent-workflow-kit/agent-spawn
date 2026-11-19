@@ -144,9 +144,10 @@ A credential reaches only the children of billed tests (their environment, or th
 home's login file) and is never printed (`Auth` hides it in every repr). Files that hold
 credential material, all mode 0600 inside the 0700 private root and deleted at teardown: the
 login copy (`AS_LIVE_COPY_LOGIN=1`), the last 20 characters of an API key in `.claude.json`, and
-for `jobsctl-cancel-force` a small env file that a wrapper script sources before it execs
-`agent-spawn launch` (jobsctl's own `--pass-env` reads only its `env_file`, which jobsctl accepts
-only when every ancestor directory is closed to group and others, and `/tmp` is not).
+for `jobsctl-cancel-force` a small 0600 env file that a 0700 wrapper script sources before it
+execs `agent-spawn launch`. The credentials go this way rather than through jobsctl's own
+`env_file` because jobsctl rejects an `env_file` whose ancestor directory is writable by group
+or others, and `/tmp` (mode 1777) is.
 Unbilled scenarios get none. Do not run pytest
 with `-l`/`--showlocals`: a failure would print locals.
 

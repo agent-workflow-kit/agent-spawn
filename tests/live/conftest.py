@@ -57,12 +57,22 @@ def _cleanup_private_files() -> None:
 atexit.register(_cleanup_private_files)
 
 
-def pytest_sessionstart(session: pytest.Session) -> None:
+def _install_signal_handlers() -> None:
     if harness.opted_in(ENVIRON) and _state["restore_signals"] is None:
         _state["restore_signals"] = harness.install_termination_handlers()
 
 
+def _restore_signal_handlers() -> None:
+    restore = _state.get("restore_signals")
+    if restore is not None:
+        restore()
+        _state["restore_signals"] = None
+
+
 def pytest_configure(config: pytest.Config) -> None:
+    # pytest_sessionstart is not called for a conftest below the rootdir unless tests/live is on
+    # the command line, so the handlers are installed here (once, only when AS_LIVE is on).
+    _install_signal_handlers()
     config.addinivalue_line(
         "markers",
         "live_scenario(name): the scenario of tests/live/scenarios.py a live test belongs to",
@@ -269,10 +279,7 @@ def billed_world(
 
 
 def pytest_sessionfinish(session: pytest.Session) -> None:
-    restore = _state.get("restore_signals")
-    if restore is not None:
-        restore()
-        _state["restore_signals"] = None
+    _restore_signal_handlers()
     path = ENVIRON.get(harness.OBSERVATIONS_ENV)
     if path and _state["observations"]:
         with open(path, "a", encoding="utf-8") as handle:
@@ -282,6 +289,10 @@ def pytest_sessionfinish(session: pytest.Session) -> None:
     if budget is not None:
         _state["summary"] = f"{budget.used} claude sessions counted (cap {budget.maximum})"
     _cleanup_private_files()
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    _restore_signal_handlers()
 
 
 def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
