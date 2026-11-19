@@ -63,6 +63,7 @@ __all__ = [
     "SchemaOlder",
     "Store",
     "StoreBusy",
+    "LeaseHolderUnparseable",
     "StoreCorrupt",
     "StoreError",
     "StoreMissing",
@@ -133,6 +134,10 @@ class StoreMissing(StoreError):
 
 class StoreCorrupt(StoreError):
     """The database or a stored value is not what agent-spawn wrote."""
+
+
+class LeaseHolderUnparseable(StoreCorrupt):
+    """A lease row's holder is not a process entry (``reconcile --reset-lease`` repairs it)."""
 
 
 class StoreBusy(StoreError):
@@ -609,10 +614,15 @@ class Store:
         is still the one judged dead, else judge again."""
         encoded = encode_value("proc", me)
         while True:
-            with _mapped():
-                row = self._conn.execute(
-                    "SELECT holder FROM leases WHERE key = ?", (key,)
-                ).fetchone()
+            try:
+                with _mapped():
+                    row = self._conn.execute(
+                        "SELECT holder FROM leases WHERE key = ?", (key,)
+                    ).fetchone()
+            except StoreCorrupt as exc:
+                if isinstance(exc.__cause__, UnicodeDecodeError):  # a TEXT holder, bad bytes
+                    raise LeaseHolderUnparseable(f"lease {key}: {exc}") from exc
+                raise
             if row is None:
                 with self.transaction():
                     inserted = self._conn.execute(
@@ -1598,9 +1608,9 @@ def _decode_holder(key: str, raw: object) -> ProcessIdentity:
     try:
         value = decode_value("proc", raw)
     except ValueDecodeError as exc:
-        raise StoreCorrupt(f"lease {key} has an unreadable holder: {exc}") from exc
+        raise LeaseHolderUnparseable(f"lease {key} has an unreadable holder: {exc}") from exc
     if not isinstance(value, ProcessIdentity):
-        raise StoreCorrupt(f"lease {key} has no holder")
+        raise LeaseHolderUnparseable(f"lease {key} has no holder")
     return value
 
 

@@ -65,7 +65,7 @@ from .lifecycle import LEASE_WAIT, lease_key
 from .output import CliError, Outcome, PayloadKind, safe_text
 from .panes import scan_dead, sockets_to_search, termctl_for
 from .records import RecordsError, append_log
-from .store import Lease, LeaseHeld, Store, StoreCorrupt, StoreError
+from .store import Lease, LeaseHeld, LeaseHolderUnparseable, Store, StoreError
 from .teardown import SUPERVISOR_ACTOR, remove_agent_files, remove_tree_at
 from .term import TermBackend
 
@@ -612,7 +612,7 @@ def _take_lease(inv: Invocation, store: Store, state_dir: str, run: _Pass) -> Le
             return lease
     try:
         return store.acquire_lease(LEASE)
-    except StoreCorrupt:
+    except LeaseHolderUnparseable:
         if bool(inv.args.reset_lease):
             raise
         raise CliError(

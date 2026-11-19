@@ -1434,6 +1434,44 @@ def test_other_exit_12_causes_carry_no_reset_hint(
     assert "--reset-lease" not in out
 
 
+def test_exit_12_for_a_non_utf8_holder_names_the_repair(env: Env, fakebin: Fakebin) -> None:
+    seed(env, fakebin)
+    put_holder(env, "placeholder")
+    db = sqlite3.connect(env.state_dir / "state.db")
+    try:
+        with db:
+            db.execute("UPDATE leases SET holder = CAST(x'fffe' AS TEXT) WHERE key = 'reconcile'")
+    finally:
+        db.close()
+    done = env.run("reconcile", "--json", *HUMAN)
+    assert done.returncode == 12, (done.stdout, done.stderr)
+    assert "--reset-lease" in result_json(done)["error"]["details"]["hint"]
+
+
+def test_a_damaged_database_exit_12_keeps_its_message_and_gets_no_hint(
+    env: Env,
+    fakebin: Fakebin,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from agent_spawn.store import StoreCorrupt
+    from tests.inspect_support import run_inprocess
+
+    seed(env, fakebin)
+
+    def damaged(self: Store, key: str, **kwargs: Any) -> Any:
+        raise StoreCorrupt("state.db is unreadable: disk image is malformed")
+
+    monkeypatch.setattr(Store, "acquire_lease", damaged)
+    code, out, _ = run_inprocess(env, monkeypatch, capsys, "reconcile", "--json", *HUMAN)
+    assert code == 12
+    assert "--reset-lease" not in out
+    # the ordinary store-error handling, not the lease-holder message
+    assert (
+        json.loads(out)["error"]["message"] == "the state database could not be used (StoreCorrupt)"
+    )
+
+
 # --- dry run, isolation of steps, idempotence ----------------------------------------------------
 
 
