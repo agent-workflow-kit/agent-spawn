@@ -38,9 +38,7 @@ def test_headless_launch_wait_end_to_end(billed_world: World) -> None:
     and the labels on the session. Confirms #36 #9, #14, #15 and design.md D1, D43."""
     world = billed_world
     hook_out = world.root / "post-park.json"
-    wt = bsetup(
-        world, spawn_extra=f'hooks:\n  post-park:\n    - cmd: "cat > {hook_out}"\n'
-    )
+    wt = bsetup(world, spawn_extra=f'hooks:\n  post-park:\n    - cmd: "cat > {hook_out}"\n')
     result_file = world.root / "out" / "result.json"
     result_file.parent.mkdir()
     done = launch_headless(
