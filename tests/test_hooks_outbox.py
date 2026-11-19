@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +75,10 @@ def lines(path: Path) -> list[dict[str, Any]]:
 
 def log_records(state_dir: Path) -> list[dict[str, Any]]:
     return lines(state_dir / "log.jsonl")
+
+
+def _log_time(record: dict[str, Any]) -> datetime:
+    return datetime.fromisoformat(record["ts"])
 
 
 def track(tracker: ProcTracker, *paths: Path) -> list[int]:
@@ -703,36 +708,51 @@ def test_hook_ignoring_sigterm_is_killed(
     )
     found = track(tracker, pids)
     assert res.timed_out and res.signal == signal.SIGKILL
-    assert time.monotonic() - start < hooks.TERM_GRACE + 3
+    # Whole-test hang guard only; loose so that a loaded machine (parallel workers) cannot fail it.
+    assert time.monotonic() - start < hooks.TERM_GRACE + 30
     assert_dead(found)
-    names = [r["signal"] for r in log_records(state_dir) if r["event"] == "signal_sent"]
-    assert names == ["SIGTERM", "SIGKILL"]
+    sent = [r for r in log_records(state_dir) if r["event"] == "signal_sent"]
+    assert [r["signal"] for r in sent] == ["SIGTERM", "SIGKILL"]
+    # The grace itself: the logged SIGKILL follows the logged SIGTERM by about TERM_GRACE (the
+    # timestamps have millisecond precision; the upper bound leaves room for a loaded machine).
+    gap = (_log_time(sent[1]) - _log_time(sent[0])).total_seconds()
+    assert hooks.TERM_GRACE - 0.1 <= gap < hooks.TERM_GRACE + 10
 
 
 def test_cooperative_hook_exits_on_sigterm_without_waiting_for_the_grace(
-    state_dir: Path,
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_dir.mkdir()
+    # A long grace makes the margin independent of machine speed: waiting it out would take 60 s.
+    monkeypatch.setattr(hooks, "TERM_GRACE", 60.0)
     start = time.monotonic()
     res = run_hook_process(
-        "sleep 60", b"{}", hook="post-park", agent_id=ID, timeout=0.3, state_dir=state_dir
+        "sleep 120", b"{}", hook="post-park", agent_id=ID, timeout=0.3, state_dir=state_dir
     )
-    assert res.timed_out and time.monotonic() - start < hooks.TERM_GRACE
+    assert res.timed_out and time.monotonic() - start < 30
 
 
 def test_leader_exits_but_child_holds_the_pipe(
-    tracker_dir: Path, tracker: ProcTracker, state_dir: Path
+    tracker_dir: Path, tracker: ProcTracker, state_dir: Path, tmp_path: Path
 ) -> None:
     state_dir.mkdir()
     pids = tracker_dir / "pids"
-    cmd = f"sleep 20 & echo $! > {shlex.quote(str(pids))}; echo done; exit 0"
-    start = time.monotonic()
-    res = run_hook_process(
-        cmd, b"{}", hook="post-park", agent_id=ID, timeout=10, state_dir=state_dir
+    exited = tmp_path / "exited"
+    cmd = (
+        f"sleep 60 & echo $! > {shlex.quote(str(pids))}; echo done; "
+        f"date +%s.%N > {shlex.quote(str(exited))}; exit 0"
     )
+    res = run_hook_process(
+        cmd, b"{}", hook="post-park", agent_id=ID, timeout=50, state_dir=state_dir
+    )
+    returned = time.time()
     track(tracker, pids)
     assert res.ok and res.stdout == b"done\n"
-    assert time.monotonic() - start < hooks.DRAIN_GRACE + 3
+    # The child's 60 s sleep (and the 50 s timeout) is not waited for: the call returns about
+    # DRAIN_GRACE after the leader exited. The lower bound proves the drain happens; the upper
+    # bound is a few seconds, so a drain that overstays fails while a loaded machine passes.
+    drain = returned - float(exited.read_text())
+    assert hooks.DRAIN_GRACE - 0.1 <= drain < hooks.DRAIN_GRACE + 3
 
 
 def test_exit_status_and_signal_death(state_dir: Path) -> None:
@@ -794,8 +814,8 @@ def test_async_hook_is_detached_and_counts_as_delivered(
     out = tmp_path / "out.jsonl"
     queue(store, event("post-park"))
     runner = AsyncRunner(state_dir)
-    cmd = f"sleep 0.4; {recorder(out)}"
-    start = time.monotonic()
+    gate = tmp_path / "gate"  # the hook waits for this file, so it is still running on return
+    cmd = f"while [ ! -e {shlex.quote(str(gate))} ]; do sleep 0.05; done; {recorder(out)}"
     result = deliver_outbox(
         store,
         ID,
@@ -803,8 +823,12 @@ def test_async_hook_is_detached_and_counts_as_delivered(
         state_dir=state_dir,
         runner=runner,
     )
-    assert result.delivered == 1 and time.monotonic() - start < 0.35
-    assert runner.poll() == 1
+    try:
+        assert result.delivered == 1
+        assert not out.exists()  # delivery did not wait for the hook
+        assert runner.poll() == 1
+    finally:
+        gate.touch()  # open the gate even when an assertion failed: no polling shell is leaked
     assert runner.wait(10) == 0
     assert len(lines(out)) == 1
     assert track(tracker) == []
@@ -1269,7 +1293,8 @@ def test_unidentified_group_still_times_out_and_only_the_leader_is_signalled(
         cmd, b"{}", hook="post-park", agent_id=ID, timeout=0.5, state_dir=state_dir
     )
     found = track(tracker, pids)
-    assert res.timed_out and not res.unreaped and time.monotonic() - start < 4
+    # The child sleeps 60 s: returning in under half of that shows nothing waited for it.
+    assert res.timed_out and not res.unreaped and time.monotonic() - start < 30
     leader, child = found
     assert not alive(leader)
     assert alive(child)  # unverified group members are never signalled

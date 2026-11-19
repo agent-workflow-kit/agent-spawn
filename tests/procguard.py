@@ -5,12 +5,12 @@ exactly that identity, through a pidfd (or the ``syscall`` fallback). SIGTERM fi
 after a grace period. Nothing is ever killed by pattern. ``tests/conftest.py`` loads this as
 a plugin; ``proc_tracker`` is autouse, so a test cannot leave a process behind unnoticed.
 
-On Linux the pytest process is made a child subreaper at session start, so every process a
-test leaves behind (a detached grandchild included) is reparented to pytest instead of init.
-After each test the tracker walks the pytest process's descendants (``/proc`` ppid links):
-a live descendant the test did not record is killed by its verified identity (pidfd), reaped
-and named in a test failure; zombies left by recorded processes are reaped quietly. Only
-descendants of the pytest process are ever touched.
+On Linux each pytest process (under pytest-xdist, every worker) is made a child subreaper at
+session start, so every process a test leaves behind (a detached grandchild included) is
+reparented to it instead of init. After each test the tracker walks that process's descendants
+(``/proc`` ppid links): a live descendant the test did not record is killed by its verified
+identity (pidfd), reaped and named in a test failure; zombies left by recorded processes are
+reaped quietly. Only descendants of the process running the test are ever touched.
 """
 
 from __future__ import annotations

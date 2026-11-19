@@ -218,8 +218,8 @@ def test_show_bounds_each_wtctl_read_with_its_own_timeout(
 ) -> None:
     agent_id = launched_in_worktree(env)
     row = env.agent(agent_id)
-    fakebin.script("wtctl", "list", sleep=5)
-    fakebin.script("wtctl", "baseline check", sleep=5)
+    fakebin.script("wtctl", "list", sleep=60)
+    fakebin.script("wtctl", "baseline check", sleep=60)
     real = gw.get_gateway()
     fake_env = fakebin.env()
 
@@ -239,7 +239,7 @@ def test_show_bounds_each_wtctl_read_with_its_own_timeout(
     started = time.monotonic()
     assert showing.third_party_run(inv, row, warnings) is None
     assert showing.repo_config_changed(inv, row, warnings) is None
-    assert time.monotonic() - started < 4
+    assert time.monotonic() - started < 40  # each fake sleeps 60 s; the 0.3 s bound cut both
     assert len(warnings) == 2
     assert "not looked up" in warnings[0] and "not checked" in warnings[1]
 

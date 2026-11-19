@@ -2,7 +2,7 @@
 
 The supervisor polls `claude-session status` once a second; with that interval made huge, only a
 relay record can make it look again, so the test cannot pass by polling alone. No clock decides
-the result: the exec stand-in just outlives the few ticks the wake-up needs.
+the result: the exec stand-in is held at a gate until the supervisor has been seen live.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import json
 import sqlite3
 import subprocess
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -25,10 +26,12 @@ from tests.test_supervise_inprocess import Rig, SpawnGateway, rig_for  # noqa: F
 class RelayingGateway(SpawnGateway):
     """After the supervisor's first `status` poll, run the real `_session-event` once."""
 
-    def __init__(self, fakebin: Fakebin, rig_ref: list[Rig], env: dict[str, str]) -> None:
+    def __init__(
+        self, fakebin: Fakebin, rig_ref: list[Rig], env: dict[str, str], gate: Path
+    ) -> None:
         super().__init__(fakebin)
         self.fakebin = fakebin
-        self.rig_ref, self.env = rig_ref, env
+        self.rig_ref, self.env, self.gate = rig_ref, env, gate
         self.relayed = False
         self.live_seen_while_exec_runs = False
 
@@ -77,6 +80,7 @@ class RelayingGateway(SpawnGateway):
             assert done.returncode == 0, done.stderr
         elif self.relayed and rig.agent()["status"] == "live":
             self.live_seen_while_exec_runs = True  # sleep runs only while `exec` is alive
+            self.gate.write_text("")  # now let `exec` finish
         super().sleep(seconds)
 
 
@@ -85,6 +89,7 @@ def test_a_relay_event_wakes_the_supervisor_which_detects_the_start(
     fakebin: Fakebin,
     isolation_env: Isolation,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     rig = rig_for()
     monkeypatch.setattr(supervise, "STATUS_EVERY", 3600.0)
@@ -96,8 +101,9 @@ def test_a_relay_event_wakes_the_supervisor_which_detects_the_start(
         merge={"state": "starting", "live": True, "run": {"phase": "launch", "state": "starting"}},
     )
     script_live_run(fakebin)
-    fakebin.script("claude-session", "exec", sleep=3, outcome="done")
-    gateway = RelayingGateway(fakebin, [rig], fakebin.env())
+    gate = tmp_path / "exec-gate"  # `exec` outlives the relay however slow it is
+    fakebin.script("claude-session", "exec", gate=str(gate), outcome="done")
+    gateway = RelayingGateway(fakebin, [rig], fakebin.env(), gate)
     rig.supervisor.gateway = gateway
     rig.supervisor.run()
     assert gateway.relayed and gateway.live_seen_while_exec_runs

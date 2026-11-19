@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -522,7 +523,9 @@ def test_signals_are_held_while_a_section_runs() -> None:
     old = signal.signal(signal.SIGTERM, lambda signum, frame: seen.append(signum))
     try:
         with launch._signals_held():  # pyright: ignore[reportPrivateUsage]
-            os.kill(os.getpid(), signal.SIGTERM)
+            # Aimed at this thread: a process-directed kill may be delivered to another thread
+            # of the process (pytest-xdist workers have some) that does not block the signal.
+            signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
             assert seen == []
         assert seen == [signal.SIGTERM]
     finally:
