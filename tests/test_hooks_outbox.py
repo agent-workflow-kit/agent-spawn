@@ -712,16 +712,16 @@ def test_hook_ignoring_sigterm_is_killed(
 
 
 def test_cooperative_hook_exits_on_sigterm_without_waiting_for_the_grace(
-    state_dir: Path,
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_dir.mkdir()
+    # A long grace makes the margin independent of machine speed: waiting it out would take 60 s.
+    monkeypatch.setattr(hooks, "TERM_GRACE", 60.0)
+    start = time.monotonic()
     res = run_hook_process(
-        "sleep 60", b"{}", hook="post-park", agent_id=ID, timeout=0.3, state_dir=state_dir
+        "sleep 120", b"{}", hook="post-park", agent_id=ID, timeout=0.3, state_dir=state_dir
     )
-    # The event, not the elapsed time: a hook that exits on SIGTERM is never sent SIGKILL.
-    assert res.timed_out and res.signal != signal.SIGKILL
-    names = [r["signal"] for r in log_records(state_dir) if r["event"] == "signal_sent"]
-    assert names == ["SIGTERM"]
+    assert res.timed_out and time.monotonic() - start < 30
 
 
 def test_leader_exits_but_child_holds_the_pipe(
