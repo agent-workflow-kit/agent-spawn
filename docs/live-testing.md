@@ -247,10 +247,15 @@ docstrings; run with `LIVE_OBSERVATIONS=live.jsonl` to get the observed values.
 
 ## First billed run
 
-The billed waves ran with the real Claude Code on 2026-11-19 (haiku only). The first run passed 9
-of its 10 scenarios; its failures were harness and doc assumptions (below), not product bugs.
-After the harness fixes (PR #98) the rerun of the affected scenarios passed. Details of the
-combined result are under [Results](#results).
+The billed waves ran with the real Claude Code on 2026-11-19 (haiku only). The #36 comment records
+that the first run (42 haiku sessions) passed 9 of the 10 scenarios it ran; it does not name them
+or the failing one, and the count is not reconciled with the 13 billed scenarios listed under
+[Results](#results). PR #98 names the scenarios it fixed after that run: `report-resume-chain`,
+`interactive-window-close`, `resumable-after-kill-pane`, `fork-throwaway`, `promotion-escalation`
+and the exec-only case of `liveness-kills`. A rerun (13 haiku sessions) after the fixes passed;
+the #36 final comment says every rerun scenario passed but does not list which ones were rerun.
+The failures were harness and doc assumptions (below), not product bugs. Combined result:
+[Results](#results).
 
 Contradicted by the first run (tests and docs corrected):
 
@@ -272,12 +277,14 @@ termctl 0.25.0, wtctl 0.32.0, tmux 3.5a, git 2.34.1, jobsctl (installed, used by
 `jobsctl-cancel-force`). The suite has passed on Linux:
 
 - **Unbilled wave** (`LIVE_SCENARIOS=unbilled`): 154 passed, 4 skipped (the recorded-only
-  scenarios below).
-- **Billed scenarios**: the first run passed 9 of 10 scenarios; after the harness fixes every
-  rerun scenario passed. Passed live: `headless-launch-wait`; `interactive-window-close` (parks
+  scenarios `placement-here-terminal`, `upgrade-live-supervisor` and `real-crontab`, and `macos`,
+  issue #37).
+- **Billed scenarios**: the first run passed 9 of the 10 scenarios it ran and, after the harness
+  fixes, every rerun scenario passed (see [First billed run](#first-billed-run) for what is and
+  is not recorded about which ran when). The 13 billed scenarios passed live: `headless-launch-wait`; `interactive-window-close` (parks
   `done` with `forwarded_hup`, because the real model files a report in its first turn);
   `report-resume-chain` (run 1 `exited-unreported` with `no_report`, automatic resume run 2
-  `done`, the agent parks `done`); `resume-continue`; `fork-inplace-holder`; `fork-throwaway`
+  `done`, the agent parks `done`); `resume-continue`; `fork-inplace-holder` (after the fork, `list --label agent=<source id>` returned only the source session); `fork-throwaway`
   (needs `--reads-third-party --sandbox preferred` on a host without bwrap and socat);
   `teardown-wtctl-real`; `promotion-escalation` (D5; final park `killed`; the original headless
   supervisor stays the recorded one and the pane process runs `supervise --host`);
@@ -293,8 +300,7 @@ termctl 0.25.0, wtctl 0.32.0, tmux 3.5a, git 2.34.1, jobsctl (installed, used by
 
 Real-tool facts confirmed live without billing: A8 (the termctl pid is tmux's `pane_pid` and the
 recorded supervisor chain), B1 (SIGHUP reaches only the leader), `--keep-on-exit failed`, the
-default-server dead-pane list and `close` without `--force` (exit 20 for a running pane), fork
-label inheritance, the default `stop` grace of about 10.5 s (SIGTERM then SIGKILL) against
+default-server dead-pane list and `close` without `--force` (exit 20 for a running pane), the default `stop` grace of about 10.5 s (SIGTERM then SIGKILL) against
 `DEFAULT_GRACE`, reconcile closing a dead pane on a real tmux server, `--reset-lease` repairs,
 cron against a fake crontab, the browse pilot over real `list`/`show` output, `exited-unreported`
 (exit 14) for a stub exiting 0, the wtctl facts of "First unbilled run", and claude-session

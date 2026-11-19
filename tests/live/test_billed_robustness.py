@@ -1,7 +1,7 @@
 """Billed scenarios, wave 3: kills, signals, the minimal environment and jobs, real Claude Code.
 
-See ``test_billed_basic.py`` for the conventions; these tests have not been run against a real
-Claude Code yet.
+See ``test_billed_basic.py`` for the conventions; these tests were run against the real tools on
+2026-11-19, see docs/live-testing.md, Results.
 """
 
 # ruff: noqa: E501  (assertion messages are prose: assumption, then the document line)

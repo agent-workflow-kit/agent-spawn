@@ -81,7 +81,7 @@ Status: planned, 2026-11-02. Implements [interface.md](interface.md) (normative)
 **Goal**: Every relied-on third-party behavior is re-checked against real Claude Code, tmux, the real sibling tools and jobsctl; macOS paths are checked.
 **Success Criteria**: a `live` suite (deselected by default, never in CI) covering: full interactive launch in a window and window close; headless escalation with promotion and continuation; resume and fork into a throwaway; teardown with real wtctl; `jobsctl cancel --force` through a job running `launch --wait`; `claude` resumable after kill-pane and SIGTERM (spike D). The macOS checklist (headless, `--placement here`, `--worktree none`, kqueue waits, `LOCAL_PEERPID` handoff) passes manually and is recorded in design.md "Live verification".
 **Tests**: the live scenarios above, each with `claude --model haiku` and small bounds.
-**Status**: In Progress (live suite done: the suite and `make live` / `make live-list` are written, see [live-testing.md](live-testing.md); it has passed on Linux against the real tools on 2026-11-19, unbilled and billed, closing #36; what remains is tracked in #97, #99 and #100; the macOS checklist is issue #37)
+**Status**: In Progress (live suite done: the suite and `make live` / `make live-list` are written, see [live-testing.md](live-testing.md); it has passed on Linux against the real tools on 2026-11-19, unbilled and billed, closing #36; the stage stays In Progress for what remains is tracked in #97, #99 and #100; the macOS checklist is issue #37)
 
 ## Stage 6: TUI (0.6)
 
