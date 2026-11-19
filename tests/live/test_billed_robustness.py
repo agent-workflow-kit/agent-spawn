@@ -24,6 +24,7 @@ from .billed import (
     bsetup,
     cs_status,
     expect_parked,
+    expected_park_after_hangup,
     launch_window,
     pid_gone,
     show,
@@ -34,7 +35,7 @@ from .billed import (
     wait_session_state,
     wait_turn_done,
 )
-from .harness import World, check, wait_for, write_executable
+from .harness import LiveError, World, check, wait_for, write_executable
 from .test_wtctl import Wt
 
 SC = pytest.mark.live_scenario
@@ -88,8 +89,10 @@ def test_claude_exits_when_its_pane_is_killed_and_the_session_resumes(billed_wor
     check(killed.returncode == 0, "kill-pane works", "design.md D1", killed.stderr)
     parked = expect_parked(world, aid, 90)
     check(
-        parked["park_reason"] == "killed" and parked["needs_attention"] is None,
-        "kill-pane parks the agent killed without attention",
+        parked["park_reason"] == expected_park_after_hangup(world, agent["csession_id"], parked)
+        and parked["needs_attention"] is None,
+        "kill-pane parks the agent killed (done when the session had already reported) without "
+        "attention",
         "design.md D1 / D13 (outcomes come from claude-session's recorded cause)",
         {k: parked[k] for k in ("park_reason", "needs_attention", "last_end_reason")},
     )
@@ -254,13 +257,22 @@ def test_killing_the_supervisor_only_and_exec_only(billed_world: World) -> None:
         target = state["supervisor"]["pid"] if victim == "supervisor" else run["wrapper_pid"]
         comm = "supervise" if victim == "supervisor" else "exec"
         signal_exact(world, int(target), signal.SIGKILL, comm_contains=comm)
-        lost = wait_agent(
-            world,
-            aid,
-            lambda s: s["agent"]["supervisor_lost"],
-            f"supervisor_lost after killing {label}",
-            60,
-        )
+        try:
+            lost = wait_agent(
+                world,
+                aid,
+                lambda s: s["agent"]["supervisor_lost"],
+                f"supervisor_lost after killing {label}",
+                60,
+            )
+        except LiveError as err:
+            now = show(world, aid)["agent"]
+            raise LiveError(
+                f"{err}; agent now: "
+                f"{ {k: now.get(k) for k in ('status', 'park_reason', 'needs_attention', 'supervisor_lost', 'last_end_reason')} }; "
+                f"claude-session run: "
+                f"{ {k: cs_status(world, csid)['run'].get(k) for k in ('outcome', 'end_reason', 'wrapper_alive', 'child_alive', 'state')} }"
+            ) from err
         run_after = cs_status(world, csid)["run"]
         world.observe(
             f"liveness.{label}.status",

@@ -157,11 +157,22 @@ def _diagnose(world: World, agent_id: str) -> str:
             f"first_working_at={[r.get('first_working_at') for r in shown.get('runs', [])]}"
         ]
         for pane in world.json_tool("termctl", "list", "--label", f"agent={agent_id}")["panes"]:
-            cap = world.tmux("capture-pane", "-p", "-t", pane["pane_id"], socket=pane["socket_path"])
+            cap = world.tmux(
+                "capture-pane", "-p", "-t", pane["pane_id"], socket=pane["socket_path"]
+            )
             parts.append(f"pane {pane['pane_id']} screen: {cap.stdout[-1500:]!r}")
         return " | ".join(parts)
     except Exception as exc:  # diagnostics must never mask the real failure
         return f"(diagnostics failed: {exc})"
+
+
+def expected_park_after_hangup(world: World, csession_id: str, parked: dict[str, Any]) -> str:
+    """The park reason a closed window gives: ``done`` when the real session had already filed its
+    report in its one turn ("a reported run keeps its outcome", interface.md Supervision; the
+    model reports in a tiny interactive run despite ``Reply with the single word ok``), else
+    ``killed``."""
+    report = cs_status(world, csession_id)["run"].get("report")
+    return "done" if report else "killed"
 
 
 def wait_turn_done(world: World, agent_id: str, timeout: float = 180) -> dict[str, Any]:

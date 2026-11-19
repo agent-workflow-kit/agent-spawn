@@ -365,7 +365,7 @@ def test_a_killed_supervisor_leaves_a_dead_pane_that_reconcile_closes(world: Wor
     time.sleep(2)
     reconciled = world.spawn_json("reconcile", ok=(0, 12))
     world.observe("agent-spawn.reconcile.second-pass", reconciled)
-    remaining =world.json_tool("termctl", "list", "--label", f"agent={aid}", "--dead")["panes"]
+    remaining = world.json_tool("termctl", "list", "--label", f"agent={aid}", "--dead")["panes"]
     parked = show(world, aid)["agent"]
     if parked["needs_attention"] is None:
         check(

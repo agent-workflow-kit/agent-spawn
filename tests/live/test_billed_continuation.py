@@ -12,8 +12,8 @@ from pathlib import Path
 import pytest
 
 from .billed import (
-    _diagnose,
     MAX_TURNS,
+    _diagnose,
     adopt,
     bsetup,
     cs_status,
@@ -372,9 +372,11 @@ def test_headless_needs_input_is_promoted_into_a_window_and_continues(billed_wor
         host = wait_agent(
             world,
             aid,
-            lambda s: s["agent"]["status"] == "live"
-            and (s.get("session") or {}).get("run") == 2
-            and (s.get("session") or {}).get("state") in {"idle", "working", "reported"},
+            lambda s: (
+                s["agent"]["status"] == "live"
+                and (s.get("session") or {}).get("run") == 2
+                and (s.get("session") or {}).get("state") in {"idle", "working", "reported"}
+            ),
             "the promoted run (run 2) to be live in the window",
             120,
         )

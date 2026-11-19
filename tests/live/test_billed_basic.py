@@ -19,6 +19,7 @@ from .billed import (
     bsetup,
     cs_status,
     expect_parked,
+    expected_park_after_hangup,
     launch_headless,
     launch_window,
     pid_gone,
@@ -148,11 +149,6 @@ def test_interactive_launch_in_a_real_window_and_window_close(billed_world: Worl
     Confirms #36 #26, #27, design.md D13, D17, A8, B1."""
     world = billed_world
     wt = bsetup(world)
-    # TODO: the real session reports (state reported, outcome done) in its one turn, so closing
-    # the window parks done ("a reported run keeps its outcome", interface.md Supervision), not
-    # killed (interactive runs have no implicit done, so --no-implicit-done/backstop: false do not
-    # help). The park check below must expect done after a report; deferred to the coordinator's
-    # triage of the first billed run (see the run report), not re-run (three fix rounds used).
     launched = launch_window(world, wt)
     agent = launched["agent"]
     aid = agent["agent_id"]
@@ -187,8 +183,10 @@ def test_interactive_launch_in_a_real_window_and_window_close(billed_world: Worl
     check(killed.returncode == 0, "kill-window works", "design.md B3", killed.stderr)
     parked = expect_parked(world, aid, 90)
     check(
-        parked["park_reason"] == "killed" and parked["needs_attention"] is None,
-        "closing the window parks the agent killed without attention",
+        parked["park_reason"] == expected_park_after_hangup(world, csid, parked)
+        and parked["needs_attention"] is None,
+        "closing the window parks the agent killed (done when the session had already reported) "
+        "without attention",
         "issue: window close parks killed / D13 D17",
         {k: parked[k] for k in ("park_reason", "needs_attention", "last_end_reason")},
     )
