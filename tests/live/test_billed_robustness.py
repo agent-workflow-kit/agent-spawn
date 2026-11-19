@@ -89,7 +89,7 @@ def test_claude_exits_when_its_pane_is_killed_and_the_session_resumes(billed_wor
     check(killed.returncode == 0, "kill-pane works", "design.md D1", killed.stderr)
     parked = expect_parked(world, aid, 90)
     check(
-        parked["park_reason"] == expected_park_after_hangup(world, agent["csession_id"], parked)
+        parked["park_reason"] == expected_park_after_hangup(world, agent["csession_id"])
         and parked["needs_attention"] is None,
         "kill-pane parks the agent killed (done when the session had already reported) without "
         "attention",
@@ -230,13 +230,105 @@ def long_headless(world: World, wt: Wt, *extra: str) -> dict[str, Any]:
     )
 
 
+def _snapshot(world: World, aid: str, csid: str) -> str:
+    """One state snapshot for a timeout message; never raises (it must not mask the timeout)."""
+    try:
+        now = show(world, aid)["agent"]
+        run = cs_status(world, csid)["run"]
+        keys = ("status", "park_reason", "needs_attention", "supervisor_lost", "last_end_reason")
+        return (
+            f"agent now: { {k: now.get(k) for k in keys} }; claude-session run: "
+            f"{ {k: run.get(k) for k in ('outcome', 'end_reason', 'wrapper_alive', 'child_alive', 'state')} }"
+        )
+    except Exception as exc:
+        return f"(snapshot failed: {exc})"
+
+
+def _supervisor_only_case(world: World, aid: str, csid: str, label: str) -> dict[str, Any]:
+    try:
+        lost = wait_agent(
+            world,
+            aid,
+            lambda s: s["agent"]["supervisor_lost"],
+            f"supervisor_lost after killing {label}",
+            60,
+        )
+    except LiveError as err:
+        raise LiveError(f"{err}; {_snapshot(world, aid, csid)}") from err
+    run_after = cs_status(world, csid)["run"]
+    world.observe(
+        f"liveness.{label}.status",
+        {k: run_after.get(k) for k in ("outcome", "wrapper_alive", "child_alive")},
+    )
+    check(
+        run_after["outcome"] is None,
+        f"killing {label} only does not finalize the run",
+        "#36 #75 3",
+        run_after.get("outcome"),
+    )
+    check(
+        run_after["child_alive"] is True,
+        "SIGKILL of the supervisor only: claude lives on",
+        "design.md B9 / #36 #75 3",
+    )
+    check(
+        lost["agent"]["supervisor_lost"] is True,
+        "agent-spawn sets supervisor_lost",
+        "#36 #75 3",
+    )
+    spawn(world, "stop", aid, ok=(0, 12))
+    wait_for(
+        lambda: cs_status(world, csid)["run"]["outcome"] is not None,
+        60,
+        "the stopped run to be final",
+    )
+    return expect_parked(world, aid, 60)
+
+
+def _exec_only_case(world: World, aid: str, csid: str, label: str) -> dict[str, Any]:
+    """A headless claude dies with the killed wrapper (PR_SET_PDEATHSIG): the run is ``lost``."""
+    try:
+        parked = expect_parked(world, aid, 60)
+    except LiveError as err:
+        raise LiveError(f"{err}; {_snapshot(world, aid, csid)}") from err
+    run_after = cs_status(world, csid)["run"]
+    world.observe(
+        f"liveness.{label}.status",
+        {k: run_after.get(k) for k in ("outcome", "end_reason", "wrapper_alive", "child_alive")},
+    )
+    check(
+        run_after["outcome"] == "lost" and run_after["end_reason"] == "lost",
+        "SIGKILL of exec only: the run ends lost",
+        "claude-session interface.md step 7 / Signals (PDEATHSIG) / #36 #75 3",
+        (run_after.get("outcome"), run_after.get("end_reason")),
+    )
+    check(
+        run_after["wrapper_alive"] is False and run_after["child_alive"] is False,
+        "SIGKILL of exec only: a headless claude dies with the wrapper",
+        "claude-session interface.md Signals (PR_SET_PDEATHSIG) / FIDELITY.md wrapper_alive",
+        (run_after["wrapper_alive"], run_after["child_alive"]),
+    )
+    check(
+        parked["park_reason"] == "lost"
+        and parked["needs_attention"] == "lost"
+        and parked["supervisor_lost"] is False,
+        "the agent parks lost with needs_attention lost and no supervisor_lost",
+        "interface.md outcome table (lost row) / #36 #75 3",
+        {k: parked[k] for k in ("park_reason", "needs_attention", "supervisor_lost")},
+    )
+    return parked
+
+
 @SC("liveness-kills")
 def test_killing_the_supervisor_only_and_exec_only(billed_world: World) -> None:
     """#36 #75 3 and 4 with real headless runs (the detached supervisor is the parent of ``exec``):
     SIGKILL of the supervisor only leaves ``exec`` and claude alive (claude-session still reports
-    the run live) and agent-spawn sets ``supervisor_lost`` once; SIGKILL of ``exec`` only gives
-    ``wrapper_alive: false`` / ``child_alive: true`` and ``supervisor_lost`` without finalizing
-    the run. ``stop`` then ends each run; a late ``claude-session reconcile`` and an
+    the run live) and agent-spawn sets ``supervisor_lost`` once; ``stop`` then ends the run.
+    SIGKILL of ``exec`` only kills a headless claude too (claude-session gives headless children
+    ``PR_SET_PDEATHSIG(SIGTERM)``, interface.md step 7 and Signals), so the run ends ``lost`` and
+    the agent parks ``lost`` with ``needs_attention: lost`` and no ``supervisor_lost`` (the
+    outcome table's ``lost`` row; the wrapper-dead-child-alive state needs an interactive child or
+    a SIGTERM-ignoring child and is not covered). A late ``claude-session reconcile`` and an
     ``agent-spawn reconcile`` do not deliver ``post-park`` twice. Signals go to exact PIDs
     recorded by agent-spawn and claude-session, after an identity check."""
     world = billed_world
@@ -257,62 +349,10 @@ def test_killing_the_supervisor_only_and_exec_only(billed_world: World) -> None:
         target = state["supervisor"]["pid"] if victim == "supervisor" else run["wrapper_pid"]
         comm = "supervise" if victim == "supervisor" else "exec"
         signal_exact(world, int(target), signal.SIGKILL, comm_contains=comm)
-        try:
-            lost = wait_agent(
-                world,
-                aid,
-                lambda s: s["agent"]["supervisor_lost"],
-                f"supervisor_lost after killing {label}",
-                60,
-            )
-        except LiveError as err:
-            now = show(world, aid)["agent"]
-            raise LiveError(
-                f"{err}; agent now: "
-                f"{ {k: now.get(k) for k in ('status', 'park_reason', 'needs_attention', 'supervisor_lost', 'last_end_reason')} }; "
-                f"claude-session run: "
-                f"{ {k: cs_status(world, csid)['run'].get(k) for k in ('outcome', 'end_reason', 'wrapper_alive', 'child_alive', 'state')} }"
-            ) from err
-        run_after = cs_status(world, csid)["run"]
-        world.observe(
-            f"liveness.{label}.status",
-            {k: run_after.get(k) for k in ("outcome", "wrapper_alive", "child_alive")},
-        )
-        check(
-            run_after["outcome"] is None,
-            f"killing {label} only does not finalize the run",
-            "#36 #75 3",
-            run_after.get("outcome"),
-        )
-        if victim == "wrapper":
-            check(
-                run_after["wrapper_alive"] is False and run_after["child_alive"] is True,
-                "SIGKILL of exec only: wrapper_alive false, child_alive true",
-                "#36 #75 3 / FIDELITY.md wrapper_alive",
-                (run_after["wrapper_alive"], run_after["child_alive"]),
-            )
+        if victim == "supervisor":
+            parked = _supervisor_only_case(world, aid, csid, label)
         else:
-            check(
-                run_after["child_alive"] is True,
-                "SIGKILL of the supervisor only: claude lives on",
-                "design.md B9 / #36 #75 3",
-            )
-        check(
-            lost["agent"]["supervisor_lost"] is True,
-            "agent-spawn sets supervisor_lost",
-            "#36 #75 3",
-        )
-        spawn(world, "stop", aid, ok=(0, 12))
-        wait_for(
-            lambda csid=csid: cs_status(world, csid)["run"]["outcome"] is not None,
-            60,
-            "the stopped run to be final",
-        )
-        parked = expect_parked(world, aid, 60)
-        world.observe(
-            f"liveness.{label}.parked",
-            {k: parked[k] for k in ("park_reason", "needs_attention", "supervisor_lost")},
-        )
+            parked = _exec_only_case(world, aid, csid, label)
         ran = f"post-park hook runs after the {label} case"
 
         def hook_runs() -> int:

@@ -9,6 +9,7 @@ window or by claude-session ``stop`` at the latest (teardown kills the private t
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -35,10 +36,21 @@ def bsetup(world: World, *, cs_extra: str = "", spawn_extra: str = "") -> Wt:
     # An interactive claude also asks "Adding a new directory" for claude-session's session
     # directory (``--add-dir``, under the private state home); trust is inherited from a trusted
     # parent, so trust the directory that holds the session directories.
-    sessions = world.home / ".local" / "state" / "claude-session" / "sessions"
-    sessions.mkdir(parents=True, exist_ok=True)
+    sessions = prepare_state_dirs(world)
     world.trust(wt.repo.clone, sessions)
     return wt
+
+
+def prepare_state_dirs(world: World) -> Path:
+    """claude-session's state directories, mode 0700 like the tool makes them (chmod after mkdir
+    because of the umask); returns the sessions directory."""
+    base = world.home / ".local" / "state" / "claude-session"
+    sessions = base / "sessions"
+    for directory in (base.parent, base, sessions):
+        directory.mkdir(parents=True, exist_ok=True)
+    base.chmod(0o700)
+    sessions.chmod(0o700)
+    return sessions
 
 
 def spawn(world: World, *args: str, ok: tuple[int, ...] = (0,), timeout: float = 240) -> Any:
@@ -147,6 +159,23 @@ def wait_session_state(
     )
 
 
+def redact(world: World, text: str) -> str:
+    """Remove credential fragments from diagnostic text: the key tail (the custom-API-key dialog
+    shows it), anything shaped like an Anthropic key and the OAuth token value."""
+    secrets: list[str] = []
+    auth = world.auth
+    if auth is not None:
+        if auth.api_key:
+            secrets.append(auth.api_key.strip()[-20:])
+        token = auth.env.get("CLAUDE_CODE_OAUTH_TOKEN")
+        if token:
+            secrets.append(token)
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    return re.sub(r"sk-ant-[A-Za-z0-9_-]+", "[redacted]", text)
+
+
 def _diagnose(world: World, agent_id: str) -> str:
     """What a timed-out interactive turn looked like: the agent's state and the pane text (the
     visible screen of the real claude TUI: no credentials)."""
@@ -161,12 +190,12 @@ def _diagnose(world: World, agent_id: str) -> str:
                 "capture-pane", "-p", "-t", pane["pane_id"], socket=pane["socket_path"]
             )
             parts.append(f"pane {pane['pane_id']} screen: {cap.stdout[-1500:]!r}")
-        return " | ".join(parts)
+        return redact(world, " | ".join(parts))
     except Exception as exc:  # diagnostics must never mask the real failure
         return f"(diagnostics failed: {exc})"
 
 
-def expected_park_after_hangup(world: World, csession_id: str, parked: dict[str, Any]) -> str:
+def expected_park_after_hangup(world: World, csession_id: str) -> str:
     """The park reason a closed window gives: ``done`` when the real session had already filed its
     report in its one turn ("a reported run keeps its outcome", interface.md Supervision; the
     model reports in a tiny interactive run despite ``Reply with the single word ok``), else

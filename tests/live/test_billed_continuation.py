@@ -382,7 +382,15 @@ def test_headless_needs_input_is_promoted_into_a_window_and_continues(billed_wor
         )
     except LiveError as err:
         raise LiveError(f"{err}; pane pid {panes[0]['pid']}; {_diagnose(world, aid)}") from err
-    cmdline = Path(f"/proc/{panes[0]['pid']}/cmdline").read_bytes().split(b"\0")
+    pane_pid = panes[0]["pid"]
+    if pane_pid is None:
+        raise LiveError(f"the pane has no process id; {_diagnose(world, aid)}")
+    try:  # Linux-only, like the harness's own process identity
+        cmdline = Path(f"/proc/{pane_pid}/cmdline").read_bytes().split(b"\0")
+    except OSError as err:
+        raise LiveError(
+            f"cannot read the pane process {pane_pid} (gone?): {err}; {_diagnose(world, aid)}"
+        ) from err
     check(
         b"supervise" in cmdline and b"--host" in cmdline,
         "the pane process is the promoted run's host (supervise --host) and stayed alive "

@@ -325,7 +325,7 @@ ACCEPTED = [
     pytest.param(["--env-allowlist-only", ""], id="empty-allowlist"),
     pytest.param(["--actor", "robot"], id="any-actor"),
     pytest.param(["--decision-id", "bad id"], id="any-decision-id"),
-    pytest.param(["--model", ""], id="empty-model"),
+    pytest.param(["--permission-profile", "x/y"], id="file-form-profile"),
     pytest.param(["--max-turns", "+5"], id="max-turns-plus"),
     pytest.param(["--max-turns", " 5"], id="max-turns-space"),
     pytest.param(["--max-turns", "٥"], id="max-turns-arabic-digit"),
@@ -335,7 +335,6 @@ ACCEPTED = [
     pytest.param(["--setting-sources", ""], id="no-setting-sources"),
     pytest.param(["--setting-sources", "user,project"], id="setting-sources"),
     pytest.param(["--max-turns", "1_0"], id="max-turns-underscore"),
-    pytest.param(["--permission-profile=-x"], id="dash-profile-with-equals"),
     pytest.param(["--hook", "pre-launch="], id="empty-hook-command"),
 ]
 
@@ -371,6 +370,11 @@ REFUSED = [
     pytest.param(["start", *HEADLESS, "--setting-sources", "User"], id="sources-case"),
     pytest.param(["start", *HEADLESS, "--setting-sources", "user,"], id="sources-trailing-comma"),
     pytest.param(["start", *HEADLESS, "--permission-profile", "-x"], id="dash-profile"),
+    pytest.param(["start", *HEADLESS, "--model", ""], id="empty-model"),
+    pytest.param(["start", *HEADLESS, "--model=\t"], id="control-character-model"),
+    pytest.param(["start", *HEADLESS, "--permission-profile=-x"], id="dash-profile-with-equals"),
+    pytest.param(["start", *HEADLESS, "--permission-profile="], id="empty-profile"),
+    pytest.param(["start", *HEADLESS, "--permission-profile=a b"], id="spaced-profile"),
     pytest.param(["start", "--resume", "cs-abcdefgh", "--reset", "kind"], id="reset-kind"),
     pytest.param(["forget", "--older-than", "abc"], id="forget-older-than-word"),
     pytest.param(["forget", "--older-than", "36501d"], id="forget-older-than-huge"),

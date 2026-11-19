@@ -5,7 +5,7 @@ Code (`claude --model haiku`), tmux, claude-session, termctl, wtctl, git and, wh
 jobsctl. It re-checks every relied-on third-party behavior that the fakes in `tests/fakebin/`
 only assume ([FIDELITY.md](../tests/fakebin/FIDELITY.md)) and that the design records as
 "assumed, check live" ([design.md](design.md), Live verification). It is **opt-in**, never part
-of `make verify` and never run in CI. Issue #36 closes only after a full run passes.
+of `make verify` and never run in CI. Issue #36 closes only after a full run passes (the first billed run found failures; their fixes are not yet re-run billed).
 
 Some scenarios cost API usage (about seventy haiku turns in total, see [Cost](#cost)); the rest
 start no Claude Code at all.
@@ -89,7 +89,7 @@ Only the billed scenarios cost anything. The bounds:
   harness fails it when it started more sessions than its registry entry says.
 
 The full billed set expects 23 real sessions (about 67 turns); `make live-list` prints the
-current numbers.
+current numbers. These are the expected numbers for one full pass; re-running a scenario after a fix starts its sessions again, so the sessions used over a debugging session can exceed them.
 
 ## Isolation
 
@@ -171,7 +171,7 @@ with `-l`/`--showlocals`: a failure would print locals.
 
 | Issue scope | Scenario |
 |---|---|
-| Full interactive launch in a window and window close (parked `killed`) | `interactive-window-close` (billed); unbilled twin with a stub: `as-stub-lifecycle` |
+| Full interactive launch in a window and window close (parked without attention; `done` when the session had already reported, `killed` otherwise) | `interactive-window-close` (billed); unbilled twin with a stub: `as-stub-lifecycle` |
 | Headless escalation with promotion and continuation (spike D5) | `promotion-escalation`; unbilled parts in `promotion-subchecks` |
 | Resume; fork into a throwaway; in-place fork holder | `resume-continue`, `fork-throwaway`, `fork-inplace-holder` |
 | Teardown with real wtctl | `teardown-wtctl-real`, `as-stub-lifecycle` |
@@ -184,7 +184,7 @@ with `-l`/`--showlocals`: a failure would print locals.
 
 | Comment (PR) | Where it is checked |
 |---|---|
-| #8 fakes: claude-session | argv forms: existing `fidelity-argv`; shapes of `start`, `status`, `list`, `stop`, `forget`, `reconcile`, exit codes, outcome file mode and single write: `cs-pending-run`, `cs-dry-run-shapes`, `cs-stop-grace`; exec signals and exit 15: `cs-stop-grace`; hooks, finalizers under a real run: `headless-launch-wait`. Not covered: option abbreviations (see `fidelity-argv`), the order of refusals when several apply, `--actor` caps, hook splitting and parallelism, the trust dialog's `starting` state, exec killed by SIGKILL exit code (`liveness-kills` records it); the pre-launch hook veto and timeout and `--input-file` copies (need a configured hook or input fixture; hook behavior is claude-session's own suite); `wait` timeout, `--interval` and its exit codes 14, 16, 17 and 18 (need runs ending in each outcome; the billed runs reach only `done`); an ambiguous id prefix (21, needs two ids sharing four characters), `start` without `--prompt-file` (exit 2), an unknown id for every command (exit 10, only `status` and `label` are checked), `stop` of an already final run (`already_final`) and the `recent_events` cap of 20 in `status`. |
+| #8 fakes: claude-session | argv forms: existing `fidelity-argv`; shapes of `start`, `status`, `list`, `stop`, `forget`, `reconcile`, exit codes, outcome file mode and single write: `cs-pending-run`, `cs-dry-run-shapes`, `cs-stop-grace`; exec signals and exit 15: `cs-stop-grace`; hooks, finalizers under a real run: `headless-launch-wait`. Not covered: option abbreviations (see `fidelity-argv`), the order of refusals when several apply, `--actor` caps, hook splitting and parallelism, the trust dialog's `starting` state, the exit code of an exec killed by SIGKILL (observed: a headless claude dies with the wrapper and the run ends `lost`, see "First billed run"); the pre-launch hook veto and timeout and `--input-file` copies (need a configured hook or input fixture; hook behavior is claude-session's own suite); `wait` timeout, `--interval` and its exit codes 14, 16, 17 and 18 (need runs ending in each outcome; the billed runs reach only `done`); an ambiguous id prefix (21, needs two ids sharing four characters), `start` without `--prompt-file` (exit 2), an unknown id for every command (exit 10, only `status` and `label` are checked), `stop` of an already final run (`already_final`) and the `recent_events` cap of 20 in `status`. |
 | #8 termctl / tmux | `termctl-open-pid`, `termctl-keep-on-exit`, `termctl-focus`, `tmux-real-server`. Not covered: the `locked` error (needs a concurrent label command), `--keep-on-exit` on tmux 3.2 (host has 3.5a); the stale-socket and missing-socket texts are checked only by `fidelity-argv` (`test_fidelity.py`), not by `tmux-real-server`. |
 | #8 wtctl | `wtctl-create-list-show`, `wtctl-collisions-reuse`, `wtctl-remove-status`, `wtctl-adopt-forget-holders`. Not covered: a `create` hook veto (11) and escalation (13) with `--override-escalation`, `bootstrap_failed` with `details.record`, a `create` killed on timeout, `remove --merged-head`, `remove --flag=value` forms beyond `--holder`/`--actor`, and a human override with `--yes` (all need configured hooks, a failing bootstrap step, a TTY or a human actor the suite does not set up). |
 | #9 session backend | `cs-pending-run`, `cs-dry-run-shapes`. Not covered: the outcome-file refusal under the caller cwd for isolated runs, a launch-failed start's not-started outcome. |
@@ -194,7 +194,7 @@ with `-l`/`--showlocals`: a failure would print locals.
 | #26, #27 window | `termctl-open-pid`, `as-stub-lifecycle`, `interactive-window-close`. Not covered: post-open hooks slower than 60 s, a user's real termctl config (rules, hooks), WSL entries like `=C:`, the marker loop against an attached client. |
 | #28 attach | `termctl-focus` (no client, unknown client, unknown id). The `switched` answer needs an attached client: not automated. |
 | #74 here | `placement-here-terminal`: recorded, not automated (needs a human at a terminal). |
-| #75 liveness | 1: `cs-pending-run`; 2: `cs-start-killed`; 3: `liveness-kills`, `as-dead-pane-reconcile`; 4 (no second `post-park` from a late reconcile): `liveness-kills` after `stop` of the killed run (a park through the liveness path itself, where the supervisor and claude are both killed, is not provoked); 5: `as-stub-lifecycle`, `fork-inplace-holder`, `resume-continue`; 6 (foreign sessions) and 7 (`forget --holder` of `creating`/`partial`): the `missing`/`unlinked` half in `wtctl-adopt-forget-holders`; the rest not covered. |
+| #75 liveness | 1: `cs-pending-run`; 2: `cs-start-killed`; 3: `liveness-kills` (supervisor only: claude lives on and `supervisor_lost` is set; exec only: a headless claude dies with the wrapper by `PR_SET_PDEATHSIG`, the run and the park are `lost`; the wrapper-dead-child-alive state needs an interactive child or a SIGTERM-ignoring child and is not covered), `as-dead-pane-reconcile`; 4 (no second `post-park` from a late reconcile): `liveness-kills` (after `stop` of the supervisor-only run, and after the `lost` park of the exec-only run); 5: `as-stub-lifecycle`, `fork-inplace-holder`, `resume-continue`; 6 (foreign sessions) and 7 (`forget --holder` of `creating`/`partial`): the `missing`/`unlinked` half in `wtctl-adopt-forget-holders`; the rest not covered. |
 | #78 overrides | `cs-dry-run-shapes` (claude-session half), `wtctl-remove-status` (wtctl half). `termctl open --override-escalation` with a changed hook and the slow `pre-teardown` hook: not covered. |
 | #79 dead panes | `termctl-default-server`, `termctl-keep-on-exit`, `as-dead-pane-reconcile` |
 | #80 reset-lease | `as-reconcile-reset-lease` (the TTY path needs a real terminal; a racing second reconcile is not provoked) |
@@ -244,6 +244,47 @@ needed). Nothing billed was run. Observed differences from what the docs assumed
 
 Everything else the `tools` wave checks passed. The per-scenario details are in the test
 docstrings; run with `LIVE_OBSERVATIONS=live.jsonl` to get the observed values.
+
+## First billed run
+
+The billed waves ran once with the real Claude Code. Six fix commits' worth of changes from that run
+are on this branch and have not been re-run billed.
+
+Confirmed live:
+
+- real hook events and `first_working_at`; the supervisor as the pane process (A8/B1) through the
+  real chain;
+- resume, in-place fork and fork into a throwaway; teardown with the real wtctl;
+- promotion (D5) with the same Claude session id;
+- SIGTERM at idle gives `done`/`signal_term`, mid-turn gives `killed`/`signal_term`; the stop grace
+  of about 10.5 s with SIGTERM then SIGKILL;
+- the minimal environment (D4); `jobsctl cancel --force`;
+- SIGKILL of the supervisor only: claude lives, the run is not finalized, the agent parks `killed`
+  after `stop`;
+- `exited-unreported` (exit 14) for a stub that exits 0; a dead pane closed via reconcile;
+- the report-resume chain (run 1 `exited-unreported` with `no_report`, automatic resume run 2
+  `done`);
+- window close and kill-pane: the park follows claude-session's recorded cause (observed `done` with
+  `forwarded_hup`, because the real model had already reported).
+
+Contradicted (tests and docs corrected):
+
+- interactive runs never stay unreported or reach `needs-input`: the real model files a report in
+  one turn even for "Reply with the single word ok.";
+- the promotion test compared the recorded supervisor with the pane process: the recorded
+  supervisor stays the original headless supervisor, and the pane runs `supervise --host`;
+- SIGKILL of exec only does not leave claude alive: a headless claude dies with the wrapper
+  (`PR_SET_PDEATHSIG`), the run ends `lost`, the agent parks `lost` with `needs_attention: lost` and
+  `supervisor_lost` false;
+- two fidelity `ACCEPTED` rows (an empty `--model`, `--permission-profile=-x`) are refused by the
+  real 0.45.2 with `usage`; the fake is corrected.
+
+Open:
+
+- real-sandbox behavior (no bwrap on the host; the fork into a throwaway passes `--sandbox preferred`);
+- the park reason for kill-pane or window close of an interactive session that has not reported
+  (`killed` was not observed);
+- the wrapper-dead-child-alive state (only with an interactive child or a SIGTERM-ignoring child).
 
 ## Extending
 

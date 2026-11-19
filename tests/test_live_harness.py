@@ -650,6 +650,39 @@ def test_an_api_key_is_approved_by_suffix_in_the_private_claude_json(world: harn
     assert "sk-ant" not in path.read_text()
 
 
+def test_trust_is_additive_across_calls(world: harness.World) -> None:
+    world.trust(Path("/first"))
+    world.trust(Path("/second"))
+    path = world.home / ".claude.json"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    projects = json.loads(path.read_text())["projects"]
+    assert set(projects) == {"/first", "/second"}
+
+
+def test_diagnostics_redact_credential_fragments(world: harness.World) -> None:
+    from tests.live import billed
+
+    key = "sk-ant-" + "k" * 30 + "ABCDEFGHIJKLMNOPQRST"
+    world.auth = harness.Auth({"ANTHROPIC_API_KEY": key}, None, "ANTHROPIC_API_KEY")
+    text = "dialog: ...ABCDEFGHIJKLMNOPQRST? and sk-ant-api03-zz_Z-9 here"
+    out = billed.redact(world, text)
+    assert "ABCDEFGHIJKLMNOPQRST" not in out and "sk-ant-api03" not in out
+    assert "dialog:" in out
+    world.auth = harness.Auth(
+        {"CLAUDE_CODE_OAUTH_TOKEN": "tok-secret-value"}, None, "CLAUDE_CODE_OAUTH_TOKEN"
+    )
+    assert "tok-secret-value" not in billed.redact(world, "x tok-secret-value y")
+
+
+def test_bsetup_state_directories_are_private(world: harness.World) -> None:
+    from tests.live import billed
+
+    billed.prepare_state_dirs(world)
+    base = world.home / ".local" / "state" / "claude-session"
+    for d in (base, base / "sessions"):
+        assert stat.S_IMODE(d.stat().st_mode) == 0o700
+
+
 def test_a_world_close_kills_only_tracked_processes_by_identity(world: harness.World) -> None:
     mine = subprocess.Popen(["sleep", "60"], start_new_session=True)
     other = subprocess.Popen(["sleep", "60"], start_new_session=True)

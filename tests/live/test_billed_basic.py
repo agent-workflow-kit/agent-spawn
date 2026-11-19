@@ -183,7 +183,7 @@ def test_interactive_launch_in_a_real_window_and_window_close(billed_world: Worl
     check(killed.returncode == 0, "kill-window works", "design.md B3", killed.stderr)
     parked = expect_parked(world, aid, 90)
     check(
-        parked["park_reason"] == expected_park_after_hangup(world, csid, parked)
+        parked["park_reason"] == expected_park_after_hangup(world, csid)
         and parked["needs_attention"] is None,
         "closing the window parks the agent killed (done when the session had already reported) "
         "without attention",

@@ -250,7 +250,7 @@ _ALL = [
     _s(
         "interactive-window-close",
         "billed-1",
-        "interactive launch in a real window; closing the window parks killed",
+        "interactive launch in a real window; closing the window parks as claude-session recorded the end (done when the session had reported, killed otherwise)",
         "claude claude-session termctl tmux",
         sessions=1,
         turns=3,
@@ -352,7 +352,7 @@ _ALL = [
     _s(
         "liveness-kills",
         "billed-3",
-        "SIGKILL of the supervisor only and of exec only against a real run in a pane",
+        "SIGKILL of the supervisor only (claude lives on) and of exec only (a headless claude dies with the wrapper: run and park lost) against a real run",
         "claude claude-session termctl tmux",
         sessions=2,
         turns=6,
