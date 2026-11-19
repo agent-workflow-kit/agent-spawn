@@ -247,8 +247,8 @@ docstrings; run with `LIVE_OBSERVATIONS=live.jsonl` to get the observed values.
 
 ## First billed run
 
-The billed waves ran once with the real Claude Code. Six fix commits' worth of changes from that run
-are on this branch and have not been re-run billed.
+The billed waves ran once with the real Claude Code. The fixes from that run are on this branch
+and have not been re-run billed.
 
 Confirmed live:
 
@@ -264,13 +264,14 @@ Confirmed live:
 - `exited-unreported` (exit 14) for a stub that exits 0; a dead pane closed via reconcile;
 - the report-resume chain (run 1 `exited-unreported` with `no_report`, automatic resume run 2
   `done`);
-- window close and kill-pane: the park follows claude-session's recorded cause (observed `done` with
-  `forwarded_hup`, because the real model had already reported).
+- window close and kill-pane: the park follows claude-session's recorded cause. Window close
+  (`interactive-window-close`) was observed `done` with `forwarded_hup`, because the real model had
+  already reported; for kill-pane the unreported case was not observed.
 
 Contradicted (tests and docs corrected):
 
-- interactive runs never stay unreported or reach `needs-input`: the real model files a report in
-  one turn even for "Reply with the single word ok.";
+- in the billed run the real model filed its report in one turn even for "Reply with the single
+  word ok.", so no interactive run stayed unreported or reached `needs-input`;
 - the promotion test compared the recorded supervisor with the pane process: the recorded
   supervisor stays the original headless supervisor, and the pane runs `supervise --host`;
 - SIGKILL of exec only does not leave claude alive: a headless claude dies with the wrapper

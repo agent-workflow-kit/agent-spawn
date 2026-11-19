@@ -353,6 +353,10 @@ def test_killing_the_supervisor_only_and_exec_only(billed_world: World) -> None:
             parked = _supervisor_only_case(world, aid, csid, label)
         else:
             parked = _exec_only_case(world, aid, csid, label)
+        world.observe(
+            f"liveness.{label}.parked",
+            {k: parked.get(k) for k in ("park_reason", "needs_attention", "supervisor_lost")},
+        )
         ran = f"post-park hook runs after the {label} case"
 
         def hook_runs() -> int:

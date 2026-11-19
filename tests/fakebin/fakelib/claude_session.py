@@ -364,6 +364,8 @@ def check_launch_flags(ctx: Context, p: Parsed) -> None:
             ctx.usage(f"--max-turns must be between 1 and {MAX_INTEGER}")
     # Real 0.45.2: exit 2 "invalid flag value" (a model must be non-empty, without control
     # characters; a profile name is ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ unless it is file-like).
+    # Name grammar only: the real tool also refuses a grammar-valid profile name that no built-in
+    # or configured profile defines (usage `invalid flag value`); that is not modeled.
     model = p.get("--model")
     if model is not None and (
         model == "" or model.startswith("-") or re.search(r"[\x00-\x1f\x7f-\x9f]", model)
