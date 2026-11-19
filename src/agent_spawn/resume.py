@@ -124,6 +124,7 @@ PASS_THROUGH_NAMES = (
     "env_allow",
     "env_allowlist_only",
     "auto_exit",
+    "implicit_done",
 )
 
 
@@ -495,6 +496,7 @@ class Resume(Launch):
             env_allow=tuple(pt.get("env_allow") or ()),
             env_allowlist_only=None if env_only is None else tuple(v for v in env_only if v),
             auto_exit=pt.get("auto_exit"),
+            implicit_done=pt.get("implicit_done"),
             reset=tuple(self.args.reset or ()) if resume else (),
             allow_tainted=bool(self.args.allow_tainted) if resume else False,
             override_escalation=self.pass_override,

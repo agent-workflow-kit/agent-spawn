@@ -401,3 +401,46 @@ def test_start_and_friends_refuse_what_the_real_argv_parsing_refuses(
     )
     done = fakebin.run("claude-session", *args)
     assert done.returncode == 2, (done.stdout, done.stderr)
+
+
+# --- --implicit-done / --no-implicit-done (claude-session 0.43.0; grammar from its source, not
+# yet in the live fidelity table: see FIDELITY.md) ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        pytest.param(["--implicit-done"], id="implicit-done"),
+        pytest.param(["--no-implicit-done"], id="no-implicit-done"),
+        pytest.param(["--implicit-done", "--no-implicit-done"], id="both-last-wins"),
+    ],
+)
+def test_start_accepts_the_implicit_done_flags(fakebin: Fakebin, extra: list[str]) -> None:
+    code, _ = run_json(
+        fakebin, "claude-session", "start", *HEADLESS, *extra, schema="cli/start.json"
+    )
+    assert code == 0
+
+
+@pytest.mark.parametrize("flag", ["--implicit-done", "--no-implicit-done"])
+def test_start_refuses_a_value_for_the_implicit_done_flags(fakebin: Fakebin, flag: str) -> None:
+    done = fakebin.run("claude-session", "start", "--json", *HEADLESS, f"{flag}=true")
+    assert done.returncode == 2
+
+
+@pytest.mark.parametrize("flag", ["--implicit-done", "--no-implicit-done"])
+def test_reset_implicit_done_with_the_flag_is_a_usage_error(fakebin: Fakebin, flag: str) -> None:
+    fakebin.seed_session()
+    done = fakebin.run(
+        "claude-session", "start", "--json", "--resume", "cs-abcdefgh",
+        "--reset", "implicit-done", flag,
+    )  # fmt: skip
+    assert done.returncode == 2
+
+
+def test_reset_implicit_done_alone_is_accepted(fakebin: Fakebin) -> None:
+    fakebin.seed_session()
+    done = fakebin.run(
+        "claude-session", "start", "--json", "--resume", "cs-abcdefgh", "--reset", "implicit-done"
+    )
+    assert done.returncode == 0, (done.stdout, done.stderr)
