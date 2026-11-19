@@ -796,7 +796,10 @@ class World:
     def json_tool(
         self, name: str, *args: str, ok: Sequence[int] = (0,), **kwargs: Any
     ) -> Any:
-        done = self.tool(name, "--json", *args, **kwargs)
+        # claude-session takes global flags after the command; termctl's `open ... -- argv` ends
+        # its options at `--`, so its flag goes first.
+        argv = [*args, "--json"] if name == "claude-session" else ["--json", *args]
+        done = self.tool(name, *argv, **kwargs)
         return parse_json(done, ok, f"{name} {' '.join(args[:3])}")
 
     def tmux(self, *args: str, socket: str | Path | None = None, **kwargs: Any) -> subprocess.CompletedProcess[str]:
