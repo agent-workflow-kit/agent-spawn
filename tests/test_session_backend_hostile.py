@@ -456,6 +456,17 @@ def test_auto_exit_is_tri_state() -> None:
     assert not any("auto-exit" in a for a in argv_of(spec()))
 
 
+def test_implicit_done_is_tri_state() -> None:
+    assert "--implicit-done" in argv_of(spec(implicit_done=True))
+    assert "--no-implicit-done" in argv_of(spec(implicit_done=False))
+    assert not any(a in ("--implicit-done", "--no-implicit-done") for a in argv_of(spec()))
+    # a resume carries the override only when it is given now
+    assert "--no-implicit-done" in argv_of(spec(resume=SESSION, implicit_done=False))
+    assert not any(
+        a in ("--implicit-done", "--no-implicit-done") for a in argv_of(spec(resume=SESSION))
+    )
+
+
 def test_start_never_runs_a_command_for_a_bad_spec() -> None:
     backend, gateway = backend_for(out(GOOD_START))
     with pytest.raises(CliError):

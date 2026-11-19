@@ -88,6 +88,7 @@ PASS_THROUGH_FLAGS = (
     "env_allow",
     "env_allowlist_only",
     "auto_exit",
+    "implicit_done",
 )
 HANDLED_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 INPUT_NAME = re.compile(r"[A-Za-z0-9._-]{1,128}")
@@ -621,6 +622,7 @@ class Launch:
             if a.env_allowlist_only is None
             else tuple(v for v in a.env_allowlist_only if v),
             auto_exit=a.auto_exit,
+            implicit_done=a.implicit_done,
             repo=a.repo,
             cwd=cwd,
             labels=tuple(labels.texts()),

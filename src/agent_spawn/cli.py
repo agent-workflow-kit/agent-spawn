@@ -207,6 +207,14 @@ def _add_pass_throughs(parser: Any) -> None:
     auto_exit.add_argument("--auto-exit", dest="auto_exit", action="store_const", const=True)
     auto_exit.add_argument("--no-auto-exit", dest="auto_exit", action="store_const", const=False)
     parser.set_defaults(auto_exit=None)
+    implicit_done = parser.add_mutually_exclusive_group()
+    implicit_done.add_argument(
+        "--implicit-done", dest="implicit_done", action="store_const", const=True
+    )
+    implicit_done.add_argument(
+        "--no-implicit-done", dest="implicit_done", action="store_const", const=False
+    )
+    parser.set_defaults(implicit_done=None)
 
 
 def _add_run_flags(parser: Any, *, with_launch_only: bool) -> None:

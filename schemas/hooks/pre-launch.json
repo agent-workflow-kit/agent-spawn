@@ -164,7 +164,17 @@
       "propertyNames": {
         "pattern": "^[a-z][a-z0-9_]*$"
       },
-      "description": "The claude-session flags given, by name (e.g. sandbox, permission_profile, env_allowlist_only, setting_sources), with their values; never prompt text."
+      "properties": {
+        "auto_exit": {
+          "type": "boolean",
+          "description": "--auto-exit (true) or --no-auto-exit (false); absent when neither was given."
+        },
+        "implicit_done": {
+          "type": "boolean",
+          "description": "--implicit-done (true) or --no-implicit-done (false), claude-session's per-call override of the kind's implicit_done; absent when neither was given (the kind's value applies)."
+        }
+      },
+      "description": "The claude-session flags given, by name (e.g. sandbox, permission_profile, env_allowlist_only, setting_sources, implicit_done), with their values; never prompt text."
     },
     "actor": {
       "$ref": "../defs.json#/$defs/actor"

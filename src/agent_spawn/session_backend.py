@@ -154,6 +154,7 @@ class RunSpec:
     env_allow: tuple[str, ...] = ()
     env_allowlist_only: tuple[str, ...] | None = None
     auto_exit: bool | None = None
+    implicit_done: bool | None = None
     reset: tuple[str, ...] = ()
     allow_tainted: bool = False
     override_escalation: bool = False
@@ -278,6 +279,8 @@ def launch_flags(spec: RunSpec) -> list[str]:
             argv.append("--env-allowlist-only=")
     if spec.auto_exit is not None:
         argv.append("--auto-exit" if spec.auto_exit else "--no-auto-exit")
+    if spec.implicit_done is not None:
+        argv.append("--implicit-done" if spec.implicit_done else "--no-implicit-done")
     for setting in spec.reset:
         argv.append(_flag("--reset", setting))
     if spec.allow_tainted:

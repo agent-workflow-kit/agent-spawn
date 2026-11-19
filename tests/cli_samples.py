@@ -22,6 +22,8 @@ PASS_THROUGHS: dict[str, str | None] = {
     "--env-allowlist-only": "PATH",
     "--auto-exit": None,
     "--no-auto-exit": None,
+    "--implicit-done": None,
+    "--no-implicit-done": None,
 }
 
 LAUNCH: dict[str, str | None] = {

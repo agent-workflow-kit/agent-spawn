@@ -71,6 +71,8 @@ LAUNCH = {
     "--reads-third-party": BOOL,
     "--auto-exit": BOOL,
     "--no-auto-exit": BOOL,
+    "--implicit-done": BOOL,
+    "--no-implicit-done": BOOL,
     "--env-allow": MULTI,
     "--env-allowlist-only": MULTI,
     "--reset": MULTI,
@@ -94,6 +96,7 @@ RESET_NAMES = (
     "max-turns",
     "permission-profile",
     "auto-exit",
+    "implicit-done",
 )
 STATES = (
     "starting",
@@ -377,7 +380,7 @@ def check_launch_flags(ctx: Context, p: Parsed) -> None:
         if resettable not in RESET_NAMES:
             ctx.usage(f"argument --reset: invalid choice: {resettable!r}")
         if f"--{resettable}" in p.flags or (
-            resettable == "auto-exit" and "--no-auto-exit" in p.flags
+            resettable in ("auto-exit", "implicit-done") and f"--no-{resettable}" in p.flags
         ):
             ctx.usage(f"--reset {resettable} together with --{resettable}")
     for var in p.multi("--env-allow"):
@@ -550,6 +553,12 @@ def do_start(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
     return 0, out, "start"
 
 
+def implicit_done_value(p: Parsed) -> bool:
+    """The effective implicit_done: the last of the two flags wins, default true."""
+    given = [t for t in p.tokens if t in ("--implicit-done", "--no-implicit-done")]
+    return given[-1] == "--implicit-done" if given else True
+
+
 def dry_run_plan(p: Parsed, existing: str | None, fork: bool) -> dict[str, Any]:
     kind = p.get("--kind", "implement")
     run = 1
@@ -574,7 +583,7 @@ def dry_run_plan(p: Parsed, existing: str | None, fork: bool) -> dict[str, Any]:
         "skill": p.get("--skill"),
         "has_prompt": p.has("--prompt-file"),
         "input_files": [os.path.basename(f) for f in p.multi("--input-file")],
-        "implicit_done": True,
+        "implicit_done": implicit_done_value(p),
         "permission_profile": None,
         "timeout": None,
         "max_turns": None,
@@ -592,7 +601,7 @@ def dry_run_plan(p: Parsed, existing: str | None, fork: bool) -> dict[str, Any]:
             "sandbox_available": False,
             "sandbox_problems": [],
             "reads_third_party": p.has("--reads-third-party"),
-            "implicit_done": True,
+            "implicit_done": implicit_done_value(p),
             "setting_sources": [],
             "mcp": "none",
             "cwd": "session-dir",
