@@ -32,7 +32,12 @@ def bsetup(world: World, *, cs_extra: str = "", spawn_extra: str = "") -> Wt:
     world.claude_session_config(cs_extra)
     world.write_config("agent-spawn", "handoff_timeout: 30s\n" + spawn_extra)
     wt = Wt(world)
-    world.trust(wt.repo.clone)
+    # An interactive claude also asks "Adding a new directory" for claude-session's session
+    # directory (``--add-dir``, under the private state home); trust is inherited from a trusted
+    # parent, so trust the directory that holds the session directories.
+    sessions = world.home / ".local" / "state" / "claude-session" / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    world.trust(wt.repo.clone, sessions)
     return wt
 
 
@@ -142,19 +147,39 @@ def wait_session_state(
     )
 
 
+def _diagnose(world: World, agent_id: str) -> str:
+    """What a timed-out interactive turn looked like: the agent's state and the pane text (the
+    visible screen of the real claude TUI: no credentials)."""
+    try:
+        shown = show(world, agent_id)
+        parts = [
+            f"status={shown['agent'].get('status')} session={shown.get('session')} "
+            f"first_working_at={[r.get('first_working_at') for r in shown.get('runs', [])]}"
+        ]
+        for pane in world.json_tool("termctl", "list", "--label", f"agent={agent_id}")["panes"]:
+            cap = world.tmux("capture-pane", "-p", "-t", pane["pane_id"], socket=pane["socket_path"])
+            parts.append(f"pane {pane['pane_id']} screen: {cap.stdout[-1500:]!r}")
+        return " | ".join(parts)
+    except Exception as exc:  # diagnostics must never mask the real failure
+        return f"(diagnostics failed: {exc})"
+
+
 def wait_turn_done(world: World, agent_id: str, timeout: float = 180) -> dict[str, Any]:
     """Wait until the interactive run has had its turn: ``first_working_at`` is set and the
     session state is settled (idle, reported or needs-input); then require idle or reported."""
-    state = wait_agent(
-        world,
-        agent_id,
-        lambda s: (
-            bool(s["runs"] and s["runs"][0].get("first_working_at"))
-            and (s.get("session") or {}).get("state") in {"idle", "reported", "needs-input"}
-        ),
-        f"agent {agent_id} to finish its first turn",
-        timeout,
-    )
+    try:
+        state = wait_agent(
+            world,
+            agent_id,
+            lambda s: (
+                bool(s["runs"] and s["runs"][0].get("first_working_at"))
+                and (s.get("session") or {}).get("state") in {"idle", "reported", "needs-input"}
+            ),
+            f"agent {agent_id} to finish its first turn",
+            timeout,
+        )
+    except LiveError as err:
+        raise LiveError(f"{err}; {_diagnose(world, agent_id)}") from err
     got = state["session"]["state"]
     if got not in {"idle", "reported"}:
         raise LiveError(
