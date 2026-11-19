@@ -139,6 +139,16 @@ def private_tmux(isolation_env: Isolation) -> Iterator[PrivateTmux]:
         server.stop()
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]) -> Iterator[None]:
+    """Under pytest-xdist, name the worker in a failed test's report (``gw0``, ...)."""
+    outcome = yield
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    report = outcome.get_result()
+    if worker and report.failed:
+        report.sections.append(("xdist worker", f"{worker} (pid {os.getpid()})"))
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """`live` tests need the real world: never run them in CI, even with ``-m live``."""
     if not os.environ.get("CI"):

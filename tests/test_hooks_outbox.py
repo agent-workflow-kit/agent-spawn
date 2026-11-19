@@ -703,7 +703,9 @@ def test_hook_ignoring_sigterm_is_killed(
     )
     found = track(tracker, pids)
     assert res.timed_out and res.signal == signal.SIGKILL
-    assert time.monotonic() - start < hooks.TERM_GRACE + 3
+    # Only a hang is caught here (the hook loops forever); the bound is generous so that a
+    # loaded machine (parallel workers) cannot fail it.
+    assert time.monotonic() - start < hooks.TERM_GRACE + 30
     assert_dead(found)
     names = [r["signal"] for r in log_records(state_dir) if r["event"] == "signal_sent"]
     assert names == ["SIGTERM", "SIGKILL"]
@@ -713,11 +715,13 @@ def test_cooperative_hook_exits_on_sigterm_without_waiting_for_the_grace(
     state_dir: Path,
 ) -> None:
     state_dir.mkdir()
-    start = time.monotonic()
     res = run_hook_process(
         "sleep 60", b"{}", hook="post-park", agent_id=ID, timeout=0.3, state_dir=state_dir
     )
-    assert res.timed_out and time.monotonic() - start < hooks.TERM_GRACE
+    # The event, not the elapsed time: a hook that exits on SIGTERM is never sent SIGKILL.
+    assert res.timed_out and res.signal != signal.SIGKILL
+    names = [r["signal"] for r in log_records(state_dir) if r["event"] == "signal_sent"]
+    assert names == ["SIGTERM"]
 
 
 def test_leader_exits_but_child_holds_the_pipe(
@@ -725,14 +729,16 @@ def test_leader_exits_but_child_holds_the_pipe(
 ) -> None:
     state_dir.mkdir()
     pids = tracker_dir / "pids"
-    cmd = f"sleep 20 & echo $! > {shlex.quote(str(pids))}; echo done; exit 0"
+    cmd = f"sleep 60 & echo $! > {shlex.quote(str(pids))}; echo done; exit 0"
     start = time.monotonic()
     res = run_hook_process(
-        cmd, b"{}", hook="post-park", agent_id=ID, timeout=10, state_dir=state_dir
+        cmd, b"{}", hook="post-park", agent_id=ID, timeout=50, state_dir=state_dir
     )
     track(tracker, pids)
     assert res.ok and res.stdout == b"done\n"
-    assert time.monotonic() - start < hooks.DRAIN_GRACE + 3
+    # Returning at all, long before the child's 60 s sleep (and the 50 s timeout) ends, is what
+    # is tested; the bound is far from the drain grace so a loaded machine cannot fail it.
+    assert time.monotonic() - start < 25
 
 
 def test_exit_status_and_signal_death(state_dir: Path) -> None:
@@ -794,8 +800,8 @@ def test_async_hook_is_detached_and_counts_as_delivered(
     out = tmp_path / "out.jsonl"
     queue(store, event("post-park"))
     runner = AsyncRunner(state_dir)
-    cmd = f"sleep 0.4; {recorder(out)}"
-    start = time.monotonic()
+    gate = tmp_path / "gate"  # the hook waits for this file, so it is still running on return
+    cmd = f"while [ ! -e {shlex.quote(str(gate))} ]; do sleep 0.05; done; {recorder(out)}"
     result = deliver_outbox(
         store,
         ID,
@@ -803,8 +809,10 @@ def test_async_hook_is_detached_and_counts_as_delivered(
         state_dir=state_dir,
         runner=runner,
     )
-    assert result.delivered == 1 and time.monotonic() - start < 0.35
+    assert result.delivered == 1
+    assert not out.exists()  # delivery did not wait for the hook
     assert runner.poll() == 1
+    gate.touch()
     assert runner.wait(10) == 0
     assert len(lines(out)) == 1
     assert track(tracker) == []
@@ -1269,7 +1277,8 @@ def test_unidentified_group_still_times_out_and_only_the_leader_is_signalled(
         cmd, b"{}", hook="post-park", agent_id=ID, timeout=0.5, state_dir=state_dir
     )
     found = track(tracker, pids)
-    assert res.timed_out and not res.unreaped and time.monotonic() - start < 4
+    # The child sleeps 60 s: returning in under half of that shows nothing waited for it.
+    assert res.timed_out and not res.unreaped and time.monotonic() - start < 30
     leader, child = found
     assert not alive(leader)
     assert alive(child)  # unverified group members are never signalled

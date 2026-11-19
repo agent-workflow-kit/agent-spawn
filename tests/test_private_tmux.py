@@ -87,7 +87,7 @@ def test_a_wrong_start_time_means_the_pid_was_reused_and_nothing_is_signaled() -
         server._server_start = "1"  # pyright: ignore[reportPrivateUsage]
         started = time.monotonic()
         server.stop()
-        assert time.monotonic() - started < 3
+        assert time.monotonic() - started < 20  # generous: only a hang is caught
         assert other.poll() is None
     finally:
         other.kill()

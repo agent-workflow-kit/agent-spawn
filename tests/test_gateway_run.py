@@ -78,14 +78,15 @@ def test_a_timeout_returns_even_when_a_grandchild_holds_the_pipes(
     pid_file = tmp_path / "grandchild"
     code = (
         "import subprocess, time\n"
-        f"p = subprocess.Popen(['sleep', '5'])\n"
+        f"p = subprocess.Popen(['sleep', '60'])\n"
         f"open({str(pid_file)!r}, 'w').write(str(p.pid))\n"
         "time.sleep(60)\n"
     )
     start = time.monotonic()
     with pytest.raises(gw.TimeoutExpired):
         run(tmp_path, code, timeout=1.5)
-    assert time.monotonic() - start < 4
+    # The grandchild sleeps 60 s; returning in under half of that shows run did not wait for it.
+    assert time.monotonic() - start < 30
     handle = procs.identify(int(pid_file.read_text()))
     if handle is not None:  # record the grandchild so the guard kills exactly it
         with handle:
