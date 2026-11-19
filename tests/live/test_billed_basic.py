@@ -2,9 +2,8 @@
 
 Every test uses the ``billed_world`` fixture (credentials in the private home, the counting
 ``claude`` wrapper first on ``PATH``). Expected sessions and turns are in ``scenarios.py``.
-These tests were written against the documents and the unbilled runs and have not been run
-against a real Claude Code yet: the first ``make live`` run decides which assertions need
-adjusting, and every failure message names the assumption it broke.
+These tests were run against the real tools on 2026-11-19, see docs/live-testing.md, Results.
+Every failure message names the assumption it broke.
 """
 
 from __future__ import annotations

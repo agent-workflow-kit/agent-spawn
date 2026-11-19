@@ -1,7 +1,7 @@
 """Billed scenarios, wave 2: resume, fork, teardown and promotion with real Claude Code.
 
-See ``test_billed_basic.py`` for the conventions; these tests have not been run against a real
-Claude Code yet.
+See ``test_billed_basic.py`` for the conventions; these tests were run against the real tools on
+2026-11-19, see docs/live-testing.md, Results.
 """
 
 from __future__ import annotations

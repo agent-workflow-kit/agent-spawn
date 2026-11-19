@@ -5,7 +5,7 @@ Code (`claude --model haiku`), tmux, claude-session, termctl, wtctl, git and, wh
 jobsctl. It re-checks every relied-on third-party behavior that the fakes in `tests/fakebin/`
 only assume ([FIDELITY.md](../tests/fakebin/FIDELITY.md)) and that the design records as
 "assumed, check live" ([design.md](design.md), Live verification). It is **opt-in**, never part
-of `make verify` and never run in CI. Issue #36 closes only after a full run passes (the first billed run found failures; their fixes are not yet re-run billed).
+of `make verify` and never run in CI. The suite has passed on Linux against the real tools (see [Results](#results)); what it does not cover is tracked in issues #97, #99, #100 and #37.
 
 Some scenarios cost API usage (about seventy haiku turns in total, see [Cost](#cost)); the rest
 start no Claude Code at all.
@@ -247,45 +247,78 @@ docstrings; run with `LIVE_OBSERVATIONS=live.jsonl` to get the observed values.
 
 ## First billed run
 
-The billed waves ran once with the real Claude Code. The fixes from that run are on this branch
-and have not been re-run billed.
+The billed waves ran with the real Claude Code on 2026-11-19 (haiku only). The #36 comment records
+that the first run (42 haiku sessions) passed 9 of the 10 scenarios it ran; it does not name them
+or the failing one, and the count is not reconciled with the 13 billed scenarios listed under
+[Results](#results). PR #98 names the scenarios it fixed after that run: `report-resume-chain`,
+`interactive-window-close`, `resumable-after-kill-pane`, `fork-throwaway`, `promotion-escalation`
+and the exec-only case of `liveness-kills`. A rerun (13 haiku sessions) after the fixes passed;
+the #36 final comment says every rerun scenario passed but does not list which ones were rerun.
+The failures were harness and doc assumptions (below), not product bugs. Combined result:
+[Results](#results).
 
-Confirmed live:
+Contradicted by the first run (tests and docs corrected):
 
-- real hook events and `first_working_at`; the supervisor as the pane process (A8/B1) through the
-  real chain;
-- resume, in-place fork and fork into a throwaway; teardown with the real wtctl;
-- promotion (D5) with the same Claude session id;
-- SIGTERM at idle gives `done`/`signal_term`, mid-turn gives `killed`/`signal_term`; the stop grace
-  of about 10.5 s with SIGTERM then SIGKILL;
-- the minimal environment (D4); `jobsctl cancel --force`;
-- SIGKILL of the supervisor only: claude lives, the run is not finalized, the agent parks `killed`
-  after `stop`;
-- `exited-unreported` (exit 14) for a stub that exits 0; a dead pane closed via reconcile;
-- the report-resume chain (run 1 `exited-unreported` with `no_report`, automatic resume run 2
-  `done`);
-- window close and kill-pane: the park follows claude-session's recorded cause. Window close
-  (`interactive-window-close`) was observed `done` with `forwarded_hup`, because the real model had
-  already reported; for kill-pane the unreported case was not observed.
-
-Contradicted (tests and docs corrected):
-
-- in the billed run the real model filed its report in one turn even for "Reply with the single
-  word ok.", so no interactive run stayed unreported or reached `needs-input`;
+- the real model filed its report in one turn even for "Reply with the single word ok.", so no
+  interactive run stayed unreported or reached `needs-input`; the window-close park was
+  `done`/`forwarded_hup`;
 - the promotion test compared the recorded supervisor with the pane process: the recorded
   supervisor stays the original headless supervisor, and the pane runs `supervise --host`;
 - SIGKILL of exec only does not leave claude alive: a headless claude dies with the wrapper
-  (`PR_SET_PDEATHSIG`), the run ends `lost`, the agent parks `lost` with `needs_attention: lost` and
-  `supervisor_lost` false;
+  (`PR_SET_PDEATHSIG`), the run ends `lost`, the agent parks `lost` with `needs_attention: lost`
+  and `supervisor_lost` false;
 - two fidelity `ACCEPTED` rows (an empty `--model`, `--permission-profile=-x`) are refused by the
   real 0.45.2 with `usage`; the fake is corrected.
 
-Open:
+## Results
 
-- real-sandbox behavior (no bwrap on the host; the fork into a throwaway passes `--sandbox preferred`);
-- the park reason for kill-pane or window close of an interactive session that has not reported
-  (`killed` was not observed);
-- the wrapper-dead-child-alive state (only with an interactive child or a SIGTERM-ignoring child).
+Run date 2026-11-19, Linux 5.15, claude 2.1.328 (`--model haiku`), claude-session 0.45.2,
+termctl 0.25.0, wtctl 0.32.0, tmux 3.5a, git 2.34.1, jobsctl (installed, used by
+`jobsctl-cancel-force`). The suite has passed on Linux:
+
+- **Unbilled wave** (`LIVE_SCENARIOS=unbilled`): 154 passed, 4 skipped (the recorded-only
+  scenarios `placement-here-terminal`, `upgrade-live-supervisor` and `real-crontab`, and `macos`,
+  issue #37).
+- **Billed scenarios**: the first run passed 9 of the 10 scenarios it ran and, after the harness
+  fixes, every rerun scenario passed (see [First billed run](#first-billed-run) for what is and
+  is not recorded about which ran when). The 13 billed scenarios passed live:
+  `headless-launch-wait`; `interactive-window-close` (parks
+  `done` with `forwarded_hup`, because the real model files a report in its first turn);
+  `report-resume-chain` (run 1 `exited-unreported` with `no_report`, automatic resume run 2
+  `done`, the agent parks `done`); `resume-continue`; `fork-inplace-holder` (after the fork,
+  `list --label agent=<source id>` returned only the source session); `fork-throwaway`
+  (needs `--reads-third-party --sandbox preferred` on a host without bwrap and socat);
+  `teardown-wtctl-real`; `promotion-escalation` (D5; final park `killed`; the original headless
+  supervisor stays the recorded one and the pane process runs `supervise --host`);
+  `resumable-after-kill-pane` (D1; run 1 `done` with `forwarded_hup`); `resumable-after-sigterm`
+  (D2/D3: SIGTERM at idle gives `done`/`signal_term`, mid-turn `killed`/`signal_term`);
+  `minimal-environment` (D4); `jobsctl-cancel-force`; `liveness-kills` (supervisor-only SIGKILL:
+  claude lives, the run is not finalized, the agent parks `killed` after `stop`; exec-only
+  SIGKILL: claude dies with the wrapper through claude-session's parent-death SIGTERM, the run
+  ends `lost`, the agent parks `lost` with `needs_attention: lost`, `supervisor_lost` false).
+- **Usage**: 42 haiku sessions in the first run (budget 45) and 13 in the rerun (budget 14), 55
+  in all, model haiku only. No API key was used: the login was copied to a private directory
+  (`AS_LIVE_COPY_LOGIN=1`) and deleted at each teardown.
+
+Real-tool facts confirmed live without billing: A8 (the termctl pid is tmux's `pane_pid` and the
+recorded supervisor chain), B1 (SIGHUP reaches only the leader), `--keep-on-exit failed`, the
+default-server dead-pane list and `close` without `--force` (exit 20 for a running pane), the default `stop` grace of about 10.5 s (SIGTERM then SIGKILL) against
+`DEFAULT_GRACE`, reconcile closing a dead pane on a real tmux server, `--reset-lease` repairs,
+cron against a fake crontab, the browse pilot over real `list`/`show` output, `exited-unreported`
+(exit 14) for a stub exiting 0, the wtctl facts of "First unbilled run", and claude-session
+`verify-secret` of an unknown session (exit 11), the 4-character id prefix, and `start --model ""`
+and `--permission-profile=-x` (exit 2, invalid flag value; the fake agrees).
+
+Still open or not covered, each tracked:
+
+- real-sandbox behavior (the host has no bwrap or socat) and the park reason of an unreported
+  interactive session killed at its window (never observed): #100;
+- the wrapper-dead-child-alive liveness state: #97;
+- the wtctl reuse mismatch: #99;
+- wave-2 coverage (the "Not covered" items in the table above): #100;
+- macOS: #37;
+- recorded-only: the `placement here` terminal check, the live upgrade of a running supervisor,
+  the real crontab.
 
 ## Extending
 
