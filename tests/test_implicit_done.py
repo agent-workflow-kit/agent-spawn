@@ -171,11 +171,19 @@ def test_the_automatic_report_resume_passes_no_override(env: Env, fakebin: Fakeb
 
 
 def test_the_flag_sits_after_auto_exit_and_before_the_labels(env: Env, fakebin: Fakebin) -> None:
-    launched(env, "--no-auto-exit", "--no-implicit-done")
+    agent_id = launched(env, "--no-auto-exit", "--no-implicit-done")
     (argv,) = starts(fakebin)
-    at = argv.index("--no-auto-exit")
-    assert argv[at : at + 2] == ["--no-auto-exit", "--no-implicit-done"]
-    assert argv[at + 2].startswith(("--repo=", "--cwd=", "--label="))
+    # Every launch_flags entry in order; only the cwd path is matched by its prefix.
+    assert argv[:5] == [
+        "start",
+        "--mode=headless",
+        "--skill=do-it",
+        "--no-auto-exit",
+        "--no-implicit-done",
+    ]
+    assert argv[5].startswith("--cwd=")
+    assert argv[6] == f"--label=agent={agent_id}"
+    assert argv[7].startswith("--hook=post-state-change=")
 
 
 def test_the_flag_sits_before_reset_on_resume(env: Env, fakebin: Fakebin) -> None:
@@ -185,8 +193,15 @@ def test_the_flag_sits_before_reset_on_resume(env: Env, fakebin: Fakebin) -> Non
     )
     assert done.returncode == 0, (done.stdout, done.stderr)
     argv = starts(fakebin)[-1]
-    at = argv.index("--no-implicit-done")
-    assert argv[at + 1] == "--reset=timeout"
+    assert argv[:6] == [
+        "start",
+        "--resume=cs-aaaaaaab",
+        "--mode=headless",
+        "--no-implicit-done",
+        "--reset=timeout",
+        f"--label=agent={agent_id}",
+    ]
+    assert argv[6].startswith("--hook=post-state-change=")
 
 
 def sessionless_agent(env: Env, fakebin: Fakebin, *extra: str) -> str:
