@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from tests.fakebin.harness import FAKES, Fakebin, flag_values, read_log_records
+from tests.procguard import ProcTracker
 
 HEADLESS = ("--mode", "headless", "--skill", "implement-issue")
 
@@ -178,7 +179,9 @@ def test_a_hung_call_gives_up_after_the_bounded_time(fakebin: Fakebin) -> None:
     assert done.returncode == 124 and "gave up after" in done.stderr
 
 
-def test_a_hung_call_ends_when_its_parent_is_gone(fakebin: Fakebin) -> None:
+def test_a_hung_call_ends_when_its_parent_is_gone(
+    fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
     fakebin.seed_session()
     fakebin.script("claude-session", "wait", hang=True)
     code = (
@@ -210,6 +213,9 @@ def test_a_hung_call_ends_when_its_parent_is_gone(fakebin: Fakebin) -> None:
     else:
         raise AssertionError("the orphaned fake did not exit")
     assert calls[0].exit_code == 124
+    # The exit is logged just before the process ends: wait for it to be gone (it was
+    # reparented to this process) so the stray guard does not see it mid-exit on a loaded machine.
+    proc_tracker.settle(30)
 
 
 # --- broken setups are one-line harness errors (R26, R27) ------------------------------------
