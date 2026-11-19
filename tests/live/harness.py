@@ -39,6 +39,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -727,6 +728,21 @@ class World:
             self.budget.maximum,
             self.environ.get(RUN_USD_ENV, DEFAULT_RUN_USD),
         )
+
+    @property
+    def agent_spawn_path(self) -> str:
+        """The console script of the interpreter running the tests (it must exec in place)."""
+        path = Path(sys.executable).parent / "agent-spawn"
+        if not path.exists():
+            raise LiveError(f"{path} is missing: run `uv sync`")
+        return str(path)
+
+    def agent_spawn(self, *args: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return self.run([self.agent_spawn_path, *args], **kwargs)
+
+    def spawn_json(self, *args: str, ok: Sequence[int] = (0,), **kwargs: Any) -> Any:
+        done = self.agent_spawn(*args, "--json", **kwargs)
+        return parse_json(done, ok, f"agent-spawn {' '.join(args[:3])}")
 
     @property
     def claude_path(self) -> str:
