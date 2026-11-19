@@ -780,6 +780,12 @@ class Supervisor:
         row = self.store.get_agent(self.agent_id)
         if row is None:
             return False
+        # The run is adopted: its time is written first (once, never rewritten), so whoever sees
+        # the agent live also sees `adopted_at`. A lost agent change below does not undo it.
+        with self.store.lease(
+            lifecycle.lease_key(self.agent_id), wait=lifecycle.LEASE_WAIT
+        ) as lease:
+            self.store.mark_run_adopted(lease, self.agent_id, ctx.run, self.gateway.wall_time())
         changes = {"last_live_at": time.time()}
         if row["status"] == "launching":
             lifecycle.go_live(self.store, self.agent_id, run=ctx.run, changes=changes)

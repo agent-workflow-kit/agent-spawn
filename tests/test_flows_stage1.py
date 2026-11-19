@@ -102,6 +102,10 @@ def test_blocked_review_run_is_acknowledged_resumed_and_finished(flow: Flow) -> 
     assert resumed.body["outcome"] == "done" and resumed.body["agent"]["status"] == "parked"
     assert flow.agent(agent_id)["run"] == 2
     assert flow.settled(agent_id)
+    # a launched run and a resumed run each show a non-null, non-decreasing adopted_at
+    shown = flow.cli(schema("show"), "show", agent_id, "--json").body["runs"]
+    stamps = [r["adopted_at"] for r in shown]
+    assert [r["run"] for r in shown] == [1, 2] and all(stamps) and stamps == sorted(stamps)
     assert flow.cli(schema("list"), "list", "--needs-attention", "--json").body["agents"] == []
     flow.validate_everything(expect_hooks=["post-launch", "post-escalate", "post-park"])
     escalations = flow.hooks_named("post-escalate", agent_id)

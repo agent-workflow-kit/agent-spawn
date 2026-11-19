@@ -136,6 +136,9 @@ def test_blocked_run_is_promoted_and_the_promoted_run_ends_done(
     assert second["promoted"] is True and second["mode"] == "interactive"
     assert second["placement"] == "window" and second["term_id"].startswith("tc-")
     assert second["outcome"]["outcome"] == "done" and second["outcome"]["promoted"] is True
+    # each run, the promoted one too, was adopted: a recorded, non-decreasing time
+    assert first["started_at"] is not None and second["started_at"] is not None
+    assert first["started_at"] <= second["started_at"]
     start = real_starts(fakebin)[1]
     assert f"--resume={row['csession_id']}" in start and "--mode=interactive" in start
     launches = [p for name, p in events(wenv, agent_id) if name == "post-launch"]

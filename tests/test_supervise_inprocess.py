@@ -106,6 +106,42 @@ def rig_for(
     return make
 
 
+# --- adopted_at (agent_runs.started_at) ---------------------------------------------------------
+
+
+def test_the_supervisor_records_the_adoption_time_of_its_run_once(
+    rig_for: Callable[..., Rig],
+) -> None:
+    rig = rig_for()
+    with Store.open(rig.state, create=False) as store:
+        assert (store.get_run(rig.agent_id, 1) or {})["started_at"] is None
+    rig.supervisor.run()
+    with Store.open(rig.state, create=False) as store:
+        run = store.get_run(rig.agent_id, 1)
+        assert run is not None and isinstance(run["started_at"], float)
+        first = run["started_at"]
+        # a second observation of the same run (a later poll) never rewrites it
+        with store.lease(f"agent:{rig.agent_id}") as lease:
+            assert store.mark_run_adopted(lease, rig.agent_id, 1, first + 50) is False
+        assert (store.get_run(rig.agent_id, 1) or {})["started_at"] == first
+    # and `show` maps it to adopted_at
+    from agent_spawn import showing
+
+    with Store.open(rig.state, create=False) as store:
+        shown = showing.run_objects(store, rig.agent())
+    assert shown[0]["adopted_at"] == ts(first)
+
+
+def test_a_run_that_never_reached_its_session_phase_has_no_adoption_time(
+    rig_for: Callable[..., Rig],
+) -> None:
+    rig = rig_for()
+    with Store.open(rig.state, create=False) as store:
+        rig.supervisor.store = store
+        assert rig.supervisor.mark_started(RunCtx(1, rig.outcome_file), "launch") is False
+        assert (store.get_run(rig.agent_id, 1) or {})["started_at"] is None
+
+
 # --- first_working_at ---------------------------------------------------------------------------
 
 EVENT_TS = "2026-11-02T10:00:05.000Z"

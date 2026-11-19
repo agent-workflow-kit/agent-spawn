@@ -76,8 +76,7 @@ def run_objects(store: Store, row: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "mode": mode if mode in _MODES else row.get("mode"),
                 "promoted": bool(stored.get("promoted")),
                 "auto_resumed": bool(stored.get("auto_resumed")),
-                # TODO(#12): nothing writes agent_runs.started_at; the supervisor must write it
-                # when it adopts the session.
+                # `started_at` is written once when the supervisor adopts the run (null before).
                 "adopted_at": ts(stored.get("started_at")),
                 "ended_at": ts(stored.get("ended_at")),
                 "first_working_at": ts(stored.get("first_working_at")),

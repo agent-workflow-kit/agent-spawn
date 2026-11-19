@@ -1360,6 +1360,21 @@ class Store:
         assert stored is not None
         return stored
 
+    def mark_run_adopted(self, lease: Lease, agent_id: str, run: int, when: float) -> bool:
+        """Record when the supervisor adopted run ``run`` (``started_at``, shown as ``adopted_at``).
+
+        Written once: only a NULL column is set, so the first time stays and a repeated call
+        changes nothing (``False``). A run with no row is not created (``False``)."""
+        with self.transaction():
+            self._require_lease(lease, f"agent:{agent_id}")
+            self._require_agent(agent_id)
+            cursor = self._conn.execute(
+                "UPDATE agent_runs SET started_at = ? "
+                "WHERE agent_id = ? AND run = ? AND started_at IS NULL",
+                (when, agent_id, run),
+            )
+            return cursor.rowcount == 1
+
     def _get_run(self, agent_id: str, run: int) -> dict[str, Any] | None:
         row = self._conn.execute(
             "SELECT * FROM agent_runs WHERE agent_id = ? AND run = ?", (agent_id, run)
