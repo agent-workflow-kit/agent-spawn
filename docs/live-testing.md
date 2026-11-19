@@ -281,10 +281,12 @@ termctl 0.25.0, wtctl 0.32.0, tmux 3.5a, git 2.34.1, jobsctl (installed, used by
   issue #37).
 - **Billed scenarios**: the first run passed 9 of the 10 scenarios it ran and, after the harness
   fixes, every rerun scenario passed (see [First billed run](#first-billed-run) for what is and
-  is not recorded about which ran when). The 13 billed scenarios passed live: `headless-launch-wait`; `interactive-window-close` (parks
+  is not recorded about which ran when). The 13 billed scenarios passed live:
+  `headless-launch-wait`; `interactive-window-close` (parks
   `done` with `forwarded_hup`, because the real model files a report in its first turn);
   `report-resume-chain` (run 1 `exited-unreported` with `no_report`, automatic resume run 2
-  `done`, the agent parks `done`); `resume-continue`; `fork-inplace-holder` (after the fork, `list --label agent=<source id>` returned only the source session); `fork-throwaway`
+  `done`, the agent parks `done`); `resume-continue`; `fork-inplace-holder` (after the fork,
+  `list --label agent=<source id>` returned only the source session); `fork-throwaway`
   (needs `--reads-third-party --sandbox preferred` on a host without bwrap and socat);
   `teardown-wtctl-real`; `promotion-escalation` (D5; final park `killed`; the original headless
   supervisor stays the recorded one and the pane process runs `supervise --host`);
