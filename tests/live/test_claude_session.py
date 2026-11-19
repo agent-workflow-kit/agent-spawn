@@ -6,6 +6,8 @@ the stub is not Claude Code, so the tests check claude-session's own bookkeeping
 claude-session config is private (``lost_grace`` and ``kill_grace`` shortened per test).
 """
 
+# ruff: noqa: E501  (assertion messages are prose: assumption, then the document line)
+
 from __future__ import annotations
 
 import json
@@ -77,7 +79,9 @@ def test_a_pending_run_status_list_stop_and_forget(world: World) -> None:
     work = prepare(world)
     outcome = world.root / "outcome" / "o.json"
     outcome.parent.mkdir()
-    started = start(world, work, "agent=ag-pend1", "--label", "job=j1", "--outcome-file", str(outcome))
+    started = start(
+        world, work, "agent=ag-pend1", "--label", "job=j1", "--outcome-file", str(outcome)
+    )
     sid = started["csession_id"]
     check(
         started["argv"][1:3] == ["exec", "--session-id"] and started["run"] == 1,
@@ -100,7 +104,11 @@ def test_a_pending_run_status_list_stop_and_forget(world: World) -> None:
         "#36 #9 status / design.md D43",
         {k: run.get(k) for k in ("phase", "state", "cwd")},
     )
-    check(status["expires_at"], "a pending run has expires_at", "#36 #29 (B) real status of an unadopted run")
+    check(
+        status["expires_at"],
+        "a pending run has expires_at",
+        "#36 #29 (B) real status of an unadopted run",
+    )
     check(
         {"agent=ag-pend1", "job=j1", "kind=implement"} <= set(status["labels"]),
         "status carries the labels agent-spawn compares",
@@ -108,7 +116,12 @@ def test_a_pending_run_status_list_stop_and_forget(world: World) -> None:
         status["labels"],
     )
     for key in ("tainted", "csession_dir", "claude_session_id", "live"):
-        check(key in status, f"status carries {key}", "#36 #15 (self-labeling reads status)", sorted(status))
+        check(
+            key in status,
+            f"status carries {key}",
+            "#36 #15 (self-labeling reads status)",
+            sorted(status),
+        )
     check(
         run.get("reads_third_party") is False and "implicit_done" in run,
         "status carries reads_third_party and implicit_done",
@@ -119,7 +132,11 @@ def test_a_pending_run_status_list_stop_and_forget(world: World) -> None:
     world.observe("claude-session.status.run.keys", sorted(run))
     other = start(world, work, "agent=ag-pend2", "--label", "job=j1")["csession_id"]
     both = cs(world, "list", "--label", "agent=ag-pend1", "--label", "job=j1")["sessions"]
-    check([s["csession_id"] for s in both] == [sid], "repeated --label filters AND", "#36 #9 list --label")
+    check(
+        [s["csession_id"] for s in both] == [sid],
+        "repeated --label filters AND",
+        "#36 #9 list --label",
+    )
     check(
         len(cs(world, "list", "--label", "job=j1")["sessions"]) == 2,
         "list --label job=j1 lists both",
@@ -158,9 +175,18 @@ def test_a_pending_run_status_list_stop_and_forget(world: World) -> None:
         "#36 #9 stop",
         stopped,
     )
-    check(outcome.exists(), "stop wrote the outcome file", "#36 #9 stop (runs the relay and writes it)")
+    check(
+        outcome.exists(),
+        "stop wrote the outcome file",
+        "#36 #9 stop (runs the relay and writes it)",
+    )
     mode = stat.S_IMODE(outcome.stat().st_mode)
-    check(mode == 0o600, "the outcome file has mode 0600", "#36 #8 claude-session (outcome file mode 0600)", oct(mode))
+    check(
+        mode == 0o600,
+        "the outcome file has mode 0600",
+        "#36 #8 claude-session (outcome file mode 0600)",
+        oct(mode),
+    )
     first = outcome.read_bytes()
     mtime = outcome.stat().st_mtime_ns
     cs_raw(world, "--json", "reconcile")
@@ -172,12 +198,26 @@ def test_a_pending_run_status_list_stop_and_forget(world: World) -> None:
     )
     body = json.loads(first)
     world.observe("claude-session.outcome-file.keys", sorted(body))
-    check(body.get("outcome") in ("killed", "not-started", "canceled"), "outcome object", "#36 #75 2", body)
+    check(
+        body.get("outcome") in ("killed", "not-started", "canceled"),
+        "outcome object",
+        "#36 #75 2",
+        body,
+    )
     done = cs(world, "status", sid)
-    world.observe("claude-session.stop-pending.final", {k: done["run"].get(k) for k in ("outcome", "end_reason", "phase")})
+    world.observe(
+        "claude-session.stop-pending.final",
+        {k: done["run"].get(k) for k in ("outcome", "end_reason", "phase")},
+    )
     # forget, then the id is unknown for every command
     cs(world, "forget", sid)
-    for argv in (["status", sid], ["label", "add", sid, "x=y"], ["label", "remove", sid, "x=y"], ["stop", sid], ["forget", sid]):
+    for argv in (
+        ["status", sid],
+        ["label", "add", sid, "x=y"],
+        ["label", "remove", sid, "x=y"],
+        ["stop", sid],
+        ["forget", sid],
+    ):
         gone = cs_raw(world, "--json", *argv)
         check(
             gone.returncode == 10,
@@ -186,7 +226,8 @@ def test_a_pending_run_status_list_stop_and_forget(world: World) -> None:
             (argv, gone.returncode, gone.stdout[-150:]),
         )
     check(
-        [s["csession_id"] for s in cs(world, "list", "--label", "agent=ag-pend1")["sessions"]] == [],
+        [s["csession_id"] for s in cs(world, "list", "--label", "agent=ag-pend1")["sessions"]]
+        == [],
         "list excludes forgotten sessions",
         "#36 #9 list",
     )
@@ -205,27 +246,65 @@ def test_an_unadopted_run_expires_never_adopted(world: World) -> None:
     status = cs(world, "status", sid)
     run = status["run"]
     check(
-        run["outcome"] == "not-started" and run["end_reason"] == "never_adopted" and run["phase"] == "launch",
+        run["outcome"] == "not-started"
+        and run["end_reason"] == "never_adopted"
+        and run["phase"] == "launch",
         "an unadopted run ends not-started / never_adopted in phase launch after lost_grace",
         "#36 #75 1 / promotion check B (expired, never_adopted)",
         {k: run.get(k) for k in ("outcome", "end_reason", "phase")},
     )
-    check(status["pending"] is False and status["expires_at"] is None, "pending and expires_at clear", "#36 #29 (B)")
+    check(
+        status["pending"] is False and status["expires_at"] is None,
+        "pending and expires_at clear",
+        "#36 #29 (B)",
+    )
     listed = cs(world, "list", "--label", "agent=ag-exp1")["sessions"]
     check(
-        listed[0]["last_outcome"] == "not-started" and listed[0]["last_end_reason"] == "never_adopted",
+        listed[0]["last_outcome"] == "not-started"
+        and listed[0]["last_end_reason"] == "never_adopted",
         "list reports the finalized run",
         "#36 #9 list may finalize runs",
         listed[0],
     )
-    plan = cs(world, "start", "--resume", sid, "--dry-run", "--cwd", str(work), "--mode", "headless", ok=(0, 20))
-    world.observe("claude-session.resume-dry-run.not-started", {k: plan.get(k) for k in ("csession_id", "cwd", "taints", "would_refuse", "fork")})
-    check(plan.get("csession_id") == sid, "a resume dry run names the existing session", "#36 #9 dry run")
-    fork = cs_raw(world, "--json", "start", "--resume", sid, "--fork", "--dry-run", "--cwd", str(work), "--mode", "headless")
+    plan = cs(
+        world,
+        "start",
+        "--resume",
+        sid,
+        "--dry-run",
+        "--cwd",
+        str(work),
+        "--mode",
+        "headless",
+        ok=(0, 20),
+    )
+    world.observe(
+        "claude-session.resume-dry-run.not-started",
+        {k: plan.get(k) for k in ("csession_id", "cwd", "taints", "would_refuse", "fork")},
+    )
+    check(
+        plan.get("csession_id") == sid,
+        "a resume dry run names the existing session",
+        "#36 #9 dry run",
+    )
+    fork = cs_raw(
+        world,
+        "--json",
+        "start",
+        "--resume",
+        sid,
+        "--fork",
+        "--dry-run",
+        "--cwd",
+        str(work),
+        "--mode",
+        "headless",
+    )
     world.observe("claude-session.fork-dry-run.not-started", (fork.returncode, fork.stdout[-400:]))
     if fork.returncode == 0:
         check(
-            json.loads(fork.stdout)["csession_id"] is None and json.loads(fork.stdout)["fork"] is True,
+            json.loads(fork.stdout)["csession_id"] is None
+            and json.loads(fork.stdout)["fork"] is True,
             "a fork dry run has csession_id null",
             "#36 #9 dry run (fork dry run has csession_id: null)",
         )
@@ -255,7 +334,9 @@ def test_verify_secret_reconcile_and_dry_run_refusal(world: World) -> None:
             (done.returncode, done.stdout[-200:]),
         )
     unknown = cs_raw(world, "--json", "verify-secret", "cs-nonexist1", input_text="x\n")
-    world.observe("claude-session.verify-secret.unknown", (unknown.returncode, unknown.stdout[-100:]))
+    world.observe(
+        "claude-session.verify-secret.unknown", (unknown.returncode, unknown.stdout[-100:])
+    )
     check(
         unknown.returncode == 11 and json.loads(unknown.stdout) == {"match": False},
         "verify-secret of an unknown session answers like a wrong secret (11, match false): "
@@ -263,7 +344,18 @@ def test_verify_secret_reconcile_and_dry_run_refusal(world: World) -> None:
         "#36 #15 verify-secret exit codes (the fake/interface assumed 10)",
         (unknown.returncode, unknown.stdout[-100:]),
     )
-    plan = cs_raw(world, "--json", "start", "--resume", sid, "--dry-run", "--cwd", str(work), "--mode", "headless")
+    plan = cs_raw(
+        world,
+        "--json",
+        "start",
+        "--resume",
+        sid,
+        "--dry-run",
+        "--cwd",
+        str(work),
+        "--mode",
+        "headless",
+    )
     body = json.loads(plan.stdout)
     check(
         plan.returncode == 20 and body.get("would_refuse") == "live",
@@ -272,15 +364,25 @@ def test_verify_secret_reconcile_and_dry_run_refusal(world: World) -> None:
         (plan.returncode, plan.stdout[-300:]),
     )
     check(
-        isinstance(body.get("profile", {}).get("reads_third_party"), bool) and isinstance(body.get("taints"), bool),
+        isinstance(body.get("profile", {}).get("reads_third_party"), bool)
+        and isinstance(body.get("taints"), bool),
         "refusal plans carry boolean profile.reads_third_party and taints",
         "#36 #9 (exit 12 plans still carry them)",
         {k: body.get(k) for k in ("taints",)},
     )
     reconcile = cs(world, "reconcile", "--dry-run")
     for key in ("already_running", "dry_run", "changes", "orphans", "warnings"):
-        check(key in reconcile, f"reconcile --dry-run carries {key}", "#36 #81 (reconcile.json shape)", sorted(reconcile))
-    check(reconcile["dry_run"] is True and reconcile["already_running"] is False, "dry run takes no lease", "#36 #81")
+        check(
+            key in reconcile,
+            f"reconcile --dry-run carries {key}",
+            "#36 #81 (reconcile.json shape)",
+            sorted(reconcile),
+        )
+    check(
+        reconcile["dry_run"] is True and reconcile["already_running"] is False,
+        "dry run takes no lease",
+        "#36 #81",
+    )
     cs(world, "stop", sid)
     cs(world, "forget", sid)
 
@@ -291,7 +393,10 @@ def test_a_killed_start_never_leaves_an_unlabeled_session(world: World) -> None:
     allocation and freezing, after freezing); ``list`` must never show a session without the
     ``agent=`` label the start was given, and a label search finds none or exactly one."""
     work = prepare(world)
-    argv_base = [str(world.bin / "claude-session"), *start_args(world, work, "agent=PLACEHOLDER", "--json")]
+    argv_base = [
+        str(world.bin / "claude-session"),
+        *start_args(world, work, "agent=PLACEHOLDER", "--json"),
+    ]
     seen = 0
     for i, offset in enumerate(range(0, 2000, 100)):
         label = f"agent=ag-kill{i:02d}"
@@ -311,10 +416,19 @@ def test_a_killed_start_never_leaves_an_unlabeled_session(world: World) -> None:
             pass
         child.wait()
         found = cs(world, "list", "--label", label)["sessions"]
-        check(len(found) <= 1, "a label search finds none or exactly one session", "#36 #75 2", (label, len(found)))
+        check(
+            len(found) <= 1,
+            "a label search finds none or exactly one session",
+            "#36 #75 2",
+            (label, len(found)),
+        )
         seen += len(found)
     everything = cs(world, "list")["sessions"]
-    unlabeled = [s["csession_id"] for s in everything if not any(label.startswith("agent=ag-kill") for label in s["labels"])]
+    unlabeled = [
+        s["csession_id"]
+        for s in everything
+        if not any(label.startswith("agent=ag-kill") for label in s["labels"])
+    ]
     check(
         not unlabeled,
         "a killed start never leaves a session without the label it was given",
@@ -325,7 +439,10 @@ def test_a_killed_start_never_leaves_an_unlabeled_session(world: World) -> None:
     for s in everything:
         status = cs(world, "status", s["csession_id"])
         if status["run"]["outcome"] not in (None,):
-            world.observe(f"claude-session.killed-start.{s['csession_id']}", {k: status["run"].get(k) for k in ("outcome", "end_reason", "phase")})
+            world.observe(
+                f"claude-session.killed-start.{s['csession_id']}",
+                {k: status["run"].get(k) for k in ("outcome", "end_reason", "phase")},
+            )
 
 
 @SC("cs-dry-run-shapes")
@@ -334,7 +451,18 @@ def test_implicit_done_flags_in_the_dry_run_plan(world: World) -> None:
     ``implicit_done`` shows the effective value; both together, ``=value`` and ``--reset
     implicit-done`` with a flag: the exit codes are recorded."""
     work = prepare(world)
-    base = ["start", "--dry-run", "--kind", "implement", "--mode", "headless", "--prompt-file", str(world.root / "prompt.md"), "--cwd", str(work)]
+    base = [
+        "start",
+        "--dry-run",
+        "--kind",
+        "implement",
+        "--mode",
+        "headless",
+        "--prompt-file",
+        str(world.root / "prompt.md"),
+        "--cwd",
+        str(work),
+    ]
     plain = cs(world, *base)
     yes = cs(world, *base, "--implicit-done")
     no = cs(world, *base, "--no-implicit-done")
@@ -344,21 +472,44 @@ def test_implicit_done_flags_in_the_dry_run_plan(world: World) -> None:
         "#36 #88 (real dry-run implicit_done)",
         (yes["implicit_done"], no["implicit_done"]),
     )
-    check(plain["implicit_done"] is plain["profile"]["implicit_done"], "without a flag the kind's value applies", "#36 #88")
+    check(
+        plain["implicit_done"] is plain["profile"]["implicit_done"],
+        "without a flag the kind's value applies",
+        "#36 #88",
+    )
     origin = plain.get("origins", {})
-    world.observe("claude-session.dry-run.origins.implicit_done", {k: origin.get(k) for k in ("implicit_done",)})
+    world.observe(
+        "claude-session.dry-run.origins.implicit_done",
+        {k: origin.get(k) for k in ("implicit_done",)},
+    )
     for label, extra in (
         ("both flags", ["--implicit-done", "--no-implicit-done"]),
         ("=value", ["--implicit-done=true"]),
         ("reset with flag", ["--reset", "implicit-done", "--no-implicit-done"]),
     ):
         done = cs_raw(world, "--json", *base, *extra)
-        world.observe(f"claude-session.implicit-done.{label}", (done.returncode, done.stdout[-160:]))
+        world.observe(
+            f"claude-session.implicit-done.{label}", (done.returncode, done.stdout[-160:])
+        )
     value = cs_raw(world, "--json", *base, "--implicit-done=true")
-    check(value.returncode == 2, "--implicit-done=value exits 2", "#36 #88 / FIDELITY.md BooleanOptionalAction", value.returncode)
+    check(
+        value.returncode == 2,
+        "--implicit-done=value exits 2",
+        "#36 #88 / FIDELITY.md BooleanOptionalAction",
+        value.returncode,
+    )
     both = cs_raw(world, "--json", *base, "--implicit-done", "--no-implicit-done")
-    check(both.returncode == 0, "both flags together are accepted (the last wins)", "FIDELITY.md implicit-done", both.returncode)
-    check(json.loads(both.stdout)["implicit_done"] is False, "the last of two flags wins", "FIDELITY.md implicit-done")
+    check(
+        both.returncode == 0,
+        "both flags together are accepted (the last wins)",
+        "FIDELITY.md implicit-done",
+        both.returncode,
+    )
+    check(
+        json.loads(both.stdout)["implicit_done"] is False,
+        "the last of two flags wins",
+        "FIDELITY.md implicit-done",
+    )
 
 
 @SC("cs-dry-run-shapes")
@@ -369,10 +520,26 @@ def test_override_escalation_refusals(world: World) -> None:
     sid = start(world, work, "agent=ag-esc1")["csession_id"]
     time.sleep(3.5)
     cs(world, "status", sid)
-    base = ["start", "--resume", sid, "--dry-run", "--override-escalation", "--mode", "headless", "--cwd", str(work)]
-    for label, extra in (("plain", []), ("fork", ["--fork"]), ("blank human actor", ["--actor", "human:"])):
+    base = [
+        "start",
+        "--resume",
+        sid,
+        "--dry-run",
+        "--override-escalation",
+        "--mode",
+        "headless",
+        "--cwd",
+        str(work),
+    ]
+    for label, extra in (
+        ("plain", []),
+        ("fork", ["--fork"]),
+        ("blank human actor", ["--actor", "human:"]),
+    ):
         done = cs_raw(world, "--json", *base, *extra, extra={})
-        world.observe(f"claude-session.override-escalation.{label}", (done.returncode, done.stdout[-200:]))
+        world.observe(
+            f"claude-session.override-escalation.{label}", (done.returncode, done.stdout[-200:])
+        )
         check(
             done.returncode == 2,
             f"--override-escalation ({label}) exits 2 when the previous run did not end escalated",
@@ -422,7 +589,10 @@ def test_stop_default_grace_matches_agent_spawns_default(world: World) -> None:
         return took, done, child.returncode
 
     took, done, code = run_and_stop()
-    world.observe("claude-session.stop.default-grace", {"took": round(took, 2), "signals": done["signals"], "exit": code})
+    world.observe(
+        "claude-session.stop.default-grace",
+        {"took": round(took, 2), "signals": done["signals"], "exit": code},
+    )
     check(
         [s["signal"] for s in done["signals"]] == ["SIGTERM", "SIGKILL"] and code == 15,
         "stop sends SIGTERM to the wrapper then SIGKILL to the child; exec exits 15",
@@ -437,13 +607,34 @@ def test_stop_default_grace_matches_agent_spawns_default(world: World) -> None:
         f"stop took {took:.1f} s",
     )
     took2, _, _ = run_and_stop("--grace", "2s")
-    check(1.5 <= took2 <= 6.0, "an explicit --grace 2s is honored", "design.md D37 / #36 #9 stop", took2)
+    check(
+        1.5 <= took2 <= 6.0,
+        "an explicit --grace 2s is honored",
+        "design.md D37 / #36 #9 stop",
+        took2,
+    )
     world.install_claude(stub_body="exit 0")
     started = start(world, work, "agent=ag-fast")
     quick = subprocess.run(
-        started["argv"], env=world.env(), capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60, check=False
+        started["argv"],
+        env=world.env(),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=60,
+        check=False,
     )
-    world.observe("claude-session.exec.stub-exit-0", (quick.returncode, quick.stdout[-300:], quick.stderr[-200:]))
+    world.observe(
+        "claude-session.exec.stub-exit-0",
+        (quick.returncode, quick.stdout[-300:], quick.stderr[-200:]),
+    )
     final = cs(world, "status", started["csession_id"])["run"]
-    world.observe("claude-session.exec.stub-exit-0.final", {k: final.get(k) for k in ("outcome", "end_reason", "phase", "exit_code")})
-    check(final["outcome"] is not None, "exec finalizes the run when the child exits", "FIDELITY.md exec")
+    world.observe(
+        "claude-session.exec.stub-exit-0.final",
+        {k: final.get(k) for k in ("outcome", "end_reason", "phase", "exit_code")},
+    )
+    check(
+        final["outcome"] is not None,
+        "exec finalizes the run when the child exits",
+        "FIDELITY.md exec",
+    )

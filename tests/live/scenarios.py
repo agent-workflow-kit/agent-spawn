@@ -12,6 +12,8 @@ Claude Code at all: they use real tmux, termctl, wtctl and claude-session, and a
 ``claude`` where a program named ``claude`` must exist.
 """
 
+# ruff: noqa: E501  (assertion messages are prose: assumption, then the document line)
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

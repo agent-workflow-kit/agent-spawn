@@ -24,7 +24,12 @@ def test_versions_are_recorded_and_meet_the_minimums(world: World) -> None:
             continue
         ok = tool.at_least(need)
         if ok is False:
-            check(False, f"{name} is at least {need}", "design.md Live verification (verified versions)", tool.label)
+            check(
+                False,
+                f"{name} is at least {need}",
+                "design.md Live verification (verified versions)",
+                tool.label,
+            )
         if ok is None:
             world.observe(f"tool.{name}.minimum", f"unknown version, needs {need}")
     cs = world.tools["claude-session"]

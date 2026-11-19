@@ -6,6 +6,8 @@ document that states it (``check(..., where)``); a docstring lists the FIDELITY.
 comment items the run confirms so the later run can update those documents.
 """
 
+# ruff: noqa: E501  (assertion messages are prose: assumption, then the document line)
+
 from __future__ import annotations
 
 import os
@@ -86,7 +88,11 @@ def test_open_reports_the_pane_process_pid(world: World) -> None:
         "design.md Live verification A8",
         (opened["pid"], pid),
     )
-    check(opened["state"] == "running" and opened["socket_path"], "open reports running + socket", "#36 #27")
+    check(
+        opened["state"] == "running" and opened["socket_path"],
+        "open reports running + socket",
+        "#36 #27",
+    )
     check(
         Path(opened["socket_path"]) == world.default_socket,
         "the default server is <TMUX_TMPDIR>/tmux-<uid>/default",
@@ -94,12 +100,15 @@ def test_open_reports_the_pane_process_pid(world: World) -> None:
         opened["socket_path"],
     )
     comm = Path(f"/proc/{pid}/comm").read_text().strip()
-    check(comm == "sleep", "the pane process is the command itself, no wrapper shell", "design.md D21", comm)
+    check(
+        comm == "sleep",
+        "the pane process is the command itself, no wrapper shell",
+        "design.md D21",
+        comm,
+    )
 
     # a wrapper shell that execs the real command keeps the same pid (supervise exec case)
-    wrapped = open_pane(
-        world, "--name", "wrap", "--", "sh", "-c", "exec sleep 300"
-    )
+    wrapped = open_pane(world, "--name", "wrap", "--", "sh", "-c", "exec sleep 300")
     wait_for(
         lambda: Path(f"/proc/{wrapped['pid']}/comm").read_text().strip() == "sleep",
         10,
@@ -122,8 +131,14 @@ def test_open_reports_the_pane_process_pid(world: World) -> None:
     # pid is the environment's: --env reaches the pane process
     envd = open_pane(world, "--name", "envd", "--env", "LIVE_X=1", "--", "sleep", "300")
     environ = Path(f"/proc/{envd['pid']}/environ").read_bytes().split(b"\0")
-    check(b"LIVE_X=1" in environ, "--env reaches the pane process", "#8 termctl: pane process environment")
-    world.observe("termctl.pane.environ.names", sorted(e.split(b"=")[0].decode() for e in environ if e))
+    check(
+        b"LIVE_X=1" in environ,
+        "--env reaches the pane process",
+        "#8 termctl: pane process environment",
+    )
+    world.observe(
+        "termctl.pane.environ.names", sorted(e.split(b"=")[0].decode() for e in environ if e)
+    )
 
 
 @SC("termctl-open-pid")
@@ -133,8 +148,22 @@ def test_dry_run_plan_against_the_real_open(world: World) -> None:
     the real open."""
     args = ["--name", "dry", "--label", "agent=ag-live2", "--keep-on-exit", "failed", "--"]
     plan = world.json_tool("termctl", "open", "--dry-run", *args, "sleep", "300")
-    for key in ("dry_run", "placement", "session", "target", "socket_path", "labels", "argv", "tmux_commands"):
-        check(key in plan, f"the dry-run plan carries {key}", "#36 #29 (E) preflight drift", sorted(plan))
+    for key in (
+        "dry_run",
+        "placement",
+        "session",
+        "target",
+        "socket_path",
+        "labels",
+        "argv",
+        "tmux_commands",
+    ):
+        check(
+            key in plan,
+            f"the dry-run plan carries {key}",
+            "#36 #29 (E) preflight drift",
+            sorted(plan),
+        )
     check(plan["dry_run"] is True and plan["argv"] == ["sleep", "300"], "dry-run argv", "#36 #8")
     check(not panes(world), "a dry run creates no pane", "design.md D36")
     real = open_pane(world, *args, "sleep", "300")
@@ -167,9 +196,28 @@ def test_bare_open_label_cap_and_argv_cap(world: World) -> None:
         labels += ["--label", f"k{i}=v"]
     done = world.tool("termctl", "--json", "open", "--name", "l32", *labels, "--", "sleep", "300")
     check(done.returncode == 0, "32 labels are accepted", "#36 #27 label cap", done.stdout[-200:])
-    over = world.tool("termctl", "--json", "open", "--name", "l33", *labels, "--label", "x=y", "--", "sleep", "300")
-    check(over.returncode == 2, "33 labels exit 2", "#36 #27 label cap 32", (over.returncode, over.stdout[-200:]))
-    big = world.tool("termctl", "--json", "open", "--name", "big", "--", "sleep", "300", "x" * 13000)
+    over = world.tool(
+        "termctl",
+        "--json",
+        "open",
+        "--name",
+        "l33",
+        *labels,
+        "--label",
+        "x=y",
+        "--",
+        "sleep",
+        "300",
+    )
+    check(
+        over.returncode == 2,
+        "33 labels exit 2",
+        "#36 #27 label cap 32",
+        (over.returncode, over.stdout[-200:]),
+    )
+    big = world.tool(
+        "termctl", "--json", "open", "--name", "big", "--", "sleep", "300", "x" * 13000
+    )
     world.observe("termctl.open.big-argv", (big.returncode, big.stdout[-150:]))
     check(big.returncode == 2, "an open argv over 12288 bytes exits 2", "#36 #27", big.returncode)
 
@@ -190,7 +238,9 @@ def test_closing_a_pane_hangs_up_only_the_pane_process(world: World, tmp_path: P
     )
     out = world.root / "b1"
     out.mkdir()
-    opened = open_pane(world, "--name", "b1", "--keep-on-exit", "never", "--", "sh", str(script), str(out))
+    opened = open_pane(
+        world, "--name", "b1", "--keep-on-exit", "never", "--", "sh", str(script), str(out)
+    )
     wait_for(lambda: (out / "child.pid").exists() and (out / "leader.pid").exists(), 10, "b1 pids")
     world.track(opened["pid"], tree=True)
     check(
@@ -217,10 +267,12 @@ def test_keep_on_exit_and_dead_pane_states(world: World) -> None:
     a dead pane (``state: dead``, ``exit_status``), a signal death carries ``exit_signal``, a clean
     exit closes the pane (state ``gone``), ``list --dead`` lists only dead panes, ``close`` of a dead
     pane needs no ``--force``."""
-    failed = open_pane(world, "--name", "fail", "--keep-on-exit", "failed", "--", "sh", "-c", "exit 3")
-    killed = open_pane(world, "--name", "sig", "--keep-on-exit", "failed", "--", "sh", "-c", "kill -9 $$")
-    clean = open_pane(world, "--name", "clean", "--keep-on-exit", "failed", "--", "sh", "-c", "exit 0")
-    always = open_pane(world, "--name", "always", "--keep-on-exit", "always", "--", "sh", "-c", "exit 0")
+    open_pane(world, "--name", "fail", "--keep-on-exit", "failed", "--", "sh", "-c", "exit 3")
+    open_pane(world, "--name", "sig", "--keep-on-exit", "failed", "--", "sh", "-c", "kill -9 $$")
+    clean = open_pane(
+        world, "--name", "clean", "--keep-on-exit", "failed", "--", "sh", "-c", "exit 0"
+    )
+    open_pane(world, "--name", "always", "--keep-on-exit", "always", "--", "sh", "-c", "exit 0")
     running = open_pane(world, "--name", "run", "--keep-on-exit", "failed", "--", "sleep", "300")
     wait_for(lambda: len(panes(world, "--dead")) >= 3, 15, "dead panes")
     dead = {p["name"]: p for p in panes(world, "--dead")}
@@ -257,13 +309,19 @@ def test_keep_on_exit_and_dead_pane_states(world: World) -> None:
     world.observe("termctl.list --dead.order", [p["name"] for p in panes(world, "--dead")])
     closed = world.json_tool("termctl", "close", dead["fail"]["id"])
     check(
-        closed["pane_closed"] is True and closed["was_running"] is False and closed["forced"] is False,
+        closed["pane_closed"] is True
+        and closed["was_running"] is False
+        and closed["forced"] is False,
         "close of a dead pane needs no --force",
         "#36 #79: close of a dead pane without --force",
         closed,
     )
     again = world.tool("termctl", "--json", "close", dead["fail"]["id"])
-    check(again.returncode == 10, "closing it again exits 10 (pane gone)", "#36 #27 exit 10 = pane gone")
+    check(
+        again.returncode == 10,
+        "closing it again exits 10 (pane gone)",
+        "#36 #27 exit 10 = pane gone",
+    )
     refused = world.tool("termctl", "--json", "close", running["id"])
     check(
         refused.returncode == 20,
@@ -271,9 +329,16 @@ def test_keep_on_exit_and_dead_pane_states(world: World) -> None:
         "#36 #79: exit 20 (running)",
         (refused.returncode, refused.stdout[-200:]),
     )
-    forced = world.tool("termctl", "--json", "close", "--force", "--actor", "human:live", running["id"])
+    forced = world.tool(
+        "termctl", "--json", "close", "--force", "--actor", "human:live", running["id"]
+    )
     world.observe("termctl.close --force", (forced.returncode, forced.stdout[-300:]))
-    check(forced.returncode == 0, "close --force of a running pane works for a human actor", "#36 #79", forced.stdout[-200:])
+    check(
+        forced.returncode == 0,
+        "close --force of a running pane works for a human actor",
+        "#36 #79",
+        forced.stdout[-200:],
+    )
 
 
 @SC("termctl-default-server")
@@ -282,7 +347,9 @@ def test_default_server_selection_and_dead_pane_listing(world: World) -> None:
     TERMCTL_SOCKET, then TMUX, then ``<TMUX_TMPDIR>/tmux-<uid>/default``; exact label matching;
     every pane carries ``socket_path``; an absent server gives exit 0 with an empty list."""
     empty = world.tool("termctl", "--json", "list", "--label", "agent=ag-none", "--dead")
-    world.observe("termctl.list.no-server", (empty.returncode, empty.stdout[-200:], empty.stderr[-200:]))
+    world.observe(
+        "termctl.list.no-server", (empty.returncode, empty.stdout[-200:], empty.stderr[-200:])
+    )
     check(
         empty.returncode == 0,
         "an absent default server gives exit 0 (an empty list)",
@@ -290,7 +357,19 @@ def test_default_server_selection_and_dead_pane_listing(world: World) -> None:
         (empty.returncode, empty.stdout[-200:]),
     )
     for name, label in (("a", "agent=ag-a"), ("ab", "agent=ag-ab")):
-        open_pane(world, "--name", name, "--label", label, "--keep-on-exit", "failed", "--", "sh", "-c", "exit 4")
+        open_pane(
+            world,
+            "--name",
+            name,
+            "--label",
+            label,
+            "--keep-on-exit",
+            "failed",
+            "--",
+            "sh",
+            "-c",
+            "exit 4",
+        )
     wait_for(lambda: len(panes(world, "--dead")) == 2, 15, "two dead panes")
     only = panes(world, "--label", "agent=ag-a", "--dead")
     check(
@@ -317,9 +396,7 @@ def test_default_server_selection_and_dead_pane_listing(world: World) -> None:
         "#36 #79 order TERMCTL_SOCKET, TMUX, default",
         via_env["socket_path"],
     )
-    via_tmux = world.run(
-        [str(world.bin / "termctl"), "--json", "list"], tmux=other, timeout=30
-    )
+    via_tmux = world.run([str(world.bin / "termctl"), "--json", "list"], tmux=other, timeout=30)
     check(
         via_tmux.returncode == 0 and f'"socket_path": "{other}"' in via_tmux.stdout,
         "TMUX selects the server when TERMCTL_SOCKET is unset",
@@ -335,7 +412,12 @@ def test_default_server_selection_and_dead_pane_listing(world: World) -> None:
     unsafe.chmod(0o777)
     bad = world.tool("termctl", "--json", "--socket", str(unsafe / "s"), "list")
     world.observe("termctl.list.unsafe-socket-dir", (bad.returncode, bad.stdout[-200:]))
-    check(bad.returncode == 12, "an unsafe socket directory exits 12", "#36 #79 spot probe (exit 12)", bad.returncode)
+    check(
+        bad.returncode == 12,
+        "an unsafe socket directory exits 12",
+        "#36 #79 spot probe (exit 12)",
+        bad.returncode,
+    )
 
 
 @SC("termctl-focus")
@@ -356,7 +438,16 @@ def test_focus_without_a_client_and_unknown_ids(world: World) -> None:
     check(unknown.returncode == 10, "unknown id exits 10", "#36 #28", unknown.returncode)
     client = world.tool("termctl", "--json", "focus", "--client", "/dev/pts/9999", opened["id"])
     world.observe("termctl.focus --client unknown", (client.returncode, client.stdout[-300:]))
-    check(client.returncode in (10, 12), "an unknown client is client_not_found/no_client", "#36 #28", client.returncode)
+    check(
+        client.returncode in (10, 12),
+        "an unknown client is client_not_found/no_client",
+        "#36 #28",
+        client.returncode,
+    )
     labels = world.tool("termctl", "--json", "label", "add", opened["id"], "a=b")
     labels2 = world.tool("termctl", "--json", "label", "add", opened["id"], "c=d")
-    check(labels.returncode == 0 and labels2.returncode == 0, "label add works sequentially", "#36 #8 termctl locked")
+    check(
+        labels.returncode == 0 and labels2.returncode == 0,
+        "label add works sequentially",
+        "#36 #8 termctl locked",
+    )

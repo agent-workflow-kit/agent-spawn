@@ -8,6 +8,8 @@ panes) runs against the real tools. What a real Claude adds (hook events, report
 conversations) is checked by the billed scenarios.
 """
 
+# ruff: noqa: E501  (assertion messages are prose: assumption, then the document line)
+
 from __future__ import annotations
 
 import json
@@ -25,7 +27,7 @@ from .test_wtctl import Wt
 SC = pytest.mark.live_scenario
 
 
-def setup(world: World, stub: str, *, agent_spawn_config: str = "") -> Wt:
+def stub_setup(world: World, stub: str, *, agent_spawn_config: str = "") -> Wt:
     world.install_claude(stub_body=stub)
     world.claude_session_config("lost_grace: 120s\n")
     world.write_config(
@@ -61,10 +63,20 @@ def test_headless_launch_with_a_new_worktree_resume_fork_and_teardown(world: Wor
     holders) and #75 5 (``list --label agent=<id>`` after resume and after ``--fork``): a headless
     stub run in a ``--worktree new`` worktree, a second run (resume), an in-place fork, then the
     original's teardown refused while the fork holds the record, and both torn down."""
-    wt = setup(world, "exit 0")
+    wt = stub_setup(world, "exit 0")
     launched = world.spawn_json(
-        "launch", "--mode", "headless", "--prompt", "reply with the single word ok",
-        "--model", "haiku", "--repo", wt.repo.repo_id, "--worktree", "new", "--wait",
+        "launch",
+        "--mode",
+        "headless",
+        "--prompt",
+        "reply with the single word ok",
+        "--model",
+        "haiku",
+        "--repo",
+        wt.repo.repo_id,
+        "--worktree",
+        "new",
+        "--wait",
         ok=(0, 14),
     )
     agent = agent_of(launched)
@@ -79,9 +91,19 @@ def test_headless_launch_with_a_new_worktree_resume_fork_and_teardown(world: Wor
         records,
     )
     cwd = Path(records[0]["path"])
-    check(agent["cwd"] == str(cwd), "the agent runs in the worktree root", "design.md D11", agent["cwd"])
+    check(
+        agent["cwd"] == str(cwd),
+        "the agent runs in the worktree root",
+        "design.md D11",
+        agent["cwd"],
+    )
     sessions = world.json_tool("claude-session", "list", "--label", f"agent={aid}")["sessions"]
-    check(len(sessions) == 1, "the session carries the agent=<id> label (found exactly once)", "#36 #75 5 / #14", sessions)
+    check(
+        len(sessions) == 1,
+        "the session carries the agent=<id> label (found exactly once)",
+        "#36 #75 5 / #14",
+        sessions,
+    )
     status = world.json_tool("claude-session", "status", agent["csession_id"])
     check(
         f"agent={aid}" in status["labels"] and status["tainted"] is False,
@@ -101,7 +123,12 @@ def test_headless_launch_with_a_new_worktree_resume_fork_and_teardown(world: Wor
     resumed = world.spawn_json(
         "resume", aid, "--mode", "headless", "--prompt", "reply ok", "--wait", ok=(0, 14)
     )
-    check(resumed["agent"]["run"] == 2, "resume makes run 2", "design.md Resume order", resumed["agent"]["run"])
+    check(
+        resumed["agent"]["run"] == 2,
+        "resume makes run 2",
+        "design.md Resume order",
+        resumed["agent"]["run"],
+    )
     check(
         len(world.json_tool("claude-session", "list", "--label", f"agent={aid}")["sessions"]) == 1,
         "after a resume `list --label agent=<id>` lists the session once",
@@ -114,9 +141,15 @@ def test_headless_launch_with_a_new_worktree_resume_fork_and_teardown(world: Wor
     )
     fork = forked["agent"]
     fid = fork["agent_id"]
-    check(fid != aid and fork["forked_from"] == aid, "a fork is a new agent with forked_from", "design.md D25/D46")
+    check(
+        fid != aid and fork["forked_from"] == aid,
+        "a fork is a new agent with forked_from",
+        "design.md D25/D46",
+    )
     after_fork = world.json_tool("claude-session", "list", "--label", f"agent={aid}")["sessions"]
-    world.observe("claude-session.fork.label-search-of-source", [s["csession_id"] for s in after_fork])
+    world.observe(
+        "claude-session.fork.label-search-of-source", [s["csession_id"] for s in after_fork]
+    )
     check(
         [s["csession_id"] for s in after_fork] == [agent["csession_id"]],
         "after resume --fork `list --label agent=<source id>` returns exactly the source session "
@@ -179,18 +212,34 @@ def test_window_launch_pane_pid_binding_and_window_close(world: World) -> None:
     which ``exec``s ``supervise``; the peer check matched) and spike B1/B2 through the real
     chain (#36 #27): closing the window parks the agent ``killed`` without attention, and the
     stub child gets hung up through ``supervise`` and ``exec`` (D17)."""
-    wt = setup(world, "while :; do sleep 0.2; done")
+    wt = stub_setup(world, "while :; do sleep 0.2; done")
     launched = world.spawn_json(
-        "launch", "--mode", "interactive", "--prompt", "reply ok", "--model", "haiku",
-        "--worktree", "none", "--cwd", str(wt.repo.clone), timeout=120,
+        "launch",
+        "--mode",
+        "interactive",
+        "--prompt",
+        "reply ok",
+        "--model",
+        "haiku",
+        "--worktree",
+        "none",
+        "--cwd",
+        str(wt.repo.clone),
+        timeout=120,
     )
     agent = agent_of(launched)
     aid = agent["agent_id"]
     window = agent["window"]
     panes = world.json_tool("termctl", "list", "--label", f"agent={aid}")["panes"]
-    check(len(panes) == 1 and panes[0]["id"] == window["term_id"], "the window is labeled agent=<id>", "design.md D2")
+    check(
+        len(panes) == 1 and panes[0]["id"] == window["term_id"],
+        "the window is labeled agent=<id>",
+        "design.md D2",
+    )
     pane = panes[0]
-    tmux_pid = int(world.tmux("display-message", "-p", "-t", pane["pane_id"], "#{pane_pid}").stdout.strip())
+    tmux_pid = int(
+        world.tmux("display-message", "-p", "-t", pane["pane_id"], "#{pane_pid}").stdout.strip()
+    )
     state = wait_status(world, aid, "live")
     supervisor = state["supervisor"]
     check(
@@ -200,8 +249,21 @@ def test_window_launch_pane_pid_binding_and_window_close(world: World) -> None:
         "#36 #26 / design.md A8 D19 D21",
         (pane["pid"], tmux_pid, supervisor["pid"]),
     )
-    check(Path(f"/proc/{tmux_pid}/cmdline").read_bytes().count(b"supervise") >= 1, "the pane process is supervise", "design.md D19")
-    check("TMUX" in {e.split(b"=")[0].decode() for e in Path(f"/proc/{tmux_pid}/environ").read_bytes().split(b"\0") if e}, "terminal variables come from the pane", "design.md A5 D4")
+    check(
+        Path(f"/proc/{tmux_pid}/cmdline").read_bytes().count(b"supervise") >= 1,
+        "the pane process is supervise",
+        "design.md D19",
+    )
+    check(
+        "TMUX"
+        in {
+            e.split(b"=")[0].decode()
+            for e in Path(f"/proc/{tmux_pid}/environ").read_bytes().split(b"\0")
+            if e
+        },
+        "terminal variables come from the pane",
+        "design.md A5 D4",
+    )
     exec_pid = supervisor["exec_pid"]
     wait_for(lambda: exec_pid and os.path.exists(f"/proc/{exec_pid}"), 15, "exec to run")
     world.track(tmux_pid, tree=True)
@@ -210,14 +272,27 @@ def test_window_launch_pane_pid_binding_and_window_close(world: World) -> None:
     killed = world.tmux("kill-window", "-t", pane["window_id"])
     check(killed.returncode == 0, "kill-window", "design.md B3", killed.stderr)
     parked = wait_status(world, aid, "parked", 60)["agent"]
-    world.observe("agent-spawn.window-close.park", {k: parked[k] for k in ("park_reason", "needs_attention", "last_outcome", "last_end_reason")})
+    world.observe(
+        "agent-spawn.window-close.park",
+        {
+            k: parked[k]
+            for k in ("park_reason", "needs_attention", "last_outcome", "last_end_reason")
+        },
+    )
     check(
         parked["park_reason"] == "killed" and parked["needs_attention"] is None,
         "closing the window parks the agent killed without attention",
         "issue: window close (parked killed) / design.md D13 D17",
         {k: parked[k] for k in ("park_reason", "needs_attention", "last_end_reason")},
     )
-    wait_for(lambda: not Path(f"/proc/{exec_pid}").exists() or Path(f"/proc/{exec_pid}/stat").read_text().rsplit(")", 1)[-1].split()[0] == "Z", 20, "exec to end after the hangup")
+    wait_for(
+        lambda: (
+            not Path(f"/proc/{exec_pid}").exists()
+            or Path(f"/proc/{exec_pid}/stat").read_text().rsplit(")", 1)[-1].split()[0] == "Z"
+        ),
+        20,
+        "exec to end after the hangup",
+    )
 
 
 @SC("as-dead-pane-reconcile")
@@ -227,14 +302,24 @@ def test_a_killed_supervisor_leaves_a_dead_pane_that_reconcile_closes(world: Wor
     default server) and #75 3 (SIGKILL of the supervisor only: ``supervisor_lost``); design.md
     D51: reconcile closes a dead pane of a parked agent without attention only with
     ``reconcile.close_dead_panes_after``."""
-    wt = setup(
+    wt = stub_setup(
         world,
         "while :; do sleep 0.2; done",
         agent_spawn_config="reconcile:\n  close_dead_panes_after: 1s\n",
     )
     launched = world.spawn_json(
-        "launch", "--mode", "interactive", "--prompt", "reply ok", "--model", "haiku",
-        "--worktree", "none", "--cwd", str(wt.repo.clone), timeout=120,
+        "launch",
+        "--mode",
+        "interactive",
+        "--prompt",
+        "reply ok",
+        "--model",
+        "haiku",
+        "--worktree",
+        "none",
+        "--cwd",
+        str(wt.repo.clone),
+        timeout=120,
     )
     aid = agent_of(launched)["agent_id"]
     state = wait_status(world, aid, "live")
@@ -244,7 +329,9 @@ def test_a_killed_supervisor_leaves_a_dead_pane_that_reconcile_closes(world: Wor
     world.track(state["supervisor"]["exec_pid"], tree=True)
     check(token is not None, "the supervisor is a live process", "#36 #75 3")
     pane = world.json_tool("termctl", "list", "--label", f"agent={aid}")["panes"][0]
-    os.kill(sup, signal.SIGKILL)  # the exact PID recorded by agent-spawn and checked against the pane
+    os.kill(
+        sup, signal.SIGKILL
+    )  # the exact PID recorded by agent-spawn and checked against the pane
     dead = wait_for(
         lambda: world.json_tool("termctl", "list", "--label", f"agent={aid}", "--dead")["panes"],
         20,
@@ -258,7 +345,13 @@ def test_a_killed_supervisor_leaves_a_dead_pane_that_reconcile_closes(world: Wor
     )
     time.sleep(2)  # past close_dead_panes_after
     after = world.spawn_json("show", aid)
-    world.observe("agent-spawn.supervisor-killed.show", {k: after["agent"][k] for k in ("status", "park_reason", "needs_attention", "supervisor_lost")})
+    world.observe(
+        "agent-spawn.supervisor-killed.show",
+        {
+            k: after["agent"][k]
+            for k in ("status", "park_reason", "needs_attention", "supervisor_lost")
+        },
+    )
     reconciled = world.spawn_json("reconcile", ok=(0, 12))
     world.observe("agent-spawn.reconcile.output", reconciled)
     remaining = world.json_tool("termctl", "list", "--label", f"agent={aid}", "--dead")["panes"]

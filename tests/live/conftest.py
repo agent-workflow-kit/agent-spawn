@@ -7,10 +7,11 @@ scenario of ``scenarios.py``. Tests are skipped unless ``AS_LIVE=1`` (``make liv
 works as usual. See docs/live-testing.md.
 """
 
+# ruff: noqa: E501  (assertion messages are prose: assumption, then the document line)
+
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import signal
 import tempfile
@@ -37,7 +38,8 @@ _state: dict[str, Any] = {"observations": [], "started": None, "login": None, "b
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
-        "markers", "live_scenario(name): the scenario of tests/live/scenarios.py a live test belongs to"
+        "markers",
+        "live_scenario(name): the scenario of tests/live/scenarios.py a live test belongs to",
     )
 
 
@@ -72,7 +74,9 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             deselected.append(item)
             continue
         if not opted:
-            item.add_marker(pytest.mark.skip(reason=f"live tests need {harness.OPT_IN_ENV}=1 (make live)"))
+            item.add_marker(
+                pytest.mark.skip(reason=f"live tests need {harness.OPT_IN_ENV}=1 (make live)")
+            )
         else:
             scenario = SCENARIOS[marker.args[0]]
             if scenario.skip:
@@ -91,7 +95,9 @@ def _budget() -> harness.SessionBudget:
         directory = Path(tempfile.mkdtemp(prefix="as-live-suite-", dir="/tmp"))
         directory.chmod(0o700)
         _state["suite_dir"] = directory
-        _state["budget"] = harness.SessionBudget(directory / "claude-sessions", harness.max_sessions(ENVIRON))
+        _state["budget"] = harness.SessionBudget(
+            directory / "claude-sessions", harness.max_sessions(ENVIRON)
+        )
     return _state["budget"]
 
 
@@ -121,14 +127,16 @@ def live_clock(request: pytest.FixtureRequest) -> Iterator[float | None]:
     scenario = _scenario_of(request.node)
     if _state["started"] is None:
         _state["started"] = time.monotonic()
-    suite_left = harness.env_int(ENVIRON, harness.SUITE_TIMEOUT_ENV, harness.DEFAULT_SUITE_TIMEOUT) - (
-        time.monotonic() - _state["started"]
-    )
+    suite_left = harness.env_int(
+        ENVIRON, harness.SUITE_TIMEOUT_ENV, harness.DEFAULT_SUITE_TIMEOUT
+    ) - (time.monotonic() - _state["started"])
     if suite_left <= 0:
         pytest.exit(f"{harness.SUITE_TIMEOUT_ENV} ran out: the live suite stopped", returncode=3)
     default = 420 if scenario is not None and scenario.billed else 180
     per_test = harness.env_int(
-        ENVIRON, harness.TEST_TIMEOUT_ENV, scenario.timeout if scenario and scenario.timeout else default
+        ENVIRON,
+        harness.TEST_TIMEOUT_ENV,
+        scenario.timeout if scenario and scenario.timeout else default,
     )
     bound = min(per_test, suite_left)
     previous = signal.signal(signal.SIGALRM, _alarm_handler)
@@ -144,7 +152,9 @@ def _require_tools(scenario: Scenario, tools: dict[str, harness.Tool | None]) ->
     for name in scenario.tools:
         if tools.get(name) is not None:
             continue
-        message = f"{scenario.name}: no real {name} (set {harness.TOOL_ENV[name]} or put it on PATH)"
+        message = (
+            f"{scenario.name}: no real {name} (set {harness.TOOL_ENV[name]} or put it on PATH)"
+        )
         if name in scenario.optional or not harness.strict(ENVIRON):
             pytest.skip(message)
         raise LiveError(message)
@@ -187,7 +197,14 @@ def _make_world(
         login = _login(auth)
     root = harness.new_root()
     world = World(
-        root, tools, ENVIRON, budget=budget, auth=auth, login=login, real_home=REAL_HOME, deadline=deadline
+        root,
+        tools,
+        ENVIRON,
+        budget=budget,
+        auth=auth,
+        login=login,
+        real_home=REAL_HOME,
+        deadline=deadline,
     )
     used_before = budget.used
     try:

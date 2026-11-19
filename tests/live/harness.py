@@ -215,7 +215,9 @@ def read_version(name: str, path: str) -> str:
         )
     except (OSError, subprocess.TimeoutExpired):
         return ""
-    return (done.stdout or done.stderr).strip().splitlines()[0] if (done.stdout or done.stderr) else ""
+    return (
+        (done.stdout or done.stderr).strip().splitlines()[0] if (done.stdout or done.stderr) else ""
+    )
 
 
 def discover_tools(environ: Mapping[str, str]) -> dict[str, Tool | None]:
@@ -315,9 +317,7 @@ def claude_json(trusted: Sequence[Path], *, api_key: str | None = None) -> dict[
     characters, which is what Claude Code stores)."""
     data: dict[str, Any] = {
         "hasCompletedOnboarding": True,
-        "projects": {
-            str(p): {"hasTrustDialogAccepted": True, "allowedTools": []} for p in trusted
-        },
+        "projects": {str(p): {"hasTrustDialogAccepted": True, "allowedTools": []} for p in trusted},
     }
     if api_key:
         data["customApiKeyResponses"] = {"approved": [api_key.strip()[-20:]], "rejected": []}
@@ -378,8 +378,15 @@ def build_env(
 def environment_leaks(env: Mapping[str, str], real_home: Path, root: Path) -> list[str]:
     """Reasons ``env`` could reach the real user's home, tmux server or config."""
     problems: list[str] = []
-    for name in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
-                 "TMPDIR", "TMUX_TMPDIR"):
+    for name in (
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "TMPDIR",
+        "TMUX_TMPDIR",
+    ):
         value = env.get(name)
         if not value or not os.path.isabs(value):
             problems.append(f"{name} is not an absolute path: {value!r}")
@@ -494,7 +501,9 @@ class SessionBudget:
 
     def check_end(self, scenario: str, expected: int, used_before: int) -> list[str]:
         """Problems after a test: refusals by the wrapper, more sessions than registered."""
-        problems = [f"{scenario}: the claude wrapper refused a launch: {r}" for r in refusals(self.counter)]
+        problems = [
+            f"{scenario}: the claude wrapper refused a launch: {r}" for r in refusals(self.counter)
+        ]
         took = self.used - used_before
         if took > expected:
             problems.append(
@@ -596,9 +605,7 @@ def _kill_group(child: subprocess.Popen[str]) -> None:
             child.kill()
 
 
-def wait_for(
-    predicate: Callable[[], Any], timeout: float, what: str, interval: float = 0.1
-) -> Any:
+def wait_for(predicate: Callable[[], Any], timeout: float, what: str, interval: float = 0.1) -> Any:
     """Poll ``predicate`` until it returns a truthy value; fail with ``what`` after ``timeout``."""
     deadline = time.monotonic() + timeout
     while True:
@@ -809,16 +816,16 @@ class World:
     def tool(self, name: str, *args: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         return self.run([str(self.bin / name), *args], **kwargs)
 
-    def json_tool(
-        self, name: str, *args: str, ok: Sequence[int] = (0,), **kwargs: Any
-    ) -> Any:
+    def json_tool(self, name: str, *args: str, ok: Sequence[int] = (0,), **kwargs: Any) -> Any:
         # claude-session takes global flags after the command; termctl's `open ... -- argv` ends
         # its options at `--`, so its flag goes first.
         argv = [*args, "--json"] if name == "claude-session" else ["--json", *args]
         done = self.tool(name, *argv, **kwargs)
         return parse_json(done, ok, f"{name} {' '.join(args[:3])}")
 
-    def tmux(self, *args: str, socket: str | Path | None = None, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    def tmux(
+        self, *args: str, socket: str | Path | None = None, **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
         """The real tmux against the private server (``TMUX_TMPDIR``'s default socket, or an
         explicit private socket path)."""
         tool = self.tools["tmux"]
@@ -935,7 +942,9 @@ def descendant_pids(pid: int) -> list[int]:
     for entry in Path("/proc").iterdir():
         if entry.name.isdigit():
             try:
-                parents[int(entry.name)] = int((entry / "stat").read_text().rsplit(")", 1)[-1].split()[1])
+                parents[int(entry.name)] = int(
+                    (entry / "stat").read_text().rsplit(")", 1)[-1].split()[1]
+                )
             except (OSError, ValueError, IndexError):
                 continue
     found: list[int] = []

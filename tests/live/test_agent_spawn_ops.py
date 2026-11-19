@@ -7,6 +7,8 @@ first on ``PATH`` fails any other ``crontab`` call with exit 70). Real-crontab f
 checked on purpose and is listed in docs/live-testing.md.
 """
 
+# ruff: noqa: E501  (assertion messages are prose: assumption, then the document line)
+
 from __future__ import annotations
 
 import json
@@ -17,7 +19,7 @@ from typing import Any
 import pytest
 
 from .harness import World, check, write_fake_crontab
-from .test_agent_spawn_stub import setup
+from .test_agent_spawn_stub import stub_setup
 
 SC = pytest.mark.live_scenario
 
@@ -51,7 +53,11 @@ def test_cron_install_replace_and_uninstall_against_a_fake_crontab(world: World)
         "interface.md cron (Table handling)",
         lines[:2],
     )
-    check(BEGIN in lines and END in lines, "the managed block markers are written", "interface.md cron (Block)")
+    check(
+        BEGIN in lines and END in lines,
+        "the managed block markers are written",
+        "interface.md cron (Block)",
+    )
     job = lines[lines.index(BEGIN) + 1]
     check(
         job.startswith("*/7 * * * * ")
@@ -71,10 +77,15 @@ def test_cron_install_replace_and_uninstall_against_a_fake_crontab(world: World)
         "interface.md cron (install replaces in place, unchanged when the same)",
         again,
     )
-    check(world.crontab_table.read_text() == table, "an unchanged install writes nothing", "interface.md cron")
+    check(
+        world.crontab_table.read_text() == table,
+        "an unchanged install writes nothing",
+        "interface.md cron",
+    )
     replaced = world.spawn_json("cron", "install", "--interval", "9")
     check(
-        world.crontab_table.read_text().splitlines().count(BEGIN) == 1 and "*/9 * * * * " in world.crontab_table.read_text(),
+        world.crontab_table.read_text().splitlines().count(BEGIN) == 1
+        and "*/9 * * * * " in world.crontab_table.read_text(),
         "a new interval replaces the block in place (exactly one block)",
         "interface.md cron",
         replaced,
@@ -82,7 +93,11 @@ def test_cron_install_replace_and_uninstall_against_a_fake_crontab(world: World)
     gone = world.spawn_json("cron", "uninstall")
     world.observe("agent-spawn.cron.uninstall", gone)
     left = world.crontab_table.read_text()
-    check(BEGIN not in left and "0 3 * * * /usr/bin/true" in left, "uninstall removes only the block", "interface.md cron")
+    check(
+        BEGIN not in left and "0 3 * * * /usr/bin/true" in left,
+        "uninstall removes only the block",
+        "interface.md cron",
+    )
     # a foreign job between the markers is refused
     world.crontab_table.write_text(f"{BEGIN}\n*/10 * * * * foreign-job\n{END}\n")
     refused = world.agent_spawn("cron", "uninstall", "--json")
@@ -106,7 +121,8 @@ def corrupt_lease(db: Path, holder: Any) -> None:
     conn = sqlite3.connect(db)
     try:
         conn.execute(
-            "INSERT OR REPLACE INTO leases (key, holder, acquired) VALUES ('reconcile', ?, 0)", (holder,)
+            "INSERT OR REPLACE INTO leases (key, holder, acquired) VALUES ('reconcile', ?, 0)",
+            (holder,),
         )
         conn.commit()
     finally:
@@ -118,9 +134,17 @@ def test_reset_lease_repairs_a_corrupted_state_db_row(world: World) -> None:
     """#36 #80 (a real ``reconcile --reset-lease`` against a corrupted ``state.db`` row: invalid
     UTF-8 bytes, a blob, deeply nested JSON; human actor; the warning when ``log.jsonl`` cannot be
     written) and design.md D52."""
-    setup(world, "exit 0")
+    stub_setup(world, "exit 0")
     launched = world.spawn_json(
-        "launch", "--mode", "headless", "--prompt", "reply ok", "--model", "haiku", "--wait", ok=(0, 14)
+        "launch",
+        "--mode",
+        "headless",
+        "--prompt",
+        "reply ok",
+        "--model",
+        "haiku",
+        "--wait",
+        ok=(0, 14),
     )
     check(launched["agent"]["agent_id"], "a launch creates state.db", "design.md D52")
     db = world.state / "agent-spawn" / "state.db"
@@ -141,23 +165,48 @@ def test_reset_lease_repairs_a_corrupted_state_db_row(world: World) -> None:
             "design.md D52",
             (plain.returncode, plain.stdout[-300:]),
         )
-        dry = world.agent_spawn("reconcile", "--reset-lease", "--dry-run", "--actor", "human:live", "--json")
-        check(dry.returncode == 2, "--reset-lease with --dry-run exits 2", "design.md D52", dry.returncode)
+        dry = world.agent_spawn(
+            "reconcile", "--reset-lease", "--dry-run", "--actor", "human:live", "--json"
+        )
+        check(
+            dry.returncode == 2,
+            "--reset-lease with --dry-run exits 2",
+            "design.md D52",
+            dry.returncode,
+        )
         auto = world.agent_spawn("reconcile", "--reset-lease", "--actor", "auto:x", "--json")
-        check(auto.returncode == 2, "--reset-lease is human-only (an auto: actor exits 2)", "design.md D52", auto.stdout[-200:])
-        repaired = world.agent_spawn("reconcile", "--reset-lease", "--actor", "human:live", "--json")
+        check(
+            auto.returncode == 2,
+            "--reset-lease is human-only (an auto: actor exits 2)",
+            "design.md D52",
+            auto.stdout[-200:],
+        )
+        repaired = world.agent_spawn(
+            "reconcile", "--reset-lease", "--actor", "human:live", "--json"
+        )
         out = json.loads(repaired.stdout)
         check(
-            repaired.returncode == 0 and any("could not be parsed and was replaced" in w for w in out["warnings"]),
+            repaired.returncode == 0
+            and any("could not be parsed and was replaced" in w for w in out["warnings"]),
             f"--reset-lease as a human replaces a {label} holder and warns",
             "#36 #80 (real corrupted state.db row)",
             (repaired.returncode, repaired.stdout[-300:]),
         )
         again = world.agent_spawn("reconcile", "--json")
-        check(again.returncode == 0, "the next plain reconcile works", "design.md D52", again.stdout[-200:])
+        check(
+            again.returncode == 0,
+            "the next plain reconcile works",
+            "design.md D52",
+            again.stdout[-200:],
+        )
     records = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
     resets = [r for r in records if r.get("details", {}).get("kind") == "lease_reset"]
-    check(len(resets) == len(holders), "each repair is audited in log.jsonl", "design.md D52", len(resets))
+    check(
+        len(resets) == len(holders),
+        "each repair is audited in log.jsonl",
+        "design.md D52",
+        len(resets),
+    )
     world.observe("agent-spawn.lease-reset.log-record.keys", sorted(resets[0]))
     # an unwritable log.jsonl: the warning says the record could not be written
     corrupt_lease(db, "not a holder")
@@ -172,7 +221,10 @@ def test_reset_lease_repairs_a_corrupted_state_db_row(world: World) -> None:
     world.observe("agent-spawn.lease-reset.unwritable-log", (quiet.returncode, quiet.stdout[-300:]))
     if quiet.returncode == 0:
         check(
-            any("the log record could not be written" in w for w in json.loads(quiet.stdout)["warnings"]),
+            any(
+                "the log record could not be written" in w
+                for w in json.loads(quiet.stdout)["warnings"]
+            ),
             "an unwritable log.jsonl ends the warning with '(the log record could not be written)'",
             "#36 #80",
             quiet.stdout[-300:],
@@ -190,16 +242,26 @@ def test_browse_lists_and_shows_real_agents(world: World, monkeypatch: pytest.Mo
     from agent_spawn.tui.app import BrowseApp
     from agent_spawn.tui.model import SubprocessBackend
 
-    setup(world, "exit 0")
+    stub_setup(world, "exit 0")
     ids = []
     for _ in range(2):
         done = world.spawn_json(
-            "launch", "--mode", "headless", "--prompt", "reply ok", "--model", "haiku", "--wait", ok=(0, 14)
+            "launch",
+            "--mode",
+            "headless",
+            "--prompt",
+            "reply ok",
+            "--model",
+            "haiku",
+            "--wait",
+            ok=(0, 14),
         )
         ids.append(done["agent"]["agent_id"])
     for name, value in world.env().items():
         monkeypatch.setenv(name, value)
-    backend = SubprocessBackend(config_path=None, actor="human:live", prefix=[world.agent_spawn_path])
+    backend = SubprocessBackend(
+        config_path=None, actor="human:live", prefix=[world.agent_spawn_path]
+    )
     app = BrowseApp(backend)
     seen: dict[str, Any] = {}
 

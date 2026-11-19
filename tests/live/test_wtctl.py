@@ -7,6 +7,8 @@ Each check names the assumption and where it is written; the docstrings list the
 design.md items the test confirms.
 """
 
+# ruff: noqa: E501  (assertion messages are prose: assumption, then the document line)
+
 from __future__ import annotations
 
 import json
@@ -70,9 +72,24 @@ def test_create_list_show_shapes_and_flag_forms(wt: Wt, world: World) -> None:
     )
     record = made["record"]
     for key in ("id", "path", "object_type", "state", "name", "owned", "holders"):
-        check(key in record, f"a record carries {key}", "design.md wtctl behavior (list/show keys)", sorted(record))
-    check(record["name"] == "n1", "the record name equals the explicit --name", "#36 #20", record["name"])
-    check(record["branch"] == "wt/n1", "default branch of a new worktree is wt/<name>", "#36 #8 wtctl", record["branch"])
+        check(
+            key in record,
+            f"a record carries {key}",
+            "design.md wtctl behavior (list/show keys)",
+            sorted(record),
+        )
+    check(
+        record["name"] == "n1",
+        "the record name equals the explicit --name",
+        "#36 #20",
+        record["name"],
+    )
+    check(
+        record["branch"] == "wt/n1",
+        "default branch of a new worktree is wt/<name>",
+        "#36 #8 wtctl",
+        record["branch"],
+    )
     check(
         record["path"] == str(Path(record["path"]).resolve()) and Path(record["path"]).is_dir(),
         "a record's path is the realpath of an existing directory",
@@ -80,16 +97,26 @@ def test_create_list_show_shapes_and_flag_forms(wt: Wt, world: World) -> None:
         record["path"],
     )
     check(
-        record["object_type"] == "worktree" and record["owned"] is True and record["state"] == "active",
+        record["object_type"] == "worktree"
+        and record["owned"] is True
+        and record["state"] == "active",
         "create makes an owned active worktree record",
         "design.md D6/D11",
     )
-    check(made["reused"] is False and made["dry_run"] is False, "first create is not reused", "#36 #20")
+    check(
+        made["reused"] is False and made["dry_run"] is False,
+        "first create is not reused",
+        "#36 #20",
+    )
     world.observe("wtctl.record.keys", sorted(record))
 
     # `--json` after the positionals, `--flag=value` everywhere
     shown = world.tool("wtctl", "show", record["id"], "--json")
-    check(shown.returncode == 0 and json.loads(shown.stdout)["id"] == record["id"], "--json after the positional works", "#36 #20")
+    check(
+        shown.returncode == 0 and json.loads(shown.stdout)["id"] == record["id"],
+        "--json after the positional works",
+        "#36 #20",
+    )
     listed = wt.ok("list")
     check(
         [r["id"] for r in listed["records"]] == [record["id"]],
@@ -98,14 +125,17 @@ def test_create_list_show_shapes_and_flag_forms(wt: Wt, world: World) -> None:
         listed,
     )
     check(
-        wt.ok("list", f"--repo={wt.repo.repo_id}")["records"] and not wt.ok("list", "--repo", "nope/x")["records"],
+        wt.ok("list", f"--repo={wt.repo.repo_id}")["records"]
+        and not wt.ok("list", "--repo", "nope/x")["records"],
         "--repo is an exact repo-id match",
         "#36 #20",
     )
     # a second repo: list without --repo returns every repo's records
     other = world.make_repo("other")
     world.wtctl_config({"proj": wt.repo, "other": other})
-    world.json_tool("wtctl", "create", "--repo", other.repo_id, "--name", "o1", "--holder", "ag-bbbb")
+    world.json_tool(
+        "wtctl", "create", "--repo", other.repo_id, "--name", "o1", "--holder", "ag-bbbb"
+    )
     everyone = wt.ok("list")["records"]
     check(
         {r["name"] for r in everyone} == {"n1", "o1"},
@@ -126,7 +156,11 @@ def test_create_list_show_shapes_and_flag_forms(wt: Wt, world: World) -> None:
     )
     # unknown id and error envelopes
     unknown = wt.run("show", "wt-zzzzzzzz")
-    check(unknown.returncode == 10 and wt.code(unknown) == "not_found", "show of an unknown id exits 10 with an envelope on stdout", "#36 #20")
+    check(
+        unknown.returncode == 10 and wt.code(unknown) == "not_found",
+        "show of an unknown id exits 10 with an envelope on stdout",
+        "#36 #20",
+    )
     for argv, exit_code in (
         (["create", "--repo", wt.repo.repo_id, "--name", "bad1", "--base", "refs/heads/main"], 2),
         (["create", "--repo", wt.repo.repo_id, "--name", "bad2", "--branch", "HEAD"], 2),
@@ -144,12 +178,24 @@ def test_create_list_show_shapes_and_flag_forms(wt: Wt, world: World) -> None:
 def test_create_dry_run_shape(wt: Wt, world: World) -> None:
     """#36 #20: ``create --dry-run`` takes no persistent record, runs no hooks, never returns
     ``reused`` (it refreshes the mirror: here the local origin)."""
-    plan = wt.ok("create", "--repo", wt.repo.repo_id, "--name", "dry1", "--holder", "ag-d", "--dry-run")
-    check(plan["dry_run"] is True and plan["reused"] is False, "dry-run shape", "#36 #20", sorted(plan))
+    plan = wt.ok(
+        "create", "--repo", wt.repo.repo_id, "--name", "dry1", "--holder", "ag-d", "--dry-run"
+    )
+    check(
+        plan["dry_run"] is True and plan["reused"] is False,
+        "dry-run shape",
+        "#36 #20",
+        sorted(plan),
+    )
     check(not wt.ok("list")["records"], "a dry run leaves no live record", "#36 #20")
     real = wt.create("dry1", "ag-d")
-    again = wt.ok("create", "--repo", wt.repo.repo_id, "--name", "dry1", "--holder", "ag-d", "--dry-run")
-    world.observe("wtctl.dry-run.over-own-record", {k: again[k] for k in ("reused", "branch_action", "dry_run")})
+    again = wt.ok(
+        "create", "--repo", wt.repo.repo_id, "--name", "dry1", "--holder", "ag-d", "--dry-run"
+    )
+    world.observe(
+        "wtctl.dry-run.over-own-record",
+        {k: again[k] for k in ("reused", "branch_action", "dry_run")},
+    )
     check(
         again["reused"] is False and real["reused"] is False,
         "a dry run over an existing own record never returns reused",
@@ -172,16 +218,36 @@ def test_name_collisions_and_reuse_by_the_same_holder(wt: Wt, world: World) -> N
         "explicit --branch retry by the same holder is reused (nothing changed)",
         "design.md wtctl behavior: explicit --branch collision reused when the same holder holds it",
     )
-    other = wt.run("create", "--repo", wt.repo.repo_id, "--name", "d4", "--branch", "feat/x", "--holder", "ag-b")
-    world.observe("wtctl.collision.explicit-branch.other-holder", (other.returncode, wt.code(other), other.stdout[-200:]))
-    check(other.returncode == 20, "another holder's retry is refused with exit 20", "design.md wtctl behavior", other.stdout[-200:])
+    other = wt.run(
+        "create",
+        "--repo",
+        wt.repo.repo_id,
+        "--name",
+        "d4",
+        "--branch",
+        "feat/x",
+        "--holder",
+        "ag-b",
+    )
+    world.observe(
+        "wtctl.collision.explicit-branch.other-holder",
+        (other.returncode, wt.code(other), other.stdout[-200:]),
+    )
+    check(
+        other.returncode == 20,
+        "another holder's retry is refused with exit 20",
+        "design.md wtctl behavior",
+        other.stdout[-200:],
+    )
     wt.create("d5", "ag-a", "--detach")
     check(
         wt.create("d5", "ag-a", "--detach")["reused"] is True,
         "--detach retry by the same holder is reused",
         "design.md wtctl behavior: --detach (path_exists) reused when the same holder holds it",
     )
-    detached_other = wt.run("create", "--repo", wt.repo.repo_id, "--name", "d5", "--detach", "--holder", "ag-b")
+    detached_other = wt.run(
+        "create", "--repo", wt.repo.repo_id, "--name", "d5", "--detach", "--holder", "ag-b"
+    )
     check(
         detached_other.returncode == 20,
         "another holder on a --detach collision exits 20",
@@ -196,18 +262,45 @@ def test_name_collisions_and_reuse_by_the_same_holder(wt: Wt, world: World) -> N
         "design.md wtctl behavior (Create order)",
         body,
     )
-    check(not any(r["name"] == "d6-2" for r in wt.ok("list")["records"]), "names are never suffixed", "#36 #20")
+    check(
+        not any(r["name"] == "d6-2" for r in wt.ok("list")["records"]),
+        "names are never suffixed",
+        "#36 #20",
+    )
     world.observe("wtctl.collision.template-branch", body)
     # a different name on the same branch: branch_in_use
-    same_holder = wt.ok("create", "--repo", wt.repo.repo_id, "--name", "d7", "--branch", "feat/x", "--holder", "ag-a")
-    world.observe("wtctl.collision.branch-in-use.same-holder", (same_holder["reused"], same_holder["record"]["name"]))
+    same_holder = wt.ok(
+        "create",
+        "--repo",
+        wt.repo.repo_id,
+        "--name",
+        "d7",
+        "--branch",
+        "feat/x",
+        "--holder",
+        "ag-a",
+    )
+    world.observe(
+        "wtctl.collision.branch-in-use.same-holder",
+        (same_holder["reused"], same_holder["record"]["name"]),
+    )
     check(
         same_holder["reused"] is True,
         "an explicit --branch in use by the same holder's record is reused (even under another --name)",
         "design.md wtctl behavior (branch_in_use reused when the same holder holds the record)",
         same_holder["record"]["name"],
     )
-    inuse = wt.run("create", "--repo", wt.repo.repo_id, "--name", "d7", "--branch", "feat/x", "--holder", "ag-b")
+    inuse = wt.run(
+        "create",
+        "--repo",
+        wt.repo.repo_id,
+        "--name",
+        "d7",
+        "--branch",
+        "feat/x",
+        "--holder",
+        "ag-b",
+    )
     world.observe("wtctl.collision.branch-in-use", (inuse.returncode, inuse.stdout[-300:]))
     check(
         inuse.returncode == 20,
@@ -221,7 +314,9 @@ def test_name_collisions_and_reuse_by_the_same_holder(wt: Wt, world: World) -> N
         "design.md wtctl behavior (branch_in_use)",
         inuse.stdout[-200:],
     )
-    throw = wt.run("create", "--throwaway", "--repo", wt.repo.repo_id, "--ref", wt.repo.sha, "--holder", "ag-t")
+    throw = wt.run(
+        "create", "--throwaway", "--repo", wt.repo.repo_id, "--ref", wt.repo.sha, "--holder", "ag-t"
+    )
     check(
         throw.returncode == 2 and wt.code(throw) == "usage",
         "a throwaway takes no holder (agent-spawn never holds throwaways)",
@@ -247,7 +342,18 @@ def test_adopt_and_forget_by_holder(wt: Wt, world: World) -> None:
     actor is accepted), #36 #22 (a forgotten adopted record prints ``record.state: forgotten``
     exactly when its last holder went; an owned record never does)."""
     made = wt.create("n1", "ag-aaaa")["record"]
-    adopted = world.json_tool("wtctl", "adopt", made["path"], "--holder=ag-bbbb", "--actor", AUTO, "--decision-id", "d1", "--repo", "other/x")
+    adopted = world.json_tool(
+        "wtctl",
+        "adopt",
+        made["path"],
+        "--holder=ag-bbbb",
+        "--actor",
+        AUTO,
+        "--decision-id",
+        "d1",
+        "--repo",
+        "other/x",
+    )
     check(
         adopted["existing"] is True and adopted["record"]["holders"] == ["ag-aaaa", "ag-bbbb"],
         "adopt of a recorded path adds the holder, existing: true, --repo ignored; --actor/--decision-id accepted",
@@ -256,7 +362,8 @@ def test_adopt_and_forget_by_holder(wt: Wt, world: World) -> None:
     )
     notholder = wt.ok("forget", made["id"], "--holder", "ag-zzzz")
     check(
-        any("not_a_holder" in w for w in notholder["warnings"]) and notholder["record"]["state"] == "active",
+        any("not_a_holder" in w for w in notholder["warnings"])
+        and notholder["record"]["state"] == "active",
         "forget of a non-holder exits 0 with the warning not_a_holder",
         "#36 #20 forget of a non-holder",
         notholder["warnings"],
@@ -272,11 +379,29 @@ def test_adopt_and_forget_by_holder(wt: Wt, world: World) -> None:
     # an adopted (not owned) record: last holder forgets it
     manual = world.root / "repos" / "manual"
     world.git("worktree", "add", "-q", "-b", "manual", str(manual), cwd=wt.repo.clone)
-    rec = world.json_tool("wtctl", "adopt", str(manual), "--holder", "ag-m1", "--repo", wt.repo.repo_id, "--actor", AUTO)["record"]
-    check(rec["owned"] is False and rec["state"] == "active", "adopt of an existing worktree is not owned", "#36 #20")
+    rec = world.json_tool(
+        "wtctl",
+        "adopt",
+        str(manual),
+        "--holder",
+        "ag-m1",
+        "--repo",
+        wt.repo.repo_id,
+        "--actor",
+        AUTO,
+    )["record"]
+    check(
+        rec["owned"] is False and rec["state"] == "active",
+        "adopt of an existing worktree is not owned",
+        "#36 #20",
+    )
     wt.ok("adopt", str(manual), "--holder", "ag-m2")
     first = wt.ok("forget", rec["id"], "--holder", "ag-m1", "--actor", AUTO)
-    check(first["record"]["state"] == "active", "forgetting one of two holders keeps the record active", "#36 #22")
+    check(
+        first["record"]["state"] == "active",
+        "forgetting one of two holders keeps the record active",
+        "#36 #22",
+    )
     last = wt.ok("forget", rec["id"], "--holder", "ag-m2", "--actor", AUTO)
     check(
         last["record"]["state"] == "forgotten",
@@ -293,7 +418,11 @@ def test_adopt_and_forget_by_holder(wt: Wt, world: World) -> None:
         again.stdout[-200:],
     )
     shown = wt.ok("show", rec["id"])
-    check(shown["state"] == "forgotten", "show of a tombstone exits 0 with its state", "#36 #20 / design.md")
+    check(
+        shown["state"] == "forgotten",
+        "show of a tombstone exits 0 with its state",
+        "#36 #20 / design.md",
+    )
 
 
 @SC("wtctl-adopt-forget-holders")
@@ -320,7 +449,12 @@ def test_forget_holder_in_unlinked_and_missing_states(wt: Wt, world: World) -> N
         done.stdout[-300:],
     )
     free = wt.run("forget", "wt-nosuchid", "--holder", "ag-aaaa")
-    check(free.returncode == 10, "forget of an unknown id exits 10 (counts as released)", "#36 #22", free.returncode)
+    check(
+        free.returncode == 10,
+        "forget of an unknown id exits 10 (counts as released)",
+        "#36 #22",
+        free.returncode,
+    )
 
 
 @SC("wtctl-remove-status")
@@ -358,8 +492,15 @@ def test_status_and_remove_contract(wt: Wt, world: World) -> None:
     )
     wt.ok("forget", made["id"], "--holder", "ag-bbbb")
     status2 = world.json_tool("wtctl", "status", made["id"], "--holder=ag-aaaa")
-    check(status2["would_remove"] is True, "status of a removable record: would_remove true", "#36 #23 item 7", status2)
-    removed = world.json_tool("wtctl", "remove", made["id"], "--yes", "--holder=ag-aaaa", f"--actor={AUTO}")
+    check(
+        status2["would_remove"] is True,
+        "status of a removable record: would_remove true",
+        "#36 #23 item 7",
+        status2,
+    )
+    removed = world.json_tool(
+        "wtctl", "remove", made["id"], "--yes", "--holder=ag-aaaa", f"--actor={AUTO}"
+    )
     check(
         removed["record"]["state"] == "removed" and not Path(made["path"]).exists(),
         "remove as an auto: actor without a TTY exits 0 and deletes the worktree",
@@ -387,12 +528,26 @@ def test_status_and_remove_contract(wt: Wt, world: World) -> None:
         (adopted.returncode, adopted.stdout[-200:]),
     )
     ast = world.json_tool("wtctl", "status", rec["id"], "--holder=ag-m1")
-    check(ast["human_required"] is True, "status marks an adopted record human_required", "#36 #23 item 7", ast)
+    check(
+        ast["human_required"] is True,
+        "status marks an adopted record human_required",
+        "#36 #23 item 7",
+        ast,
+    )
     world.observe("wtctl.status.keys", sorted(status))
     world.observe("wtctl.status.force_overrides", status["force_overrides"])
-    forced = wt.run("remove", rec["id"], "--yes", "--holder=ag-m1", f"--actor={AUTO}", "--override-escalation")
-    world.observe("wtctl.remove.override-escalation.auto", (forced.returncode, forced.stdout[-200:]))
-    check(forced.returncode == 2, "--override-escalation with a non-human actor exits 2", "#36 #78 (wtctl remove --override-escalation)", forced.returncode)
+    forced = wt.run(
+        "remove", rec["id"], "--yes", "--holder=ag-m1", f"--actor={AUTO}", "--override-escalation"
+    )
+    world.observe(
+        "wtctl.remove.override-escalation.auto", (forced.returncode, forced.stdout[-200:])
+    )
+    check(
+        forced.returncode == 2,
+        "--override-escalation with a non-human actor exits 2",
+        "#36 #78 (wtctl remove --override-escalation)",
+        forced.returncode,
+    )
 
 
 @SC("wtctl-baseline-check")
@@ -413,7 +568,9 @@ def test_baseline_check_and_listing_paths(wt: Wt, world: World) -> None:
     config = wt.repo.clone / ".git" / "config"
     config.write_text(config.read_text() + "\n[alias]\n\tlive = status\n")
     changed = wt.run("baseline", "check", made["id"])
-    world.observe("wtctl.baseline.check.after-config-change", (changed.returncode, changed.stdout[-400:]))
+    world.observe(
+        "wtctl.baseline.check.after-config-change", (changed.returncode, changed.stdout[-400:])
+    )
     if changed.returncode == 20:
         err = json.loads(changed.stdout)["error"]
         check(
@@ -425,7 +582,9 @@ def test_baseline_check_and_listing_paths(wt: Wt, world: World) -> None:
             err,
         )
         world.observe("wtctl.baseline.error.keys", sorted(err))
-    throw = wt.ok("create", "--throwaway", "--repo", wt.repo.repo_id, "--ref", wt.repo.sha)["record"]
+    throw = wt.ok("create", "--throwaway", "--repo", wt.repo.repo_id, "--ref", wt.repo.sha)[
+        "record"
+    ]
     kinds = {r["name"]: r["object_type"] for r in wt.ok("list")["records"]}
     check(
         sorted(kinds.values()) == ["throwaway", "worktree"],
@@ -434,7 +593,12 @@ def test_baseline_check_and_listing_paths(wt: Wt, world: World) -> None:
         kinds,
     )
     for r in wt.ok("list")["records"]:
-        check(r["path"] == str(Path(r["path"]).resolve()), "list paths are realpaths", "#36 #25", r["path"])
+        check(
+            r["path"] == str(Path(r["path"]).resolve()),
+            "list paths are realpaths",
+            "#36 #25",
+            r["path"],
+        )
     shutil.rmtree(made["path"])
     wt.run("reconcile")
     gone = wt.run("baseline", "check", made["id"])
