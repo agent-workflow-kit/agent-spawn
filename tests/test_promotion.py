@@ -77,6 +77,21 @@ def script_promoted_done(fakebin: Fakebin) -> None:
     fakebin.script("claude-session", "exec", times=1, outcome="done")
 
 
+def test_a_promoted_run_passes_no_implicit_done_flag_of_its_own(
+    wenv: WindowEnv, fakebin: Fakebin, tmp_path: Path
+) -> None:
+    # The promoted run gets the launch's override through claude-session's carry.
+    wenv.capture_supervisor(tmp_path / "cap")
+    script_first_run(fakebin)
+    script_promoted_done(fakebin)
+    done = wenv.run(*LAUNCH, "--promote", "--no-implicit-done", "--wait")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    first, second = real_starts(fakebin)[:2]
+    flags = ("--implicit-done", "--no-implicit-done")
+    assert [a for a in first if a in flags] == ["--no-implicit-done"]
+    assert "--mode=interactive" in second and not [a for a in second if a in flags]
+
+
 def host_exited(capture: Capture, code: int | None = None) -> bool:
     """The ``supervise --host`` process exited (with ``code``, when given); False while the
     wrapper has not written its exit code yet."""

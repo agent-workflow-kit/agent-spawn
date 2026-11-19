@@ -408,18 +408,28 @@ def test_start_and_friends_refuse_what_the_real_argv_parsing_refuses(
 
 
 @pytest.mark.parametrize(
-    "extra",
+    ("extra", "effective"),
     [
-        pytest.param(["--implicit-done"], id="implicit-done"),
-        pytest.param(["--no-implicit-done"], id="no-implicit-done"),
-        pytest.param(["--implicit-done", "--no-implicit-done"], id="both-last-wins"),
+        pytest.param(["--implicit-done"], True, id="implicit-done"),
+        pytest.param(["--no-implicit-done"], False, id="no-implicit-done"),
+        pytest.param(["--implicit-done", "--no-implicit-done"], False, id="both-last-wins"),
+        pytest.param(["--no-implicit-done", "--implicit-done"], True, id="both-last-wins-reversed"),
     ],
 )
-def test_start_accepts_the_implicit_done_flags(fakebin: Fakebin, extra: list[str]) -> None:
+def test_start_accepts_the_implicit_done_flags(
+    fakebin: Fakebin, extra: list[str], effective: bool
+) -> None:
     code, _ = run_json(
         fakebin, "claude-session", "start", *HEADLESS, *extra, schema="cli/start.json"
     )
     assert code == 0
+    code, plan = run_json(
+        fakebin, "claude-session", "start", *HEADLESS, *extra, "--dry-run",
+        schema="cli/exec-dry-run.json",
+    )  # fmt: skip
+    assert code == 0
+    assert plan["implicit_done"] is effective
+    assert plan["profile"]["implicit_done"] is effective
 
 
 @pytest.mark.parametrize("flag", ["--implicit-done", "--no-implicit-done"])

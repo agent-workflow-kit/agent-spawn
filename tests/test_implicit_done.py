@@ -168,3 +168,55 @@ def test_the_automatic_report_resume_passes_no_override(env: Env, fakebin: Fakeb
     first, second = starts(fakebin)
     assert implicit_args(first) == ["--no-implicit-done"]
     assert second[1].startswith("--resume=cs-") and implicit_args(second) == []
+
+
+def test_the_flag_sits_after_auto_exit_and_before_the_labels(env: Env, fakebin: Fakebin) -> None:
+    launched(env, "--no-auto-exit", "--no-implicit-done")
+    (argv,) = starts(fakebin)
+    at = argv.index("--no-auto-exit")
+    assert argv[at : at + 2] == ["--no-auto-exit", "--no-implicit-done"]
+    assert argv[at + 2].startswith(("--repo=", "--cwd=", "--label="))
+
+
+def test_the_flag_sits_before_reset_on_resume(env: Env, fakebin: Fakebin) -> None:
+    agent_id = launched(env)
+    done = env.run(
+        "resume", agent_id, "--no-implicit-done", "--reset", "timeout", "--json", "--wait"
+    )
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    argv = starts(fakebin)[-1]
+    at = argv.index("--no-implicit-done")
+    assert argv[at + 1] == "--reset=timeout"
+
+
+def sessionless_agent(env: Env, fakebin: Fakebin, *extra: str) -> str:
+    fakebin.script("claude-session", "start", argv_contains=["--dry-run"])
+    fakebin.script(
+        "claude-session",
+        "start",
+        times=1,
+        exit=20,
+        error={"code": "refused", "message": "no", "reason": "live"},
+    )
+    assert env.run(*LAUNCH, *extra).returncode == 20
+    (row,) = env.agents()
+    assert row["csession_id"] is None
+    return str(row["agent_id"])
+
+
+def test_a_sessionless_resume_relaunches_with_the_stored_flag(env: Env, fakebin: Fakebin) -> None:
+    agent_id = sessionless_agent(env, fakebin, "--no-implicit-done")
+    done = env.run("resume", agent_id, "--json", "--wait")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    argv = starts(fakebin)[-1]
+    assert implicit_args(argv) == ["--no-implicit-done"]
+    assert not [a for a in argv if a.startswith("--resume")]
+
+
+def test_a_sessionless_resume_prefers_the_flag_given_now(env: Env, fakebin: Fakebin) -> None:
+    agent_id = sessionless_agent(env, fakebin, "--no-implicit-done")
+    done = env.run("resume", agent_id, "--implicit-done", "--json", "--wait")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    argv = starts(fakebin)[-1]
+    assert implicit_args(argv) == ["--implicit-done"]
+    assert not [a for a in argv if a.startswith("--resume")]
