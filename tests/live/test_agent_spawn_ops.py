@@ -219,16 +219,15 @@ def test_reset_lease_repairs_a_corrupted_state_db_row(world: World) -> None:
         state_dir.chmod(0o700)
         log.chmod(0o600)
     world.observe("agent-spawn.lease-reset.unwritable-log", (quiet.returncode, quiet.stdout[-300:]))
-    if quiet.returncode == 0:
-        check(
-            any(
-                "the log record could not be written" in w
-                for w in json.loads(quiet.stdout)["warnings"]
-            ),
-            "an unwritable log.jsonl ends the warning with '(the log record could not be written)'",
-            "#36 #80",
-            quiet.stdout[-300:],
-        )
+    check(
+        quiet.returncode == 0
+        and any(
+            "the log record could not be written" in w for w in json.loads(quiet.stdout)["warnings"]
+        ),
+        "an unwritable log.jsonl ends the warning with '(the log record could not be written)'",
+        "#36 #80",
+        (quiet.returncode, quiet.stdout[-300:]),
+    )
 
 
 @SC("as-browse-pilot")

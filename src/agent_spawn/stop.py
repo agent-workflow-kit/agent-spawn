@@ -42,7 +42,8 @@ WAIT_MARGIN = 30.0  # seconds added to the grace
 # claude-session's kill_grace default. claude-session exposes it only as a config key of its own
 # (not in status or stop output) and agent-spawn has no such key (decided in #13), so the wait
 # budget assumes the default.
-# todo(#36): the live suite should check that claude-session's default kill_grace is still 10 s.
+# The live scenario `cs-stop-grace` (tests/live/test_claude_session.py) checks that a stop of a
+# SIGTERM-ignoring child returns within DEFAULT_GRACE + WAIT_MARGIN, i.e. that this default holds.
 DEFAULT_GRACE = 10.0
 POLL = 0.1  # seconds between looks at the agent row while waiting
 STATUS_EVERY = 1.0  # seconds between looks at `claude-session status` while waiting

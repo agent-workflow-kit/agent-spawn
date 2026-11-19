@@ -176,8 +176,11 @@ def test_create_list_show_shapes_and_flag_forms(wt: Wt, world: World) -> None:
 
 @SC("wtctl-create-list-show")
 def test_create_dry_run_shape(wt: Wt, world: World) -> None:
-    """#36 #20: ``create --dry-run`` takes no persistent record, runs no hooks, never returns
-    ``reused`` (it refreshes the mirror: here the local origin)."""
+    """#36 #20: ``create --dry-run`` takes no persistent record and runs no hooks (it refreshes the
+    mirror: here the local origin). A dry run over the *holder's own* record answers like the real
+    call: ``reused: true``, ``dry_run: false``, ``branch_action`` null (wtctl interface.md, Create
+    order, "Retry after a crash": "also under ``--dry-run``: the answer is the same"); another
+    holder over the same name is refused ``path_exists`` (exit 20), never ``reused``."""
     plan = wt.ok(
         "create", "--repo", wt.repo.repo_id, "--name", "dry1", "--holder", "ag-d", "--dry-run"
     )
@@ -197,10 +200,28 @@ def test_create_dry_run_shape(wt: Wt, world: World) -> None:
         {k: again[k] for k in ("reused", "branch_action", "dry_run")},
     )
     check(
-        again["reused"] is False and real["reused"] is False,
-        "a dry run over an existing own record never returns reused",
-        "#36 #20 / design.md ('never reuses')",
+        real["reused"] is False
+        and again["reused"] is True
+        and again["dry_run"] is False
+        and again["branch_action"] is None
+        and again["record"]["id"] == real["record"]["id"],
+        "a dry run over the holder's own record returns reused: true, dry_run: false, "
+        "branch_action null (the same answer as the real call)",
+        "wtctl interface.md Create order, Retry after a crash (line 195: also under --dry-run)",
         again,
+    )
+    other = wt.run(
+        "create", "--repo", wt.repo.repo_id, "--name", "dry1", "--holder", "ag-x", "--dry-run"
+    )
+    err = json.loads(other.stdout).get("error", {}) if other.stdout.strip() else {}
+    check(
+        other.returncode == 20
+        and err.get("reason") == "path_exists"
+        and "reused" not in other.stdout,
+        "a dry run by another holder over the same name is refused (exit 20, path_exists), "
+        "never reused",
+        "wtctl interface.md Names (explicit --name collision) / Create order step 10",
+        (other.returncode, other.stdout[-300:]),
     )
     world.observe("wtctl.dry-run.record-state", plan["record"]["state"])
 
@@ -233,11 +254,16 @@ def test_name_collisions_and_reuse_by_the_same_holder(wt: Wt, world: World) -> N
         "wtctl.collision.explicit-branch.other-holder",
         (other.returncode, wt.code(other), other.stdout[-200:]),
     )
+    other_err = json.loads(other.stdout).get("error", {})
     check(
-        other.returncode == 20,
-        "another holder's retry is refused with exit 20",
-        "design.md wtctl behavior",
-        other.stdout[-200:],
+        other.returncode == 20
+        and other_err.get("reason") == "path_exists"
+        and other_err.get("details", other_err).get("holder_id") == same["record"]["id"],
+        "another holder's retry is refused with exit 20, reason path_exists naming the holder's "
+        "record (the name collision, whose path would be taken, is checked before the branch)",
+        "wtctl interface.md Names (explicit --name collision: reason path_exists) / Create order "
+        "step 10 (holder_id)",
+        other.stdout[-300:],
     )
     wt.create("d5", "ag-a", "--detach")
     check(
@@ -571,17 +597,23 @@ def test_baseline_check_and_listing_paths(wt: Wt, world: World) -> None:
     world.observe(
         "wtctl.baseline.check.after-config-change", (changed.returncode, changed.stdout[-400:])
     )
-    if changed.returncode == 20:
-        err = json.loads(changed.stdout)["error"]
-        check(
-            err.get("reason") == "repo_config_changed"
-            and err.get("details", {}).get("changed_classes") == ["git"],
-            "a baseline change exits 20 (code refused, reason repo_config_changed) with "
-            "details.changed_classes naming only the changed class",
-            "#36 #25",
-            err,
-        )
-        world.observe("wtctl.baseline.error.keys", sorted(err))
+    check(
+        changed.returncode == 20,
+        "a changed baseline exits 20",
+        "#36 #25",
+        (changed.returncode, changed.stdout[-300:]),
+    )
+    err = json.loads(changed.stdout)["error"]
+    check(
+        err.get("code") == "refused"
+        and err.get("reason") == "repo_config_changed"
+        and err.get("details", {}).get("changed_classes") == ["git"],
+        "a baseline change is refused (code refused, reason repo_config_changed) with "
+        "details.changed_classes naming only the changed class (the git config)",
+        "#36 #25",
+        err,
+    )
+    world.observe("wtctl.baseline.error.keys", sorted(err))
     throw = wt.ok("create", "--throwaway", "--repo", wt.repo.repo_id, "--ref", wt.repo.sha)[
         "record"
     ]
@@ -603,9 +635,12 @@ def test_baseline_check_and_listing_paths(wt: Wt, world: World) -> None:
     wt.run("reconcile")
     gone = wt.run("baseline", "check", made["id"])
     world.observe("wtctl.baseline.check.missing", (gone.returncode, gone.stdout[-300:]))
+    gone_err = json.loads(gone.stdout).get("error", {}) if gone.stdout.strip() else {}
     check(
-        gone.returncode == 20 and wt.code(gone) in ("unlinked", "repo_config_changed", "refused"),
-        "baseline check of a missing record exits 20 unlinked",
+        gone.returncode == 20
+        and gone_err.get("code") == "refused"
+        and gone_err.get("reason") == "unlinked",
+        "baseline check of a missing record exits 20 (code refused, reason unlinked)",
         "#36 #25 (partial, missing and clone_missing records exit 20 unlinked)",
         (gone.returncode, gone.stdout[-300:]),
     )

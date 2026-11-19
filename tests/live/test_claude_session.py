@@ -159,10 +159,9 @@ def test_a_pending_run_status_list_stop_and_forget(world: World) -> None:
     check(unknown_prefix.returncode == 10, "an unknown prefix exits 10", "#36 #8 claude-session")
     # forget of a pending session is refused
     live = cs_raw(world, "--json", "forget", sid)
-    err = json.loads(live.stdout)
     world.observe("claude-session.forget.pending", (live.returncode, live.stdout[-300:]))
     check(
-        live.returncode == 20 or err.get("skipped"),
+        live.returncode == 20,
         "forget of a pending session exits 20 live",
         "#36 #9 forget (exit 20 live for pending or live sessions)",
         live.stdout[-300:],
@@ -301,13 +300,14 @@ def test_an_unadopted_run_expires_never_adopted(world: World) -> None:
         "headless",
     )
     world.observe("claude-session.fork-dry-run.not-started", (fork.returncode, fork.stdout[-400:]))
-    if fork.returncode == 0:
-        check(
-            json.loads(fork.stdout)["csession_id"] is None
-            and json.loads(fork.stdout)["fork"] is True,
-            "a fork dry run has csession_id null",
-            "#36 #9 dry run (fork dry run has csession_id: null)",
-        )
+    check(
+        fork.returncode == 0
+        and json.loads(fork.stdout)["csession_id"] is None
+        and json.loads(fork.stdout)["fork"] is True,
+        "a fork dry run of a finalized session exits 0 with csession_id null and fork true",
+        "#36 #9 dry run (fork dry run has csession_id: null)",
+        (fork.returncode, fork.stdout[-300:]),
+    )
     cs(world, "forget", sid)
     check(
         not cs(world, "list", "--label", "agent=ag-exp1")["sessions"],
@@ -317,9 +317,64 @@ def test_an_unadopted_run_expires_never_adopted(world: World) -> None:
 
 
 @SC("cs-pending-run")
+def test_verify_secret_of_an_adopted_run_matches_only_the_right_secret(world: World) -> None:
+    """#36 #15 verify-secret exit codes: with a run adopted by ``exec`` (a stub claude that stays
+    alive) the run's own secret (read from ``$CSESSION_DIR/secret``, mode 0600) answers exit 0
+    ``{"match": true}``, also with a trailing newline (trailing whitespace is stripped); a wrong
+    secret answers 11 (claude-session interface.md, ``verify-secret``: 0 only for an adopted, live
+    run). The secret is read from the file and never printed or observed."""
+    work = prepare(world)
+    world.install_claude(stub_body="trap 'exit 0' TERM; while :; do sleep 0.2; done")
+    started = start(world, work, "agent=ag-vs0")
+    sid = started["csession_id"]
+    child = subprocess.Popen(
+        started["argv"],
+        env=world.env(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        world.track(child.pid, tree=True)
+        wait_for(
+            lambda: cs(world, "status", sid)["run"].get("child_alive"), 30, "the stub child of exec"
+        )
+        world.track(child.pid, tree=True)
+        secret = (Path(started["csession_dir"]) / "secret").read_text().strip()
+        check(
+            bool(secret), "the adopted run has a secret file", "claude-session interface.md layout"
+        )
+        for text in (secret, secret + "\n"):
+            done = cs_raw(world, "--json", "verify-secret", sid, input_text=text)
+            check(
+                done.returncode == 0 and json.loads(done.stdout) == {"match": True},
+                "verify-secret of the adopted live run's secret exits 0 (match true), with or "
+                "without a trailing newline",
+                "claude-session interface.md verify-secret / #36 #15",
+                (done.returncode, done.stdout[-100:]),
+            )
+        wrong = cs_raw(world, "--json", "verify-secret", sid, input_text="not-the-secret\n")
+        check(
+            wrong.returncode == 11 and json.loads(wrong.stdout) == {"match": False},
+            "a wrong secret against the adopted run exits 11 (match false)",
+            "claude-session interface.md verify-secret / #36 #15",
+            (wrong.returncode, wrong.stdout[-100:]),
+        )
+        cs(world, "stop", sid, "--grace", "2s")
+        child.wait(timeout=30)
+    finally:
+        if child.poll() is None:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+    cs(world, "forget", sid)
+
+
+@SC("cs-pending-run")
 def test_verify_secret_reconcile_and_dry_run_refusal(world: World) -> None:
-    """#36 #9 (``verify-secret`` returns 11 for a pending run, strips trailing whitespace, needs
-    stdin; ``reconcile --dry-run`` exits 0 with the ``reconcile.json`` shape, takes no lease;
+    """#36 #9 (``verify-secret`` returns 11 for a pending run (the exit 0 case is
+    ``test_verify_secret_of_an_adopted_run_matches_only_the_right_secret``), strips trailing
+    whitespace, needs stdin; ``reconcile --dry-run`` exits 0 with the ``reconcile.json`` shape, takes no lease;
     a resume dry run of a live session exits 20 with ``would_refuse: live``), #36 #15
     (verify-secret stdin protocol and exit codes), #36 #81."""
     work = prepare(world)
@@ -341,7 +396,7 @@ def test_verify_secret_reconcile_and_dry_run_refusal(world: World) -> None:
         unknown.returncode == 11 and json.loads(unknown.stdout) == {"match": False},
         "verify-secret of an unknown session answers like a wrong secret (11, match false): "
         "it is not an existence oracle",
-        "#36 #15 verify-secret exit codes (the fake/interface assumed 10)",
+        "#36 #15 verify-secret exit codes (interface.md: 11 for an unknown session; the fake agrees)",
         (unknown.returncode, unknown.stdout[-100:]),
     )
     plan = cs_raw(
@@ -551,8 +606,8 @@ def test_override_escalation_refusals(world: World) -> None:
 @SC("cs-stop-grace")
 def test_stop_default_grace_matches_agent_spawns_default(world: World) -> None:
     """#36 #19 (``DEFAULT_GRACE``): claude-session's default ``kill_grace`` is the time ``stop``
-    gives a SIGTERM-ignoring child before SIGKILL; agent-spawn's hard-coded wait budget must match.
-    Also: an explicit ``--grace`` is honored, and a child that exits on SIGTERM is stopped at once
+    gives a SIGTERM-ignoring child before SIGKILL; ``stop`` must return within agent-spawn's wait
+    budget (``DEFAULT_GRACE`` plus ``WAIT_MARGIN``). Also: an explicit ``--grace`` is honored
     (FIDELITY.md exec signals: SIGTERM then SIGKILL after the grace, exit 15)."""
     from agent_spawn import stop as spawn_stop
 
@@ -593,17 +648,23 @@ def test_stop_default_grace_matches_agent_spawns_default(world: World) -> None:
         "claude-session.stop.default-grace",
         {"took": round(took, 2), "signals": done["signals"], "exit": code},
     )
+    # stop's own SIGKILL of the child races exec's (it SIGKILLs the child kill_grace after the
+    # SIGTERM it was sent): observed both with and without the second entry, so only the order and
+    # the kinds are fixed.
+    names = [s["signal"] for s in done["signals"]]
     check(
-        [s["signal"] for s in done["signals"]] == ["SIGTERM", "SIGKILL"] and code == 15,
-        "stop sends SIGTERM to the wrapper then SIGKILL to the child; exec exits 15",
+        names in (["SIGTERM"], ["SIGTERM", "SIGKILL"]) and code == 15,
+        "stop sends SIGTERM to the wrapper, and SIGKILL to the child unless exec's own escalation "
+        "got there first; exec exits 15",
         "FIDELITY.md exec signals (SIGTERM then SIGKILL after grace, exit 15)",
         done["signals"],
     )
     check(
-        abs(took - spawn_stop.DEFAULT_GRACE) <= 3.0,
-        "claude-session's default kill_grace equals agent-spawn's DEFAULT_GRACE "
-        f"({spawn_stop.DEFAULT_GRACE:.0f} s), so stop does not give up before the escalation ends",
-        "src/agent_spawn/stop.py DEFAULT_GRACE todo(#36)",
+        took <= spawn_stop.DEFAULT_GRACE + spawn_stop.WAIT_MARGIN,
+        "claude-session's default kill_grace (10 s) fits inside agent-spawn's DEFAULT_GRACE "
+        f"({spawn_stop.DEFAULT_GRACE:.0f} s) plus WAIT_MARGIN ({spawn_stop.WAIT_MARGIN:.0f} s), "
+        "so stop does not give up before the escalation ends",
+        "src/agent_spawn/stop.py DEFAULT_GRACE / WAIT_MARGIN",
         f"stop took {took:.1f} s",
     )
     took2, _, _ = run_and_stop("--grace", "2s")

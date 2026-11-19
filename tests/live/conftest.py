@@ -11,6 +11,7 @@ works as usual. See docs/live-testing.md.
 
 from __future__ import annotations
 
+import atexit
 import json
 import shutil
 import signal
@@ -33,7 +34,32 @@ LIVE_DIR = Path(__file__).resolve().parent
 ENVIRON: dict[str, str] = dict(isolation.ORIGINAL_ENV)
 REAL_HOME = Path(ENVIRON.get("HOME", "/nonexistent"))
 
-_state: dict[str, Any] = {"observations": [], "started": None, "login": None, "budget": None}
+_state: dict[str, Any] = {
+    "observations": [],
+    "started": None,
+    "login": None,
+    "budget": None,
+    "restore_signals": None,
+}
+
+
+def _cleanup_private_files() -> None:
+    """Delete the login copy and the suite directory (idempotent; also run at exit, so a
+    pytest that dies without ``pytest_sessionfinish`` leaves no credential copy behind)."""
+    login = _state.get("login")
+    if login is not None:
+        login.remove()
+    suite_dir = _state.get("suite_dir")
+    if suite_dir is not None:
+        shutil.rmtree(suite_dir, ignore_errors=True)
+
+
+atexit.register(_cleanup_private_files)
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    if harness.opted_in(ENVIRON) and _state["restore_signals"] is None:
+        _state["restore_signals"] = harness.install_termination_handlers()
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -195,7 +221,7 @@ def _make_world(
             if harness.strict(ENVIRON):
                 raise LiveError(message)
             pytest.skip(message)
-        budget.check_start(scenario.name, scenario.sessions)
+        budget.check_start(scenario.name, scenario.sessions_per_test)
         login = _login(auth)
     root = harness.new_root()
     world = World(
@@ -209,6 +235,8 @@ def _make_world(
         deadline=deadline,
     )
     used_before = budget.used
+    refused_before = len(harness.refusals(budget.counter))
+    per_test = scenario.sessions_per_test
     try:
         if billed:
             world.install_claude()
@@ -218,7 +246,7 @@ def _make_world(
         _state["observations"].extend(world.observations)
         world.close()
     if billed:
-        problems = budget.check_end(scenario.name, scenario.sessions, used_before)
+        problems = budget.check_end(scenario.name, per_test, used_before, refused_before)
         if problems:
             raise LiveError("; ".join(problems))
 
@@ -241,10 +269,10 @@ def billed_world(
 
 
 def pytest_sessionfinish(session: pytest.Session) -> None:
-    login = _state.get("login")
-    if login is not None:
-        login.remove()
-    suite_dir = _state.get("suite_dir")
+    restore = _state.get("restore_signals")
+    if restore is not None:
+        restore()
+        _state["restore_signals"] = None
     path = ENVIRON.get(harness.OBSERVATIONS_ENV)
     if path and _state["observations"]:
         with open(path, "a", encoding="utf-8") as handle:
@@ -253,8 +281,7 @@ def pytest_sessionfinish(session: pytest.Session) -> None:
     budget = _state.get("budget")
     if budget is not None:
         _state["summary"] = f"{budget.used} claude sessions counted (cap {budget.maximum})"
-    if suite_dir is not None:
-        shutil.rmtree(suite_dir, ignore_errors=True)
+    _cleanup_private_files()
 
 
 def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:

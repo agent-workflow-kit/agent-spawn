@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -371,7 +372,16 @@ def test_the_wrapper_refuses_a_launch_over_the_cap_and_records_the_refusal(tmp_p
 
 
 @pytest.mark.parametrize(
-    "args", [[], ["--model", "opus"], ["--model", "sonnet", "-p"], ["-p", "haiku"]]
+    "args",
+    [
+        [],
+        ["--model", "opus"],
+        ["--model", "sonnet", "-p"],
+        ["-p", "haiku"],
+        ["--model", "haiku", "--model", "opus"],  # the last --model wins in claude
+        ["--model=haiku"],  # the inline form is not accepted
+        ["--model", "haiku", "--model=opus"],
+    ],
 )
 def test_the_wrapper_refuses_a_launch_without_a_haiku_model_before_counting(
     tmp_path: Path, args: list[str]
@@ -381,6 +391,12 @@ def test_the_wrapper_refuses_a_launch_without_a_haiku_model_before_counting(
     assert done.returncode == 98 and "haiku" in done.stderr
     assert harness.counted_sessions(counter) == 0 and not log.exists()
     assert harness.refusals(counter) == ["no-haiku"]
+
+
+def test_the_wrapper_accepts_a_last_haiku_after_another_model(tmp_path: Path) -> None:
+    wrapper, counter, _ = make_wrapper(tmp_path, 5)
+    assert run_wrapper(wrapper, "--model", "opus", "--model", "haiku").returncode == 0
+    assert harness.counted_sessions(counter) == 1
 
 
 def test_the_wrapper_adds_a_budget_to_print_runs_only(tmp_path: Path) -> None:
@@ -424,6 +440,19 @@ def test_the_session_budget_reports_overruns_and_refusals(tmp_path: Path) -> Non
     assert "registry says 1" in budget.check_end("x", 1, 0)[0]
     Path(f"{counter}.refused").write_text("over 10\n")
     assert "refused a launch" in budget.check_end("x", 9, 0)[0]
+    # only refusals recorded after the test started count (the file is suite-wide)
+    assert budget.check_end("x", 9, 0, refused_before=1) == []
+    with Path(f"{counter}.refused").open("a") as handle:
+        handle.write("no-haiku\n")
+    assert "no-haiku" in budget.check_end("x", 9, 0, refused_before=1)[0]
+    assert harness.refusals_since(counter, 1) == ["no-haiku"]
+
+
+def test_a_scenario_with_several_tests_shares_its_sessions_between_them() -> None:
+    sigterm = sc.SCENARIOS["resumable-after-sigterm"]
+    assert sigterm.tests == 2 and sigterm.sessions_per_test * sigterm.tests >= sigterm.sessions
+    assert sigterm.sessions_per_test == 2
+    assert sc.SCENARIOS["headless-launch-wait"].sessions_per_test == 1
 
 
 # --- fake crontab, stub claude, tripwire ---------------------------------------------------------
@@ -638,6 +667,131 @@ def test_a_world_close_kills_only_tracked_processes_by_identity(world: harness.W
         other.wait()
         mine.kill()
         mine.wait()
+
+
+def fake_tmux(tmp_path: Path) -> tuple[harness.Tool, Path]:
+    log = tmp_path / "tmux.calls"
+    script = tmp_path / "fake-tmux"
+    script.write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
+    script.chmod(0o755)
+    return harness.Tool("tmux", str(script), "tmux 3.5a", (3, 5, 0)), log
+
+
+def make_socket(path: Path) -> socket.socket:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sock = socket.socket(socket.AF_UNIX)
+    sock.bind(str(path))
+    return sock
+
+
+def test_teardown_kills_every_private_server_even_after_the_deadline(tmp_path: Path) -> None:
+    root = harness.new_root()
+    tool, log = fake_tmux(tmp_path)
+    w = harness.World(root, {"tmux": tool}, {"LANG": "C.UTF-8"}, deadline=time.monotonic() - 5)
+    paths = [
+        root / "tmuxdir" / f"tmux-{os.getuid()}" / "default",
+        root / "tmuxdir" / "other" / "x.sock",
+        root / "repos" / "deep" / "my-server",
+    ]
+    socks = [make_socket(p) for p in paths]
+    try:
+        with pytest.raises(harness.LiveTimeout):
+            w.run(["true"])  # the deadline is over: ordinary calls refuse
+        w.close()
+        calls = log.read_text().splitlines()
+        assert len(calls) == 3 and all(c.endswith("kill-server") for c in calls)
+        assert {c.split()[3] for c in calls} == {str(p) for p in paths}
+        assert not root.exists()
+    finally:
+        for sock in socks:
+            sock.close()
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_close_disarms_the_alarm_and_removes_the_root_when_collect_raises(
+    tmp_path: Path,
+) -> None:
+    class Failing(harness.LoginCache):
+        def collect(self, home: Path) -> None:
+            raise OSError("disk trouble")
+
+    source = tmp_path / "creds"
+    source.write_text("x")
+    cache = harness.new_login_cache(source, base=tmp_path)
+    cache.__class__ = Failing
+    root = harness.new_root()
+    w = harness.World(root, {}, {"LANG": "C.UTF-8"}, login=cache)
+    (root / "home" / ".claude" / ".credentials.json").write_text("token")
+    signal.setitimer(signal.ITIMER_REAL, 600)
+    try:
+        with pytest.raises(OSError, match="disk trouble"):
+            w.close()
+        assert signal.getitimer(signal.ITIMER_REAL)[0] == 0  # disarmed first
+        assert not root.exists()  # credentials and private home deleted regardless
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        cache.remove()
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_close_kills_processes_running_in_the_world_by_home_or_cwd(world: harness.World) -> None:
+    bare = {"PATH": "/usr/bin:/bin"}
+    by_home = subprocess.Popen(
+        ["sleep", "60"], env={**bare, "HOME": str(world.home)}, start_new_session=True
+    )
+    by_cwd = subprocess.Popen(
+        ["sleep", "60"], cwd=world.root / "repos", env=bare, start_new_session=True
+    )
+    outside = subprocess.Popen(
+        ["sleep", "60"], cwd="/", env={**bare, "HOME": "/nonexistent"}, start_new_session=True
+    )
+    try:
+        found = {pid for pid, _ in harness.world_processes(world.root, world.home)}
+        assert {by_home.pid, by_cwd.pid} <= found and outside.pid not in found
+        world.close()
+        by_home.wait(timeout=10)
+        by_cwd.wait(timeout=10)
+        assert by_home.returncode == -signal.SIGKILL and by_cwd.returncode == -signal.SIGKILL
+        assert outside.poll() is None
+    finally:
+        for child in (by_home, by_cwd, outside):
+            child.kill()
+            child.wait()
+
+
+def test_teardown_stops_the_noted_claude_sessions(tmp_path: Path) -> None:
+    root = harness.new_root()
+    log = tmp_path / "cs.calls"
+    script = tmp_path / "cs"
+    script.write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
+    script.chmod(0o755)
+    tool = harness.Tool("claude-session", str(script), "claude-session 0.45.2", (0, 45, 2))
+    w = harness.World(root, {"claude-session": tool}, {"LANG": "C.UTF-8"})
+    w.note_session("cs-aaaaaaaa")
+    w.note_session("cs-aaaaaaaa")
+    w.close()
+    assert log.read_text().splitlines() == ["stop cs-aaaaaaaa --json"]
+
+
+def test_a_command_runs_in_the_private_repos_directory_by_default(world: harness.World) -> None:
+    done = world.run(["pwd", "-P"])
+    assert Path(done.stdout.strip()) == (world.root / "repos").resolve()
+    assert Path.cwd() != world.root / "repos"
+    other = world.run(["pwd", "-P"], cwd=world.home)
+    assert Path(other.stdout.strip()) == world.home.resolve()
+
+
+def test_termination_signals_raise_keyboard_interrupt_and_the_handlers_are_restored() -> None:
+    before = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP))
+    restore = harness.install_termination_handlers()
+    try:
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            with pytest.raises(KeyboardInterrupt):
+                os.kill(os.getpid(), sig)
+                time.sleep(2)  # the handler runs before the sleep ends
+    finally:
+        restore()
+    assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP)) == before
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")

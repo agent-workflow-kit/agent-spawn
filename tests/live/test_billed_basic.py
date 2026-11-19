@@ -21,8 +21,10 @@ from .billed import (
     expect_parked,
     launch_headless,
     launch_window,
+    pid_gone,
     show,
-    wait_session_state,
+    track_agent,
+    wait_turn_done,
 )
 from .harness import World, check, wait_for
 
@@ -87,6 +89,7 @@ def test_headless_launch_wait_end_to_end(billed_world: World) -> None:
         "the result file carries the same JSON",
         "design.md D32",
     )
+    wait_for(hook_out.exists, 15, "the post-park hook to write its payload")
     payload = json.loads(hook_out.read_text())
     world.observe("agent-spawn.post-park.payload.keys", sorted(payload))
     check(
@@ -148,10 +151,12 @@ def test_interactive_launch_in_a_real_window_and_window_close(billed_world: Worl
     launched = launch_window(world, wt)
     agent = launched["agent"]
     aid = agent["agent_id"]
-    state = wait_session_state(world, aid, {"idle", "needs-input"}, timeout=180)
+    track_agent(world, aid)
+    state = wait_turn_done(world, aid, timeout=180)
     check(
-        state["session"]["state"] == "idle",
-        "after the one-turn prompt the interactive session settles idle (not needs-input)",
+        state["session"]["state"] in ("idle", "reported"),
+        "after the one-turn prompt the interactive session settles idle or reported (not "
+        "needs-input); --no-auto-exit keeps it up",
         "design.md D1 / #36 #27 (real states from real hook events)",
         state["session"],
     )
@@ -168,7 +173,7 @@ def test_interactive_launch_in_a_real_window_and_window_close(billed_world: Worl
     )
     world.observe("agent-spawn.window.marker-after-idle", (pane["marker"], pane["marker_text"]))
     csid = agent["csession_id"]
-    claude_pid = cs_status(world, csession_id=csid)["run"].get("child_pid")
+    claude_pid = cs_status(world, csid)["run"].get("child_pid")
     check(
         claude_pid, "claude-session knows the claude pid", "FIDELITY.md wrapper_alive/child_alive"
     )
@@ -182,9 +187,7 @@ def test_interactive_launch_in_a_real_window_and_window_close(billed_world: Worl
         "issue: window close parks killed / D13 D17",
         {k: parked[k] for k in ("park_reason", "needs_attention", "last_end_reason")},
     )
-    wait_for(
-        lambda: not Path(f"/proc/{claude_pid}").exists(), 30, "claude to exit after the hangup"
-    )
+    wait_for(lambda: pid_gone(int(claude_pid)), 30, "claude to exit after the hangup")
     final = cs_status(world, csid)["run"]
     world.observe(
         "claude-session.window-close.final",
@@ -203,11 +206,15 @@ def test_no_implicit_done_run_and_the_automatic_report_resume_carry_the_flag(
     run 2 is not an implicit done either. Needs claude-session >= 0.43.0. Confirms #36 #88 and the
     report-resume chain of interface.md."""
     world = billed_world
-    wt = bsetup(world)
+    # kinds.implement.backstop defaults to true: the Stop hook would block once and make the agent
+    # file a report. Switch it off so run 1 really ends without one (claude-session
+    # interface.md, Kind profile fields; design.md "backstop: false").
+    wt = bsetup(world, cs_extra="kinds:\n  implement:\n    backstop: false\n")
     done = launch_headless(
         world,
         wt,
-        "Reply with the single word ok. Do not report anything.",
+        "Reply with the single word ok. Do not run claude-session and do not file any report "
+        "or status of any kind.",
         "--no-implicit-done",
         "--worktree",
         "none",
@@ -218,6 +225,13 @@ def test_no_implicit_done_run_and_the_automatic_report_resume_carry_the_flag(
     aid = done["agent"]["agent_id"]
     runs = show(world, aid)["runs"]
     world.observe("report-resume.runs", [(r["run"], r["auto_resumed"], r["outcome"]) for r in runs])
+    if runs and runs[0]["outcome"] not in (None, "exited-unreported"):
+        world.observe("report-resume.run1-reported-anyway", runs[0]["outcome"])
+        world.spawn_json("teardown", aid, ok=(0, 20))
+        pytest.skip(
+            "report-resume-chain: the model filed a report in run 1 despite the prompt "
+            f"(outcome {runs[0]['outcome']}): the chain was not exercised"
+        )
     check(
         len(runs) == 2 and runs[1]["auto_resumed"] is True,
         "run 1 ended unreported and agent-spawn started its automatic report resume (run 2)",

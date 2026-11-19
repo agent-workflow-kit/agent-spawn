@@ -7,7 +7,9 @@ anything, and ``tests/test_live_harness.py`` checks that it agrees with the test
 ``sessions`` is the number of real Claude Code processes the scenario is expected to start
 (each one is counted by the ``claude`` wrapper the harness puts first on ``PATH``, and the
 suite fails before starting more than ``MAX_LIVE_SESSIONS``); ``turns`` is the number of model
-turns those sessions are expected to take (one tiny prompt each). Unbilled scenarios start no
+turns those sessions are expected to take: a tiny claude-session run takes about three (read the
+prompt file, run the report command, the final answer), a ``-p`` probe with ``--max-turns 1``
+one. Unbilled scenarios start no
 Claude Code at all: they use real tmux, termctl, wtctl and claude-session, and a stub
 ``claude`` where a program named ``claude`` must exist.
 """
@@ -45,7 +47,13 @@ class Scenario:
     timeout: int | None = None
     #: Minimum claude-session version of the scenario (compared when the version is known).
     min_claude_session: str | None = None
+    #: Number of tests of the scenario (``sessions`` is the total; each test may start its share).
+    tests: int = 1
     extra: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def sessions_per_test(self) -> int:
+        return -(-self.sessions // self.tests)
 
     @property
     def billed(self) -> bool:
@@ -77,7 +85,8 @@ _ALL = [
     _s(
         "tmux-real-server",
         "tools",
-        "stale and missing socket texts, list-commands, -L with -S, unknown command text",
+        "list-commands, -L with -S, unknown command text, start-server (the stale and missing socket "
+        "texts are checked by fidelity-argv)",
         "tmux",
         covers=("#36 #8 tmux", "FIDELITY.md tmux"),
     ),
@@ -113,7 +122,7 @@ _ALL = [
     _s(
         "termctl-focus",
         "tools",
-        "focus without a client, attach answer, unknown id, locked error",
+        "focus without a client (attach or no_client), unknown id, unknown client, sequential label add",
         "termctl tmux",
         covers=("#36 #28", "#36 #8 termctl focus"),
     ),
@@ -156,7 +165,8 @@ _ALL = [
         "cs-pending-run",
         "tools",
         "claude-session start without adoption: pending status, list --label, stop, forget, "
-        "expiry never_adopted, verify-secret, label exit 10, reconcile --dry-run",
+        "expiry never_adopted, verify-secret (11 pending, 0 for an adopted run's secret), label "
+        "exit 10, reconcile --dry-run",
         "claude-session",
         covers=("#36 #9", "#36 #14", "#36 #15", "#36 #75 1", "#36 #81", "promotion check B"),
     ),
@@ -234,7 +244,7 @@ _ALL = [
         "headless launch --wait: result object, relay states, status fields, outcome file",
         "claude claude-session",
         sessions=1,
-        turns=1,
+        turns=3,
         covers=("#36 #9", "#36 #14", "#36 #15", "#36 #8 claude-session", "design.md D1 D43"),
     ),
     _s(
@@ -243,7 +253,7 @@ _ALL = [
         "interactive launch in a real window; closing the window parks killed",
         "claude claude-session termctl tmux",
         sessions=1,
-        turns=1,
+        turns=3,
         covers=("#36 #27", "#36 #26", "design.md D17 B9", "#36 issue: interactive launch"),
     ),
     _s(
@@ -252,7 +262,7 @@ _ALL = [
         "--no-implicit-done run ends unreported; the automatic report resume carries the flag",
         "claude claude-session",
         sessions=2,
-        turns=2,
+        turns=6,
         min_claude_session="0.43.0",
         covers=("#36 #88", "#36 #9", "interface.md report resume"),
     ),
@@ -262,7 +272,7 @@ _ALL = [
         "headless resume continues the Claude session; list --label shows one session",
         "claude claude-session",
         sessions=2,
-        turns=2,
+        turns=6,
         covers=("#36 #75 5", "#36 #9 resume", "issue: resume"),
     ),
     _s(
@@ -271,7 +281,7 @@ _ALL = [
         "fork in place holds the worktree record; the original's teardown is held",
         "claude claude-session wtctl git",
         sessions=2,
-        turns=2,
+        turns=6,
         covers=("#36 #21", "#36 #22", "#36 #23", "#36 #75 5", "issue: in-place fork holder"),
     ),
     _s(
@@ -280,7 +290,7 @@ _ALL = [
         "fork into a throwaway with a third-party-reading run",
         "claude claude-session wtctl git",
         sessions=2,
-        turns=2,
+        turns=6,
         covers=("#36 #21", "issue: fork into a throwaway", "design.md D49"),
     ),
     _s(
@@ -289,7 +299,7 @@ _ALL = [
         "teardown of a launched --worktree new agent with the real wtctl",
         "claude claude-session wtctl git",
         sessions=1,
-        turns=1,
+        turns=3,
         covers=("#36 #23", "#36 #20", "issue: teardown with real wtctl"),
     ),
     _s(
@@ -298,7 +308,7 @@ _ALL = [
         "headless run reports needs-input, is promoted into a window and continues (spike D5)",
         "claude claude-session termctl tmux",
         sessions=2,
-        turns=2,
+        turns=6,
         covers=("design.md D5", "#36 #29", "#36 #73", "issue: headless escalation"),
     ),
     _s(
@@ -307,7 +317,7 @@ _ALL = [
         "claude exits 0 on kill-pane and the session resumes (spike D1)",
         "claude claude-session termctl tmux",
         sessions=2,
-        turns=2,
+        turns=6,
         covers=("design.md D1", "#36 issue: spike D"),
     ),
     _s(
@@ -316,7 +326,8 @@ _ALL = [
         "SIGTERM of an idle and of a mid-turn claude: exit 143, both resume (spikes D2, D3)",
         "claude claude-session termctl tmux",
         sessions=4,
-        turns=4,
+        turns=12,
+        tests=2,
         covers=("design.md D2 D3", "#36 issue: spike D"),
     ),
     _s(
@@ -334,7 +345,7 @@ _ALL = [
         "jobsctl cancel --force of a job running launch --wait",
         "claude claude-session jobsctl",
         sessions=1,
-        turns=2,
+        turns=3,
         optional=("jobsctl",),
         covers=("issue: jobsctl cancel --force", "design.md D20 D44"),
     ),
@@ -344,7 +355,7 @@ _ALL = [
         "SIGKILL of the supervisor only and of exec only against a real run in a pane",
         "claude claude-session termctl tmux",
         sessions=2,
-        turns=2,
+        turns=6,
         covers=("#36 #75 3", "#36 #75 4", "design.md B9", "FIDELITY.md wrapper_alive"),
     ),
     # ---- recorded but not automated --------------------------------------------------------

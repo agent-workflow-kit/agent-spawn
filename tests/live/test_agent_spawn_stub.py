@@ -199,10 +199,15 @@ def test_headless_launch_with_a_new_worktree_resume_fork_and_teardown(world: Wor
             "design.md D14 (forget the session)",
             unknown.returncode,
         )
+    tomb = world.agent_spawn("show", aid, "--json")
+    tomb_agent = json.loads(tomb.stdout)["agent"] if tomb.returncode == 0 else {}
     check(
-        world.agent_spawn("show", aid, "--json").returncode in (0, 10),
-        "a torn-down agent is a tombstone",
-        "design.md D14",
+        tomb.returncode == 0
+        and tomb_agent.get("status") == "torn_down"
+        and tomb_agent.get("torn_down_at"),
+        "a full id of a torn-down agent shows its tombstone (status torn_down, torn_down_at set)",
+        "interface.md show (a full id of a torn-down agent shows its tombstone)",
+        (tomb.returncode, tomb.stdout[-200:]),
     )
 
 

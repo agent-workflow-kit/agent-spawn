@@ -7,7 +7,7 @@ only assume ([FIDELITY.md](../tests/fakebin/FIDELITY.md)) and that the design re
 "assumed, check live" ([design.md](design.md), Live verification). It is **opt-in**, never part
 of `make verify` and never run in CI. Issue #36 closes only after a full run passes.
 
-Some scenarios cost API usage (a few dozen haiku turns in total, see [Cost](#cost)); the rest
+Some scenarios cost API usage (about seventy haiku turns in total, see [Cost](#cost)); the rest
 start no Claude Code at all.
 
 ## Running
@@ -70,13 +70,17 @@ Only the billed scenarios cost anything. The bounds:
 - **The `claude` wrapper.** The private `PATH` starts with a `claude` wrapper (written by
   `harness.write_claude_wrapper`) around the real binary. It counts every launch in a file
   shared by the whole run (a version probe is not a launch), refuses a launch over
-  `MAX_LIVE_SESSIONS` (exit 97), refuses a launch whose `--model` is not a haiku model (exit 98)
-  and adds `--max-budget-usd` to `-p` runs. This counts runs started by agent-spawn on its own
+  `MAX_LIVE_SESSIONS` (exit 97), refuses a launch whose last `--model <value>` is not `haiku` (or
+  a `claude-haiku-*` id) or that uses the `--model=<value>` form (exit 98) and adds
+  `--max-budget-usd` to `-p` runs. A test fails on the refusals recorded since it started, not on
+  earlier ones. This counts runs started by agent-spawn on its own
   as well (the automatic report resume, a promotion).
-- **Turns.** Headless launches pass `--max-turns 3` and `--timeout 4m`. `--max-turns` only warns
-  in interactive mode, so an interactive session has no turn cap: it is bounded by the one-turn
-  prompt, the test closing its window, `stop`, the test's wall-clock bound and the end of the
-  private tmux server.
+- **Turns.** A tiny claude-session run takes about three turns (read the prompt file, run the
+  report command, the final answer) and claude gets `--max-turns` + 1, so headless launches pass
+  `--max-turns 6` (the promotion scenario 8) and `--timeout 4m`. `--max-turns` only warns in
+  interactive mode, so an interactive session has no turn cap: it is bounded by the tiny prompt,
+  `--no-auto-exit` plus the test closing its window or `stop`, the test's wall-clock bound and the
+  end of the private tmux server.
 - **Wall clock.** Every test has a bound (`LIVE_TEST_TIMEOUT`, `SIGALRM`), the run has one
   (`LIVE_SUITE_TIMEOUT`), and every child process call is bounded and ends exactly the process
   group it created.
@@ -84,7 +88,7 @@ Only the billed scenarios cost anything. The bounds:
   warns when the selection expects more than `MAX_LIVE_SESSIONS`. After a billed test the
   harness fails it when it started more sessions than its registry entry says.
 
-The full billed set expects 23 real sessions (about 24 turns); `make live-list` prints the
+The full billed set expects 23 real sessions (about 67 turns); `make live-list` prints the
 current numbers.
 
 ## Isolation
@@ -103,9 +107,18 @@ git repositories (a bare origin and a clone, wired to wtctl with `repos.<id>.clo
   environment for paths outside the private root.
 - The real tmux server, `~/.claude`, crontab, termctl and wtctl state are never read or written.
   The real home is read only to find the login file `AS_LIVE_COPY_LOGIN=1` asks for.
-- Only the private tmux server is stopped (`kill-server` on its socket). Processes a test must
-  signal are signaled by exact PID after an identity check (start-time token and command
-  line); leftovers are killed at teardown by PID plus token. Nothing is signaled by pattern.
+- Only private tmux servers are stopped (`kill-server` on every unix socket under the private
+  root, with a fixed 10 s bound that does not depend on the test's deadline). Processes a test
+  must signal are signaled by exact PID after an identity check (start-time token and command
+  line). At teardown the harness also `claude-session stop`s the sessions the test noted and
+  kills, each by exact PID plus start-time token, the tracked processes and any process whose
+  `HOME` is the world's home or whose working directory lies under the world's root (a detached
+  supervisor or claude a failed test left behind). Nothing is signaled by pattern. Each teardown
+  step is guarded so the credential copy and the private home are always deleted, and pytest
+  turns SIGTERM and SIGHUP into `KeyboardInterrupt` so an interrupted run still tears down (the
+  login copy is also removed at exit).
+- Commands run in the world's private `repos` directory unless a test names another; they never
+  inherit pytest's working directory.
 - The cron scenario runs against a fake `crontab` first on `PATH`; the real crontab is never
   touched. Real-crontab fidelity (the system's `no crontab for <user>` wording and exit code,
   localized messages) is therefore **not checked** and stays in FIDELITY.md's Unverified list.
@@ -115,8 +128,10 @@ git repositories (a bare origin and a clone, wired to wtctl with `repos.<id>.clo
 Billed scenarios need Claude Code credentials, supplied as in claude-session's live suite, in
 this order:
 
-1. `ANTHROPIC_API_KEY`. The key is also approved (its last 20 characters) in the private
-   `~/.claude.json`, so interactive sessions do not stop at Claude Code's custom-key dialog.
+1. `ANTHROPIC_API_KEY`. Claude Code needs the key approved, so its last 20 characters are
+   written to the private `~/.claude.json` (mode 0600 in the 0700 private root, deleted at
+   teardown) and interactive sessions do not stop at the custom-key dialog. The full key is
+   never written to a file by the harness.
 2. `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`). The variable name is written to the
    private claude-session config (`claude_auth_env`), never its value.
 3. `AS_LIVE_COPY_LOGIN=1`: a copy of `~/.claude/.credentials.json`. It is copied once per pytest
@@ -126,8 +141,13 @@ this order:
    rotate the refresh token and sign your real installation out, so prefer a token.
 
 A credential reaches only the children of billed tests (their environment, or the private
-home's login file), is never written to a config file, never printed (`Auth` hides it in every
-repr) and is not in any file this suite writes. Unbilled scenarios get none. Do not run pytest
+home's login file) and is never printed (`Auth` hides it in every repr). Files that hold
+credential material, all mode 0600 inside the 0700 private root and deleted at teardown: the
+login copy (`AS_LIVE_COPY_LOGIN=1`), the last 20 characters of an API key in `.claude.json`, and
+for `jobsctl-cancel-force` a small env file that a wrapper script sources before it execs
+`agent-spawn launch` (jobsctl's own `--pass-env` reads only its `env_file`, which jobsctl accepts
+only when every ancestor directory is closed to group and others, and `/tmp` is not).
+Unbilled scenarios get none. Do not run pytest
 with `-l`/`--showlocals`: a failure would print locals.
 
 ## Reading the results
@@ -163,17 +183,17 @@ with `-l`/`--showlocals`: a failure would print locals.
 
 | Comment (PR) | Where it is checked |
 |---|---|
-| #8 fakes: claude-session | argv forms: existing `fidelity-argv`; shapes of `start`, `status`, `list`, `stop`, `forget`, `reconcile`, exit codes, outcome file mode and single write: `cs-pending-run`, `cs-dry-run-shapes`, `cs-stop-grace`; exec signals and exit 15: `cs-stop-grace`; hooks, finalizers under a real run: `headless-launch-wait`. Not covered: option abbreviations (see `fidelity-argv`), the order of refusals when several apply, `--actor` caps, hook splitting and parallelism, the trust dialog's `starting` state, exec killed by SIGKILL exit code (`liveness-kills` records it). |
-| #8 termctl / tmux | `termctl-open-pid`, `termctl-keep-on-exit`, `termctl-focus`, `tmux-real-server`. Not covered: the `locked` error (needs a concurrent label command), `--keep-on-exit` on tmux 3.2 (host has 3.5a). |
-| #8 wtctl | `wtctl-create-list-show`, `wtctl-collisions-reuse`, `wtctl-remove-status`, `wtctl-adopt-forget-holders` |
+| #8 fakes: claude-session | argv forms: existing `fidelity-argv`; shapes of `start`, `status`, `list`, `stop`, `forget`, `reconcile`, exit codes, outcome file mode and single write: `cs-pending-run`, `cs-dry-run-shapes`, `cs-stop-grace`; exec signals and exit 15: `cs-stop-grace`; hooks, finalizers under a real run: `headless-launch-wait`. Not covered: option abbreviations (see `fidelity-argv`), the order of refusals when several apply, `--actor` caps, hook splitting and parallelism, the trust dialog's `starting` state, exec killed by SIGKILL exit code (`liveness-kills` records it); the pre-launch hook veto and timeout and `--input-file` copies (need a configured hook or input fixture; hook behavior is claude-session's own suite); `wait` timeout, `--interval` and its exit codes 14, 16, 17 and 18 (need runs ending in each outcome; the billed runs reach only `done`); an ambiguous id prefix (21, needs two ids sharing four characters), `start` without `--prompt-file` (exit 2), an unknown id for every command (exit 10, only `status` and `label` are checked), `stop` of an already final run (`already_final`) and the `recent_events` cap of 20 in `status`. |
+| #8 termctl / tmux | `termctl-open-pid`, `termctl-keep-on-exit`, `termctl-focus`, `tmux-real-server`. Not covered: the `locked` error (needs a concurrent label command), `--keep-on-exit` on tmux 3.2 (host has 3.5a); the stale-socket and missing-socket texts are checked only by `fidelity-argv` (`test_fidelity.py`), not by `tmux-real-server`. |
+| #8 wtctl | `wtctl-create-list-show`, `wtctl-collisions-reuse`, `wtctl-remove-status`, `wtctl-adopt-forget-holders`. Not covered: a `create` hook veto (11) and escalation (13) with `--override-escalation`, `bootstrap_failed` with `details.record`, a `create` killed on timeout, `remove --merged-head`, `remove --flag=value` forms beyond `--holder`/`--actor`, and a human override with `--yes` (all need configured hooks, a failing bootstrap step, a TTY or a human actor the suite does not set up). |
 | #9 session backend | `cs-pending-run`, `cs-dry-run-shapes`. Not covered: the outcome-file refusal under the caller cwd for isolated runs, a launch-failed start's not-started outcome. |
 | #14 relay | `headless-launch-wait` (real hook payload, `first_working_at`), `liveness-kills` (late delivery). Not covered: a hook whose stderr closed early, an event for a session whose label names another agent, redelivery of a dropped `malformed_payload`. |
-| #15 self-label | status fields: `cs-pending-run`, `headless-launch-wait`; `verify-secret`: `cs-pending-run` (the self-label flow itself needs an agent inside a session: not automated). |
-| #20, #21, #22, #23, #25 wtctl | the `wtctl-*` scenarios; `as-stub-lifecycle`; `fork-inplace-holder`, `teardown-wtctl-real`. A `remove` killed on timeout mid-delete, exit 1 `partial` (needs a failure injected into git) and the `creating` state: not covered. |
+| #15 self-label | status fields: `cs-pending-run`, `headless-launch-wait`; `verify-secret`: `cs-pending-run` (11 for pending, wrong and unknown; 0 for an adopted run's own secret read from its session directory with a stub claude; the self-label flow itself needs an agent inside a session: not automated). |
+| #20, #21, #22, #23, #25 wtctl | the `wtctl-*` scenarios; `as-stub-lifecycle`; `fork-inplace-holder`, `teardown-wtctl-real`. A `remove` killed on timeout mid-delete, exit 1 `partial` (needs a failure injected into git) and the `creating` state: not covered. `baseline check`: only the git class change is covered; a change of only the `claude` class, and a digest-only or anchors-only change (no `changed_classes`), are not covered (they need a changed Claude project config or an anchor mutation). |
 | #26, #27 window | `termctl-open-pid`, `as-stub-lifecycle`, `interactive-window-close`. Not covered: post-open hooks slower than 60 s, a user's real termctl config (rules, hooks), WSL entries like `=C:`, the marker loop against an attached client. |
 | #28 attach | `termctl-focus` (no client, unknown client, unknown id). The `switched` answer needs an attached client: not automated. |
 | #74 here | `placement-here-terminal`: recorded, not automated (needs a human at a terminal). |
-| #75 liveness | 1: `cs-pending-run`; 2: `cs-start-killed`; 3 and 4: `liveness-kills`, `as-dead-pane-reconcile`; 5: `as-stub-lifecycle`, `fork-inplace-holder`, `resume-continue`; 6 (foreign sessions) and 7 (`forget --holder` of `creating`/`partial`): the `missing`/`unlinked` half in `wtctl-adopt-forget-holders`; the rest not covered. |
+| #75 liveness | 1: `cs-pending-run`; 2: `cs-start-killed`; 3: `liveness-kills`, `as-dead-pane-reconcile`; 4 (no second `post-park` from a late reconcile): `liveness-kills` after `stop` of the killed run (a park through the liveness path itself, where the supervisor and claude are both killed, is not provoked); 5: `as-stub-lifecycle`, `fork-inplace-holder`, `resume-continue`; 6 (foreign sessions) and 7 (`forget --holder` of `creating`/`partial`): the `missing`/`unlinked` half in `wtctl-adopt-forget-holders`; the rest not covered. |
 | #78 overrides | `cs-dry-run-shapes` (claude-session half), `wtctl-remove-status` (wtctl half). `termctl open --override-escalation` with a changed hook and the slow `pre-teardown` hook: not covered. |
 | #79 dead panes | `termctl-default-server`, `termctl-keep-on-exit`, `as-dead-pane-reconcile` |
 | #80 reset-lease | `as-reconcile-reset-lease` (the TTY path needs a real terminal; a racing second reconcile is not provoked) |
@@ -203,22 +223,23 @@ The `tools` wave was run on Linux 5.15 with tmux 3.5a, git 2.34.1, termctl 0.25.
 and claude-session 0.45.2 (the siblings built from their `origin/main`; jobsctl 0.34.0 was not
 needed). Nothing billed was run. Observed differences from what the docs assumed:
 
-- tmux: an unknown command without a server fails at the connect (`error connecting to <sock>`),
-  not as `unknown command`.
-- wtctl `create --dry-run` over a record the holder already has returns `reused: true`
-  (design.md says a dry run never returns `reused`): `wtctl-create-list-show` fails on it.
+- wtctl `create --dry-run` over a record the holder already has returns `reused: true`,
+  `dry_run: false`, `branch_action` null. The product is right (wtctl interface.md, Create order,
+  "Retry after a crash": the answer is the same under `--dry-run`); design.md and the fake were
+  wrong and are corrected. Another holder over the same name is refused `path_exists`.
 - wtctl, explicit `--branch` held by another holder under the same `--name`: refusal reason
   `path_exists` (the path check runs first), not `branch_in_use`; under another `--name` the
   same holder gets its existing record back (`reused: true`, the record keeps the old name).
 - wtctl `baseline check` change: `error.code` is `refused` and `error.reason` is
-  `repo_config_changed` (with `details.changed_classes`).
+  `repo_config_changed` (with `details.changed_classes`); the fake does not model a changed
+  baseline.
 - claude-session `verify-secret` of an unknown session answers like a wrong secret
-  (`11`, `{"match": false}`), not exit 10; an id prefix needs 4 characters after `cs-`.
+  (`11`, `{"match": false}`, claude-session interface.md; the fake already does the same); an id
+  prefix needs 4 characters after `cs-`.
 - claude-session takes `--json` after the command (a leading `--json` is exit 2).
 - `stop` of a SIGTERM-ignoring child took 11.6 s with the default `kill_grace` of 10 s, inside
-  agent-spawn's `DEFAULT_GRACE` plus margin.
-- agent-spawn accepts only `pre-launch` and `post-launch` as `--hook` names; the other hooks
-  come from config.
+  agent-spawn's `DEFAULT_GRACE` plus margin. Its `signals` list sometimes holds only the SIGTERM
+  (exec's own SIGKILL won the race), so the scenario accepts both.
 
 Everything else the `tools` wave checks passed. The per-scenario details are in the test
 docstrings; run with `LIVE_OBSERVATIONS=live.jsonl` to get the observed values.

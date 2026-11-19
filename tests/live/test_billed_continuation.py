@@ -6,11 +6,14 @@ Claude Code yet.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from .billed import (
+    MAX_TURNS,
+    adopt,
     bsetup,
     cs_status,
     expect_parked,
@@ -20,7 +23,7 @@ from .billed import (
     spawn_raw,
     wait_agent,
 )
-from .harness import World, check
+from .harness import LiveError, World, check, strict
 
 SC = pytest.mark.live_scenario
 
@@ -54,7 +57,7 @@ def test_headless_resume_continues_the_claude_session(billed_world: World) -> No
         "--model",
         "haiku",
         "--max-turns",
-        "3",
+        MAX_TURNS,
         "--prompt",
         "What word did I ask you to remember? Reply with that word only.",
         "--wait",
@@ -116,7 +119,7 @@ def test_in_place_fork_holds_the_worktree_and_the_original_is_held(billed_world:
         "--model",
         "haiku",
         "--max-turns",
-        "3",
+        MAX_TURNS,
         "--prompt",
         "What word did I ask you to remember? Reply with that word only.",
         "--wait",
@@ -162,8 +165,8 @@ def test_fork_into_a_throwaway(billed_world: World) -> None:
     """A third-party-reading run in a wtctl throwaway, then ``resume --fork --cwd <other
     throwaway>``: throwaways are never held, the fork runs in the other throwaway's root, and the
     throwaway records survive both teardowns. Confirms #36 #21 and design.md D6, D49 (forks into
-    throwaways). Skips (recorded) when a third-party-reading run cannot start on this host (no
-    sandbox)."""
+    throwaways). Fails when a third-party-reading run cannot start on this host (no sandbox), unless
+    ``AS_LIVE_STRICT=0``, which skips it."""
     world = billed_world
     wt = bsetup(world)
     ref = wt.repo.sha
@@ -186,9 +189,12 @@ def test_fork_into_a_throwaway(billed_world: World) -> None:
         auth=False,
     )
     if dry.returncode != 0:
-        pytest.skip(
+        message = (
             f"fork-throwaway: a third-party-reading run cannot start here: {dry.stdout[-300:]}"
         )
+        if strict(world.environ):
+            raise LiveError(message)
+        pytest.skip(message)
     world.trust(Path(first_record["path"]), Path(second_record["path"]), wt.repo.clone)
     first = launch_headless(
         world, wt, "Remember the word pear. Reply with the single word ok.", *flags
@@ -212,7 +218,7 @@ def test_fork_into_a_throwaway(billed_world: World) -> None:
         "--model",
         "haiku",
         "--max-turns",
-        "3",
+        MAX_TURNS,
         "--prompt",
         "Reply with the single word ok.",
         "--wait",
@@ -269,10 +275,15 @@ def test_teardown_of_a_launched_worktree_with_the_real_wtctl(billed_world: World
         "design.md D14",
         torn,
     )
+    tomb = world.agent_spawn("show", aid, "--json")
+    tomb_agent = json.loads(tomb.stdout)["agent"] if tomb.returncode == 0 else {}
     check(
-        world.agent_spawn("show", aid, "--json").returncode in (0, 10),
-        "the agent is a tombstone",
-        "design.md D14",
+        tomb.returncode == 0
+        and tomb_agent.get("status") == "torn_down"
+        and tomb_agent.get("torn_down_at"),
+        "a full id of a torn-down agent shows its tombstone (status torn_down, torn_down_at set)",
+        "interface.md show (a full id of a torn-down agent shows its tombstone)",
+        (tomb.returncode, tomb.stdout[-200:]),
     )
 
 
@@ -289,9 +300,12 @@ def test_headless_needs_input_is_promoted_into_a_window_and_continues(billed_wor
     design.md D5, D30, D47."""
     world = billed_world
     wt = bsetup(world, spawn_extra="kinds:\n  implement:\n    promote: true\n")
+    # `report needs-input` takes its reason only from a file inside $CSESSION_DIR
+    # (--reason-file; claude-session interface.md `report`, exit 2 for anything else).
     prompt = (
         "Run exactly this shell command, then stop and say nothing else: "
-        'claude-session report needs-input --reason="need a decision"'
+        "printf 'need a decision\\n' > \"$CSESSION_DIR/artifacts/reason.md\" && "
+        'claude-session report needs-input --reason-file "$CSESSION_DIR/artifacts/reason.md"'
     )
     launched = spawn(
         world,
@@ -303,7 +317,7 @@ def test_headless_needs_input_is_promoted_into_a_window_and_continues(billed_wor
         "--model",
         "haiku",
         "--max-turns",
-        "4",
+        "8",
         "--timeout",
         "5m",
         "--worktree",
@@ -314,6 +328,7 @@ def test_headless_needs_input_is_promoted_into_a_window_and_continues(billed_wor
         ok=(0, 16, 17, 18),
     )
     aid = launched["agent"]["agent_id"]
+    adopt(world, launched["agent"])
     state = wait_agent(
         world,
         aid,

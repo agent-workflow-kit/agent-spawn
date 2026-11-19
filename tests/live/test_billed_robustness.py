@@ -9,13 +9,17 @@ Claude Code yet.
 from __future__ import annotations
 
 import json
+import os
+import shlex
 import signal
 import subprocess
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from .billed import (
+    MAX_TURNS,
     PROMPT_OK,
     bsetup,
     cs_status,
@@ -25,10 +29,12 @@ from .billed import (
     show,
     signal_exact,
     spawn,
+    track_agent,
     wait_agent,
     wait_session_state,
+    wait_turn_done,
 )
-from .harness import World, check, wait_for
+from .harness import World, check, wait_for, write_executable
 from .test_wtctl import Wt
 
 SC = pytest.mark.live_scenario
@@ -46,7 +52,7 @@ def resume_headless(world: World, aid: str) -> dict[str, Any]:
         "--model",
         "haiku",
         "--max-turns",
-        "3",
+        MAX_TURNS,
         "--prompt",
         PROMPT_OK,
         "--wait",
@@ -73,7 +79,8 @@ def test_claude_exits_when_its_pane_is_killed_and_the_session_resumes(billed_wor
     wt = bsetup(world)
     agent = launch_window(world, wt)["agent"]
     aid = agent["agent_id"]
-    state = wait_session_state(world, aid, {"idle"}, 180)
+    track_agent(world, aid)
+    state = wait_turn_done(world, aid, 180)  # the run has had a turn: it is resumable
     child = claude_pid(world, agent["csession_id"])
     pane = world.json_tool("termctl", "list", "--label", f"agent={aid}")["panes"][0]
     world.track(state["supervisor"]["pid"], tree=True)
@@ -105,7 +112,11 @@ def test_claude_exits_when_its_pane_is_killed_and_the_session_resumes(billed_wor
 def sigterm_case(world: World, wt: Wt, prompt: str, states: set[str]) -> None:
     agent = launch_window(world, wt, prompt)["agent"]
     aid = agent["agent_id"]
-    state = wait_session_state(world, aid, states, 180)
+    track_agent(world, aid)
+    if states == {"idle"}:
+        state = wait_turn_done(world, aid, 180)  # a turn happened: the session is resumable
+    else:
+        state = wait_session_state(world, aid, states, 180)
     world.track(state["supervisor"]["pid"], tree=True)
     child = claude_pid(world, agent["csession_id"])
     signal_exact(world, child, signal.SIGTERM, comm_contains="claude")
@@ -205,7 +216,7 @@ def long_headless(world: World, wt: Wt, *extra: str) -> dict[str, Any]:
         "--model",
         "haiku",
         "--max-turns",
-        "3",
+        MAX_TURNS,
         "--timeout",
         "4m",
         "--worktree",
@@ -229,19 +240,13 @@ def test_killing_the_supervisor_only_and_exec_only(billed_world: World) -> None:
     hook_log = world.root / "post-park.log"
     wt = bsetup(
         world,
-        spawn_extra=f'hooks:\n  post-park:\n    - cmd: "cat >> {hook_log}; echo >> {hook_log}"\n',
+        spawn_extra=f'hooks:\n  post-park:\n    - cmd: "cat > /dev/null; echo ran >> {hook_log}"\n',
     )
     for label, victim in (("supervisor", "supervisor"), ("exec", "wrapper")):
         launched = long_headless(world, wt)
         aid = launched["agent"]["agent_id"]
         csid = launched["agent"]["csession_id"]
-        state = wait_agent(
-            world,
-            aid,
-            lambda s: s["agent"]["status"] == "live" and s["supervisor"]["alive"],
-            "a live run",
-            120,
-        )
+        state = track_agent(world, aid)
         wait_for(
             lambda csid=csid: cs_status(world, csid)["run"].get("child_alive"), 60, "claude to run"
         )
@@ -296,15 +301,28 @@ def test_killing_the_supervisor_only_and_exec_only(billed_world: World) -> None:
             f"liveness.{label}.parked",
             {k: parked[k] for k in ("park_reason", "needs_attention", "supervisor_lost")},
         )
-        before = hook_log.read_text() if hook_log.exists() else ""
-        world.tool("claude-session", "reconcile", "--json", auth=True)
-        world.spawn_json("reconcile", ok=(0, 12))
-        after = hook_log.read_text() if hook_log.exists() else ""
+        ran = f"post-park hook runs after the {label} case"
+
+        def hook_runs() -> int:
+            return hook_log.read_text().count("ran\n") if hook_log.exists() else 0
+
+        expected = 1 if label == "supervisor" else 2
+        wait_for(lambda expected=expected: hook_runs() >= expected, 15, ran)
+        before = hook_runs()
         check(
-            before == after,
+            before == expected,
+            "post-park ran exactly once for this park (before the late reconcile)",
+            "#36 #75 4 / interface.md post-park (once per park)",
+            before,
+        )
+        world.tool("claude-session", "reconcile", "--json")
+        world.spawn_json("reconcile", ok=(0, 12))
+        after = hook_runs()
+        check(
+            after == before,
             "a late reconcile delivers no second post-park (no hook runs twice)",
-            "#36 #75 4 (late delivery after a liveness park)",
-            (len(before), len(after)),
+            "#36 #75 4 (late delivery after the stopped run's park)",
+            (before, after),
         )
         again = show(world, aid)["agent"]
         check(
@@ -316,14 +334,37 @@ def test_killing_the_supervisor_only_and_exec_only(billed_world: World) -> None:
         world.spawn_json("teardown", aid, ok=(0, 20))
 
 
+def write_job_wrapper(world: World) -> Path:
+    """A 0700 script in the private root that sources the credential variables from a 0600 file in
+    the private root (nothing is stored in jobsctl's state or argv) and execs its arguments.
+
+    jobsctl's ``--pass-env`` reads only from its ``env_file``, which jobsctl accepts only when
+    every ancestor directory is writable by the owner alone; the private root is under ``/tmp``
+    (1777), so that file would always be ``env_file_unsafe`` there (src-jobsctl env_file.py,
+    ``_dir_trusted``). In login-copy mode ``HOME`` suffices and the file is empty."""
+    auth_file = world.root / "job-auth.env"
+    lines = [
+        f"export {name}={shlex.quote(value)}\n"
+        for name, value in (world.auth.env if world.auth else {}).items()
+    ]
+    fd = os.open(auth_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write("".join(lines))
+    wrapper = world.root / "job-run.sh"
+    write_executable(wrapper, f'#!/bin/sh\n. {shlex.quote(str(auth_file))}\nexec "$@"\n')
+    return wrapper
+
+
 @SC("jobsctl-cancel-force")
 def test_jobsctl_cancel_force_of_a_job_running_launch_wait(billed_world: World) -> None:
     """A jobsctl job whose command is ``agent-spawn launch --wait`` with a long headless prompt;
     ``jobsctl cancel --force`` SIGTERMs the waiter, which forwards (D44) and keeps waiting until the
-    agent parked ``killed``; no claude is left running. Confirms the issue's jobsctl scenario and
-    design.md D20, D44 (a waiter SIGKILLed after its grace would leave the agent running)."""
+    agent parked ``killed``; cancel exits 0, the job ends ``canceled`` (``forced``) and no claude is
+    left running. Confirms the issue's jobsctl scenario and design.md D20, D44 (a waiter SIGKILLed
+    after its grace would leave the agent running)."""
     world = billed_world
     wt = bsetup(world)
+    wrapper = write_job_wrapper(world)
     job_env = {
         "PATH": f"{world.bin}:/usr/bin:/bin",
         "HOME": str(world.home),
@@ -332,6 +373,7 @@ def test_jobsctl_cancel_force_of_a_job_running_launch_wait(billed_world: World) 
         "TMUX_TMPDIR": str(world.tmuxdir),
     }
     argv = [
+        str(wrapper),
         world.agent_spawn_path,
         "launch",
         "--mode",
@@ -341,7 +383,7 @@ def test_jobsctl_cancel_force_of_a_job_running_launch_wait(billed_world: World) 
         "--model",
         "haiku",
         "--max-turns",
-        "3",
+        MAX_TURNS,
         "--timeout",
         "4m",
         "--worktree",
@@ -354,19 +396,16 @@ def test_jobsctl_cancel_force_of_a_job_running_launch_wait(billed_world: World) 
     env_args: list[str] = []
     for name, value in job_env.items():
         env_args += ["--env", f"{name}={value}"]
-    pass_env = [a for name in (world.auth.env if world.auth else {}) for a in ("--pass-env", name)]
     added = world.json_tool(
         "jobsctl",
         "add",
         "--kill-grace",
         "60s",
         *env_args,
-        *pass_env,
         "--cwd",
         str(wt.repo.clone),
         "--",
         *argv,
-        auth=True,
     )
     job = added.get("job", added)
     job_id = job["id"]
@@ -377,6 +416,7 @@ def test_jobsctl_cancel_force_of_a_job_running_launch_wait(billed_world: World) 
         "the job to launch an agent",
     )
     aid = agent["agent_id"]
+    state = track_agent(world, aid)
     wait_agent(
         world,
         aid,
@@ -386,6 +426,7 @@ def test_jobsctl_cancel_force_of_a_job_running_launch_wait(billed_world: World) 
         "the run to work",
         120,
     )
+    child = claude_pid(world, state["agent"]["csession_id"])
     cancelled = world.tool(
         "jobsctl",
         "--json",
@@ -396,13 +437,22 @@ def test_jobsctl_cancel_force_of_a_job_running_launch_wait(billed_world: World) 
         "--actor",
         "human:live",
         job_id,
-        auth=True,
         timeout=150,
     )
     world.observe("jobsctl.cancel", (cancelled.returncode, cancelled.stdout[-300:]))
+    check(
+        cancelled.returncode == 0,
+        "cancel --force of the running job exits 0 once the job is terminal",
+        "jobsctl interface.md cancel (exit 12 cancel_pending on a timeout)",
+        (cancelled.returncode, cancelled.stdout[-200:], cancelled.stderr[-200:]),
+    )
     shown = world.json_tool("jobsctl", "show", job_id)
-    world.observe(
-        "jobsctl.show", {k: shown.get(k, shown.get("job", {}).get(k)) for k in ("status", "reason")}
+    final = shown.get("job", shown)
+    check(
+        final.get("status") == "canceled" and final.get("reason") == "forced",
+        "the job ends canceled with reason forced",
+        "jobsctl interface.md cancel / status table (canceled, forced)",
+        {k: final.get(k) for k in ("status", "reason")},
     )
     parked = expect_parked(world, aid, 90)
     check(
@@ -418,4 +468,5 @@ def test_jobsctl_cancel_force_of_a_job_running_launch_wait(billed_world: World) 
         "design.md D20 residual risk",
         run.get("outcome"),
     )
+    wait_for(lambda: pid_gone(child), 30, "the job's claude to be gone after the cancel")
     world.spawn_json("teardown", aid, ok=(0, 20))

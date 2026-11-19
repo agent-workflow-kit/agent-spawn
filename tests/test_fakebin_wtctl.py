@@ -439,15 +439,24 @@ def test_a_template_branch_collision_with_an_explicit_name_is_branch_exists(
     assert "tip" in error["details"]
 
 
-def test_a_dry_run_applies_the_refusals_and_never_reuses(fakebin: Fakebin) -> None:
+def test_a_dry_run_reuses_the_holders_own_record_and_refuses_other_holders(
+    fakebin: Fakebin,
+) -> None:
+    # wtctl interface.md, Create order, "Retry after a crash": the answer is the same under
+    # --dry-run (reused: true, dry_run: false, branch_action null).
     args = ("--detach", "--name", "same", "--holder", "ag-aaaaaaaa")
-    create(fakebin, *args)
-    code, error = error_of(fakebin, "wtctl", "create", "--repo", REPO, *args, "--dry-run")
+    made = create(fakebin, *args)
+    _, again = run_json(fakebin, "wtctl", "create", "--repo", REPO, *args, "--dry-run")
+    assert again["reused"] is True and again["dry_run"] is False  # type: ignore[index]
+    assert again["branch_action"] is None  # type: ignore[index]
+    assert again["record"]["id"] == made["record"]["id"]  # type: ignore[index]
+    other = ("--detach", "--name", "same", "--holder", "ag-bbbbbbbb")
+    code, error = error_of(fakebin, "wtctl", "create", "--repo", REPO, *other, "--dry-run")
     assert (code, error["reason"]) == (20, "path_exists")
     create(fakebin, "--branch", "b9", "--holder", "ag-aaaaaaaa")
     code, error = error_of(
         fakebin, "wtctl", "create", "--repo", REPO, "--branch", "b9",
-        "--holder", "ag-aaaaaaaa", "--dry-run",
+        "--holder", "ag-bbbbbbbb", "--dry-run",
     )  # fmt: skip
     assert (code, error["reason"]) == (20, "branch_in_use")
 

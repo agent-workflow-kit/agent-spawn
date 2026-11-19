@@ -17,8 +17,13 @@ from .harness import LiveError, World, process_token, wait_for
 from .test_wtctl import Wt
 
 PROMPT_OK = "Reply with the single word ok."
-HEADLESS_BOUNDS = ["--model", "haiku", "--max-turns", "3", "--timeout", "4m"]
-INTERACTIVE_BOUNDS = ["--model", "haiku", "--timeout", "10m"]
+#: A tiny headless run takes at least three turns (read the prompt file, run the report command,
+#: the final answer) and claude gets ``--max-turns`` + 1 (the Stop backstop turn), so 6 leaves room.
+MAX_TURNS = "6"
+HEADLESS_BOUNDS = ["--model", "haiku", "--max-turns", MAX_TURNS, "--timeout", "4m"]
+#: ``--no-auto-exit``: the session stays up after its turn, so a test acts on a settled idle
+#: session instead of racing claude-session's auto-exit.
+INTERACTIVE_BOUNDS = ["--model", "haiku", "--timeout", "10m", "--no-auto-exit"]
 
 
 def bsetup(world: World, *, cs_extra: str = "", spawn_extra: str = "") -> Wt:
@@ -44,7 +49,7 @@ def spawn_raw(world: World, *args: str, timeout: float = 240) -> Any:
 def launch_headless(
     world: World, wt: Wt, prompt: str = PROMPT_OK, *extra: str, ok: tuple[int, ...] = (0,)
 ) -> dict[str, Any]:
-    return spawn(
+    done = spawn(
         world,
         "launch",
         "--mode",
@@ -56,9 +61,38 @@ def launch_headless(
         *extra,
         ok=ok,
     )
+    adopt(world, done["agent"])
+    return done
+
+
+def adopt(world: World, agent: dict[str, Any]) -> None:
+    """Make teardown end this agent's session (``claude-session stop``) and kill what it left."""
+    world.note_session(agent.get("csession_id") or "")
+
+
+def track_agent(world: World, agent_id: str) -> dict[str, Any]:
+    """Track the live agent's supervisor and its current descendants (supervisor, exec, claude)
+    for teardown, as soon as it is live: a launch without ``--wait`` or a test that fails early
+    must not leave a detached supervisor or claude running."""
+    state = wait_agent(
+        world,
+        agent_id,
+        lambda s: s["agent"]["status"] == "live" and bool((s.get("supervisor") or {}).get("pid")),
+        f"agent {agent_id} to be live with a supervisor",
+        120,
+    )
+    world.track(int(state["supervisor"]["pid"]), tree=True)
+    adopt(world, state["agent"])
+    return state
 
 
 def launch_window(world: World, wt: Wt, prompt: str = PROMPT_OK, *extra: str) -> dict[str, Any]:
+    launched = launch_window_raw(world, wt, prompt, *extra)
+    adopt(world, launched["agent"])
+    return launched
+
+
+def launch_window_raw(world: World, wt: Wt, prompt: str = PROMPT_OK, *extra: str) -> dict[str, Any]:
     return spawn(
         world,
         "launch",
@@ -106,6 +140,28 @@ def wait_session_state(
         f"agent {agent_id} session state in {sorted(states)}",
         timeout,
     )
+
+
+def wait_turn_done(world: World, agent_id: str, timeout: float = 180) -> dict[str, Any]:
+    """Wait until the interactive run has had its turn: ``first_working_at`` is set and the
+    session state is settled (idle, reported or needs-input); then require idle or reported."""
+    state = wait_agent(
+        world,
+        agent_id,
+        lambda s: (
+            bool(s["runs"] and s["runs"][0].get("first_working_at"))
+            and (s.get("session") or {}).get("state") in {"idle", "reported", "needs-input"}
+        ),
+        f"agent {agent_id} to finish its first turn",
+        timeout,
+    )
+    got = state["session"]["state"]
+    if got not in {"idle", "reported"}:
+        raise LiveError(
+            f"assumption broken: the one-turn prompt settles idle or reported, not {got} "
+            f"[design.md D1 / #36 #27] {state['session']}"
+        )
+    return state
 
 
 def cs_status(world: World, csession_id: str) -> dict[str, Any]:

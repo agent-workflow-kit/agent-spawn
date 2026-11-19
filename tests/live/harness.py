@@ -20,12 +20,16 @@ Credentials follow claude-session's live suite. In order: ``ANTHROPIC_API_KEY``;
 ``CLAUDE_CODE_OAUTH_TOKEN`` (from ``claude setup-token``); the user's login file, only with
 ``AS_LIVE_COPY_LOGIN=1``, copied once per pytest process into a mode-0700 private directory
 (``LoginCache``), installed mode 0600 into each billed test's private home and deleted at the end
-of the run. A variable's value reaches only the children that need it (billed tests), is never
-written to a file by this module and never printed (``Auth.__repr__`` hides it).
+of the run. A variable's value reaches only the children that need it (billed tests) and is
+never printed (``Auth.__repr__`` hides it). It is written to no file except what is needed: the
+last 20 characters of ``ANTHROPIC_API_KEY`` go to the private ``.claude.json`` (Claude Code
+requires them) and the jobsctl scenario writes an env file its job wrapper sources; both are mode
+0600 under the 0700 private root and deleted at teardown.
 
 Cost. Every real ``claude`` started in a test is counted by the wrapper in ``World.bin``: the
 wrapper appends one line to the suite's counter file, refuses (exit 97) once the count would pass
-``MAX_LIVE_SESSIONS`` and refuses a launch whose ``--model`` is not a haiku model (exit 98).
+``MAX_LIVE_SESSIONS`` and refuses a launch whose last ``--model <value>`` is not ``haiku`` or a
+``claude-haiku-*`` id, or that uses the ``--model=<value>`` form (exit 98).
 ``-p`` runs get ``--max-budget-usd``. Tests and the whole suite have wall-clock limits.
 """
 
@@ -413,21 +417,27 @@ case "$1" in
   --version|-v|--help|-h) exec "$REAL" "$@" ;;
 esac
 prev=
-haiku=
+model=
+inline=
 budget=
 print=
 for a in "$@"; do
   case "$prev" in
-    --model) case "$a" in *haiku*) haiku=1 ;; esac ;;
+    --model) model="$a" ;;
   esac
   case "$a" in
+    --model=*) inline=1 ;;
     --max-budget-usd|--max-budget-usd=*) budget=1 ;;
     -p|--print) print=1 ;;
   esac
   prev="$a"
 done
-if [ -z "$haiku" ]; then
-  echo "live claude wrapper: refusing a launch without --model haiku" >&2
+case "$model" in
+  haiku|claude-haiku-*) ok=1 ;;
+  *) ok= ;;
+esac
+if [ -n "$inline" ] || [ -z "$ok" ]; then
+  echo "live claude wrapper: refusing a launch whose last '--model <value>' is not haiku" >&2
   echo "no-haiku" >> "$COUNTER.refused"
   exit 98
 fi
@@ -480,6 +490,11 @@ def refusals(counter: Path) -> list[str]:
         return []
 
 
+def refusals_since(counter: Path, before: int) -> list[str]:
+    """Refusals the wrapper recorded after the first ``before`` (a test's own, not the suite's)."""
+    return refusals(counter)[before:]
+
+
 class SessionBudget:
     """The suite's session counter: the counter file the wrappers append to, and the cap."""
 
@@ -499,10 +514,14 @@ class SessionBudget:
                 f"expected > {self.maximum} (raise the variable or select fewer scenarios)"
             )
 
-    def check_end(self, scenario: str, expected: int, used_before: int) -> list[str]:
-        """Problems after a test: refusals by the wrapper, more sessions than registered."""
+    def check_end(
+        self, scenario: str, expected: int, used_before: int, refused_before: int = 0
+    ) -> list[str]:
+        """Problems after a test: refusals the wrapper recorded since the test started, more
+        sessions than registered."""
         problems = [
-            f"{scenario}: the claude wrapper refused a launch: {r}" for r in refusals(self.counter)
+            f"{scenario}: the claude wrapper refused a launch: {r}"
+            for r in refusals_since(self.counter, refused_before)
         ]
         took = self.used - used_before
         if took > expected:
@@ -697,6 +716,7 @@ class World:
         self.crontab_table = root / "crontab.table"
         self.claude_pids = root / "stub-claude.pids"
         self.pids: list[tuple[int, str]] = []  # (pid, start token) of processes we may signal
+        self.csessions: list[str] = []  # claude-session ids stopped at teardown
         self.observations: list[tuple[str, Any]] = []
         self._installed = False
         self._stub = False
@@ -805,11 +825,13 @@ class World:
         input_text: str | None = None,
         tmux: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        """Run ``argv`` in the private environment; the default working directory is the
+        private ``repos`` directory, never the cwd of pytest."""
         return run_process(
             argv,
             env=self.env(extra, auth=auth, tmux=tmux),
             timeout=self.timeout(timeout),
-            cwd=cwd,
+            cwd=cwd if cwd is not None else self.root / "repos",
             input_text=input_text,
         )
 
@@ -837,15 +859,36 @@ class World:
     def default_socket(self) -> Path:
         return self.tmuxdir / f"tmux-{os.getuid()}" / "default"
 
-    def stop_tmux(self) -> None:
-        """Stop the private default server and any private socket under the root."""
-        sockets = [self.default_socket, *self.root.glob("*.sock")]
-        for sock in sockets:
-            if sock.exists():
+    def sockets(self) -> list[Path]:
+        """Every unix socket under the private root (the default server's, ``-S`` sockets of
+        tests, anything in ``TMUX_TMPDIR``): the root is ours alone, so each is ours."""
+        found: list[Path] = []
+        for base, dirs, files in os.walk(self.root):
+            for name in [*dirs, *files]:
+                path = Path(base) / name
                 try:
-                    self.tmux("kill-server", socket=sock, timeout=10)
-                except (LiveError, LiveTimeout, OSError):
-                    pass
+                    if stat.S_ISSOCK(path.lstat().st_mode):
+                        found.append(path)
+                except OSError:
+                    continue
+        return found
+
+    def stop_tmux(self) -> None:
+        """``kill-server`` on every private socket. Teardown must not depend on the test's
+        deadline, so this calls ``run_process`` directly with a fixed 10 s bound."""
+        tool = self.tools.get("tmux")
+        if tool is None:
+            return
+        for sock in self.sockets():
+            try:
+                run_process(
+                    [tool.path, "-f", "/dev/null", "-S", str(sock), "kill-server"],
+                    env=self.env(),
+                    timeout=10,
+                    cwd=self.root,
+                )
+            except (LiveError, OSError):
+                pass
 
     # -- configuration files ----------------------------------------------------------------
 
@@ -923,17 +966,117 @@ class World:
 
     # -- teardown ---------------------------------------------------------------------------
 
-    def close(self) -> None:
-        self.stop_tmux()
-        for pid, token in reversed(self.pids):
+    def note_session(self, csession_id: str) -> None:
+        """Remember a claude-session id so teardown ends it with ``claude-session stop``."""
+        if csession_id and csession_id not in self.csessions:
+            self.csessions.append(csession_id)
+
+    def stop_sessions(self) -> None:
+        link = self.bin / "claude-session"
+        if not link.exists():
+            return
+        for csid in self.csessions:
+            try:
+                run_process(
+                    [str(link), "stop", csid, "--json"],
+                    env=self.env(),
+                    timeout=20,
+                    cwd=self.root,
+                )
+            except (LiveError, OSError):
+                pass
+
+    def kill_leftovers(self) -> None:
+        """Kill what tests tracked and anything still running in this world (its ``HOME`` or a
+        working directory under its root): each by exact PID plus start token, never by pattern."""
+        victims = list(reversed(self.pids))
+        victims += [(pid, token) for pid, token in world_processes(self.root, self.home)]
+        for pid, token in victims:
             if process_token(pid) == token:
                 try:
                     os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
                     pass
-        if self.login is not None:
-            self.login.collect(self.home)
-        shutil.rmtree(self.root, ignore_errors=True)
+
+    def close(self) -> None:
+        """Tear the world down. Nothing here depends on the test's deadline (the alarm is
+        disarmed first) and every step is guarded so deleting the credentials and the private
+        home always happens."""
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        try:
+            self._close_steps()
+        finally:
+            shutil.rmtree(self.root, ignore_errors=True)
+
+    def _close_steps(self) -> None:
+        try:
+            self.stop_sessions()
+        finally:
+            try:
+                self.stop_tmux()
+            finally:
+                try:
+                    self.kill_leftovers()
+                finally:
+                    if self.login is not None:
+                        self.login.collect(self.home)
+
+
+def world_processes(root: Path, home: Path) -> list[tuple[int, str]]:
+    """Processes (pid, start token) of this user whose ``HOME`` is ``home`` or whose working
+    directory lies under ``root``, excluding this process and its ancestors."""
+    skip = {os.getpid(), *ancestors(os.getpid())}
+    found: list[tuple[int, str]] = []
+    real_root = os.path.realpath(root)
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) in skip:
+            continue
+        pid = int(entry.name)
+        token = process_token(pid)
+        if token is None:
+            continue
+        mine = False
+        try:
+            env = (entry / "environ").read_bytes().split(b"\0")
+            mine = f"HOME={home}".encode() in env
+        except OSError:
+            pass
+        if not mine:
+            try:
+                cwd = os.path.realpath(os.readlink(entry / "cwd"))
+                mine = cwd == real_root or cwd.startswith(real_root + os.sep)
+            except OSError:
+                pass
+        if mine and process_token(pid) == token:
+            found.append((pid, token))
+    return found
+
+
+def ancestors(pid: int) -> list[int]:
+    chain: list[int] = []
+    while pid > 1:
+        try:
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[-1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+        chain.append(pid)
+    return chain
+
+
+def install_termination_handlers() -> Callable[[], None]:
+    """Make SIGTERM and SIGHUP raise ``KeyboardInterrupt`` (so pytest runs its teardown: worlds,
+    login copy, suite directory) and return a function restoring the previous handlers."""
+
+    def handler(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt(f"live suite stopped by signal {signum}")
+
+    previous = {sig: signal.signal(sig, handler) for sig in (signal.SIGTERM, signal.SIGHUP)}
+
+    def restore() -> None:
+        for sig, old in previous.items():
+            signal.signal(sig, old)
+
+    return restore
 
 
 def descendant_pids(pid: int) -> list[int]:
