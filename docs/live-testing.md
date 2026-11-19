@@ -39,6 +39,10 @@ process.
 | `LIVE_RUN_USD` | `--max-budget-usd` the wrapper adds to `-p` runs (default 0.25). |
 | `LIVE_OBSERVATIONS` | Append the recorded observations (below) to this JSON-lines file. |
 
+claude-session must be installed with `--link-mode=copy` (`uv tool install --link-mode=copy`):
+its isolated (third-party-reading) runs refuse a hard-linked install, which `fork-throwaway`
+needs.
+
 Tools are found on `PATH` (or the `LIVE_*` variable); the suite never installs anything. Their
 versions are recorded by `tools-versions` and compared with the minimums in
 `tests/live/harness.py` (`MINIMUMS`). A version that cannot be read (an editable install of a
