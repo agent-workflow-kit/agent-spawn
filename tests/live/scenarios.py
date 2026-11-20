@@ -210,6 +210,14 @@ _ALL = [
         covers=("#36 #20-#23", "#36 #25", "#36 #26", "#36 #15", "#36 #12"),
     ),
     _s(
+        "as-wrapper-dead-child-alive",
+        "tools",
+        "SIGKILL of exec under a SIGTERM-ignoring stub claude: wrapper dead, child alive, no "
+        "outcome, supervisor_lost once, stop parks it killed (the row liveness-kills cannot reach)",
+        "claude-session wtctl termctl tmux git",
+        covers=("#36 #75 3", "#36 #75 4", "#97"),
+    ),
+    _s(
         "wtctl-reuse-mismatch",
         "tools",
         "agent-spawn refuses the record the real wtctl reuses for the same holder under another "
