@@ -179,6 +179,7 @@ _ALL = [
         "a digest-only baseline change (repo_config_changed with only the digests), a moved anchor "
         "(baseline check says unlinked; accept --expect-digest shows details.anchors, no classes)",
         "wtctl git",
+        tests=2,
         covers=("#115", "#36 #25", "wtctl interface.md Baseline check, Baseline accept"),
     ),
     _s(
@@ -384,6 +385,15 @@ _ALL = [
         "an oversized, duplicate, badly named or '-' input",
         "claude-session",
         covers=("#116", "#36 #8 claude-session", "claude-session interface.md Launch flags"),
+    ),
+    _s(
+        "tty-human-gates",
+        "tools",
+        "a pseudo-terminal as stdin and no --actor: wtctl baseline accept asks [y/N], --yes skips "
+        "it and the actor defaults to human; agent-spawn --override-escalation is accepted, an "
+        "explicit auto actor refused",
+        "claude-session wtctl git",
+        covers=("#116", "wtctl interface.md Audit and log, Actor", "interface.md Global flags"),
     ),
     _s(
         "as-cron-fake-crontab",

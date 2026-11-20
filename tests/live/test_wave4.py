@@ -15,6 +15,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pty
 import signal
 import sqlite3
 import subprocess
@@ -1051,3 +1052,149 @@ def test_wait_has_no_interval_flag_and_cron_install_interval_is_one_to_fifty_nin
             "claude-session interface.md cron install (--interval 1 to 59, else exit 2)",
             (bad.returncode, bad.stdout[-200:]),
         )
+
+
+def run_on_tty(
+    world: World,
+    argv: Sequence[str],
+    *,
+    typed: str = "",
+    timeout: float = 60,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run ``argv`` with a pseudo-terminal as its stdin (so ``isatty(0)`` is true), in the private
+    environment, in its own session. ``typed`` is what a human types at the prompt: written to the
+    terminal's master side up front (the line discipline holds it until the program reads). stdout
+    and stderr stay pipes, so ``--json`` output is captured. On a timeout exactly the group this
+    call created is killed."""
+    master, slave = pty.openpty()
+    child = subprocess.Popen(
+        list(argv),
+        env=world.env(),
+        cwd=cwd if cwd is not None else world.root / "repos",
+        stdin=slave,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    os.close(slave)
+    try:
+        if typed:
+            os.write(master, typed.encode())
+        out, err = child.communicate(timeout=world.timeout(timeout))
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        child.communicate()
+        raise LiveError(f"timed out after {timeout:.0f}s on a tty: {' '.join(argv[:4])}") from None
+    except BaseException:
+        if child.poll() is None:
+            os.killpg(child.pid, signal.SIGKILL)
+        child.wait()
+        raise
+    finally:
+        os.close(master)
+    return subprocess.CompletedProcess(list(argv), child.returncode, out, err)
+
+
+@SC("tty-human-gates")
+def test_human_gates_and_yes_at_a_real_terminal(world: World) -> None:
+    """wtctl interface.md Audit and log (Actor: ``--actor`` absent and stdin a TTY gives the human
+    actor ``human:<me.name>``; human-only commands exit 13 without one), Remove order step 7 and
+    ``baseline accept`` (from a TTY without ``--yes`` wtctl asks and a "no" changes nothing;
+    ``--yes`` skips only the prompt), and agent-spawn interface.md Global flags (Human-only flags:
+    accepted when stdin is a TTY, and the default actor is then ``human:<me.name>``; an explicit
+    non-human ``--actor`` is refused even at a TTY). Every other live test stands in for the
+    terminal with ``--actor human:tester``; here a pseudo-terminal is the stdin and no ``--actor``
+    is given. #116 (a human ``--yes`` at a TTY)."""
+    payload = world.root / "tty-payload.json"
+    escalate = write_script(world, "tty-escalate.sh", f"cat > {payload}; exit 13\n")
+    wt = stub_setup(world, "exit 0", agent_spawn_config=hook_config("pre-launch", (escalate, None)))
+    made = wt.create("tty1", "ag-aaaa")["record"]
+    rid = made["id"]
+    wtctl = str(world.bin / "wtctl")
+    wtctl_db_update(world, "update records set baseline_digest = ? where id = ?", "0" * 64, rid)
+
+    # no terminal, no actor: a human-only command exits 13
+    plain = wt.run("baseline", "accept", rid, "--yes")
+    check(
+        plain.returncode == 13 and err_of(plain)["code"] == "confirmation_required",
+        "without a TTY and without an actor baseline accept --yes exits 13 confirmation_required",
+        "wtctl interface.md Audit and log (human-only commands exit 13 without a human actor)",
+        (plain.returncode, plain.stdout[-300:]),
+    )
+    # a terminal, no --yes: the prompt appears on stderr; "n" declines and changes nothing
+    declined = run_on_tty(world, [wtctl, "--json", "baseline", "accept", rid], typed="n\n")
+    world.observe("wtctl.tty.declined", (declined.returncode, declined.stdout[-200:], declined.stderr[-300:]))
+    check(
+        declined.returncode == 13
+        and "[y/N]" in declined.stderr
+        and wt.run("baseline", "check", rid).returncode == 20,
+        "at a TTY without --yes baseline accept asks [y/N]; 'n' exits 13 and leaves the baseline unchanged",
+        "wtctl interface.md baseline accept (asks unless --yes), Remove order step 7",
+        (declined.returncode, declined.stderr[-300:]),
+    )
+    # a terminal and --yes, still no --actor: the actor defaults to a human and the accept goes through
+    # (wtctl 1.0.0 writes no audit record for it, see test_baseline_accept_is_audited)
+    accepted = run_on_tty(world, [wtctl, "--json", "baseline", "accept", rid, "--yes"])
+    check(
+        accepted.returncode == 0 and "[y/N]" not in accepted.stderr
+        and wt.run("baseline", "check", rid).returncode == 0,
+        "at a TTY with --yes and no --actor baseline accept runs as the default human actor, without a prompt",
+        "wtctl interface.md Audit and log (Actor: the default is human:<me.name> when stdin is a TTY)",
+        (accepted.returncode, accepted.stdout[-300:], accepted.stderr[-300:]),
+    )
+
+    # agent-spawn: --override-escalation is accepted at a TTY (default human actor) and refused with an auto actor
+    stub = wt
+    spawn = [str(world.agent_spawn_path), "--json"]
+    refused = run_on_tty(
+        world, [*spawn, *launch_args(stub, "--override-escalation", "--actor", "auto:bot")]
+    )
+    check(
+        refused.returncode == 2 and json.loads(refused.stdout)["error"]["code"] == "usage",
+        "an explicit non-human --actor is refused for --override-escalation even at a TTY",
+        "interface.md Global flags (an explicit non-human --actor is refused even when stdin is a TTY)",
+        (refused.returncode, refused.stdout[-300:]),
+    )
+    ran = run_on_tty(
+        world, [*spawn, *launch_args(stub, "--override-escalation", "--wait")], timeout=120
+    )
+    world.observe("agent-spawn.tty.override", (ran.returncode, ran.stdout[-300:]))
+    body = json.loads(payload.read_text())
+    check(
+        ran.returncode == 14
+        and body["override_escalation"] is True
+        and str(body["actor"]).startswith("human:"),
+        "at a TTY --override-escalation needs no --actor: the escalation counts as allow and the hook payload names a human actor",
+        "interface.md Global flags (Human-only flags; default actor human:<me.name> when stdin is a TTY), Escalation overrides",
+        (ran.returncode, {k: body.get(k) for k in ("override_escalation", "actor")}),
+    )
+
+
+
+@SC("wtctl-baseline-no-classes")
+@pytest.mark.xfail(
+    strict=True,
+    raises=LiveError,
+    reason="product gap, reported with #115/#116: wtctl 1.0.0 does not audit baseline accept "
+    "(its source carries TODO(#5) at commands/baseline_accept.py) although interface.md Audit and "
+    "log lists the baseline_accept action",
+)
+def test_baseline_accept_is_audited(world: World) -> None:
+    """wtctl interface.md Audit and log (``audit.jsonl`` actions: ``baseline_accept`` with the old
+    and new digest, the changed items and the anchors, and the actor). Observed with wtctl 1.0.0:
+    ``export --audit`` is empty after a human accept. strict: promote this to a plain test when
+    wtctl audits the action."""
+    wt = Wt(world)
+    made = wt.create("au1", "ag-aaaa")["record"]
+    wtctl_db_update(world, "update records set baseline_digest = ? where id = ?", "0" * 64, made["id"])
+    done = wt.run("baseline", "accept", made["id"], "--yes", "--actor", "human:tester")
+    check(done.returncode == 0, "the human accept succeeds", "wtctl baseline accept", done.stdout[-300:])
+    records = json.loads(wt.run("export", "--audit").stdout)
+    check(
+        [r["action"] for r in records] == ["baseline_accept"] and records[0]["actor"] == "human:tester",
+        "the accept is recorded in audit.jsonl with the human actor",
+        "wtctl interface.md Audit and log (baseline_accept)",
+        records,
+    )
