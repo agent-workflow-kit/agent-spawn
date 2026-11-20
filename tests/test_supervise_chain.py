@@ -100,6 +100,9 @@ def test_report_resume_runs_a_second_run_and_its_outcome_applies(
     assert second["outcome"]["outcome"] == "done"
     assert first["started_at"] is not None and second["started_at"] is not None
     assert first["started_at"] <= second["started_at"]
+    # (the test clock is real, so two runs may share a timestamp: `<=`, not `<`)
+    shown = result_json(env.run("show", agent_id, "--json"))["runs"]
+    assert [r["adopted_at"] is not None for r in shown] == [True, True]
     # start --resume with the fixed prompt, a classification dry run before it
     resume = real_starts(fakebin)[1]
     session = row["csession_id"]

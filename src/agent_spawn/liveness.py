@@ -656,6 +656,7 @@ class Liveness:
             run=run,
             changes={"last_live_at": self.gateway.wall_time(), "run": run},
             guard=self._guard(ctx.row),
+            adopted_at=self.gateway.wall_time(),
         )
         if moved is None:
             return False
@@ -733,6 +734,9 @@ class Liveness:
         }
         if isinstance(report_status, str):
             run_fields["report_status"] = report_status
+        if result.phase == "session" and (run_row or {}).get("started_at") is None:
+            # The run started and the supervisor that would have recorded it is gone.
+            run_fields["started_at"] = self.gateway.wall_time()
         if outcome["first_working_at"]:
             try:
                 run_fields["first_working_at"] = parse_record_ts(

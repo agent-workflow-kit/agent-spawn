@@ -416,6 +416,42 @@ def test_launching_with_a_dead_supervisor_and_a_final_run_is_parked_by_its_row(
     )
 
 
+def test_a_dead_supervisor_that_never_wrote_the_adoption_time_gets_it_from_the_check(
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    script_live_run(fakebin)
+    seed(env, status="launching", supervisor=dead(proc_tracker), launcher=dead(proc_tracker))
+    shown = show(env)
+    assert shown["agent"]["status"] == "live"
+    assert shown["runs"][0]["adopted_at"] is not None
+    first = shown["runs"][0]["adopted_at"]
+    assert show(env)["runs"][0]["adopted_at"] == first  # written once
+
+
+def test_a_run_in_its_launch_phase_has_no_adoption_time_after_the_check(
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    script_launch_phase(fakebin)
+    seed(env, status="launching", supervisor=dead(proc_tracker))
+    assert show(env)["runs"][0]["adopted_at"] is None
+
+
+def test_a_final_run_parked_by_the_check_in_its_session_phase_gets_an_adoption_time(
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    fakebin.script("claude-session", "status", outcome="failed")
+    seed(env, status="launching", supervisor=dead(proc_tracker))
+    assert show(env)["runs"][0]["adopted_at"] is not None
+
+
+def test_a_final_run_parked_by_the_check_in_its_launch_phase_has_no_adoption_time(
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
+) -> None:
+    fakebin.script("claude-session", "status", outcome="vetoed")
+    seed(env, status="launching", supervisor=dead(proc_tracker))
+    assert show(env)["runs"][0]["adopted_at"] is None
+
+
 def test_launching_with_a_live_launcher_and_no_supervisor_is_left_alone(
     env: Env, fakebin: Fakebin
 ) -> None:

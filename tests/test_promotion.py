@@ -139,6 +139,9 @@ def test_blocked_run_is_promoted_and_the_promoted_run_ends_done(
     # each run, the promoted one too, was adopted: a recorded, non-decreasing time
     assert first["started_at"] is not None and second["started_at"] is not None
     assert first["started_at"] <= second["started_at"]
+    # (the test clock is real, so two runs may share a timestamp: `<=`, not `<`)
+    shown = result_json(wenv.run("show", agent_id, "--json"))["runs"]
+    assert [r["adopted_at"] is not None for r in shown] == [True, True]
     start = real_starts(fakebin)[1]
     assert f"--resume={row['csession_id']}" in start and "--mode=interactive" in start
     launches = [p for name, p in events(wenv, agent_id) if name == "post-launch"]

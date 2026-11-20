@@ -780,12 +780,16 @@ class Supervisor:
         row = self.store.get_agent(self.agent_id)
         if row is None:
             return False
-        # The run is adopted: its time is written first (once, never rewritten), so whoever sees
-        # the agent live also sees `adopted_at`. A lost agent change below does not undo it.
-        with self.store.lease(
-            lifecycle.lease_key(self.agent_id), wait=lifecycle.LEASE_WAIT
-        ) as lease:
-            self.store.mark_run_adopted(lease, self.agent_id, ctx.run, self.gateway.wall_time())
+        # The run started: its time is written first (once, never rewritten), so whoever sees
+        # the agent live also sees `adopted_at`. It is best effort: a refused write (the lease
+        # is held or lost, the agent is gone) never delays going live or loses the outcome.
+        try:
+            with self.store.lease(
+                lifecycle.lease_key(self.agent_id), wait=lifecycle.LEASE_WAIT
+            ) as lease:
+                self.store.mark_run_adopted(lease, self.agent_id, ctx.run, self.gateway.wall_time())
+        except StoreError as error:
+            self.log("warning", level="warn", message=f"could not record adopted_at: {error}")
         changes = {"last_live_at": time.time()}
         if row["status"] == "launching":
             lifecycle.go_live(self.store, self.agent_id, run=ctx.run, changes=changes)
