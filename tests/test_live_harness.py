@@ -17,11 +17,12 @@ import stat
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from tests.live import harness
+from tests.live import billed, harness
 from tests.live import scenarios as sc
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -974,3 +975,53 @@ def test_the_make_targets_exist_and_verify_does_not_depend_on_live() -> None:
     assert re.search(r"^live-list:\n\tuv run python -m tests\.live", makefile, re.M)
     verify = next(line for line in makefile.splitlines() if line.startswith("verify:"))
     assert "live" not in verify
+
+
+def _adopted_state(*pairs: tuple[str | None, str | None]) -> dict:
+    return {
+        "agent": {"created": "2026-01-01T00:00:00.000Z"},
+        "runs": [{"run": n + 1, "adopted_at": a, "ended_at": e} for n, (a, e) in enumerate(pairs)],
+    }
+
+
+_WINDOW = (datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC), datetime(2026, 1, 1, 0, 10, 0, tzinfo=UTC))
+
+
+def test_check_adopted_at_accepts_an_ordered_chain_and_returns_the_values() -> None:
+    state = _adopted_state(
+        ("2026-01-01T00:01:00.000Z", "2026-01-01T00:02:00.000Z"),
+        ("2026-01-01T00:03:00.000Z", None),
+    )
+    first = billed.check_adopted_at(state, _WINDOW, runs=2, where="t")
+    assert first == ["2026-01-01T00:01:00.000Z", "2026-01-01T00:03:00.000Z"]
+    assert billed.check_adopted_at(state, _WINDOW, runs=2, where="t", first=first[:1]) == first
+
+
+@pytest.mark.parametrize(
+    "pairs",
+    [
+        [(None, None)],
+        [("not a time", None)],
+        [("2026-01-01T00:01:00", None)],  # naive: not a date-time with an offset
+        [("2025-12-31T00:01:00.000Z", None)],  # before the agent was created
+        [("2026-01-01T00:05:00.000Z", "2026-01-01T00:04:00.000Z")],  # adopted after it ended
+        [
+            ("2026-01-01T00:03:00.000Z", "2026-01-01T00:04:00.000Z"),
+            ("2026-01-01T00:02:00.000Z", None),  # decreasing
+        ],
+        [("2026-01-01T00:20:00.000Z", None)],  # outside the test's window
+    ],
+)
+def test_check_adopted_at_rejects_bad_values(pairs: list) -> None:
+    with pytest.raises(harness.LiveError):
+        billed.check_adopted_at(_adopted_state(*pairs), _WINDOW, runs=len(pairs), where="t")
+
+
+def test_check_adopted_at_rejects_a_changed_first_value_and_a_wrong_run_count() -> None:
+    state = _adopted_state(("2026-01-01T00:01:00.000Z", None))
+    with pytest.raises(harness.LiveError):
+        billed.check_adopted_at(
+            state, _WINDOW, runs=1, where="t", first=["2026-01-01T00:00:30.000Z"]
+        )
+    with pytest.raises(harness.LiveError):
+        billed.check_adopted_at(state, _WINDOW, runs=2, where="t")

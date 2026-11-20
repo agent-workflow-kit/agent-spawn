@@ -191,13 +191,27 @@ def test_exec_killed_under_a_real_interactive_claude_in_a_window(billed_world: W
             {k: parked.get(k) for k in ("park_reason", "supervisor_lost")},
         )
     else:
+        # The run is final. Its outcome is claude-session's record: ``done`` when the real model
+        # had already filed its report in its first turn ("a reported run keeps its outcome",
+        # end reason ``wrapper_lost``, observed 2026-11-20), ``lost`` when it had not. The agent
+        # parks per the outcome table row of that outcome.
+        rows = {"done": ("done", None), "lost": ("lost", "lost"), "killed": ("killed", None)}
+        outcome = cs_run.get("outcome")
+        check(
+            outcome in rows,
+            "the dead real claude's run ended with an outcome of the table's rows (done when it "
+            "had reported, else lost)",
+            "interface.md Outcome table / claude-session Outcome",
+            outcome,
+        )
+        expected = rows[outcome]
         check(
             after["agent"]["status"] == "parked"
-            and after["agent"]["park_reason"] == "lost"
-            and after["agent"]["needs_attention"] == "lost",
-            "the real interactive claude died with its terminal: the run is lost and the agent "
-            "parks lost with attention lost",
-            "interface.md Outcome table (lost: parked, attention lost, park reason lost)",
-            after["agent"],
+            and (after["agent"]["park_reason"], after["agent"]["needs_attention"]) == expected
+            and after["agent"]["supervisor_lost"] is False,
+            "the real interactive claude died with its terminal: the agent parks per the outcome "
+            "table row of the run's recorded outcome (no supervisor_lost for a final run)",
+            "interface.md Outcome table (done: parked, none; lost: parked, lost) / Liveness",
+            (outcome, after["agent"]),
         )
     world.spawn_json("teardown", aid, ok=(0, 20))
