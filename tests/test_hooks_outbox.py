@@ -854,7 +854,7 @@ def test_async_hook_timeout_is_enforced_while_the_starter_lives(
         b"{}",
         hook="post-park",
         agent_id=ID,
-        timeout=0.3,
+        timeout=3,
     )
     assert error is None
     end = time.monotonic() + 60
@@ -865,6 +865,7 @@ def test_async_hook_timeout_is_enforced_while_the_starter_lives(
     assert found and runner.wait(10) == 0
     assert_dead(found)
     assert any(r["event"] == "hook_timeout" for r in log_records(state_dir))
+    quiesce()  # the watchdog subshell lingers through its SIGKILL grace
 
 
 def test_async_timeout_is_reported_even_when_the_watchdog_fires_before_poll(

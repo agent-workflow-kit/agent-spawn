@@ -121,6 +121,7 @@ def test_a_repeat_of_the_recorded_signal_is_ignored_and_the_run_finalizes_once(
     while not signals_file.exists():
         assert time.monotonic() < started_at, "the child's handlers were never installed"
         time.sleep(0.01)
+    fakebin.wait_for_hang(proc.pid, timeout=60)  # the fake's handlers are installed
     proc.send_signal(signal.SIGHUP)
     while "SIGHUP" not in signals_file.read_text():  # recorded: the fake passed it on
         assert time.monotonic() < started_at, "the first SIGHUP was never recorded"
