@@ -74,6 +74,30 @@ def test_a_record_dated_in_the_future_does_not_suppress(tmp_path: Path) -> None:
     assert once(tmp_path, [entry()]) == 1
 
 
+def test_a_record_dated_slightly_ahead_still_suppresses(tmp_path: Path) -> None:
+    once(tmp_path, [entry()], NOW + timedelta(seconds=30))
+    assert once(tmp_path, [entry()]) == 0
+
+
+def test_a_record_dated_beyond_the_slack_ahead_does_not_suppress(tmp_path: Path) -> None:
+    once(tmp_path, [entry()], NOW + timedelta(minutes=2))
+    assert once(tmp_path, [entry()]) == 1
+
+
+def test_a_first_line_cut_by_the_tail_is_not_seen(tmp_path: Path) -> None:
+    once(tmp_path, [entry()])
+    size = (tmp_path / "log.jsonl").stat().st_size
+    assert once(tmp_path, [entry()], NOW + timedelta(seconds=1), tail_bytes=size - 1) == 1
+    assert len(lines(tmp_path)) == 2
+
+
+def test_a_first_line_the_tail_covers_whole_is_seen(tmp_path: Path) -> None:
+    once(tmp_path, [entry()])
+    size = (tmp_path / "log.jsonl").stat().st_size
+    assert once(tmp_path, [entry()], NOW + timedelta(seconds=1), tail_bytes=size) == 0
+    assert len(lines(tmp_path)) == 1
+
+
 def test_a_torn_last_line_and_garbage_are_survived(tmp_path: Path) -> None:
     once(tmp_path, [entry(A)])
     with open(tmp_path / "log.jsonl", "ab") as handle:
