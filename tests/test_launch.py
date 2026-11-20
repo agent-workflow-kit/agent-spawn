@@ -204,7 +204,11 @@ def _wait_exec_hanging(env: Env, fakebin: Fakebin, agent_id: str) -> None:
     """The supervisor recorded its `exec` and the fake `exec` reached its hang (its signal
     handlers are installed), so a signal sent now cannot beat the chain being up: under load the
     `live` status can come before either."""
-    env.wait_for(lambda: env.agent(agent_id).get("exec_proc") is not None, "the supervisor's exec")
+    env.wait_for(
+        lambda: env.agent(agent_id).get("exec_proc") is not None,
+        "the supervisor's exec",
+        timeout=60,
+    )
     fakebin.wait_for_hang(env.agent(agent_id)["exec_proc"].pid, timeout=60)
 
 

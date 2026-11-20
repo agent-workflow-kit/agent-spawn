@@ -71,10 +71,12 @@ def send_together(proc: subprocess.Popen[Any], numbers: tuple[signal.Signals, ..
     default action (the process then dies of that signal: -1 or -15, not 15).
     """
     proc.send_signal(signal.SIGSTOP)
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 60
     while True:
-        info = os.waitid(os.P_PID, proc.pid, os.WSTOPPED | os.WNOHANG | os.WNOWAIT)
-        if info is not None:
+        # os.waitid is not available on macOS, so poll waitpid for the stop report
+        pid, status = os.waitpid(proc.pid, os.WUNTRACED | os.WNOHANG)
+        if pid == proc.pid:
+            assert os.WIFSTOPPED(status), "the fake exited before it stopped"
             break
         assert time.monotonic() < deadline, "the fake never stopped"
         time.sleep(0.005)
@@ -88,7 +90,7 @@ def test_two_different_signals_in_a_row_still_finalize_once(
 ) -> None:
     outcome_file = tmp_path / "o.json"
     proc = hanging_exec(fakebin, outcome_file)
-    send_together(proc, (signal.SIGTERM, signal.SIGHUP, signal.SIGTERM))
+    send_together(proc, (signal.SIGTERM, signal.SIGHUP))
     out, err = proc.communicate(timeout=10)
     assert proc.returncode == 15 and "Traceback" not in err, err
     printed = json.loads(out)
@@ -96,6 +98,42 @@ def test_two_different_signals_in_a_row_still_finalize_once(
     last = fakebin.invocations("claude-session")[-1]
     # only the first signal counts (Python runs pending handlers by signal number)
     assert last.exit_code == 15 and len(last.signals) == 1
+
+
+def test_a_repeat_of_the_recorded_signal_is_ignored_and_the_run_finalizes_once(
+    fakebin: Fakebin, tmp_path: Path
+) -> None:
+    # A child that does not end on SIGHUP keeps the fake inside its first handler, so the repeat
+    # arrives while the signal is recorded and the fake has not finished (no race on exit).
+    fakebin.script("claude-session", "exec", hang=True, child=True)
+    outcome_file = tmp_path / "o.json"
+    proc = spawn(
+        fakebin, "exec", "--mode", "headless", "--skill", "x", "--json",
+        "--outcome-file", str(outcome_file),
+    )  # fmt: skip
+    wait_for_call(fakebin, proc.pid)
+    started_at = time.monotonic() + 60
+    while not fakebin.records("child_started"):
+        assert time.monotonic() < started_at, "the child never started"
+        time.sleep(0.01)
+    started = fakebin.records("child_started")[0]
+    signals_file = Path(started["signals_file"])
+    while not signals_file.exists():
+        assert time.monotonic() < started_at, "the child's handlers were never installed"
+        time.sleep(0.01)
+    proc.send_signal(signal.SIGHUP)
+    while "SIGHUP" not in signals_file.read_text():  # recorded: the fake passed it on
+        assert time.monotonic() < started_at, "the first SIGHUP was never recorded"
+        time.sleep(0.01)
+    proc.send_signal(signal.SIGHUP)  # the repeat, while the fake waits for the child
+    os.kill(started["pid"], signal.SIGTERM)  # the child this test's fake started: lets it finish
+    out, err = proc.communicate(timeout=60)
+    assert proc.returncode == 15 and "Traceback" not in err, err
+    printed = json.loads(out)
+    assert json.loads(outcome_file.read_text()) == printed and printed["outcome"] == "killed"
+    assert printed["end_reason"] == "forwarded_hup"
+    last = fakebin.invocations("claude-session")[-1]
+    assert last.signals == [signal.SIGHUP]
 
 
 @pytest.mark.parametrize(

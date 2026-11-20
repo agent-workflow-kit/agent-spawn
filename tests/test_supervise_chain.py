@@ -282,29 +282,34 @@ def test_classification_mismatch_of_the_resume_cancels_it_and_parks(
 
 
 def test_sigterm_during_the_resume_start_cancels_the_pending_run(
-    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker
+    env: Env, fakebin: Fakebin, proc_tracker: ProcTracker, tmp_path: Path
 ) -> None:
     script_unreported_first(fakebin)
     fakebin.script("claude-session", "start", argv_contains=["--dry-run"])
     fakebin.script("claude-session", "start", times=1)
-    fakebin.script("claude-session", "start", sleep=4)  # the resume's start, in flight
-    done = env.run(*LAUNCH)  # without --wait: returns once the run is live
-    body = result_json(done)
-    agent_id = body["agent"]["agent_id"]
-    track_agent(env, proc_tracker, agent_id)
-    env.wait_for(lambda: len(real_starts(fakebin)) == 2, "the resume's start")
-    supervisor = env.agent(agent_id)["supervisor"]
-    handle = procs.open_verified(supervisor)
-    assert handle is not None
-    with handle:
-        assert handle.send(signal.SIGTERM)  # no `exec` child right now
-    env.wait_for(lambda: env.agent(agent_id)["status"] == "parked", "the park", timeout=30)
-    row = env.agent(agent_id)
-    assert row["park_reason"] == "unreported" and row["needs_attention"] == "unreported"
-    assert [a for a in fakebin.argvs("claude-session") if a[0] == "stop"]
-    assert len([a for a in fakebin.argvs("claude-session") if a[0] == "exec"]) == 1
-    assert [p["chain_failure"] for n, p in events(env, agent_id) if n == "post-park"] == [None]
-    env.wait_for(lambda: not procs.is_alive(supervisor), "the supervisor to exit")
+    start_gate = tmp_path / "start-gate"
+    fakebin.script("claude-session", "start", gate=str(start_gate))  # the resume's start, in flight
+    try:
+        done = env.run(*LAUNCH)  # without --wait: returns once the run is live
+        body = result_json(done)
+        agent_id = body["agent"]["agent_id"]
+        track_agent(env, proc_tracker, agent_id)
+        env.wait_for(lambda: len(real_starts(fakebin)) == 2, "the resume's start", timeout=60)
+        supervisor = env.agent(agent_id)["supervisor"]
+        handle = procs.open_verified(supervisor)
+        assert handle is not None
+        with handle:
+            assert handle.send(signal.SIGTERM)  # no `exec` child right now
+        start_gate.touch()  # the signal arrived while start was in flight: let it return
+        env.wait_for(lambda: env.agent(agent_id)["status"] == "parked", "the park", timeout=60)
+        row = env.agent(agent_id)
+        assert row["park_reason"] == "unreported" and row["needs_attention"] == "unreported"
+        assert [a for a in fakebin.argvs("claude-session") if a[0] == "stop"]
+        assert len([a for a in fakebin.argvs("claude-session") if a[0] == "exec"]) == 1
+        assert [p["chain_failure"] for n, p in events(env, agent_id) if n == "post-park"] == [None]
+        env.wait_for(lambda: not procs.is_alive(supervisor), "the supervisor to exit", timeout=60)
+    finally:
+        start_gate.touch()  # never leave the fake's start waiting
 
 
 # --- started polling --------------------------------------------------------------------------
@@ -374,18 +379,20 @@ def test_sigterm_chain_reaches_exec_and_its_child_even_when_exec_is_stopped(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    env.wait_for(lambda: bool(fakebin.records("child_started")), "the child of exec")
-    env.wait_for(lambda: any(a["status"] == "live" for a in _agents(env)), "a live agent")
+    env.wait_for(lambda: bool(fakebin.records("child_started")), "the child of exec", timeout=60)
+    env.wait_for(
+        lambda: any(a["status"] == "live" for a in _agents(env)), "a live agent", timeout=60
+    )
     agent_id = env.agents()[0]["agent_id"]
     track_agent(env, proc_tracker, agent_id)
     started = fakebin.records("child_started")[0]
     # The child records its signals in this file once its handlers are installed: a SIGTERM that
     # beats them kills it with nothing recorded.
-    env.wait_for(lambda: Path(started["signals_file"]).exists(), "the child's handlers")
+    env.wait_for(lambda: Path(started["signals_file"]).exists(), "the child's handlers", timeout=60)
     child = procs.read_identity(started["pid"])
     assert child is not None
     proc_tracker.record(child)
-    env.wait_for(lambda: bool(fakebin.records("hang_ready")), "exec to be waiting")
+    env.wait_for(lambda: bool(fakebin.records("hang_ready")), "exec to be waiting", timeout=60)
     # A stopped exec never acts on SIGTERM unless SIGCONT follows it (Signals).
     exec_identity = env.agent(agent_id)["exec_proc"]
     handle = procs.open_verified(exec_identity)

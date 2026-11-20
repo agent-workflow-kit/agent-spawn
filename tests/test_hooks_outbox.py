@@ -119,7 +119,7 @@ def wait_for(path: Path, timeout: float = 10.0) -> None:
         time.sleep(0.02)
 
 
-def wait_for_text(path: Path, timeout: float = 10.0) -> str:
+def wait_for_text(path: Path, timeout: float = 60.0) -> str:
     """Wait until ``path`` has content (a shell creates a file, then writes it); return it."""
     end = time.monotonic() + timeout
     while not (path.exists() and (text := path.read_text())):
@@ -857,10 +857,12 @@ def test_async_hook_timeout_is_enforced_while_the_starter_lives(
         timeout=0.3,
     )
     assert error is None
-    wait_for(pids)
-    time.sleep(0.1)
+    end = time.monotonic() + 60
+    while len(pids.read_text().split() if pids.exists() else []) < 2:  # shell and its sleep
+        assert time.monotonic() < end, "the hook never wrote both pids"
+        time.sleep(0.02)
     found = track(tracker, pids)
-    assert runner.wait(10) == 0
+    assert found and runner.wait(10) == 0
     assert_dead(found)
     assert any(r["event"] == "hook_timeout" for r in log_records(state_dir))
 
@@ -1363,7 +1365,9 @@ def test_a_hook_that_finished_by_the_deadline_is_not_timed_out(
     def read_then_expire(*args: Any, **kwargs: Any) -> None:
         real(*args, **kwargs)
         gate.touch()  # the hook was still running at the first look: now it may exit
-        assert_dead([int(wait_for_text(pid_file))])  # it exits (a zombie until reaped) ...
+        assert_dead(
+            [int(wait_for_text(pid_file))], timeout=60
+        )  # it exits (a zombie until reaped) ...
         gw.skew = 1000.0  # ... and the deadline passes before the next look
 
     monkeypatch.setattr(hooks, "_read_capped", read_then_expire)

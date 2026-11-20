@@ -1287,6 +1287,7 @@ def test_a_signal_after_the_handoff_is_forwarded_even_before_the_listener_closes
             "        except OSError:\n"
             "            pass\n"
             "        time.sleep(0.01)\n"
+            "    raise RuntimeError('the fake exec never reached its hang')\n"
             "_close, calls = handoff.HandoffListener.close, []\n"
             "def close(self):\n"
             "    calls.append(1)\n"

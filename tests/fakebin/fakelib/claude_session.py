@@ -784,9 +784,11 @@ while time.monotonic() < deadline and os.getppid() == parent:
 
 def spawn_child(ctx: Context) -> subprocess.Popen[bytes]:
     """A real child of the fake ``exec`` (a stand-in for ``claude``): it records the signals it
-    gets in a file named by the ``child_started`` record, and ends on SIGTERM. The file exists
-    (empty) once the child's handlers are installed: a signal sent before then kills it."""
-    path = os.path.join(os.environ.get("FAKEBIN_LOG", "/tmp") + ".child-signals")
+    gets in a per-exec file (named by the ``child_started`` record), and ends on SIGTERM. The
+    file exists (empty) once the child's handlers are installed: a signal sent before then
+    kills it."""
+    log = os.environ.get("FAKEBIN_LOG", "/tmp")
+    path = f"{log}.child-signals.{os.getpid()}"
     child = subprocess.Popen(
         [sys.executable, "-c", CHILD_SCRIPT, path, str(os.getpid())], stdin=subprocess.DEVNULL
     )
