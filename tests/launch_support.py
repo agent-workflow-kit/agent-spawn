@@ -41,12 +41,17 @@ class Env:
         return [agent_spawn_path(), *args]
 
     def run(
-        self, *args: str, extra_env: Mapping[str, str] | None = None, timeout: float = 60.0
+        self,
+        *args: str,
+        extra_env: Mapping[str, str] | None = None,
+        timeout: float = 60.0,
+        cwd: str | Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             self.argv(*args),
             capture_output=True,
             text=True,
+            cwd=cwd,
             env=self.env(extra_env),
             stdin=subprocess.DEVNULL,
             timeout=timeout,

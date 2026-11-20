@@ -133,8 +133,11 @@ def test_a_fork_passes_a_nonexistent_cwd_for_claude_session_to_refuse(
     source = launched(env)
     missing = str(tmp_path / "does" / "not" / "exist")
     done = env.run("resume", source, "--fork", "--cwd", missing, "--json", "--wait")
-    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert done.returncode == 1, (done.stdout, done.stderr)  # claude-session exits 2
     assert f"--cwd={missing}" in starts(fakebin)[-1]
+    error = error_of(done)  # claude-session's own refusal, passed through
+    assert (error["tool"], error["lower_code"]) == ("claude-session", "usage")
+    assert missing in error["lower_error"]["message"]
 
 
 # --- R9: a relative --cwd is resolved, not refused ---------------------------------------

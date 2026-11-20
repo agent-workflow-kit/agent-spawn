@@ -263,11 +263,9 @@ def test_termctl_open_escalation_is_overridden_by_a_human_resume(world: World) -
         f"cat >> {seen}; echo >> {seen}; touch {marker}; echo 'still needs a human' >&2; exit 13\n",
     )
     world.write_config("termctl", hook_config("pre-open", (changed, None)))
-    # The caller's cwd is the agent's own: from another directory this resume is refused (see
-    # test_the_override_resume_from_another_cwd, an expected failure that records the divergence).
-    resumed = world.spawn_json(
-        "resume", eid, "--override-escalation", *HUMAN, timeout=120, cwd=wt.repo.clone
-    )
+    # From the harness's neutral cwd, not the agent's repo: the canceled pending run recorded no
+    # cwd, so the resume passes the agent's own (#119).
+    resumed = world.spawn_json("resume", eid, "--override-escalation", *HUMAN, timeout=120)
     after = wait_status(world, eid, "live")["agent"]
     world.observe("agent-spawn.termctl-escalation.resumed", resumed["agent"]["status"])
     state = show(world, eid)
@@ -304,42 +302,30 @@ def test_termctl_open_escalation_is_overridden_by_a_human_resume(world: World) -
 
 
 @SC("as-termctl-override-escalation")
-@pytest.mark.xfail(
-    strict=True,
-    raises=KnownDivergence,
-    reason="product bug agent-spawn#119: resuming a launch whose pending run was canceled "
-    "(termctl escalated before the session was adopted) runs claude-session start --resume in the "
-    "caller's cwd, not the agent's recorded cwd; from a directory outside the repository "
-    "claude-session refuses it (exit 12, end reason git_dir_changed)",
-)
 def test_the_override_resume_from_another_cwd(world: World) -> None:
-    """interface.md Resume order step 4 (``Cwd: plain resume, the agent's recorded cwd``): the
-    human override of a termctl escalation must work wherever the human runs ``resume``. It does
-    not from a directory outside the repository (the harness's default cwd): the canceled pending
-    run recorded no cwd, so claude-session resumes in the caller's cwd and refuses the changed git
-    directory (agent-spawn#119). The test raises ``KnownDivergence`` only at that point (the
-    escalated launch exited 13, the resume exited 12 with ``git_dir_changed``); anything else is a
-    real failure. strict: when the product is fixed this test starts passing and must be
-    promoted to a plain test."""
+    """interface.md Resume order step 4 (``Cwd``): the human override of a termctl escalation
+    works wherever the human runs ``resume``. The canceled pending run recorded no cwd, so
+    claude-session would resolve the caller's cwd (the harness's, outside the repository) and
+    refuse the changed git directory (``git_dir_changed``); agent-spawn passes the agent's
+    recorded cwd with ``--cwd`` instead (#119)."""
     escalate = write_script(world, "pre-open-escalate.sh", "cat > /dev/null; exit 13\n")
     wt = stub_setup(world, "while :; do sleep 0.2; done")
     world.write_config("termctl", hook_config("pre-open", (escalate, None)))
     escalated = world.spawn_json(*window_launch_args(wt), ok=(13,), timeout=120)
     eid = escalated["error"]["agent_id"]
-    resumed = world.agent_spawn(
-        "resume", eid, "--override-escalation", *HUMAN, "--json", timeout=120
-    )
-    world.observe(
-        "agent-spawn.termctl-escalation.resume-other-cwd",
-        (resumed.returncode, resumed.stdout[-600:]),
-    )
-    if resumed.returncode == 12 and "git_dir_changed" in resumed.stdout + resumed.stderr:
-        raise KnownDivergence(
-            "resume --override-escalation from another cwd exits 12 git_dir_changed (agent-spawn#119): "
-            + resumed.stdout[-300:]
-        )
+    resumed = world.spawn_json("resume", eid, "--override-escalation", *HUMAN, timeout=120)
+    world.observe("agent-spawn.termctl-escalation.resume-other-cwd", resumed["agent"]["status"])
     state = wait_status(world, eid, "live")
     world.track(int(state["supervisor"]["pid"]), tree=True)
+    session = state["agent"]["csession_id"]
+    status = world.json_tool("claude-session", "status", session)
+    check(
+        os.path.realpath(status["run"]["cwd"]) == os.path.realpath(str(wt.repo.clone)),
+        "the resumed run recorded the agent's cwd, not the caller's",
+        "interface.md Resume order step 4 (Cwd); claude-session status run.cwd",
+        status["run"]["cwd"],
+    )
+    world.spawn_json("stop", eid, "--grace", "2s", ok=(0,), timeout=60)
 
 
 def lock_file_of(world: World, socket_path: str) -> Path:
