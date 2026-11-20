@@ -301,6 +301,23 @@ _ALL = [
         covers=("#100", "#36 #8 wtctl", "#36 #78", "#36 #25"),
     ),
     _s(
+        "as-slow-pre-teardown",
+        "tools",
+        "a pre-teardown hook that outlasts its timeout vetoes the teardown (11), its process "
+        "group is ended, the agent is parked unchanged; --override-escalation does not lift it",
+        "claude-session",
+        covers=("#113", "interface.md Hooks, Teardown order step 3"),
+    ),
+    _s(
+        "as-termctl-override-escalation",
+        "tools",
+        "a termctl pre-open hook escalates (launch parks escalated by termctl), resume "
+        "--override-escalation is human-only and, after the hook changed, opens the window",
+        "claude-session termctl tmux",
+        tests=2,
+        covers=("#112", "#36 #78", "interface.md Escalation overrides"),
+    ),
+    _s(
         "as-cron-fake-crontab",
         "tools",
         "cron install and uninstall against a fake crontab that is first on PATH",
