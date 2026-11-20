@@ -127,6 +127,15 @@ _ALL = [
         covers=("#36 #28", "#36 #8 termctl focus"),
     ),
     _s(
+        "termctl-locked",
+        "tools",
+        "termctl label add with the server's flock held by the test: exit 12 locked after about "
+        "10 s (cause timeout), nothing changed, dry run and list unaffected, a lock file that "
+        "cannot be used (cause unusable) fails at once",
+        "termctl tmux",
+        covers=("#114", "#36 #8 termctl", "termctl interface.md Locking"),
+    ),
+    _s(
         "wtctl-create-list-show",
         "tools",
         "create, list, show: names, branches, paths, shapes, --flag=value, errors",
@@ -163,6 +172,31 @@ _ALL = [
         "the branch deleted",
         "wtctl git",
         covers=("#100", "#36 #8 wtctl"),
+    ),
+    _s(
+        "wtctl-baseline-no-classes",
+        "tools",
+        "a digest-only baseline change (repo_config_changed with only the digests), a moved anchor "
+        "(baseline check says unlinked; accept --expect-digest shows details.anchors, no classes)",
+        "wtctl git",
+        tests=2,
+        covers=("#115", "#36 #25", "wtctl interface.md Baseline check, Baseline accept"),
+    ),
+    _s(
+        "wtctl-create-busy",
+        "tools",
+        "a create held in a pre-create hook: a concurrent create is busy (12) after lease_wait; held "
+        "in bootstrap: the record is creating, remove and forget are busy, a create without "
+        "bootstrap goes through",
+        "wtctl git",
+        covers=("#116", "wtctl interface.md Create order, Locking"),
+    ),
+    _s(
+        "wtctl-version",
+        "tools",
+        "wtctl --version prints its real release version, not the 0.0.0 placeholder of 0.32.x",
+        "wtctl",
+        covers=("#116", "docs/live-testing.md Results"),
     ),
     _s(
         "wtctl-collisions-reuse",
@@ -202,6 +236,14 @@ _ALL = [
         "SIGKILL of start at many offsets never leaves an unlabeled session",
         "claude-session",
         covers=("#36 #75 2",),
+    ),
+    _s(
+        "cs-wait-interval",
+        "tools",
+        "claude-session wait has no --interval flag (exit 2; agent-spawn wait neither); cron install "
+        "--interval accepts 1 to 59 only",
+        "claude-session",
+        covers=("#116", "#36 #8 claude-session", "claude-session interface.md wait, cron install"),
     ),
     _s(
         "cs-dry-run-shapes",
@@ -299,6 +341,78 @@ _ALL = [
         "bootstrap-failing (12, resume continues) wtctl; repo_config_changed for a claude-only change",
         "claude-session wtctl git",
         covers=("#100", "#36 #8 wtctl", "#36 #78", "#36 #25"),
+    ),
+    _s(
+        "as-slow-pre-teardown",
+        "tools",
+        "a pre-teardown hook that outlasts its timeout vetoes the teardown (11), its process "
+        "group is ended, the agent is parked unchanged; --override-escalation does not lift it",
+        "claude-session",
+        covers=("#113", "interface.md Hooks, Teardown order step 3"),
+    ),
+    _s(
+        "as-termctl-override-escalation",
+        "tools",
+        "a termctl pre-open hook escalates (launch parks escalated by termctl), resume "
+        "--override-escalation is human-only and, after the hook changed, opens the window",
+        "claude-session termctl tmux",
+        tests=2,
+        covers=("#112", "#36 #78", "interface.md Escalation overrides"),
+    ),
+    _s(
+        "as-label-locked",
+        "tools",
+        "agent-spawn label add on a live window agent while termctl's server lock is held: the "
+        "change lands on the agent and the session, a warning reports `termctl label add failed (exit 12)`, reconcile pushes it",
+        "claude-session termctl tmux",
+        covers=("#114", "interface.md label add, Reconcile label re-sync"),
+    ),
+    _s(
+        "as-wtctl-baseline-no-classes",
+        "tools",
+        "show repo_config_changed and teardown for a digest-only baseline change and a moved anchor "
+        "of the agent's worktree record",
+        "claude-session wtctl git",
+        covers=("#115", "interface.md show, Teardown order step 4"),
+    ),
+    _s(
+        "as-teardown-partial",
+        "tools",
+        "wtctl remove exits 1 partial (the worktree's parent loses its write bit): teardown is "
+        "exit 12 partial and sticky, reconcile reports teardown_incomplete, a human remove then a "
+        "retry completes",
+        "claude-session wtctl git",
+        covers=(
+            "#116",
+            "wtctl interface.md Remove order step 9",
+            "interface.md Teardown order step 4",
+        ),
+    ),
+    _s(
+        "as-input-files",
+        "tools",
+        "launch --input-file: the stub reads the staged copy (readable), agent-spawn's "
+        "private copy is deleted, a resume's own input replaces the set, claude-session refuses "
+        "an oversized, duplicate, badly named or '-' input",
+        "claude-session",
+        covers=("#116", "#36 #8 claude-session", "claude-session interface.md Launch flags"),
+    ),
+    _s(
+        "tty-human-gates",
+        "tools",
+        "a pseudo-terminal as stdin and no --actor: wtctl baseline accept asks [y/N], --yes skips "
+        "it and the actor defaults to human; agent-spawn --override-escalation is accepted, an "
+        "explicit auto actor refused",
+        "claude-session wtctl git",
+        covers=("#116", "wtctl interface.md Audit and log, Actor", "interface.md Global flags"),
+    ),
+    _s(
+        "as-window-close-post-park",
+        "tools",
+        "a killed window of an unreported session and a SIGKILLed exec under a stub that dies with "
+        "its terminal: parked killed and lost, post-park once, late reconciles deliver no second one",
+        "claude-session termctl tmux",
+        covers=("#116", "#36 #75 4", "interface.md Hooks, Reconcile"),
     ),
     _s(
         "as-cron-fake-crontab",
