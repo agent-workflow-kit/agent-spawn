@@ -230,6 +230,14 @@ _ALL = [
         covers=("#36 #75 2",),
     ),
     _s(
+        "cs-wait-interval",
+        "tools",
+        "claude-session wait has no --interval flag (exit 2; agent-spawn wait neither); cron install "
+        "--interval accepts 1 to 59 only",
+        "claude-session",
+        covers=("#116", "#36 #8 claude-session", "claude-session interface.md wait, cron install"),
+    ),
+    _s(
         "cs-dry-run-shapes",
         "tools",
         "dry-run plans: implicit-done flags and origins, would_refuse, override-escalation "
@@ -367,6 +375,15 @@ _ALL = [
         "retry completes",
         "claude-session wtctl git",
         covers=("#116", "wtctl interface.md Remove order step 9", "interface.md Teardown order step 4"),
+    ),
+    _s(
+        "as-input-files",
+        "tools",
+        "launch --input-file: the stub reads the staged copy (readable, write-denied), agent-spawn's "
+        "private copy is deleted, a resume's own input replaces the set, claude-session refuses "
+        "an oversized, duplicate, badly named or '-' input",
+        "claude-session",
+        covers=("#116", "#36 #8 claude-session", "claude-session interface.md Launch flags"),
     ),
     _s(
         "as-cron-fake-crontab",

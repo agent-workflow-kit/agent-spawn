@@ -28,6 +28,7 @@ import pytest
 
 from .billed import pid_gone
 from .harness import LiveError, World, check, process_token, wait_for
+from .test_claude_session import cs, cs_raw, prepare, start_args
 from .test_agent_spawn_hooks import HUMAN, hook_config, launch_args, write_script
 from .test_agent_spawn_stub import agent_of, show, stub_setup, wait_status
 from .test_wtctl import AUTO, Wt
@@ -896,3 +897,157 @@ def test_a_remove_that_leaves_an_entry_is_partial_and_teardown_stays_sticky(worl
         "interface.md Teardown order step 4 (a tombstone completes the record and teardown continues)",
         torn,
     )
+
+
+@SC("as-input-files")
+def test_input_files_are_copied_staged_carried_and_refused_by_claude_session(world: World) -> None:
+    """claude-session interface.md Launch flags (``--input-file``: copied to
+    ``$CSESSION_DIR/inputs/<run>/<basename>``, readable (mode 0600 observed), unique basenames from the
+    artifact-name grammar, ``-`` rejected, each at most ``input_max_bytes``) and Prompts and inputs
+    (a resume given its own inputs replaces the carried set; earlier inputs stay readable);
+    agent-spawn interface.md Launch order step 1 (``--input-file`` is passed as a private copy that
+    is deleted once a session is allocated). The stub claude lists what it can read under
+    ``$CSESSION_DIR/inputs`` with the mode and content of each file. #116 (``--input-file``
+    copies, needing an input fixture)."""
+    seen = world.root / "inputs.seen"
+    wt = stub_setup(
+        world,
+        f'for f in "$CSESSION_DIR"/inputs/*/*; do echo "$f $(stat -c %a "$f") $(cat "$f")" >> {seen}; done; exit 0',
+    )
+    fixtures = world.root / "fixtures"
+    fixtures.mkdir()
+    note, other = fixtures / "note.txt", fixtures / "other.md"
+    note.write_text("first input\n")
+    other.write_text("second input\n")
+
+    launched = world.spawn_json(
+        *launch_args(wt, "--wait", "--input-file", str(note)), ok=(14,), timeout=120
+    )
+    aid, csid = agent_of(launched)["agent_id"], agent_of(launched)["csession_id"]
+    world.note_session(csid)
+    note.write_text("changed after launch\n")  # the staged copy is independent of the caller's file
+    lines = seen.read_text().splitlines()
+    world.observe("agent-spawn.input-file.seen", lines)
+    check(
+        len(lines) == 1
+        and lines[0].endswith("/inputs/1/note.txt " + lines[0].split()[1] + " first input")
+        and int(lines[0].split()[1], 8) & 0o400 != 0
+        and int(lines[0].split()[1], 8) & 0o077 == 0,
+        "the run could read inputs/1/note.txt with the original content from an owner-only file "
+        "(mode 0600: the 'write-denied' of the doc is the sandbox's deny rule for isolated runs, "
+        "not a read-only file mode, and is not checked here: the host has no bwrap)",
+        "claude-session interface.md Launch flags (--input-file: copied, readable, write-denied)",
+        lines,
+    )
+    status = world.json_tool("claude-session", "status", csid)
+    check(
+        status["run"]["input_files"] == ["note.txt"],
+        "status lists the run's input files by basename",
+        "claude-session interface.md status (input_files)",
+        status["run"]["input_files"],
+    )
+    prompts = world.state / "agent-spawn" / "prompts" / aid
+    check(
+        not prompts.exists() or not any(prompts.iterdir()),
+        "agent-spawn's private copy of the input was deleted once the session was allocated",
+        "interface.md Launch order step 1 (copies deleted once a session is allocated)",
+        list(prompts.iterdir()) if prompts.exists() else [],
+    )
+
+    # a resume given its own input set replaces the carried one; the earlier input stays readable
+    seen.write_text("")
+    world.spawn_json(
+        "resume", aid, "--mode", "headless", "--prompt", "again", "--input-file", str(other),
+        "--wait", ok=(14,), timeout=120,
+    )  # fmt: skip
+    names = sorted(line.split()[0].split("/inputs/")[1] for line in seen.read_text().splitlines())
+    check(
+        names == ["1/note.txt", "2/other.md"],
+        "after a resume with its own input the new file is in inputs/2 and the earlier one stays readable in inputs/1",
+        "claude-session interface.md Prompts and inputs (earlier inputs stay readable in inputs/<n>/)",
+        names,
+    )
+    check(
+        world.json_tool("claude-session", "status", csid)["run"]["input_files"] == ["other.md"],
+        "the second run's input set is the one given to the resume",
+        "claude-session interface.md Carry rules (given now: replaces the carried input set)",
+    )
+
+    # refusals: exit 2, nothing allocated (direct claude-session)
+    work = prepare(world, "lost_grace: 600s\ninput_max_bytes: 16\n")
+    sessions = len(world.json_tool("claude-session", "list")["sessions"])
+    big = fixtures / "big.txt"
+    big.write_text("x" * 17)
+    nested = fixtures / "sub"
+    nested.mkdir()
+    (nested / "note.txt").write_text("dup\n")
+    bad_name = fixtures / "bad name.txt"
+    bad_name.write_text("x\n")
+    for what, extra in (
+        ("an input over input_max_bytes", ("--input-file", str(big))),
+        ("duplicate input basenames", ("--input-file", str(note), "--input-file", str(nested / "note.txt"))),
+        ("an input whose basename is outside the artifact-name grammar", ("--input-file", str(bad_name))),
+        ("--input-file -", ("--input-file", "-")),
+    ):
+        done = cs_raw(world, *start_args(world, work, "agent=ag-input", *extra))
+        world.observe(f"claude-session.input-file.refused.{what}", (done.returncode, done.stdout[-200:]))
+        check(
+            done.returncode == 2 and json.loads(done.stdout)["error"]["code"] == "usage",
+            f"{what} exits 2 usage",
+            "claude-session interface.md Exit codes (2: input-file names, --input-file -, files over input_max_bytes)",
+            (done.returncode, done.stdout[-300:]),
+        )
+    check(
+        len(world.json_tool("claude-session", "list")["sessions"]) == sessions,
+        "no session was allocated by the refused starts",
+        "claude-session interface.md Launch order (usage errors allocate nothing)",
+    )
+
+
+@SC("cs-wait-interval")
+def test_wait_has_no_interval_flag_and_cron_install_interval_is_one_to_fifty_nine(world: World) -> None:
+    """claude-session interface.md ``wait`` (``claude-session wait <id> [--run] [--timeout]
+    [--outcome-file]``: no polling flag; the poll period is the config's ``poll_interval``) and
+    ``cron install`` (``--interval`` 1 to 59 minutes, else exit 2; validated before any crontab is read, so the tripwire crontab is never reached).
+    The #36 comment's "not covered: ``wait --interval``" names a flag claude-session does not have
+    (a doc bug in docs/live-testing.md, corrected there): the test pins that the real tool refuses
+    it, so a fake or a caller cannot rely on it, and checks the range of the ``--interval`` that does exist (``cron install``).
+    agent-spawn's own ``wait`` has none either. #116."""
+    work = prepare(world, "lost_grace: 600s\npoll_interval: 100ms\n")
+    started = cs(world, *start_args(world, work, "agent=ag-wait"))
+    csid = started["csession_id"]
+    refused = cs_raw(world, "wait", csid, "--interval", "1", "--timeout", "1s")
+    world.observe("claude-session.wait.interval", (refused.returncode, refused.stdout, refused.stderr[-200:]))
+    check(
+        refused.returncode == 2,
+        "claude-session wait --interval 1 is a usage error (exit 2): the flag does not exist",
+        "claude-session interface.md wait (flags: --run, --timeout, --outcome-file)",
+        (refused.returncode, refused.stdout[-300:], refused.stderr[-300:]),
+    )
+    ours = world.agent_spawn("wait", "ag-aaaaaaaa", "--interval", "1", "--json")
+    check(
+        ours.returncode == 2,
+        "agent-spawn wait --interval is a usage error too",
+        "interface.md wait (no polling flag)",
+        (ours.returncode, ours.stdout[-300:], ours.stderr[-300:]),
+    )
+    # the wait that does exist runs on poll_interval: a pending run is canceled by stop, and wait
+    # returns the run's outcome promptly rather than after a long poll
+    cs(world, "stop", csid)
+    begun = time.monotonic()
+    done = cs_raw(world, "wait", csid, "--timeout", "30s")
+    world.observe("claude-session.wait.after-stop", (done.returncode, round(time.monotonic() - begun, 2)))
+    check(
+        done.returncode != 22 and time.monotonic() - begun < 20,
+        "wait of an ended run returns at once with its outcome",
+        "claude-session interface.md wait",
+        (done.returncode, done.stdout[-300:]),
+    )
+    for interval in ("0", "60", "abc"):
+        bad = world.tool("claude-session", "cron", "install", "--interval", interval, "--dry-run", "--json")
+        check(
+            bad.returncode == 2,
+            f"cron install --interval {interval} is a usage error",
+            "claude-session interface.md cron install (--interval 1 to 59, else exit 2)",
+            (bad.returncode, bad.stdout[-200:]),
+        )
