@@ -77,9 +77,10 @@ def test_a_record_dated_in_the_future_does_not_suppress(tmp_path: Path) -> None:
 def test_a_torn_last_line_and_garbage_are_survived(tmp_path: Path) -> None:
     once(tmp_path, [entry(A)])
     with open(tmp_path / "log.jsonl", "ab") as handle:
-        handle.write(b"not json liveness_unreadable\n{\"event\": \"warning\", \"ts\": ")
+        handle.write(b'not json liveness_unreadable\n{"event": "warning", "ts": ')
     assert once(tmp_path, [entry(A), entry(B)], NOW + timedelta(seconds=1)) == 1
-    assert [r.get("agent_id") for r in lines(tmp_path)[-1:]] == [B]
+    text = (tmp_path / "log.jsonl").read_text()
+    assert text.count(f'"agent_id":"{B}"') == 1 and text.count(f'"agent_id":"{A}"') == 1
 
 
 def test_only_the_tail_is_read_so_an_old_line_beyond_it_is_not_seen(tmp_path: Path) -> None:

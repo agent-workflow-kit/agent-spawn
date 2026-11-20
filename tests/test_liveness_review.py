@@ -8,8 +8,11 @@ outcome is scripted explicitly.
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
 import subprocess
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -509,6 +512,16 @@ def test_launch_wait_exits_12_on_an_unreadable_supervisor_entry(
     assert caught.value.exit_code == 12
 
 
+def list_agents(capsys: pytest.CaptureFixture[str]) -> tuple[int, str]:
+    code = cli.main(["list", "--json"])
+    return code, capsys.readouterr().out
+
+
+def unreadable_log(env: Env, agent: str | None = None) -> list[dict[str, Any]]:
+    found = logged(env, "warning", cause="liveness_unreadable")
+    return [line for line in found if agent in (None, line["agent_id"])]
+
+
 def test_list_lists_a_row_with_an_unreadable_entry_unchanged_and_logs_it(
     env: Env,
     unreadable: ProcessIdentity,
@@ -521,6 +534,127 @@ def test_list_lists_a_row_with_an_unreadable_entry_unchanged_and_logs_it(
     assert [(a["agent_id"], a["status"]) for a in agents] == [(AGENT, "live")]
     unreadable_lines = logged(env, "warning", cause="liveness_unreadable")
     assert [line["agent_id"] for line in unreadable_lines] == [AGENT]
+
+
+def test_a_repeated_list_logs_the_same_unreadable_row_once_and_prints_the_same(
+    env: Env, unreadable: ProcessIdentity, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed(env, supervisor=unreadable)
+    first = list_agents(capsys)
+    for _ in range(3):
+        assert list_agents(capsys) == first
+    assert first[0] == 0
+    assert len(unreadable_log(env)) == 1
+
+
+def test_an_unreadable_row_is_logged_again_when_its_last_line_is_older_than_the_window(
+    env: Env, unreadable: ProcessIdentity, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed(env, supervisor=unreadable)
+    list_agents(capsys)
+    path = env.state_dir / "log.jsonl"
+    old = (datetime.now(UTC) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    lines[0]["ts"] = old
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    list_agents(capsys)
+    assert len(unreadable_log(env)) == 2
+
+
+def test_a_row_that_reads_again_and_breaks_again_inside_the_window_is_not_logged_twice(
+    env: Env,
+    unreadable: ProcessIdentity,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    seed(env, supervisor=unreadable)
+    list_agents(capsys)
+    monkeypatch.setattr(procs, "is_alive", lambda *a, **k: True)  # the entry reads again
+    list_agents(capsys)
+    monkeypatch.setattr(
+        procs, "is_alive", lambda *a, **k: (_ for _ in ()).throw(procs.ProcessIdentityError("x"))
+    )
+    list_agents(capsys)
+    assert len(unreadable_log(env)) == 1
+
+
+def test_a_changed_reason_for_the_same_row_is_logged_as_a_new_line(
+    env: Env,
+    unreadable: ProcessIdentity,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    seed(env, supervisor=unreadable)
+    list_agents(capsys)
+    real = procs.is_alive
+
+    def other(identity: ProcessIdentity, *args: Any, **kwargs: Any) -> bool:
+        if identity.pid == UNREADABLE_PID:
+            raise procs.ProcessIdentityError("a different reason")
+        return real(identity, *args, **kwargs)
+
+    monkeypatch.setattr(procs, "is_alive", other)
+    list_agents(capsys)
+    reasons = [line["details"]["reason"] for line in unreadable_log(env)]
+    assert len(reasons) == 2 and reasons[0] != reasons[1]
+
+
+def test_many_unreadable_rows_are_one_line_each_however_often_listed(
+    env: Env, unreadable: ProcessIdentity, capsys: pytest.CaptureFixture[str]
+) -> None:
+    alphabet = "abcdefghijklmnopqrstuvwxyz234567"
+    ids = [
+        "ag-" + alphabet[n // 1024 % 32] + alphabet[n // 32 % 32] + alphabet[n % 32] + "aaaaa"
+        for n in range(1500)
+    ]
+    with Store.open(env.state_dir) as store:
+        for agent_id in ids:
+            store.insert_agent(
+                agent_id,
+                {
+                    "name": "seeded",
+                    "mode": "headless",
+                    "status": "live",
+                    "launch_kind": "implement",
+                    "csession_id": SESSION,
+                    "run": None,
+                    "supervisor": unreadable,
+                },
+            )
+    first = list_agents(capsys)
+    again = list_agents(capsys)
+    assert first == again and first[0] == 0
+    assert sorted(line["agent_id"] for line in unreadable_log(env)) == sorted(ids)
+
+
+def test_concurrent_lists_log_an_unreadable_row_once(
+    env: Env, unreadable: ProcessIdentity, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed(env, supervisor=unreadable)
+    ctx = multiprocessing.get_context("fork")
+    gate = ctx.Barrier(4)
+
+    def run() -> None:
+        gate.wait(timeout=30)
+        os._exit(cli.main(["list", "--json"]))  # the forked child never runs pytest's teardown
+
+    children = [ctx.Process(target=run) for _ in range(4)]
+    for child in children:
+        child.start()
+    for child in children:
+        child.join(120)
+    assert [child.exitcode for child in children] == [0] * 4
+    assert len(unreadable_log(env)) == 1
+
+
+def test_list_is_unchanged_when_the_log_cannot_be_written(
+    env: Env, unreadable: ProcessIdentity, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed(env, supervisor=unreadable)
+    (env.state_dir / "log.jsonl").mkdir()
+    code, out = list_agents(capsys)
+    assert code == 0
+    assert [a["agent_id"] for a in json.loads(out)["agents"]] == [AGENT]
 
 
 # -- R10: behaviors the first round left untested --------------------------------------------------
