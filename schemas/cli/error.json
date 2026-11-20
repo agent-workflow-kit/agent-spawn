@@ -115,6 +115,8 @@
                 "classification_unknown",
                 "worktree_mismatch",
                 "worktree_state",
+                "cwd_missing",
+                "cwd_changed",
                 null
               ]
             },
@@ -377,7 +379,9 @@
                     "enum": [
                       "classification_mismatch",
                       "classification_unknown",
-                      "worktree_mismatch"
+                      "worktree_mismatch",
+                      "cwd_missing",
+                      "cwd_changed"
                     ]
                   }
                 },
