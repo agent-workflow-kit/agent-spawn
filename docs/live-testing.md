@@ -46,7 +46,7 @@ needs.
 Tools are found on `PATH` (or the `LIVE_*` variable); the suite never installs anything. Their
 versions are recorded by `tools-versions` and compared with the minimums in
 `tests/live/harness.py` (`MINIMUMS`). A version that cannot be read (an editable install of a
-sibling reports `0.0.0`) is recorded as unknown, never failed. claude-session older than 0.43.0
+sibling reports `0.0.0` (wtctl 0.32.x)) is recorded as unknown, never failed. claude-session older than 0.43.0
 skips the scenarios that need `--implicit-done`.
 
 ### Waves
@@ -300,7 +300,7 @@ termctl 0.25.0, wtctl 0.32.0, tmux 3.5a, git 2.34.1, jobsctl (installed, used by
   issue #37).
 - **`as-wrapper-dead-child-alive`** (added after the first runs, 2026-11-20, claude-session
   0.45.2, termctl 0.25.0, wtctl 0.32.2 (an `origin/main` build from `git archive`; its
-  `--version` printed the `0.0.0` placeholder in 0.32.x, the package metadata said 0.32.2; wtctl 1.0.0 built from its checkout prints `wtctl 1.0.0`), tmux 3.5a):
+  `--version` printed the `0.0.0` placeholder in 0.32.x, the package metadata said 0.32.2; the `0.0.0` remark applies to the 0.32.x runs only. `wtctl --version` was not re-checked against the 1.0.0 build used in the wave-3 run (a checkout of wtctl at 1.0.0 printed `wtctl 1.0.0`)), tmux 3.5a):
   passed. The stub child ignores SIGTERM but records each one, and the test waits for its ready
   file before killing anything. SIGKILL of exec leaves the child alive (the one SIGTERM it
   received came from `PR_SET_PDEATHSIG` at that moment, and it ignored it); claude-session
