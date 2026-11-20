@@ -235,6 +235,28 @@ def test_a_sessionless_new_worktree_relaunch_resolves_the_cwd_at_step_5(
     assert f"--cwd={tree_dir.resolve() / 'pkg'}" in real_starts(fakebin)[-1]
 
 
+def test_a_new_worktree_relaunch_with_a_recorded_but_missing_cwd_keeps_the_dry_run_fallback(
+    fakebin: Fakebin, isolation_env: Isolation, tmp_path: Path
+) -> None:
+    """The stored row cwd is recorded but missing before step 5 (the worktree is not created
+    yet): the dry run must go without it rather than exit 12 cwd_missing; step 5 creates the
+    worktree, so the real run succeeds in it."""
+    env = Env(fakebin, isolation_env)
+    fakebin.script("wtctl", "create", times=1, error={"code": "busy", "message": "later"}, exit=12)
+    done = env.run("launch", "--mode", "headless", "--skill", "do-it", "--json", "--wait",
+                   "--repo", REPO, "--worktree", "new", "--worktree-name", "pkg-tree",
+                   "--prompt", "P")  # fmt: skip
+    assert done.returncode == 12, (done.stdout, done.stderr)
+    (agent,) = env.agents()
+    root = Path(fake_throwaway(fakebin)["path"]).parent.parent
+    tree_dir = root / "worktrees" / REPO.split("/", 1)[0] / "team" / "project" / "pkg-tree"
+    set_cwd(env, agent["agent_id"], str(tree_dir))
+    assert not tree_dir.exists()  # wtctl create makes it at step 5
+    done = env.run("resume", agent["agent_id"], "--json", "--wait", cwd=tmp_path)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert f"--cwd={tree_dir.resolve()}" in real_starts(fakebin)[-1]
+
+
 def test_a_sessionless_new_worktree_relaunch_with_the_cwd_absent_is_refused_at_step_5(
     fakebin: Fakebin, isolation_env: Isolation, tmp_path: Path
 ) -> None:
