@@ -119,6 +119,15 @@ def wait_for(path: Path, timeout: float = 10.0) -> None:
         time.sleep(0.02)
 
 
+def wait_for_text(path: Path, timeout: float = 10.0) -> str:
+    """Wait until ``path`` has content (a shell creates a file, then writes it); return it."""
+    end = time.monotonic() + timeout
+    while not (path.exists() and (text := path.read_text())):
+        assert time.monotonic() < end, f"{path} never had content"
+        time.sleep(0.02)
+    return text
+
+
 def quiesce(timeout: float = 8.0) -> None:
     """Wait until this process has no live (non-zombie) descendants."""
     end = time.monotonic() + timeout
@@ -857,12 +866,18 @@ def test_async_hook_timeout_is_enforced_while_the_starter_lives(
 
 
 def test_async_timeout_is_reported_even_when_the_watchdog_fires_before_poll(
-    state_dir: Path,
+    state_dir: Path, tmp_path: Path, tracker: ProcTracker
 ) -> None:
     state_dir.mkdir()
+    pids = tmp_path / "pids"
     runner = AsyncRunner(state_dir)
-    assert runner.start("sleep 60", b"{}", hook="post-park", agent_id=ID, timeout=0.3) is None
-    time.sleep(1.8)  # the watchdog (1 s, rounded up) kills the group before the first poll
+    cmd = f"echo $$ > {shlex.quote(str(pids))}; sleep 60"
+    assert runner.start(cmd, b"{}", hook="post-park", agent_id=ID, timeout=0.3) is None
+    wait_for_text(pids)
+    found = track(tracker, pids)
+    # The watchdog (1 s, rounded up) kills the group before the first poll: wait for the hook's
+    # shell to be dead (nothing has polled or reaped it: it is a zombie) before the first look.
+    assert_dead(found, timeout=60)
     assert runner.wait(10) == 0
     events = [r["event"] for r in log_records(state_dir)]
     assert "hook_timeout" in events and "hook_failed" not in events
@@ -1338,20 +1353,26 @@ class _Skewed(SystemGateway):
 
 
 def test_a_hook_that_finished_by_the_deadline_is_not_timed_out(
-    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+    state_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_dir.mkdir()
     gw = _Skewed()
     real = hooks._read_capped  # noqa: SLF001
+    pid_file, gate = tmp_path / "pid", tmp_path / "gate"
 
     def read_then_expire(*args: Any, **kwargs: Any) -> None:
         real(*args, **kwargs)
-        time.sleep(0.5)  # the hook exits ...
+        gate.touch()  # the hook was still running at the first look: now it may exit
+        assert_dead([int(wait_for_text(pid_file))])  # it exits (a zombie until reaped) ...
         gw.skew = 1000.0  # ... and the deadline passes before the next look
 
     monkeypatch.setattr(hooks, "_read_capped", read_then_expire)
+    cmd = (
+        f"echo $$ > {shlex.quote(str(pid_file))}; "
+        f"while [ ! -e {shlex.quote(str(gate))} ]; do sleep 0.02; done; echo ok"
+    )
     res = run_hook_process(
-        "echo ok", b"{}", hook="post-park", agent_id=ID, timeout=5, state_dir=state_dir, gateway=gw
+        cmd, b"{}", hook="post-park", agent_id=ID, timeout=5, state_dir=state_dir, gateway=gw
     )
     assert res.ok and not res.timed_out and res.stdout == b"ok\n"
 

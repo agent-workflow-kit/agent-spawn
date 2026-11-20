@@ -128,11 +128,11 @@ def test_sigint_is_ignored_by_an_interactive_run(fakebin: Fakebin, tmp_path: Pat
     )
     try:
         wait_for_call(fakebin, proc.pid)
-        proc.send_signal(signal.SIGINT)
-        time.sleep(0.4)
-        assert proc.poll() is None, "SIGINT must not end an interactive run"
-        proc.send_signal(signal.SIGTERM)
+        # Together, SIGINT first by number: were it not ignored, it would end the run (and be the
+        # signal recorded) before the SIGTERM; no waiting for a SIGINT that does nothing.
+        send_together(proc, (signal.SIGINT, signal.SIGTERM))
         assert proc.wait(timeout=10) == 15
+        assert fakebin.invocations("claude-session")[-1].signals == [signal.SIGTERM]
     finally:
         if proc.poll() is None:
             proc.kill()  # the exact Popen child this test started
