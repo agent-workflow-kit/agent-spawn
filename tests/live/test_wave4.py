@@ -30,9 +30,9 @@ import pytest
 
 from .billed import pid_gone, signal_exact
 from .harness import LiveError, World, check, process_token, wait_for
-from .test_claude_session import cs, cs_raw, prepare, start_args
 from .test_agent_spawn_hooks import HUMAN, hook_config, launch_args, write_script
 from .test_agent_spawn_stub import agent_of, show, stub_setup, wait_status
+from .test_claude_session import cs, cs_raw, prepare, start_args
 from .test_wtctl import AUTO, Wt
 from .test_wtctl_hooks import create_args, err_of, wt_config
 
@@ -66,9 +66,7 @@ def test_a_slow_pre_teardown_hook_times_out_and_vetoes_the_teardown(world: World
         f"cat > /dev/null\necho $$ > {world.root / 'hook.pid'}\necho slow >> {ran}\n"
         f"sleep 120 &\necho $! > {sleeper}\nwait\n",
     )
-    wt = stub_setup(
-        world, "exit 0", agent_spawn_config=hook_config("pre-teardown", (slow, 1))
-    )
+    wt = stub_setup(world, "exit 0", agent_spawn_config=hook_config("pre-teardown", (slow, 1)))
     aid = parked_stub_agent(world, wt)
     before = show(world, aid)["agent"]
 
@@ -174,7 +172,9 @@ def test_termctl_open_escalation_is_overridden_by_a_human_resume(world: World) -
     and Audit (an ``--override-escalation`` run is audited). #112, #36 #78."""
     seen = world.root / "pre-open-payloads.log"
     escalate = write_script(
-        world, "pre-open-escalate.sh", f"cat >> {seen}; echo >> {seen}; echo 'needs a human' >&2; exit 13\n"
+        world,
+        "pre-open-escalate.sh",
+        f"cat >> {seen}; echo >> {seen}; echo 'needs a human' >&2; exit 13\n",
     )
     wt = stub_setup(world, "while :; do sleep 0.2; done")
     world.write_config("termctl", hook_config("pre-open", (escalate, None)))
@@ -269,8 +269,7 @@ def test_termctl_open_escalation_is_overridden_by_a_human_resume(world: World) -
         "termctl interface.md Audit and log (audit.jsonl: every open run with --override-escalation)",
         audit.read_text() if audit.exists() else "(no audit.jsonl)",
     )
-    stop = world.spawn_json("stop", eid, "--grace", "2s", ok=(0,), timeout=60)
-    _ = (os, signal, process_token, stop)
+    world.spawn_json("stop", eid, "--grace", "2s", ok=(0,), timeout=60)
 
 
 @SC("as-termctl-override-escalation")
@@ -347,7 +346,9 @@ def test_termctl_locked_is_provoked_with_the_servers_lock_held(world: World) -> 
         started = time.monotonic()
         refused = world.tool("termctl", "--json", "label", "add", pane, "c=d", timeout=60)
         waited = time.monotonic() - started
-        world.observe("termctl.locked.timeout", (refused.returncode, round(waited, 1), refused.stdout))
+        world.observe(
+            "termctl.locked.timeout", (refused.returncode, round(waited, 1), refused.stdout)
+        )
         error = json.loads(refused.stdout)["error"]
         check(
             refused.returncode == 12
@@ -366,7 +367,9 @@ def test_termctl_locked_is_provoked_with_the_servers_lock_held(world: World) -> 
         )
         labels = [p["labels"] for p in world.json_tool("termctl", "list")["panes"]]
         check(
-            labels == [["a=b", "k=v"]] or labels == [["k=v", "a=b"]] or sorted(labels[0]) == ["a=b", "k=v"],
+            labels == [["a=b", "k=v"]]
+            or labels == [["k=v", "a=b"]]
+            or sorted(labels[0]) == ["a=b", "k=v"],
             "the refused label change changed nothing on the pane",
             "termctl interface.md Locking (the lock guards the read-modify-write)",
             labels,
@@ -380,7 +383,12 @@ def test_termctl_locked_is_provoked_with_the_servers_lock_held(world: World) -> 
             (dry.returncode, dry.stdout[-300:]),
         )
         listed = world.tool("termctl", "--json", "list")
-        check(listed.returncode == 0, "list takes no lock", "termctl interface.md Locking", listed.stderr)
+        check(
+            listed.returncode == 0,
+            "list takes no lock",
+            "termctl interface.md Locking",
+            listed.stderr,
+        )
 
     # released: the same command succeeds (the lock is not left behind by the refused one)
     ok = world.json_tool("termctl", "label", "add", pane, "c=d")
@@ -446,7 +454,9 @@ def test_agent_spawn_label_add_reports_a_locked_pane_and_resyncs_later(world: Wo
     check(
         changed["changed"] is True
         and "team=blue" in changed["labels"]
-        and any("termctl label add failed (exit 12)" in w and "queued" in w for w in changed["warnings"]),
+        and any(
+            "termctl label add failed (exit 12)" in w and "queued" in w for w in changed["warnings"]
+        ),
         "label add with the pane's server lock held succeeds on the agent and warns that termctl's "
         "label add failed with exit 12 (locked) and the change is queued",
         "interface.md label add (a mirror failure is a warning and queues the change); termctl Locking",
@@ -555,9 +565,18 @@ def test_a_digest_only_and_an_anchor_only_baseline_change(world: World) -> None:
             error,
         )
         refused = wt.run(
-            "baseline", "accept", rid, "--yes", "--actor", "human:tester", "--expect-digest", "f" * 64
+            "baseline",
+            "accept",
+            rid,
+            "--yes",
+            "--actor",
+            "human:tester",
+            "--expect-digest",
+            "f" * 64,
         )
-        world.observe(f"wtctl.baseline.anchor-only.{column}.accept", (refused.returncode, refused.stdout))
+        world.observe(
+            f"wtctl.baseline.anchor-only.{column}.accept", (refused.returncode, refused.stdout)
+        )
         error = json.loads(refused.stdout)["error"]
         details = error["details"]
         check(
@@ -625,7 +644,12 @@ def test_agent_spawn_show_and_teardown_for_a_baseline_change_without_classes(wor
         "interface.md Teardown order (a refusal that changed nothing returns the agent to parked)",
     )
     ok = wt.run("baseline", "accept", rid, "--yes", "--actor", "human:tester")
-    check(ok.returncode == 0, "the human accept clears the digest-only change", "wtctl baseline accept", ok.stdout[:300])
+    check(
+        ok.returncode == 0,
+        "the human accept clears the digest-only change",
+        "wtctl baseline accept",
+        ok.stdout[:300],
+    )
 
     # a moved anchor
     wtctl_db_update(world, "update records set dir_id = ? where id = ?", "1:2", rid)
@@ -641,13 +665,19 @@ def test_agent_spawn_show_and_teardown_for_a_baseline_change_without_classes(wor
     refused = world.spawn_json("teardown", aid, ok=(20,))
     world.observe("agent-spawn.teardown.anchor-only", refused["error"])
     check(
-        refused["error"]["tool"] == "wtctl" and refused["error"]["lower_error"]["reason"] == "unlinked",
+        refused["error"]["tool"] == "wtctl"
+        and refused["error"]["lower_error"]["reason"] == "unlinked",
         "teardown passes wtctl's unlinked refusal of the moved anchor through (exit 20)",
         "interface.md Teardown order step 4 (wtctl refusals are passed through)",
         refused["error"],
     )
     ok = wt.run("baseline", "accept", rid, "--yes", "--actor", "human:tester")
-    check(ok.returncode == 0, "the human accept re-records the anchor", "wtctl baseline accept", ok.stdout[:300])
+    check(
+        ok.returncode == 0,
+        "the human accept re-records the anchor",
+        "wtctl baseline accept",
+        ok.stdout[:300],
+    )
     torn = world.spawn_json("teardown", aid)
     check(
         [w["action"] for w in torn["worktrees"]] == ["removed"],
@@ -987,12 +1017,20 @@ def test_input_files_are_copied_staged_carried_and_refused_by_claude_session(wor
     bad_name.write_text("x\n")
     for what, extra in (
         ("an input over input_max_bytes", ("--input-file", str(big))),
-        ("duplicate input basenames", ("--input-file", str(note), "--input-file", str(nested / "note.txt"))),
-        ("an input whose basename is outside the artifact-name grammar", ("--input-file", str(bad_name))),
+        (
+            "duplicate input basenames",
+            ("--input-file", str(note), "--input-file", str(nested / "note.txt")),
+        ),
+        (
+            "an input whose basename is outside the artifact-name grammar",
+            ("--input-file", str(bad_name)),
+        ),
         ("--input-file -", ("--input-file", "-")),
     ):
         done = cs_raw(world, *start_args(world, work, "agent=ag-input", *extra))
-        world.observe(f"claude-session.input-file.refused.{what}", (done.returncode, done.stdout[-200:]))
+        world.observe(
+            f"claude-session.input-file.refused.{what}", (done.returncode, done.stdout[-200:])
+        )
         check(
             done.returncode == 2 and json.loads(done.stdout)["error"]["code"] == "usage",
             f"{what} exits 2 usage",
@@ -1007,7 +1045,9 @@ def test_input_files_are_copied_staged_carried_and_refused_by_claude_session(wor
 
 
 @SC("cs-wait-interval")
-def test_wait_has_no_interval_flag_and_cron_install_interval_is_one_to_fifty_nine(world: World) -> None:
+def test_wait_has_no_interval_flag_and_cron_install_interval_is_one_to_fifty_nine(
+    world: World,
+) -> None:
     """claude-session interface.md ``wait`` (``claude-session wait <id> [--run] [--timeout]
     [--outcome-file]``: no polling flag; the poll period is the config's ``poll_interval``) and
     ``cron install`` (``--interval`` 1 to 59 minutes, else exit 2; validated before any crontab is read, so the tripwire crontab is never reached).
@@ -1019,7 +1059,9 @@ def test_wait_has_no_interval_flag_and_cron_install_interval_is_one_to_fifty_nin
     started = cs(world, *start_args(world, work, "agent=ag-wait"))
     csid = started["csession_id"]
     refused = cs_raw(world, "wait", csid, "--interval", "1", "--timeout", "1s")
-    world.observe("claude-session.wait.interval", (refused.returncode, refused.stdout, refused.stderr[-200:]))
+    world.observe(
+        "claude-session.wait.interval", (refused.returncode, refused.stdout, refused.stderr[-200:])
+    )
     check(
         refused.returncode == 2,
         "claude-session wait --interval 1 is a usage error (exit 2): the flag does not exist",
@@ -1038,7 +1080,9 @@ def test_wait_has_no_interval_flag_and_cron_install_interval_is_one_to_fifty_nin
     cs(world, "stop", csid)
     begun = time.monotonic()
     done = cs_raw(world, "wait", csid, "--timeout", "30s")
-    world.observe("claude-session.wait.after-stop", (done.returncode, round(time.monotonic() - begun, 2)))
+    world.observe(
+        "claude-session.wait.after-stop", (done.returncode, round(time.monotonic() - begun, 2))
+    )
     check(
         done.returncode != 22 and time.monotonic() - begun < 20,
         "wait of an ended run returns at once with its outcome",
@@ -1046,7 +1090,9 @@ def test_wait_has_no_interval_flag_and_cron_install_interval_is_one_to_fifty_nin
         (done.returncode, done.stdout[-300:]),
     )
     for interval in ("0", "60", "abc"):
-        bad = world.tool("claude-session", "cron", "install", "--interval", interval, "--dry-run", "--json")
+        bad = world.tool(
+            "claude-session", "cron", "install", "--interval", interval, "--dry-run", "--json"
+        )
         check(
             bad.returncode == 2,
             f"cron install --interval {interval} is a usage error",
@@ -1126,7 +1172,9 @@ def test_human_gates_and_yes_at_a_real_terminal(world: World) -> None:
     )
     # a terminal, no --yes: the prompt appears on stderr; "n" declines and changes nothing
     declined = run_on_tty(world, [wtctl, "--json", "baseline", "accept", rid], typed="n\n")
-    world.observe("wtctl.tty.declined", (declined.returncode, declined.stdout[-200:], declined.stderr[-300:]))
+    world.observe(
+        "wtctl.tty.declined", (declined.returncode, declined.stdout[-200:], declined.stderr[-300:])
+    )
     check(
         declined.returncode == 13
         and "[y/N]" in declined.stderr
@@ -1139,7 +1187,8 @@ def test_human_gates_and_yes_at_a_real_terminal(world: World) -> None:
     # (wtctl 1.0.0 writes no audit record for it, see test_baseline_accept_is_audited)
     accepted = run_on_tty(world, [wtctl, "--json", "baseline", "accept", rid, "--yes"])
     check(
-        accepted.returncode == 0 and "[y/N]" not in accepted.stderr
+        accepted.returncode == 0
+        and "[y/N]" not in accepted.stderr
         and wt.run("baseline", "check", rid).returncode == 0,
         "at a TTY with --yes and no --actor baseline accept runs as the default human actor, without a prompt",
         "wtctl interface.md Audit and log (Actor: the default is human:<me.name> when stdin is a TTY)",
@@ -1173,7 +1222,6 @@ def test_human_gates_and_yes_at_a_real_terminal(world: World) -> None:
     )
 
 
-
 @SC("wtctl-baseline-no-classes")
 @pytest.mark.xfail(
     strict=True,
@@ -1189,12 +1237,20 @@ def test_baseline_accept_is_audited(world: World) -> None:
     wtctl audits the action."""
     wt = Wt(world)
     made = wt.create("au1", "ag-aaaa")["record"]
-    wtctl_db_update(world, "update records set baseline_digest = ? where id = ?", "0" * 64, made["id"])
+    wtctl_db_update(
+        world, "update records set baseline_digest = ? where id = ?", "0" * 64, made["id"]
+    )
     done = wt.run("baseline", "accept", made["id"], "--yes", "--actor", "human:tester")
-    check(done.returncode == 0, "the human accept succeeds", "wtctl baseline accept", done.stdout[-300:])
+    check(
+        done.returncode == 0,
+        "the human accept succeeds",
+        "wtctl baseline accept",
+        done.stdout[-300:],
+    )
     records = json.loads(wt.run("export", "--audit").stdout)
     check(
-        [r["action"] for r in records] == ["baseline_accept"] and records[0]["actor"] == "human:tester",
+        [r["action"] for r in records] == ["baseline_accept"]
+        and records[0]["actor"] == "human:tester",
         "the accept is recorded in audit.jsonl with the human actor",
         "wtctl interface.md Audit and log (baseline_accept)",
         records,
@@ -1269,7 +1325,9 @@ def test_a_late_reconcile_after_a_window_close_park_writes_no_second_post_park(
     state = wait_status(world, bid, "live")
     world.track(int(state["supervisor"]["pid"]), tree=True)
     run = wait_for(
-        lambda: (r := _status_run(world, bcsid)).get("child_alive") and r.get("wrapper_alive") and r,
+        lambda: (
+            (r := _status_run(world, bcsid)).get("child_alive") and r.get("wrapper_alive") and r
+        ),
         30,
         "the stub child and its wrapper to be running",
     )
@@ -1288,7 +1346,10 @@ def test_a_late_reconcile_after_a_window_close_park_writes_no_second_post_park(
     parked = wait_status(world, bid, "parked", 90)["agent"]
     world.observe(
         "window-wrapper-dead.stub-dies",
-        {k: parked[k] for k in ("park_reason", "needs_attention", "supervisor_lost", "last_outcome")},
+        {
+            k: parked[k]
+            for k in ("park_reason", "needs_attention", "supervisor_lost", "last_outcome")
+        },
     )
     check(
         parked["park_reason"] == "lost" and parked["needs_attention"] == "lost",

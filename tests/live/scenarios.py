@@ -382,7 +382,11 @@ _ALL = [
         "exit 12 partial and sticky, reconcile reports teardown_incomplete, a human remove then a "
         "retry completes",
         "claude-session wtctl git",
-        covers=("#116", "wtctl interface.md Remove order step 9", "interface.md Teardown order step 4"),
+        covers=(
+            "#116",
+            "wtctl interface.md Remove order step 9",
+            "interface.md Teardown order step 4",
+        ),
     ),
     _s(
         "as-input-files",
