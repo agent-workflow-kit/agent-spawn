@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from agent_spawn import __version__
+from tests.pyproject_version import pyproject_version
 
 
 def _run(tmp_path: Path, *argv: str) -> subprocess.CompletedProcess[str]:
@@ -32,7 +32,7 @@ def _run(tmp_path: Path, *argv: str) -> subprocess.CompletedProcess[str]:
 def test_version_prints_version_and_exits_zero(tmp_path: Path) -> None:
     done = _run(tmp_path, "--version")
     assert done.returncode == 0
-    assert done.stdout.strip() == f"agent-spawn {__version__}"
+    assert done.stdout == f"agent-spawn {pyproject_version()}\n"
 
 
 def test_usage_error_exits_2_with_the_envelope_on_stdout(tmp_path: Path) -> None:

@@ -21,7 +21,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, NoReturn
 
-from . import __version__, gateway, relay
+from . import gateway, relay
 from . import launch as launch_module
 from .commands.base import Invocation
 from .commands.table import HANDLERS
@@ -360,10 +360,37 @@ def _add_supervise(parser: Any) -> None:
     parser.add_argument("--handoff-timeout", metavar="SECONDS")
 
 
+class _VersionAction(argparse.Action):
+    """``--version``: reads the package metadata only when the flag is given."""
+
+    def __init__(
+        self, option_strings: Sequence[str], dest: str = argparse.SUPPRESS, **_: Any
+    ) -> None:
+        super().__init__(
+            option_strings,
+            dest,
+            nargs=0,
+            default=argparse.SUPPRESS,
+            help="show the version and exit",
+        )
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        from . import __version__
+
+        print(f"{PROG} {__version__}")
+        parser.exit()
+
+
 def build_parser() -> SpawnParser:
     """The whole command surface. ``command_parsers`` maps ``label add`` etc. to its parser."""
     parser = SpawnParser(prog=PROG, description=DESCRIPTION)
-    parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
+    parser.add_argument("--version", action=_VersionAction)
     _add_global_flags(parser, top=True)
     commands = parser.add_subparsers(dest="command", metavar="<command>", required=True)
 
