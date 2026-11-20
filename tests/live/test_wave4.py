@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import pty
+import re
 import signal
 import sqlite3
 import subprocess
@@ -27,7 +28,7 @@ from typing import Any
 
 import pytest
 
-from .billed import pid_gone
+from .billed import pid_gone, signal_exact
 from .harness import LiveError, World, check, process_token, wait_for
 from .test_claude_session import cs, cs_raw, prepare, start_args
 from .test_agent_spawn_hooks import HUMAN, hook_config, launch_args, write_script
@@ -1197,4 +1198,143 @@ def test_baseline_accept_is_audited(world: World) -> None:
         "the accept is recorded in audit.jsonl with the human actor",
         "wtctl interface.md Audit and log (baseline_accept)",
         records,
+    )
+
+
+def _status_run(world: World, csid: str) -> dict[str, Any]:
+    return dict(world.json_tool("claude-session", "status", csid)["run"])
+
+
+@SC("as-window-close-post-park")
+def test_a_late_reconcile_after_a_window_close_park_writes_no_second_post_park(
+    world: World,
+) -> None:
+    """#75 item 4 (a late ``reconcile`` after a park delivers no second ``post-park``) on the two
+    window park paths the billed ``interactive-window-close-unreported`` and
+    ``window-wrapper-dead-child-alive-real`` reach with a real claude: an unreported session whose
+    window is killed (parked ``killed``, ``forwarded_hup``), and SIGKILL of the recorded ``exec``
+    under a child that dies with its terminal (the run is ``lost``, parked ``lost`` with attention
+    ``lost``). Unbilled twin with a stub claude that dies on hangup: it checks the product's
+    behavior on those paths; the two billed scenarios themselves still configure no ``post-park``
+    hook (docs/live-testing.md, Not covered). interface.md Hooks (``post-park`` once per park),
+    Reconcile."""
+    hook_log = world.root / "post-park.log"
+    wt = stub_setup(
+        world,
+        "while :; do sleep 0.2; done",
+        agent_spawn_config=f'hooks:\n  post-park:\n    - cmd: "cat > /dev/null; echo ran >> {hook_log}"\n',
+    )
+
+    def runs() -> int:
+        return hook_log.read_text().count("ran\n") if hook_log.exists() else 0
+
+    # 1. the window of an unreported session is killed
+    first = world.spawn_json(*window_launch_args(wt), timeout=120)["agent"]
+    aid, csid = first["agent_id"], first["csession_id"]
+    world.note_session(csid)
+    state = wait_status(world, aid, "live")
+    world.track(int(state["supervisor"]["pid"]), tree=True)
+    run = wait_for(
+        lambda: (r := _status_run(world, csid)).get("child_alive") and r,
+        30,
+        "the stub child to be running",
+    )
+    child = int(run["child_pid"])
+    pane = panes_of(world, aid)[0]
+    killed = world.tmux("kill-window", "-t", pane["window_id"])
+    check(killed.returncode == 0, "kill-window works", "design.md B3", killed.stderr)
+    parked = wait_status(world, aid, "parked", 90)["agent"]
+    wait_for(lambda: pid_gone(child), 30, "the stub to end after the hangup")
+    check(
+        parked["park_reason"] == "killed" and parked["needs_attention"] is None,
+        "a killed window parks the unreported agent killed without attention",
+        "interface.md Outcome table (killed, forwarded_hup)",
+        {k: parked[k] for k in ("park_reason", "needs_attention", "last_end_reason")},
+    )
+    wait_for(lambda: runs() >= 1, 15, "post-park to run for the window-close park")
+    world.spawn_json("reconcile", ok=(0, 12))
+    world.spawn_json("reconcile", ok=(0, 12))
+    check(
+        runs() == 1,
+        "post-park ran exactly once for the window-close park; late reconciles delivered no second one",
+        "interface.md Hooks (post-park once per park), #75 item 4",
+        runs(),
+    )
+    world.spawn_json("teardown", aid)
+
+    # 2. SIGKILL of the recorded exec under a child that dies with its terminal
+    second = world.spawn_json(*window_launch_args(wt), timeout=120)["agent"]
+    bid, bcsid = second["agent_id"], second["csession_id"]
+    world.note_session(bcsid)
+    state = wait_status(world, bid, "live")
+    world.track(int(state["supervisor"]["pid"]), tree=True)
+    run = wait_for(
+        lambda: (r := _status_run(world, bcsid)).get("child_alive") and r.get("wrapper_alive") and r,
+        30,
+        "the stub child and its wrapper to be running",
+    )
+    wrapper, child = int(run["wrapper_pid"]), int(run["child_pid"])
+    check(
+        state["supervisor"].get("exec_pid") == wrapper,
+        "the exec pid agent-spawn recorded is claude-session's wrapper pid",
+        "design.md D19 / claude-session status run.wrapper_pid",
+        (state["supervisor"], wrapper),
+    )
+    before = runs()
+    signal_exact(world, wrapper, signal.SIGKILL, comm_contains="exec")
+    wait_for(lambda: pid_gone(wrapper), 20, "the wrapper to be dead")
+    wait_for(lambda: pid_gone(child), 30, "the stub to end with its terminal")
+    world.spawn_json("reconcile", ok=(0, 12))
+    parked = wait_status(world, bid, "parked", 90)["agent"]
+    world.observe(
+        "window-wrapper-dead.stub-dies",
+        {k: parked[k] for k in ("park_reason", "needs_attention", "supervisor_lost", "last_outcome")},
+    )
+    check(
+        parked["park_reason"] == "lost" and parked["needs_attention"] == "lost",
+        "a child that died with its terminal after the wrapper was killed ends the run lost and parks the agent lost with attention lost",
+        "interface.md Outcome table (lost), Liveness",
+        {k: parked[k] for k in ("park_reason", "needs_attention", "supervisor_lost")},
+    )
+    wait_for(lambda: runs() >= before + 1, 15, "post-park to run for the lost park")
+    world.spawn_json("reconcile", ok=(0, 12))
+    check(
+        runs() == before + 1,
+        "post-park ran once for the lost park; a late reconcile delivered no second one",
+        "interface.md Hooks (post-park once per park), #75 item 4",
+        (before, runs()),
+    )
+    world.spawn_json("teardown", bid, ok=(0, 20))
+
+
+@SC("wtctl-version")
+def test_wtctl_prints_its_release_version(world: World) -> None:
+    """wtctl interface.md Global flags (``--version`` prints ``wtctl <version>``). The 0.32.x
+    builds printed the hard-coded ``0.0.0`` placeholder, so the harness recorded the version as
+    unknown; a released 1.0.0 prints its real version (#116). This test is for released installs:
+    it fails on a build that prints the placeholder, and the harness's own reading of the version
+    (``tools-versions``) must agree with it."""
+    done = world.tool("wtctl", "--version")
+    found = re.fullmatch(r"wtctl (\d+)\.(\d+)\.(\d+)\S*", done.stdout.strip())
+    world.observe("wtctl.version", done.stdout.strip())
+    check(
+        done.returncode == 0 and found is not None,
+        "wtctl --version prints 'wtctl <major>.<minor>.<patch>'",
+        "wtctl interface.md Global flags (--version)",
+        (done.returncode, done.stdout, done.stderr),
+    )
+    assert found is not None
+    parsed = tuple(int(g) for g in found.groups())
+    check(
+        parsed != (0, 0, 0),
+        "wtctl --version is not the 0.0.0 placeholder of the 0.32.x builds (run the suite against a released wtctl)",
+        "docs/live-testing.md Results (wtctl 0.32.x printed 0.0.0); wtctl 1.0.0 prints wtctl 1.0.0",
+        done.stdout.strip(),
+    )
+    tool = world.tools["wtctl"]
+    check(
+        tool is not None and tool.version == parsed,
+        "the harness reads the same version as wtctl --version (it is not recorded as unknown)",
+        "tests/live/harness.py read_version",
+        (tool.version if tool else None, parsed),
     )

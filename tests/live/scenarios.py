@@ -192,6 +192,13 @@ _ALL = [
         covers=("#116", "wtctl interface.md Create order, Locking"),
     ),
     _s(
+        "wtctl-version",
+        "tools",
+        "wtctl --version prints its real release version, not the 0.0.0 placeholder of 0.32.x",
+        "wtctl",
+        covers=("#116", "docs/live-testing.md Results"),
+    ),
+    _s(
         "wtctl-collisions-reuse",
         "tools",
         "explicit --name collisions per case, reuse by the same holder",
@@ -394,6 +401,14 @@ _ALL = [
         "explicit auto actor refused",
         "claude-session wtctl git",
         covers=("#116", "wtctl interface.md Audit and log, Actor", "interface.md Global flags"),
+    ),
+    _s(
+        "as-window-close-post-park",
+        "tools",
+        "a killed window of an unreported session and a SIGKILLed exec under a stub that dies with "
+        "its terminal: parked killed and lost, post-park once, late reconciles deliver no second one",
+        "claude-session termctl tmux",
+        covers=("#116", "#36 #75 4", "interface.md Hooks, Reconcile"),
     ),
     _s(
         "as-cron-fake-crontab",
