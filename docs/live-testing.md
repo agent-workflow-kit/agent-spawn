@@ -53,7 +53,7 @@ skips the scenarios that need `--implicit-done`.
 
 | Wave | Scenarios | Cost |
 |---|---|---|
-| `tools` | tmux, termctl, wtctl, claude-session (with a stub `claude`), agent-spawn against all of them (including `as-wrapper-dead-child-alive` and its window variant, the hook, `wait` exit-code, `adopted_at` and wtctl-failure scenarios of wave 2), wtctl hooks, bootstrap and `remove --merged-head`, cron, `reconcile --reset-lease`, browse, and the wave-4 scenarios (termctl hook override, slow `pre-teardown`, `locked`, baseline digest/anchor changes, concurrent `create`, partial teardown, input files, a pty for the human gates, window-close `post-park`) | none |
+| `tools` | tmux, termctl, wtctl, claude-session (with a stub `claude`), agent-spawn against all of them (including `as-wrapper-dead-child-alive` and its window variant, the hook, `wait` exit-code, `adopted_at` and wtctl-failure scenarios of wave 2), wtctl hooks, bootstrap and `remove --merged-head`, cron, `reconcile --reset-lease`, `as-scope-supervisor` (a scope-hosted detached supervisor against the real `systemd-run --user`; skips without a user manager), browse, and the wave-4 scenarios (termctl hook override, slow `pre-teardown`, `locked`, baseline digest/anchor changes, concurrent `create`, partial teardown, input files, a pty for the human gates, window-close `post-park`) | none |
 | `billed-1` | headless launch, interactive window and window close, `--no-implicit-done` report-resume chain | 4 sessions |
 | `billed-2` | resume, in-place fork, fork into a throwaway, teardown with real wtctl, promotion | 9 sessions |
 | `billed-3` | kill-pane, SIGTERM idle and mid-turn, minimal environment, `jobsctl cancel --force`, liveness kills, `interactive-window-close-unreported`, `window-wrapper-dead-child-alive-real` | 12 sessions |
@@ -122,6 +122,7 @@ git repositories (a bare origin and a clone, wired to wtctl with `repos.<id>.clo
 - `as-teardown-partial` makes a directory under the world unwritable (mode 0555) and restores it
   in a `finally`; the test skips as root. A pytest killed by SIGKILL in that window leaves a
   directory `rm` cannot delete: recover with `chmod -R u+rwX /tmp/as-live-*` and remove it.
+- `as-scope-supervisor` is the one scenario that reaches outside its world, and only into the user's own systemd user manager through transient scopes: it hands the manager's bus address (`DBUS_SESSION_BUS_ADDRESS`, never `XDG_RUNTIME_DIR`) to `agent-spawn launch` and to its own `systemd-run`/`systemctl --user` calls, starts the units `agent-spawn-<agent_id>-r1` (and the probe unit `agent-spawn-probe-<agent_id>`), and in a `finally` stops exactly those units by their exact names (`systemctl --user stop <unit>`, never a pattern, only when the exact unit is listed), then fails if one is still listed. It skips with the reason when `systemd-run --user --scope` does not work. It never runs `loginctl` and never changes a unit it did not start.
 - The cron scenario runs against a fake `crontab` first on `PATH`; the real crontab is never
   touched. Real-crontab fidelity (the system's `no crontab for <user>` wording and exit code,
   localized messages) is therefore **not checked** and stays in FIDELITY.md's Unverified list.
@@ -304,6 +305,7 @@ Run date 2026-11-19, Linux 5.15, claude 2.1.328 (`--model haiku`), claude-sessio
 termctl 0.25.0, wtctl 0.32.0, tmux 3.5a, git 2.34.1, jobsctl (installed, used by
 `jobsctl-cancel-force`). The suite has passed on Linux:
 
+- **`as-scope-supervisor`** (2026-11-20, #40; systemd 249.11 with a user manager (lingering), logind `KillUserProcesses=no`, claude-session, termctl and wtctl built from `git archive` of `origin/main`, stub `claude`, tmux 3.5a, Python 3.12, 0 sessions): passed in about 11 s. Observed: the agent is `live` (the stub child runs), the recorded supervisor PID is the `supervise` process (no `systemd-run` in its command line), its cgroup is `0::/user.slice/user-1000.slice/user@1000.service/app.slice/agent-spawn-<agent_id>-r1.scope` and the PID is in that cgroup's `cgroup.procs`, `systemctl --user show` says `ActiveState=active`, `show` reports no `supervisor_lost`, `stop` (`action: session_stop`) parks the agent `killed`, the supervisor exits and the manager drops the unit; no unit was left. With no bus (`DBUS_SESSION_BUS_ADDRESS` empty and `XDG_RUNTIME_DIR` unusable) it skips with its reason. **Not verified:** survival of a real logout under `KillUserProcesses=yes` (see Not covered).
 - **Unbilled wave** (`LIVE_SCENARIOS=unbilled`): 154 passed (before `as-wrapper-dead-child-alive`), 4 skipped (the recorded-only
   scenarios `placement-here-terminal`, `upgrade-live-supervisor` and `real-crontab`, and `macos`,
   issue #37).

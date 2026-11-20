@@ -148,6 +148,24 @@ def test_a_resume_starts_its_own_scope_named_after_its_run(
     assert len(probes) == 2
 
 
+def test_a_resume_whose_scope_cannot_start_changes_nothing(
+    scope_flow: Flow, fakebin: Fakebin
+) -> None:
+    first = scope_flow.cli(schema("launch"), *HEADLESS, "--wait", extra_env=RUNTIME)
+    agent_id = first.body["agent"]["agent_id"]
+    before = scope_flow.agent(agent_id)
+    refused = scope_flow.cli(schema("resume"), "resume", agent_id, "--json")  # no bus
+    assert refused.code == 12, (refused.stdout, refused.stderr)
+    assert error_of(refused)["details"]["cause"] == "scope_unavailable"
+    after = scope_flow.agent(agent_id)
+    assert (after["status"], after["park_reason"], after["run"]) == (
+        before["status"],
+        before["park_reason"],
+        before["run"],
+    )
+    assert len(supervisor_calls(fakebin)) == 1  # only the launch's supervisor ever started
+
+
 # --- failure ----------------------------------------------------------------------------------
 
 
