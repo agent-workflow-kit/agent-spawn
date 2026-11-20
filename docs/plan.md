@@ -99,5 +99,5 @@ Status: planned, 2026-11-02. Implements [interface.md](interface.md) (normative)
 - **0.5** (stage 5): live suite and macOS checks.
 - **0.6** (stage 6): `browse`.
 - **1.0**: stages 0–6 done; the v1 review, ticket and response slices have run through agent-spawn without interface changes; the live suite and the macOS checklist passed; the interface is declared stable (a deliberate breaking-change commit per architecture section 18.3).
-- **1.x** (additive): a cgroup- or scope-based detached supervisor option (`systemd-run --user --scope`) for hosts with `KillUserProcesses=yes`; agent-spawn `pre-resume` hook if a policy needs one; a second termctl placement target when termctl supports panes.
+- **1.x** (additive): a scope-based detached supervisor option (`supervisor.detach: scope`, `systemd-run --user --scope`) for hosts with `KillUserProcesses=yes` (issue #40, D54); agent-spawn `pre-resume` hook if a policy needs one; a second termctl placement target when termctl supports panes.
 - **2.0**: a second agent session backend (binding C, architecture section 3.5), or any non-additive state or interface change.
