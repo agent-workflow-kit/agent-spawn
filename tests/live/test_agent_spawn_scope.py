@@ -181,6 +181,7 @@ def test_a_scope_hosted_supervisor_runs_in_its_own_scope_and_stop_ends_it(world:
     )
     unit = ""
     aid = ""
+    cleanup_error: Exception | None = None
     try:
         launched = world.spawn_json(
             "launch",
@@ -271,10 +272,17 @@ def test_a_scope_hosted_supervisor_runs_in_its_own_scope_and_stop_ends_it(world:
             f"the manager to drop {unit} after its last process exited",
         )
     finally:
-        # every unit this world's agents may have started, by exact name, even when the launch
-        # failed before returning an agent id
-        ours = units_of(bus, world_agent_ids(world, aid))
-        for name in ours:
-            stop_unit(bus, name)
-        stuck: list[Any] = units_of(bus, world_agent_ids(world, aid))
-        check(not stuck, "no unit of this scenario is left running", "docs/live-testing.md", stuck)
+        # Stop every unit this world's agents may have started, by exact name, even when the launch
+        # failed before returning an agent id. A cleanup failure is kept aside and raised only
+        # after this block when the body succeeded: it never replaces an in-flight exception.
+        if unit:
+            manager(bus, "systemctl", "--user", "stop", unit)
+        try:
+            for name in units_of(bus, world_agent_ids(world, aid)):
+                manager(bus, "systemctl", "--user", "stop", name)
+        except Exception as exc:
+            cleanup_error = exc
+    if cleanup_error is not None:
+        raise cleanup_error
+    stuck: list[Any] = units_of(bus, world_agent_ids(world, aid))
+    check(not stuck, "no unit of this scenario is left running", "docs/live-testing.md", stuck)
