@@ -13,12 +13,12 @@ from typing import Any
 
 import pytest
 
-from agent_spawn import chain, cli
+from agent_spawn import chain, cli, showing
 from agent_spawn.agent_view import ts
 from agent_spawn.gateway import SystemGateway
 from agent_spawn.ids import new_agent_id
 from agent_spawn.session_backend import RunOutcome
-from agent_spawn.store import Store
+from agent_spawn.store import Store, StoreError
 from agent_spawn.supervise import Final, RunCtx, Signals, Supervisor
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
@@ -104,6 +104,71 @@ def rig_for(
         return Rig(fakebin, monkeypatch, tmp_path, **agent)
 
     return make
+
+
+# --- adopted_at (agent_runs.started_at) ---------------------------------------------------------
+
+
+def test_the_supervisor_records_the_adoption_time_of_its_run_once(
+    rig_for: Callable[..., Rig],
+) -> None:
+    rig = rig_for()
+    with Store.open(rig.state, create=False) as store:
+        assert (store.get_run(rig.agent_id, 1) or {})["started_at"] is None
+    rig.supervisor.run()
+    with Store.open(rig.state, create=False) as store:
+        run = store.get_run(rig.agent_id, 1)
+        assert run is not None and isinstance(run["started_at"], float)
+        first = run["started_at"]
+        # a second observation of the same run (a later poll) never rewrites it
+        with store.lease(f"agent:{rig.agent_id}") as lease:
+            assert store.mark_run_adopted(lease, rig.agent_id, 1, first + 50) is False
+        assert (store.get_run(rig.agent_id, 1) or {})["started_at"] == first
+    # and `show` maps it to adopted_at
+    with Store.open(rig.state, create=False) as store:
+        shown = showing.run_objects(store, rig.agent())
+    assert shown[0]["adopted_at"] == ts(first)
+
+
+def test_a_run_that_never_reached_its_session_phase_has_no_adoption_time(
+    rig_for: Callable[..., Rig],
+) -> None:
+    rig = rig_for()
+    with Store.open(rig.state, create=False) as store:
+        rig.supervisor.store = store
+        assert rig.supervisor.mark_started(RunCtx(1, rig.outcome_file), "launch") is False
+        assert (store.get_run(rig.agent_id, 1) or {})["started_at"] is None
+
+
+def test_a_run_that_ended_in_its_launch_phase_keeps_a_null_adoption_time(
+    rig_for: Callable[..., Rig], fakebin: Fakebin
+) -> None:
+    rig = rig_for()
+    fakebin.script("claude-session", "exec", outcome="vetoed")
+    rig.supervisor.run()
+    with Store.open(rig.state, create=False) as store:
+        run = store.get_run(rig.agent_id, 1)
+        assert run is not None and run["outcome"]["phase"] == "launch"
+        assert run["started_at"] is None
+        shown = showing.run_objects(store, rig.agent())
+    assert shown[0]["adopted_at"] is None
+
+
+def test_a_failed_adoption_write_does_not_lose_the_outcome_or_the_live_transition(
+    rig_for: Callable[..., Rig], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = rig_for()
+
+    def refuse(*args: Any, **kwargs: Any) -> bool:
+        raise StoreError("someone else holds the agent")
+
+    monkeypatch.setattr(Store, "mark_run_adopted", refuse)
+    rig.supervisor.run()
+    row = rig.agent()
+    assert row["status"] == "parked" and row["park_reason"] == "done"
+    with Store.open(rig.state, create=False) as store:
+        run = store.get_run(rig.agent_id, 1)
+    assert run is not None and run["outcome"]["outcome"] == "done" and run["started_at"] is None
 
 
 # --- first_working_at ---------------------------------------------------------------------------

@@ -122,13 +122,18 @@ def go_live(
     run: int,
     changes: Mapping[str, object] | None = None,
     guard: Guard | None = None,
+    adopted_at: float | None = None,
 ) -> dict[str, Any] | None:
     """``launching`` → ``live`` when the run is started: clears ``needs_attention``, records
-    ``post-launch`` (and the status change). ``None`` when the agent is no longer launching."""
+    ``post-launch`` (and the status change). ``None`` when the agent is no longer launching.
+    ``adopted_at``: the time the liveness check first saw the run started (the supervisor that
+    would have written it is gone); written once, only when the transition is going to apply."""
     with store.lease(lease_key(agent_id), wait=LEASE_WAIT) as lease:
         row = store.get_agent(agent_id)
         if row is None or row["status"] != "launching" or (guard is not None and not guard(row)):
             return None
+        if adopted_at is not None:
+            store.mark_run_adopted(lease, agent_id, run, adopted_at)
         all_changes: dict[str, object] = {
             **(changes or {}),
             "updated": store.gateway.wall_time(),
