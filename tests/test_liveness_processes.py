@@ -133,6 +133,43 @@ def test_a_sigkilled_supervisor_leaves_supervisor_lost_and_stop_is_the_remedy(
     assert agent["supervisor_lost"] is False and agent["needs_attention"] is None
 
 
+def test_a_sigkilled_exec_under_a_surviving_child_leaves_supervisor_lost_and_stop_is_the_remedy(
+    flow: Flow, proc_tracker: ProcTracker
+) -> None:
+    """The wrapper-dead-child-alive row (issue #97): only ``exec`` is SIGKILLed and the session is
+    still live (claude-session reports no outcome, the child ignoring SIGTERM survives). The
+    supervisor finds no outcome and ends without parking; the next look flags ``supervisor_lost``
+    once and never stops or signals anything; ``stop`` is the remedy."""
+    agent_id = flow.live_launch(proc_tracker)
+    row = flow.agent(agent_id)
+    kill_exactly(row["exec_proc"])  # the status script stays live: no outcome, no outcome file
+    flow.wait_settled(agent_id)  # the supervisor read no outcome and ended
+    assert flow.agent(agent_id)["status"] == "live"  # nothing parked it
+    shown = flow.cli(schema("show"), "show", agent_id, "--json")
+    assert shown.body["agent"]["supervisor_lost"] is True
+    assert shown.body["agent"]["needs_attention"] == "lost"
+    assert shown.body["supervisor"]["alive"] is False
+    again = flow.cli(schema("show"), "show", agent_id, "--json")
+    assert again.body["agent"]["supervisor_lost"] is True
+    flagged = [
+        r
+        for r in flow.log()
+        if r.get("event") == "reconcile_change"
+        and r.get("agent_id") == agent_id
+        and r["details"]["kind"] == "supervisor_lost"
+    ]
+    assert len(flagged) == 1  # set once, on the transition
+    assert stop_calls(flow) == []  # liveness never stops the run
+    stopper = flow.start(proc_tracker, "stop", agent_id, "--json")
+    flow.env.wait_for(lambda: bool(stop_calls(flow)), "claude-session stop")
+    flow.fakebin.script("claude-session", "status", outcome="killed", replace=True)
+    stopped = flow.finish(schema("stop"), stopper)
+    assert stopped.code == 0, (stopped.stdout, stopped.stderr)
+    agent = flow.agent(agent_id)
+    assert agent["status"] == "parked" and agent["park_reason"] == "killed"
+    assert agent["supervisor_lost"] is False and agent["needs_attention"] is None
+
+
 def test_a_supervisor_killed_between_runs_is_parked_without_the_automatic_resume(
     flow: Flow, proc_tracker: ProcTracker
 ) -> None:

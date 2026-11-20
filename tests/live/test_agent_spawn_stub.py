@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 
+from .billed import pid_gone
 from .harness import World, check, process_token, wait_for
 from .test_wtctl import Wt
 
@@ -480,3 +481,201 @@ def test_a_killed_supervisor_leaves_a_dead_pane_that_reconcile_closes(world: Wor
         )
     done = world.spawn_json("teardown", aid)
     check(done is not None, "teardown after the pane was closed succeeds", "design.md D14 step 5")
+
+
+def _run_status(world: World, csid: str) -> dict[str, Any]:
+    return world.json_tool("claude-session", "status", csid)["run"]
+
+
+@SC("as-wrapper-dead-child-alive")
+def test_a_wrapper_killed_under_a_sigterm_ignoring_child_is_supervisor_lost_until_stop(
+    world: World,
+) -> None:
+    """#75 3 and 4, the row the billed ``liveness-kills`` cannot reach (issue #97): a headless
+    ``claude`` normally dies with a SIGKILLed ``exec`` (claude-session gives it
+    ``PR_SET_PDEATHSIG(SIGTERM)``, so the run ends ``lost``). A child that ignores SIGTERM
+    survives: the stub ``trap '' TERM``. claude-session then reports wrapper dead, child alive and
+    no outcome; agent-spawn keeps the agent ``live`` with ``supervisor_lost`` (and
+    ``needs_attention: lost``, set once on the transition), ``reconcile`` changes nothing a second
+    time, and ``stop`` ends the orphan (SIGTERM ignored, then SIGKILL after the grace) and parks
+    it ``killed``. Signals go to the exact PIDs claude-session and agent-spawn recorded."""
+    hook_log = world.root / "post-park.log"
+    wt = stub_setup(
+        world,
+        "trap '' TERM; while :; do sleep 0.2; done",
+        agent_spawn_config=f'hooks:\n  post-park:\n    - cmd: "cat > /dev/null; echo ran >> {hook_log}"\n',
+    )
+    launched = world.spawn_json(
+        "launch",
+        "--mode",
+        "headless",
+        "--prompt",
+        "reply with the single word ok",
+        "--model",
+        "haiku",
+        "--worktree",
+        "none",
+        "--cwd",
+        str(wt.repo.clone),
+        timeout=120,
+    )
+    aid = agent_of(launched)["agent_id"]
+    csid = agent_of(launched)["csession_id"]
+    world.note_session(csid)
+    state = wait_status(world, aid, "live")
+    world.track(int(state["supervisor"]["pid"]), tree=True)
+    run = wait_for(
+        lambda: (r := _run_status(world, csid)).get("child_alive") and r.get("wrapper_alive") and r,
+        30,
+        "the stub child and its wrapper to be running",
+    )
+    wrapper, child = int(run["wrapper_pid"]), int(run["child_pid"])
+    child_token = process_token(child)
+    check(
+        child_token is not None and wrapper != child,
+        "the wrapper and the stub child are two live processes",
+        "claude-session interface.md status run fields (wrapper_pid, child_pid)",
+        (wrapper, child),
+    )
+    world.pids.append((child, child_token or ""))
+    check(
+        state["supervisor"].get("exec_pid") == wrapper,
+        "the exec pid agent-spawn recorded is claude-session's wrapper pid",
+        "design.md D19 / claude-session status run.wrapper_pid",
+        (state["supervisor"].get("exec_pid"), wrapper),
+    )
+    wrapper_token = process_token(wrapper)
+    cmdline = Path(f"/proc/{wrapper}/cmdline").read_bytes()
+    check(b"exec" in cmdline, "the wrapper is claude-session exec", "#36 #75 3", cmdline[:120])
+    os.kill(wrapper, signal.SIGKILL)  # exact PID recorded by claude-session, identity checked above
+    wait_for(
+        lambda: (
+            process_token(wrapper) != wrapper_token
+            or Path(f"/proc/{wrapper}/stat").read_text().rsplit(")", 1)[-1].split()[0] == "Z"
+        ),
+        20,
+        "the wrapper to be dead",
+    )
+    after = wait_for(
+        lambda: (r := _run_status(world, csid)).get("wrapper_alive") is False and r,
+        30,
+        "claude-session to see the wrapper dead",
+    )
+    world.observe(
+        "wrapper-dead.status",
+        {k: after.get(k) for k in ("outcome", "end_reason", "wrapper_alive", "child_alive")},
+    )
+    check(
+        after["child_alive"] is True and process_token(child) == child_token,
+        "a SIGTERM-ignoring child survives the death of its wrapper (PR_SET_PDEATHSIG is ignored)",
+        "claude-session interface.md Signals / #97",
+        (after.get("child_alive"), process_token(child)),
+    )
+    check(
+        after["outcome"] is None,
+        "wrapper dead, child alive: claude-session records no outcome",
+        "claude-session interface.md status; #36 #75 3",
+        after.get("outcome"),
+    )
+    lost = wait_status_flag(world, aid)
+    world.observe("wrapper-dead.supervisor", lost.get("supervisor"))
+    check(
+        (lost.get("supervisor") or {}).get("alive") is False,
+        "the supervisor ended on its own (exec died with no outcome to read)",
+        "interface.md Liveness (a dead supervisor) / supervise.py end_of_run",
+        lost.get("supervisor"),
+    )
+    world.observe(
+        "wrapper-dead.agent",
+        {k: lost["agent"][k] for k in ("status", "needs_attention", "supervisor_lost")},
+    )
+    check(
+        lost["agent"]["status"] == "live"
+        and lost["agent"]["supervisor_lost"] is True
+        and lost["agent"]["needs_attention"] == "lost",
+        "agent-spawn keeps the agent live with supervisor_lost and needs_attention lost",
+        "interface.md Liveness (a still-live session under a dead supervisor) / #36 #75 3",
+        {k: lost["agent"][k] for k in ("status", "needs_attention", "supervisor_lost")},
+    )
+    listed = [a for a in world.spawn_json("list")["agents"] if a["agent_id"] == aid]
+    check(
+        len(listed) == 1 and listed[0]["supervisor_lost"] is True and listed[0]["status"] == "live",
+        "list reports the same",
+        "interface.md Liveness / list",
+        listed,
+    )
+    changes = world.spawn_json("reconcile", ok=(0, 12))
+    check(
+        not [c for c in changes["changes"] if c["agent_id"] == aid and c["kind"] == "parked"],
+        "reconcile does not park an orphan that is still live",
+        "interface.md Liveness (stop is the remedy)",
+        changes["changes"],
+    )
+    log = (world.state / "agent-spawn" / "log.jsonl").read_text().splitlines()
+    flagged = [
+        r
+        for r in map(json.loads, log)
+        if r.get("agent_id") == aid
+        and r.get("event") == "reconcile_change"
+        and (r.get("details") or {}).get("kind") == "supervisor_lost"
+    ]
+    check(
+        len(flagged) == 1,
+        "supervisor_lost is logged once however many times liveness runs",
+        "interface.md Liveness (needs_attention only on the transition) / #36 #75 3",
+        len(flagged),
+    )
+    check(
+        process_token(child) == child_token,
+        "no liveness check signalled the orphan",
+        "interface.md Liveness (liveness never stops the run)",
+    )
+    # the remedy: stop ends the orphan (SIGTERM is ignored, so SIGKILL after the grace)
+    stopped = world.spawn_json("stop", aid, "--grace", "2s", ok=(0, 12))
+    world.observe("wrapper-dead.stop", stopped)
+    wait_for(lambda: pid_gone(child), 30, "the stub child to be gone")
+    final = _run_status(world, csid)
+    check(
+        final["outcome"] is not None and final["child_alive"] is False,
+        "after stop the run is final and the child gone",
+        "interface.md stop / claude-session stop",
+        {k: final.get(k) for k in ("outcome", "end_reason", "child_alive")},
+    )
+    parked = wait_status(world, aid, "parked", 60)["agent"]
+    world.observe(
+        "wrapper-dead.parked",
+        {
+            k: parked[k]
+            for k in ("park_reason", "needs_attention", "supervisor_lost", "last_outcome")
+        },
+    )
+    check(
+        parked["park_reason"] == "killed" and parked["supervisor_lost"] is False,
+        "stop parks the orphaned agent killed and clears supervisor_lost",
+        "interface.md outcome table / Liveness (supervisor_lost clears when the run is final)",
+        {k: parked[k] for k in ("park_reason", "needs_attention", "supervisor_lost")},
+    )
+
+    def hook_runs() -> int:
+        return hook_log.read_text().count("ran\n") if hook_log.exists() else 0
+
+    wait_for(lambda: hook_runs() >= 1, 15, "post-park to run for the stop's park")
+    world.spawn_json("reconcile", ok=(0, 12))
+    check(
+        hook_runs() == 1,
+        "post-park ran exactly once; a late reconcile delivers no second one",
+        "#36 #75 4 / interface.md post-park (once per park)",
+        hook_runs(),
+    )
+    world.spawn_json("teardown", aid, ok=(0, 20))
+
+
+def wait_status_flag(world: World, agent_id: str, timeout: float = 60) -> dict[str, Any]:
+    box: dict[str, Any] = {}
+
+    def lost() -> bool:
+        box["show"] = show(world, agent_id)
+        return box["show"]["agent"]["supervisor_lost"] is True
+
+    wait_for(lost, timeout, f"agent {agent_id} to be supervisor_lost", interval=0.5)
+    return box["show"]
