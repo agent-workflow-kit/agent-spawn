@@ -123,6 +123,46 @@ def test_resume_finds_the_record_a_crashed_launch_left_by_name(env: Env, fakebin
         assert [h["record_id"] for h in store.get_holds(agent_id)] == [left["id"]]
 
 
+def test_resume_refuses_a_reused_record_that_is_not_the_planned_worktree(
+    env: Env, fakebin: Fakebin
+) -> None:
+    # the first run asked for an explicit branch; the same holder already has a record on it
+    # under another name (wtctl: reused: true, "the retry's other flags are not compared")
+    agent_id = failed_launch(env, fakebin, "--branch", "feat/x")
+    old = fakebin.run("wtctl", "create", "--repo", REPO, "--holder", agent_id,
+                      "--name", "older", "--branch", "feat/x", "--json")  # fmt: skip
+    assert old.returncode == 0, old.stderr
+    kept = json.loads(old.stdout)["record"]
+    before, kept_records = env.agent(agent_id), records(fakebin)
+    done = env.run("resume", agent_id, "--json")
+    assert done.returncode == 12, (done.stdout, done.stderr)
+    body = json.loads(done.stdout)
+    schema_registry.validate(body, "agent-spawn/cli/error.json")
+    error = body["error"]
+    assert error["code"] == "launch_failed" and error["details"]["cause"] == "worktree_mismatch"
+    assert kept["id"] in error["message"] and "older" in error["message"]
+    after = env.agent(agent_id)  # the pre-resume row is restored, the record is not adopted
+    assert after["updated"] == before["updated"] and after["status"] == "parked"
+    assert after["wt_record_id"] is None and after["csession_id"] is None
+    assert (after["park_reason"], after["needs_attention"]) == (
+        before["park_reason"], before["needs_attention"])  # fmt: skip
+    assert records(fakebin) == kept_records
+    assert not [c for c in wtctl_calls(fakebin) if c[0] in ("adopt", "forget", "remove")]
+    with env.store() as store:
+        assert store.get_holds(agent_id) == []
+
+
+def test_resume_with_a_stored_record_id_does_not_create_again(env: Env, fakebin: Fakebin) -> None:
+    done = env.run(*LAUNCH, "--repo", REPO, "--worktree", "new", "--branch", "feat/x")
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    agent_id = str(only_agent(env)["agent_id"])
+    assert env.agent(agent_id)["wt_record_id"] is not None
+    creates = len(wtctl_calls(fakebin, "create"))
+    again = env.run("resume", agent_id, "--json", "--wait", "--prompt", "again")
+    assert again.returncode == 0, (again.stdout, again.stderr)
+    assert len(wtctl_calls(fakebin, "create")) == creates  # `show` found the record: no create
+
+
 def test_a_record_of_the_same_name_held_by_someone_else_is_not_ours(
     env: Env, fakebin: Fakebin
 ) -> None:

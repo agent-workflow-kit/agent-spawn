@@ -434,23 +434,54 @@ def test_a_foreign_record_in_the_details_of_another_failure_is_not_stored(
         assert store.get_holds(row["agent_id"]) == []
 
 
-def test_a_reused_adopted_record_is_stored_with_wtctls_owned_flag(
-    env: Env, fakebin: Fakebin, tmp_path: Path
-) -> None:
-    adopted = fake_adopted(fakebin, tree(tmp_path))
-    fakebin.script(
-        "wtctl",
-        "create",
-        stdout={"record": adopted, "branch_action": None, "bootstrap": None, "reused": True,
-                "warnings": [], "dry_run": False},
-    )  # fmt: skip
+def test_a_matching_reuse_is_stored_with_wtctls_owned_flag(env: Env, fakebin: Fakebin) -> None:
+    # the retry after a crash: wtctl answers with the record this agent holds under the planned
+    # name; it was adopted by someone else, so wtctl says it is not owned
+    fakebin.script("wtctl", "create", merge={"reused": True, "record": {"owned": False}})
     done = env.run(*LAUNCH, "--repo", REPO, "--worktree", "new")
     assert done.returncode == 0, (done.stdout, done.stderr)
     agent_id = result_json(done)["agent"]["agent_id"]
+    record = next(iter(records(fakebin).values()))
     row = env.agent(agent_id)
-    assert row["wt_record_id"] == adopted["id"] and row["wt_owned"] is False
+    assert row["wt_record_id"] == record["id"] and row["wt_owned"] is False
     with env.store() as store:
         assert [h["owned"] for h in store.get_holds(agent_id)] == [False]
+
+
+@pytest.mark.parametrize(
+    ("record", "flags"),
+    [
+        pytest.param({"name": "another-name"}, [], id="name"),
+        pytest.param({"branch": "feat/old"}, ["--branch", "feat/new"], id="branch"),
+        pytest.param({"holders": ["ag-zzzzzzzz"]}, [], id="holder"),
+    ],
+)
+def test_a_reused_record_that_is_not_the_planned_worktree_is_refused_untouched(
+    env: Env, fakebin: Fakebin, record: dict[str, Any], flags: list[str]
+) -> None:
+    fakebin.script("wtctl", "create", merge={"reused": True, "record": record})
+    done = env.run(*LAUNCH, "--repo", REPO, "--worktree", "new", *flags)
+    assert done.returncode == 12, (done.stdout, done.stderr)
+    body = json.loads(done.stdout)
+    schema_registry.validate(body, "agent-spawn/cli/error.json")
+    error = body["error"]
+    row = parked_row(env)
+    assert (error["code"], error["tool"], error["agent_id"]) == (
+        "launch_failed", "agent-spawn", row["agent_id"])  # fmt: skip
+    assert (
+        error["details"]["cause"] == "worktree_mismatch" and error["details"]["retryable"] is False
+    )
+    kept = next(iter(records(fakebin).values()))
+    assert kept["id"] in error["message"]
+    assert error["details"]["hint"].startswith(f"wtctl show {kept['id']}; a human frees")
+    assert f"wtctl forget {kept['id']} --holder {row['agent_id']}" in error["details"]["hint"]
+    assert (row["park_reason"], row["needs_attention"]) == ("launch_failed", "launch_failed")
+    assert row["csession_id"] is None and row["wt_record_id"] is None and row["wt_path"] is None
+    with env.store() as store:
+        assert store.get_holds(row["agent_id"]) == []
+    # nothing was adopted, forgotten or removed, and no session started
+    assert [c[0] for c in wtctl_calls(fakebin)] == ["create"]
+    assert real_starts(fakebin) == []
 
 
 def test_adopt_failures_park_per_the_spec(env: Env, fakebin: Fakebin, tmp_path: Path) -> None:

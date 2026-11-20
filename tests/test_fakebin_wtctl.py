@@ -429,6 +429,21 @@ def test_an_explicit_name_with_an_explicit_branch_is_reused_by_its_holder(
     assert again["reused"] is True and again["record"] == first["record"]
 
 
+def test_the_same_holder_with_a_new_name_and_a_held_branch_gets_the_old_record(
+    fakebin: Fakebin,
+) -> None:
+    # Observed live (wtctl 0.32.0, docs/live-testing.md "First unbilled run"): the retry's other
+    # flags are not compared, so another --name over a branch the holder's record has returns
+    # that record, named as before.
+    first = create(fakebin, "--branch", "feat/q", "--name", "old", "--holder", "ag-aaaaaaaa")
+    again = create(fakebin, "--branch", "feat/q", "--name", "new", "--holder", "ag-aaaaaaaa")
+    assert again["reused"] is True and again["record"] == first["record"]
+    record = again["record"]
+    assert isinstance(record, dict) and record["name"] == "old"
+    _, listed = run_json(fakebin, "wtctl", "list", "--repo", REPO, schema="cli/list.json")
+    assert [r["name"] for r in listed["records"]] == ["old"]  # no record named "new"
+
+
 def test_a_template_branch_collision_with_an_explicit_name_is_branch_exists(
     fakebin: Fakebin,
 ) -> None:

@@ -5,7 +5,7 @@ Code (`claude --model haiku`), tmux, claude-session, termctl, wtctl, git and, wh
 jobsctl. It re-checks every relied-on third-party behavior that the fakes in `tests/fakebin/`
 only assume ([FIDELITY.md](../tests/fakebin/FIDELITY.md)) and that the design records as
 "assumed, check live" ([design.md](design.md), Live verification). It is **opt-in**, never part
-of `make verify` and never run in CI. The suite has passed on Linux against the real tools (see [Results](#results)); what it does not cover is tracked in issues #97, #99, #100 and #37.
+of `make verify` and never run in CI. The suite has passed on Linux against the real tools (see [Results](#results)); what it does not cover is tracked in issues #97, #100 and #37.
 
 Some scenarios cost API usage (about seventy haiku turns in total, see [Cost](#cost)); the rest
 start no Claude Code at all.
@@ -190,7 +190,7 @@ with `-l`/`--showlocals`: a failure would print locals.
 | #9 session backend | `cs-pending-run`, `cs-dry-run-shapes`. Not covered: the outcome-file refusal under the caller cwd for isolated runs, a launch-failed start's not-started outcome. |
 | #14 relay | `headless-launch-wait` (real hook payload, `first_working_at`), `liveness-kills` (late delivery). Not covered: a hook whose stderr closed early, an event for a session whose label names another agent, redelivery of a dropped `malformed_payload`. |
 | #15 self-label | status fields: `cs-pending-run`, `headless-launch-wait`; `verify-secret`: `cs-pending-run` (11 for pending, wrong and unknown; 0 for an adopted run's own secret read from its session directory with a stub claude; the self-label flow itself needs an agent inside a session: not automated). |
-| #20, #21, #22, #23, #25 wtctl | the `wtctl-*` scenarios; `as-stub-lifecycle`; `fork-inplace-holder`, `teardown-wtctl-real`. A `remove` killed on timeout mid-delete, exit 1 `partial` (needs a failure injected into git) and the `creating` state: not covered. `baseline check`: only the git class change is covered; a change of only the `claude` class, and a digest-only or anchors-only change (no `changed_classes`), are not covered (they need a changed Claude project config or an anchor mutation). |
+| #20, #21, #22, #23, #25 wtctl | the `wtctl-*` scenarios (`wtctl-reuse-mismatch`: agent-spawn against the real wtctl, wrapped only to give the launch's holder an earlier record on the branch under another name, refuses the reused record as `worktree_mismatch` and leaves it alone, #99); `as-stub-lifecycle`; `fork-inplace-holder`, `teardown-wtctl-real`. A `remove` killed on timeout mid-delete, exit 1 `partial` (needs a failure injected into git) and the `creating` state: not covered. `baseline check`: only the git class change is covered; a change of only the `claude` class, and a digest-only or anchors-only change (no `changed_classes`), are not covered (they need a changed Claude project config or an anchor mutation). |
 | #26, #27 window | `termctl-open-pid`, `as-stub-lifecycle`, `interactive-window-close`. Not covered: post-open hooks slower than 60 s, a user's real termctl config (rules, hooks), WSL entries like `=C:`, the marker loop against an attached client. |
 | #28 attach | `termctl-focus` (no client, unknown client, unknown id). The `switched` answer needs an attached client: not automated. |
 | #74 here | `placement-here-terminal`: recorded, not automated (needs a human at a terminal). |
@@ -231,6 +231,7 @@ needed). Nothing billed was run. Observed differences from what the docs assumed
 - wtctl, explicit `--branch` held by another holder under the same `--name`: refusal reason
   `path_exists` (the path check runs first), not `branch_in_use`; under another `--name` the
   same holder gets its existing record back (`reused: true`, the record keeps the old name).
+  agent-spawn refuses that record (#99, scenario `wtctl-reuse-mismatch`).
 - wtctl `baseline check` change: `error.code` is `refused` and `error.reason` is
   `repo_config_changed` (with `details.changed_classes`); the fake does not model a changed
   baseline.
@@ -314,7 +315,7 @@ Still open or not covered, each tracked:
 - real-sandbox behavior (the host has no bwrap or socat) and the park reason of an unreported
   interactive session killed at its window (never observed): #100;
 - the wrapper-dead-child-alive liveness state: #97;
-- the wtctl reuse mismatch: #99;
+- the wtctl reuse mismatch: fixed by #99 (refused as `worktree_mismatch`; checked by `wtctl-reuse-mismatch`);
 - wave-2 coverage (the "Not covered" items in the table above): #100;
 - macOS: #37;
 - recorded-only: the `placement here` terminal check, the live upgrade of a running supervisor,

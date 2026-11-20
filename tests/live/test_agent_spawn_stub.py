@@ -211,6 +211,99 @@ def test_headless_launch_with_a_new_worktree_resume_fork_and_teardown(world: Wor
     )
 
 
+PRIME_WTCTL = """#!/bin/sh
+# Runs the real wtctl, but before agent-spawn's real `create` it makes the same holder a record on
+# the branch under another name, so wtctl answers agent-spawn's create with that record (reused).
+real={real}
+case " $* " in *" --dry-run "*) exec "$real" "$@" ;; esac
+if [ "$1" = create ]; then
+  for arg in "$@"; do
+    case "$arg" in --holder=*) holder="${{arg#--holder=}}" ;; esac
+  done
+  "$real" create --repo={repo} --holder="$holder" --name=older --branch=feat/x --json >/dev/null \
+    || exit 99
+fi
+exec "$real" "$@"
+"""
+
+
+@SC("wtctl-reuse-mismatch")
+def test_a_reused_record_under_another_name_is_refused_and_left_alone(world: World) -> None:
+    """#99: the same holder with a new ``--name`` and an explicit ``--branch`` an earlier record
+    holds gets that record back from the real wtctl (``reused: true``, the old name): agent-spawn
+    refuses it (``launch_failed`` / ``worktree_mismatch``, exit 12), parks the agent, starts no
+    session and leaves the record as it was. wtctl is the real one, wrapped only to create the
+    earlier record for the holder agent-spawn allocated."""
+    wrapper = world.root / "wtctl-prime"
+    # the wrapper needs the repo id, known once the Wt (its repo) exists
+    wt = stub_setup(world, "exit 0")
+    real = world.tools["wtctl"]
+    assert real is not None
+    wrapper.write_text(PRIME_WTCTL.format(real=real.path, repo=wt.repo.repo_id))
+    wrapper.chmod(0o700)
+    world.write_config(
+        "agent-spawn",
+        f"auto_report_resume: false\nhandoff_timeout: 30s\nwtctl_cmd: [{json.dumps(str(wrapper))}]\n",
+    )
+    failed = world.spawn_json(
+        "launch",
+        "--mode",
+        "headless",
+        "--prompt",
+        "reply with the single word ok",
+        "--model",
+        "haiku",
+        "--repo",
+        wt.repo.repo_id,
+        "--worktree",
+        "new",
+        "--branch",
+        "feat/x",
+        "--wait",
+        ok=(12,),
+    )
+    error = failed["error"]
+    aid = error["agent_id"]
+    world.observe("agent-spawn.launch.reuse-mismatch", error)
+    records = wt.ok("list")["records"]
+    check(
+        len(records) == 1 and records[0]["name"] == "older" and records[0]["holders"] == [aid],
+        "the real wtctl answered the create with the holder's earlier record (nothing new was made)",
+        "wtctl interface.md Create order, Retry after a crash (the retry's other flags are not compared); "
+        "docs/live-testing.md First unbilled run",
+        records,
+    )
+    check(
+        error["code"] == "launch_failed"
+        and error["tool"] == "agent-spawn"
+        and error["details"]["cause"] == "worktree_mismatch"
+        and records[0]["id"] in error["message"],
+        "the launch is refused naming the returned record, with details.cause worktree_mismatch",
+        "interface.md Launch order step 4 (a reused record that is not the planned worktree)",
+        error,
+    )
+    shown = show(world, aid)["agent"]
+    check(
+        shown["status"] == "parked"
+        and shown["park_reason"] == "launch_failed"
+        and shown["worktree"] is None,
+        "the agent is parked launch_failed and recorded no worktree",
+        "interface.md Launch order step 4",
+        shown,
+    )
+    check(
+        world.json_tool("claude-session", "list", "--label", f"agent={aid}")["sessions"] == [],
+        "no session was started",
+        "interface.md Launch order step 4 (nothing launched)",
+    )
+    check(
+        records[0]["state"] == "active" and Path(records[0]["path"]).exists(),
+        "the reused record and its worktree are untouched (never adopted, forgotten or removed)",
+        "interface.md Launch order step 4",
+        records[0],
+    )
+
+
 @SC("as-stub-lifecycle")
 def test_window_launch_pane_pid_binding_and_window_close(world: World) -> None:
     """Spike A8 with the real termctl and its hooks (#36 #26: ``pid`` equals the window process,
