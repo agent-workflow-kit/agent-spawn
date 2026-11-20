@@ -13,6 +13,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -61,13 +62,35 @@ def hanging_exec(
 # --- signals (R1, R13, R18) ------------------------------------------------------------------
 
 
+def send_together(proc: subprocess.Popen[Any], numbers: tuple[signal.Signals, ...]) -> None:
+    """Deliver ``numbers`` to ``proc`` (the PID this test launched) as one burst.
+
+    The process is stopped first (and seen stopped), so every signal is pending when it is
+    continued and the fake's handlers get all of them before it can finish. Sent one by one, a
+    later signal can land after the fake began to exit, where Python has already put back the
+    default action (the process then dies of that signal: -1 or -15, not 15).
+    """
+    proc.send_signal(signal.SIGSTOP)
+    deadline = time.monotonic() + 60
+    while True:
+        # os.waitid is not available on macOS, so poll waitpid for the stop report
+        pid, status = os.waitpid(proc.pid, os.WUNTRACED | os.WNOHANG)
+        if pid == proc.pid:
+            assert os.WIFSTOPPED(status), "the fake exited before it stopped"
+            break
+        assert time.monotonic() < deadline, "the fake never stopped"
+        time.sleep(0.005)
+    for number in numbers:
+        proc.send_signal(number)
+    proc.send_signal(signal.SIGCONT)
+
+
 def test_two_different_signals_in_a_row_still_finalize_once(
     fakebin: Fakebin, tmp_path: Path
 ) -> None:
     outcome_file = tmp_path / "o.json"
     proc = hanging_exec(fakebin, outcome_file)
-    for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGTERM):
-        proc.send_signal(number)  # proc.pid is the PID this test launched
+    send_together(proc, (signal.SIGTERM, signal.SIGHUP))
     out, err = proc.communicate(timeout=10)
     assert proc.returncode == 15 and "Traceback" not in err, err
     printed = json.loads(out)
@@ -75,6 +98,43 @@ def test_two_different_signals_in_a_row_still_finalize_once(
     last = fakebin.invocations("claude-session")[-1]
     # only the first signal counts (Python runs pending handlers by signal number)
     assert last.exit_code == 15 and len(last.signals) == 1
+
+
+def test_a_repeat_of_the_recorded_signal_is_ignored_and_the_run_finalizes_once(
+    fakebin: Fakebin, tmp_path: Path
+) -> None:
+    # A child that does not end on SIGHUP keeps the fake inside its first handler, so the repeat
+    # arrives while the signal is recorded and the fake has not finished (no race on exit).
+    fakebin.script("claude-session", "exec", hang=True, child=True)
+    outcome_file = tmp_path / "o.json"
+    proc = spawn(
+        fakebin, "exec", "--mode", "headless", "--skill", "x", "--json",
+        "--outcome-file", str(outcome_file),
+    )  # fmt: skip
+    wait_for_call(fakebin, proc.pid)
+    started_at = time.monotonic() + 60
+    while not fakebin.records("child_started"):
+        assert time.monotonic() < started_at, "the child never started"
+        time.sleep(0.01)
+    started = fakebin.records("child_started")[0]
+    signals_file = Path(started["signals_file"])
+    while not signals_file.exists():
+        assert time.monotonic() < started_at, "the child's handlers were never installed"
+        time.sleep(0.01)
+    fakebin.wait_for_hang(proc.pid, timeout=60)  # the fake's handlers are installed
+    proc.send_signal(signal.SIGHUP)
+    while "SIGHUP" not in signals_file.read_text():  # recorded: the fake passed it on
+        assert time.monotonic() < started_at, "the first SIGHUP was never recorded"
+        time.sleep(0.01)
+    proc.send_signal(signal.SIGHUP)  # the repeat, while the fake waits for the child
+    os.kill(started["pid"], signal.SIGTERM)  # the child this test's fake started: lets it finish
+    out, err = proc.communicate(timeout=60)
+    assert proc.returncode == 15 and "Traceback" not in err, err
+    printed = json.loads(out)
+    assert json.loads(outcome_file.read_text()) == printed and printed["outcome"] == "killed"
+    assert printed["end_reason"] == "forwarded_hup"
+    last = fakebin.invocations("claude-session")[-1]
+    assert last.signals == [signal.SIGHUP]
 
 
 @pytest.mark.parametrize(
@@ -108,11 +168,11 @@ def test_sigint_is_ignored_by_an_interactive_run(fakebin: Fakebin, tmp_path: Pat
     )
     try:
         wait_for_call(fakebin, proc.pid)
-        proc.send_signal(signal.SIGINT)
-        time.sleep(0.4)
-        assert proc.poll() is None, "SIGINT must not end an interactive run"
-        proc.send_signal(signal.SIGTERM)
+        # Together, SIGINT first by number: were it not ignored, it would end the run (and be the
+        # signal recorded) before the SIGTERM; no waiting for a SIGINT that does nothing.
+        send_together(proc, (signal.SIGINT, signal.SIGTERM))
         assert proc.wait(timeout=10) == 15
+        assert fakebin.invocations("claude-session")[-1].signals == [signal.SIGTERM]
     finally:
         if proc.poll() is None:
             proc.kill()  # the exact Popen child this test started

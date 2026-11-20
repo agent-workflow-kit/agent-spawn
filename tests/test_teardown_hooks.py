@@ -465,7 +465,10 @@ def test_a_signal_during_a_hook_terminates_the_hook_and_leaves_the_agent_retryab
         assert proc.returncode == -sig  # it still ended by the signal
         env.wait_for(lambda: not procs.is_alive(hook_identity), "the hook's group to be stopped")
         child = procs.read_identity(int((tmp_path / "hook-pid.child").read_text()))
-        assert child is None or not procs.is_alive(child)  # the hook's children went with it
+        if child is not None:  # the hook's children went with it (the group's kill is not instant)
+            env.wait_for(
+                lambda: not procs.is_alive(child), "the hook's child to be gone", timeout=60
+            )
     finally:
         if hook_identity is not None and procs.is_alive(hook_identity):
             os.kill(hook_identity.pid, signal.SIGKILL)
