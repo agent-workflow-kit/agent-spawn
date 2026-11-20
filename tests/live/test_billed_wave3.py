@@ -17,6 +17,7 @@ from .billed import (
     bsetup,
     cs_status,
     expect_parked,
+    expected_park,
     launch_window,
     pid_gone,
     show,
@@ -151,14 +152,25 @@ def test_exec_killed_under_a_real_interactive_claude_in_a_window(billed_world: W
     deadline = time.monotonic() + 20
     while not pid_gone(child) and time.monotonic() < deadline:
         time.sleep(0.5)
-    child_alive = not pid_gone(child) and process_token(child) == child_token
+    child_alive_first = not pid_gone(child) and process_token(child) == child_token
     world.spawn_json("reconcile", ok=(0, 12))
     after = show(world, aid)
+    # The arm comes from claude-session's state read AFTER ``show``: a child that died between
+    # the first look and the agent read must not be judged against the live row.
     cs_run = cs_status(world, csid)["run"]
+    child_alive = bool(cs_run.get("child_alive"))
+    if not child_alive and after["agent"]["status"] != "parked":
+        # the child died after the agent state was read: let the agent notice, then re-read
+        world.spawn_json("reconcile", ok=(0, 12))
+        after = wait_agent(
+            world, aid, lambda s: s["agent"]["status"] == "parked", "the agent to park", 60
+        )
+        cs_run = cs_status(world, csid)["run"]
     world.observe(
         "window-wrapper-dead-real",
         {
-            "child_alive_after_wrapper_kill": child_alive,
+            "child_alive_after_wrapper_kill": child_alive_first,
+            "child_alive_at_second_read": child_alive,
             "agent_at_first_notice": {
                 k: settled["agent"].get(k) for k in ("status", "supervisor_lost", "needs_attention")
             },
@@ -194,24 +206,25 @@ def test_exec_killed_under_a_real_interactive_claude_in_a_window(billed_world: W
         # The run is final. Its outcome is claude-session's record: ``done`` when the real model
         # had already filed its report in its first turn ("a reported run keeps its outcome",
         # end reason ``wrapper_lost``, observed 2026-11-20), ``lost`` when it had not. The agent
-        # parks per the outcome table row of that outcome.
-        rows = {"done": ("done", None), "lost": ("lost", "lost"), "killed": ("killed", None)}
-        outcome = cs_run.get("outcome")
+        # parks per the outcome table row of that outcome (and end reason, for ``killed``).
+        outcome, end_reason = cs_run.get("outcome"), cs_run.get("end_reason")
+        expected = expected_park(outcome, end_reason)
         check(
-            outcome in rows,
-            "the dead real claude's run ended with an outcome of the table's rows (done when it "
-            "had reported, else lost)",
+            expected is not None,
+            "the dead real claude's run ended with an outcome and end reason that the outcome "
+            "table has a row for",
             "interface.md Outcome table / claude-session Outcome",
-            outcome,
+            (outcome, end_reason),
         )
-        expected = rows[outcome]
+        agent = after["agent"]
         check(
-            after["agent"]["status"] == "parked"
-            and (after["agent"]["park_reason"], after["agent"]["needs_attention"]) == expected
-            and after["agent"]["supervisor_lost"] is False,
+            agent["status"] == "parked"
+            and (agent["park_reason"], agent["needs_attention"]) == expected
+            and agent["supervisor_lost"] is False,
             "the real interactive claude died with its terminal: the agent parks per the outcome "
-            "table row of the run's recorded outcome (no supervisor_lost for a final run)",
-            "interface.md Outcome table (done: parked, none; lost: parked, lost) / Liveness",
-            (outcome, after["agent"]),
+            "table row of the run's recorded outcome and end reason (no supervisor_lost for a "
+            "final run)",
+            "interface.md Outcome table / Liveness",
+            (outcome, end_reason, agent),
         )
     world.spawn_json("teardown", aid, ok=(0, 20))

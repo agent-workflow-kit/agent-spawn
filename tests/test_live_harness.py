@@ -1025,3 +1025,118 @@ def test_check_adopted_at_rejects_a_changed_first_value_and_a_wrong_run_count() 
         )
     with pytest.raises(harness.LiveError):
         billed.check_adopted_at(state, _WINDOW, runs=2, where="t")
+
+
+def _adopted_with(created: str, *pairs: tuple[str | None, str | None]) -> dict:
+    state = _adopted_state(*pairs)
+    state["agent"]["created"] = created
+    return state
+
+
+def _rejects(state: dict) -> str:
+    with pytest.raises(harness.LiveError) as caught:
+        billed.check_adopted_at(state, _WINDOW, runs=len(state["runs"]), where="t")
+    return str(caught.value)
+
+
+def test_check_adopted_at_rejects_adoption_before_the_previous_run_ended() -> None:
+    # only the previous-run-end check fails: ordered, before its own end, inside the window
+    message = _rejects(
+        _adopted_state(
+            ("2026-01-01T00:01:00.000Z", "2026-01-01T00:04:00.000Z"),
+            ("2026-01-01T00:02:00.000Z", None),
+        )
+    )
+    assert "after the previous run ended" in message
+
+
+def test_check_adopted_at_rejects_a_decreasing_chain_of_unended_runs() -> None:
+    message = _rejects(
+        _adopted_state(("2026-01-01T00:03:00.000Z", None), ("2026-01-01T00:02:00.000Z", None))
+    )
+    assert "non-decreasing" in message
+
+
+def test_check_adopted_at_rejects_a_value_before_the_window_but_after_creation() -> None:
+    state = _adopted_with("2025-12-31T00:00:00.000Z", ("2025-12-31T23:59:58.000Z", None))
+    assert "wall-clock window" in _rejects(state)
+
+
+def test_check_adopted_at_rejects_creation_later_than_adoption_inside_the_window() -> None:
+    state = _adopted_with("2026-01-01T00:05:00.000Z", ("2026-01-01T00:03:00.000Z", None))
+    assert "creation" in _rejects(state)
+
+
+def test_check_adopted_at_accepts_adoption_at_creation_and_rejects_a_missing_creation() -> None:
+    same = _adopted_with("2026-01-01T00:01:00.000Z", ("2026-01-01T00:01:00.000Z", None))
+    billed.check_adopted_at(same, _WINDOW, runs=1, where="t")
+    missing = _adopted_with("2026-01-01T00:01:00.000Z", ("2026-01-01T00:01:00.000Z", None))
+    missing["agent"]["created"] = None
+    assert "creation" in _rejects(missing)
+
+
+def test_check_adopted_at_window_and_ordering_slack_is_one_second() -> None:
+    inside = _adopted_state(("2026-01-01T00:10:00.900Z", None))  # window end + 0.9 s
+    billed.check_adopted_at(inside, _WINDOW, runs=1, where="t")
+    assert "wall-clock window" in _rejects(_adopted_state(("2026-01-01T00:10:01.100Z", None)))
+    # the ordering checks tolerate a sub-second step too, and not more than a second
+    tolerated = _adopted_state(("2026-01-01T00:02:00.900Z", "2026-01-01T00:02:00.000Z"))
+    billed.check_adopted_at(tolerated, _WINDOW, runs=1, where="t")
+    assert "before it ended" in _rejects(
+        _adopted_state(("2026-01-01T00:02:01.100Z", "2026-01-01T00:02:00.000Z"))
+    )
+    chain = _adopted_state(
+        ("2026-01-01T00:01:00.000Z", "2026-01-01T00:02:00.900Z"),
+        ("2026-01-01T00:02:00.000Z", None),
+    )
+    billed.check_adopted_at(chain, _WINDOW, runs=2, where="t")
+
+
+def test_check_adopted_at_slack_applies_to_creation_and_to_the_chain_order() -> None:
+    # creation 1.0 s after adoption passes (boundary inclusive); 1.1 s fails
+    at_edge = _adopted_with("2026-01-01T00:03:01.000Z", ("2026-01-01T00:03:00.000Z", None))
+    billed.check_adopted_at(at_edge, _WINDOW, runs=1, where="t")
+    assert "creation" in _rejects(
+        _adopted_with("2026-01-01T00:03:01.100Z", ("2026-01-01T00:03:00.000Z", None))
+    )
+    # a second run adopted 0.5 s before the first passes; 1.5 s before fails
+    near = _adopted_state(("2026-01-01T00:03:00.500Z", None), ("2026-01-01T00:03:00.000Z", None))
+    billed.check_adopted_at(near, _WINDOW, runs=2, where="t")
+    far = _adopted_state(("2026-01-01T00:03:01.500Z", None), ("2026-01-01T00:03:00.000Z", None))
+    assert "non-decreasing" in _rejects(far)
+
+
+def test_check_adopted_at_compares_each_run_with_the_end_of_the_run_just_before() -> None:
+    # run 3 starts after run 1's end but before run 2's: only the third run's check fails
+    message = _rejects(
+        _adopted_state(
+            ("2026-01-01T00:01:00.000Z", "2026-01-01T00:02:00.000Z"),
+            ("2026-01-01T00:03:00.000Z", "2026-01-01T00:06:00.000Z"),
+            ("2026-01-01T00:04:00.000Z", None),
+        )
+    )
+    assert "run 3 was adopted after the previous run ended" in message
+
+
+@pytest.mark.parametrize(
+    ("outcome", "end_reason", "expected"),
+    [
+        ("done", "wrapper_lost", ("done", None)),
+        ("lost", "wrapper_lost", ("lost", "lost")),
+        ("failed", None, ("failed", "failed")),
+        ("exited-unreported", "child_exited", ("unreported", "unreported")),
+        ("killed", "forwarded_hup", ("killed", None)),
+        ("killed", "stopped", ("killed", None)),
+        ("killed", "signal_kill", ("killed", "failed")),
+        ("killed", "internal_error", ("killed", "failed")),
+        ("killed", "something_new", None),
+        ("killed", "signalled", None),
+        ("killed", None, None),
+        ("surprise", None, None),
+        (None, None, None),
+    ],
+)
+def test_expected_park_follows_the_outcome_table(
+    outcome: object, end_reason: object, expected: object
+) -> None:
+    assert billed.expected_park(outcome, end_reason) == expected
