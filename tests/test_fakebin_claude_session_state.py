@@ -61,13 +61,33 @@ def hanging_exec(
 # --- signals (R1, R13, R18) ------------------------------------------------------------------
 
 
+def send_together(proc: subprocess.Popen[str], numbers: tuple[signal.Signals, ...]) -> None:
+    """Deliver ``numbers`` to ``proc`` (the PID this test launched) as one burst.
+
+    The process is stopped first (and seen stopped), so every signal is pending when it is
+    continued and the fake's handlers get all of them before it can finish. Sent one by one, a
+    later signal can land after the fake began to exit, where Python has already put back the
+    default action (the process then dies of that signal: -1 or -15, not 15).
+    """
+    proc.send_signal(signal.SIGSTOP)
+    deadline = time.monotonic() + 10
+    while True:
+        info = os.waitid(os.P_PID, proc.pid, os.WSTOPPED | os.WNOHANG | os.WNOWAIT)
+        if info is not None:
+            break
+        assert time.monotonic() < deadline, "the fake never stopped"
+        time.sleep(0.005)
+    for number in numbers:
+        proc.send_signal(number)
+    proc.send_signal(signal.SIGCONT)
+
+
 def test_two_different_signals_in_a_row_still_finalize_once(
     fakebin: Fakebin, tmp_path: Path
 ) -> None:
     outcome_file = tmp_path / "o.json"
     proc = hanging_exec(fakebin, outcome_file)
-    for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGTERM):
-        proc.send_signal(number)  # proc.pid is the PID this test launched
+    send_together(proc, (signal.SIGTERM, signal.SIGHUP, signal.SIGTERM))
     out, err = proc.communicate(timeout=10)
     assert proc.returncode == 15 and "Traceback" not in err, err
     printed = json.loads(out)
