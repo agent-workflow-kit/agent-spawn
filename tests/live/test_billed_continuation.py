@@ -16,9 +16,11 @@ from .billed import (
     _diagnose,
     adopt,
     bsetup,
+    check_adopted_at,
     cs_status,
     expect_parked,
     launch_headless,
+    now_utc,
     show,
     spawn,
     spawn_raw,
@@ -37,6 +39,7 @@ def test_headless_resume_continues_the_claude_session(billed_world: World) -> No
     design.md D5 (continuation under the same Claude session id) and the resume order."""
     world = billed_world
     wt = bsetup(world)
+    started = now_utc()
     first = launch_headless(
         world,
         wt,
@@ -49,6 +52,9 @@ def test_headless_resume_continues_the_claude_session(billed_world: World) -> No
     agent = first["agent"]
     aid = agent["agent_id"]
     before = cs_status(world, agent["csession_id"])
+    adopted = check_adopted_at(
+        show(world, aid), (started, now_utc()), runs=1, where="resume-continue run 1"
+    )
     second = spawn(
         world,
         "resume",
@@ -85,6 +91,17 @@ def test_headless_resume_continues_the_claude_session(billed_world: World) -> No
         len(listed),
     )
     world.observe("resume.run2.num_turns", after["run"].get("num_turns"))
+    chain = show(world, aid)
+    check_adopted_at(
+        chain,
+        (started, now_utc()),
+        runs=2,
+        where="resume-continue after the resume (run 1 unchanged, run 2 adopted)",
+        first=adopted,
+    )
+    world.observe(
+        "adopted_at.resume-continue", [(r["adopted_at"], r["ended_at"]) for r in chain["runs"]]
+    )
     world.spawn_json("teardown", aid)
 
 
@@ -304,6 +321,7 @@ def test_headless_needs_input_is_promoted_into_a_window_and_continues(billed_wor
     design.md D5, D30, D47."""
     world = billed_world
     wt = bsetup(world, spawn_extra="kinds:\n  implement:\n    promote: true\n")
+    started = now_utc()
     # `report needs-input` takes its reason only from a file inside $CSESSION_DIR
     # (--reason-file; claude-session interface.md `report`, exit 2 for anything else).
     prompt = (
@@ -406,9 +424,25 @@ def test_headless_needs_input_is_promoted_into_a_window_and_continues(billed_wor
         "design.md D5",
         status["claude_session_ids"],
     )
+    live_chain = show(world, aid)
+    adopted = check_adopted_at(
+        live_chain, (started, now_utc()), runs=2, where="promotion-escalation (promoted run live)"
+    )
     world.track(panes[0]["pid"], tree=True)
     world.tmux("kill-window", "-t", panes[0]["window_id"])
     parked = expect_parked(world, aid, 90)
+    final_chain = show(world, aid)
+    check_adopted_at(
+        final_chain,
+        (started, now_utc()),
+        runs=2,
+        where="promotion-escalation after the park",
+        first=adopted,
+    )
+    world.observe(
+        "adopted_at.promotion-escalation",
+        [(r["adopted_at"], r["ended_at"]) for r in final_chain["runs"]],
+    )
     world.observe(
         "promotion.final",
         {k: parked[k] for k in ("park_reason", "needs_attention", "last_outcome")},

@@ -11,10 +11,11 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .harness import LiveError, World, process_token, wait_for
+from .harness import LiveError, World, check, process_token, wait_for
 from .test_wtctl import Wt
 
 PROMPT_OK = "Reply with the single word ok."
@@ -261,3 +262,133 @@ def expect_parked(world: World, agent_id: str, timeout: float = 90) -> dict[str,
     return wait_agent(
         world, agent_id, lambda s: s["agent"]["status"] == "parked", f"{agent_id} to park", timeout
     )["agent"]
+
+
+#: interface.md Outcome table: claude-session outcome -> (park_reason, needs_attention) of an
+#: interactive run that ended without promotion. ``killed`` depends on the end reason.
+_PARK_BY_OUTCOME: dict[str, tuple[str, str | None]] = {
+    "done": ("done", None),
+    "blocked": ("blocked", "blocked"),
+    "needs-input": ("escalated", "escalated"),
+    "failed": ("failed", "failed"),
+    "exited-unreported": ("unreported", "unreported"),
+    "timeout": ("timeout", "timeout"),
+    "lost": ("lost", "lost"),
+}
+_KILLED_QUIET = ("stopped", "forwarded_term", "forwarded_hup", "forwarded_int")
+
+
+def expected_park(outcome: object, end_reason: object) -> tuple[str, str | None] | None:
+    """The (park_reason, needs_attention) the outcome table gives a run's recorded outcome and end
+    reason, or None when the table has no row for them."""
+    if outcome == "killed":
+        if end_reason in _KILLED_QUIET:
+            return ("killed", None)
+        if end_reason == "internal_error" or (
+            isinstance(end_reason, str) and end_reason.startswith("signal_")
+        ):
+            return ("killed", "failed")
+        return None
+    return _PARK_BY_OUTCOME.get(outcome) if isinstance(outcome, str) else None
+
+
+def now_utc() -> datetime:
+    return datetime.now(UTC)
+
+
+def _stamp(value: object) -> datetime | None:
+    """A ``date-time`` string parsed to an aware datetime, or None when it is not one."""
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else None
+
+
+def check_adopted_at(
+    state: dict[str, Any],
+    window: tuple[datetime, datetime],
+    *,
+    runs: int,
+    where: str,
+    first: list[str] | None = None,
+) -> list[str]:
+    """``show --json`` ``runs[].adopted_at`` against real claude-session timing (#91, #100).
+
+    Every one of the ``runs`` adopted runs has a date-time, non-null ``adopted_at`` that is not
+    earlier than the agent's creation, is non-decreasing along the chain, never later than the
+    run's own ``ended_at`` and not earlier than the previous run's ``ended_at``, and lies inside
+    ``window`` (the test's wall-clock bounds). Every comparison tolerates 1 s (the millisecond
+    truncation, the clock read order and a small clock step). ``first`` is the list returned by
+    an earlier call for the same runs: those values must be unchanged (written once). Returns
+    the ``adopted_at`` strings.
+
+    **Supervised runs only.** The ``adopted_at <= ended_at`` and ``previous ended_at <=
+    adopted_at`` orderings hold when the supervisor wrote the run's ``started_at`` before its
+    ``ended_at``. When the supervisor is gone and liveness finalizes the run (liveness.py,
+    supervisor-gone path), ``started_at`` is written after ``ended_at``, so do not use this
+    helper for such runs. The chain check against the previous run's end is skipped when that
+    run has a null ``ended_at`` (an adopted run that has not ended); adopted runs only."""
+    shown = state["runs"]
+    slack = timedelta(seconds=1)
+    check(
+        len(shown) == runs,
+        f"{where}: the agent has {runs} run(s)",
+        "interface.md show (runs)",
+        [r.get("run") for r in shown],
+    )
+    raw = [r.get("adopted_at") for r in shown]
+    stamps = [_stamp(v) for v in raw]
+    check(
+        all(s is not None for s in stamps),
+        f"{where}: every adopted run has a date-time adopted_at (not null)",
+        "interface.md show (adopted_at: the run's Started time) / #91",
+        raw,
+    )
+    moments = [s for s in stamps if s is not None]
+    created = _stamp(state["agent"].get("created"))
+    check(
+        created is not None and all(created <= m + slack for m in moments),
+        f"{where}: adopted_at is not earlier than the agent's creation",
+        "interface.md show; #91",
+        (state["agent"].get("created"), raw),
+    )
+    check(
+        all(a <= b + slack for a, b in zip(moments, moments[1:], strict=False)),
+        f"{where}: adopted_at is non-decreasing along the run chain",
+        "interface.md show; #91",
+        raw,
+    )
+    previous_end: datetime | None = None
+    for run, moment in zip(shown, moments, strict=True):
+        end = _stamp(run.get("ended_at"))
+        check(
+            end is None or moment <= end + slack,
+            f"{where}: run {run.get('run')} was adopted before it ended",
+            "interface.md show (adopted_at is the Started moment); #91",
+            (run.get("adopted_at"), run.get("ended_at")),
+        )
+        check(
+            previous_end is None or previous_end <= moment + slack,
+            f"{where}: run {run.get('run')} was adopted after the previous run ended",
+            "interface.md show; #91",
+            (run.get("adopted_at"), previous_end),
+        )
+        previous_end = end
+    check(
+        all(window[0] - slack <= m <= window[1] + slack for m in moments),
+        f"{where}: adopted_at lies inside the test's wall-clock window (real timing, not a stale "
+        "or default value)",
+        "interface.md show (wall-clock time of the supervisor's first sight); #91",
+        (raw, window),
+    )
+    if first is not None:
+        check(
+            raw[: len(first)] == first,
+            f"{where}: adopted_at is written once (earlier runs' values unchanged)",
+            "interface.md show (written once and never changed); #91",
+            (first, raw),
+        )
+    return [str(v) for v in raw]

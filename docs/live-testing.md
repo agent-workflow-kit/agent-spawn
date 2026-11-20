@@ -46,7 +46,7 @@ needs.
 Tools are found on `PATH` (or the `LIVE_*` variable); the suite never installs anything. Their
 versions are recorded by `tools-versions` and compared with the minimums in
 `tests/live/harness.py` (`MINIMUMS`). A version that cannot be read (an editable install of a
-sibling reports `0.0.0`) is recorded as unknown, never failed. claude-session older than 0.43.0
+sibling reports `0.0.0` (wtctl 0.32.x)) is recorded as unknown, never failed. claude-session older than 0.43.0
 skips the scenarios that need `--implicit-done`.
 
 ### Waves
@@ -56,7 +56,7 @@ skips the scenarios that need `--implicit-done`.
 | `tools` | tmux, termctl, wtctl, claude-session (with a stub `claude`), agent-spawn against all of them (including `as-wrapper-dead-child-alive` and its window variant, the hook, `wait` exit-code, `adopted_at` and wtctl-failure scenarios of wave 2), wtctl hooks, bootstrap and `remove --merged-head`, cron, `reconcile --reset-lease`, browse | none |
 | `billed-1` | headless launch, interactive window and window close, `--no-implicit-done` report-resume chain | 4 sessions |
 | `billed-2` | resume, in-place fork, fork into a throwaway, teardown with real wtctl, promotion | 9 sessions |
-| `billed-3` | kill-pane, SIGTERM idle and mid-turn, minimal environment, `jobsctl cancel --force`, liveness kills | 10 sessions |
+| `billed-3` | kill-pane, SIGTERM idle and mid-turn, minimal environment, `jobsctl cancel --force`, liveness kills, `interactive-window-close-unreported`, `window-wrapper-dead-child-alive-real` | 12 sessions |
 
 Run the waves in order; a failure in `tools` usually explains the later ones.
 
@@ -88,7 +88,7 @@ Only the billed scenarios cost anything. The bounds:
   warns when the selection expects more than `MAX_LIVE_SESSIONS`. After a billed test the
   harness fails it when it started more sessions than its registry entry says.
 
-The full billed set expects 23 real sessions (about 67 turns); `make live-list` prints the
+The full billed set expects 25 real sessions (about 71 turns); `make live-list` prints the
 current numbers. These are the expected numbers for one full pass; re-running a scenario after a fix starts its sessions again, so the sessions used over a debugging session can exceed them.
 
 ## Isolation
@@ -172,6 +172,8 @@ with `-l`/`--showlocals`: a failure would print locals.
 | Issue scope | Scenario |
 |---|---|
 | Full interactive launch in a window and window close (parked without attention; `done` when the session had already reported, `killed` otherwise) | `interactive-window-close` (billed); unbilled twin with a stub: `as-stub-lifecycle` |
+| An unreported interactive session whose window is closed mid-turn (parked `killed`, no report) | `interactive-window-close-unreported` (billed) |
+| `exec` SIGKILLed under a real interactive claude in a window | `window-wrapper-dead-child-alive-real` (billed) |
 | Headless escalation with promotion and continuation (spike D5) | `promotion-escalation`; unbilled parts in `promotion-subchecks` |
 | Resume; fork into a throwaway; in-place fork holder | `resume-continue`, `fork-throwaway`, `fork-inplace-holder` |
 | Teardown with real wtctl | `teardown-wtctl-real`, `as-stub-lifecycle` |
@@ -194,7 +196,7 @@ with `-l`/`--showlocals`: a failure would print locals.
 | #26, #27 window | `termctl-open-pid`, `as-stub-lifecycle`, `interactive-window-close`. Not covered: post-open hooks slower than 60 s, a user's real termctl config (rules, hooks), WSL entries like `=C:`, the marker loop against an attached client. |
 | #28 attach | `termctl-focus` (no client, unknown client, unknown id). The `switched` answer needs an attached client: not automated. |
 | #74 here | `placement-here-terminal`: recorded, not automated (needs a human at a terminal). |
-| #75 liveness | 1: `cs-pending-run`; 2: `cs-start-killed`; 3: `liveness-kills` (supervisor only: claude lives on and `supervisor_lost` is set; exec only: a headless claude dies with the wrapper by `PR_SET_PDEATHSIG`, the run and the park are `lost`), `as-wrapper-dead-child-alive` (the wrapper-dead-child-alive row, with a SIGTERM-ignoring stub: exec SIGKILLed, claude-session reports wrapper dead, child alive, no outcome; the supervisor ends, the agent stays `live` with `supervisor_lost` and `needs_attention: lost`, set once; `stop` ends the orphan and parks it `killed`; the interactive-window variant, `as-wrapper-dead-child-alive-window`: the stub ignores SIGTERM and SIGHUP, SIGKILL of exec leaves the child running and the window dead, the agent stays `live` with `supervisor_lost`, `stop` parks it `killed`), `as-dead-pane-reconcile`; 4 (no second `post-park` from a late reconcile): `liveness-kills` (after `stop` of the supervisor-only run, and after the `lost` park of the exec-only run), `as-wrapper-dead-child-alive` (after the `stop` park); 5: `as-stub-lifecycle`, `fork-inplace-holder`, `resume-continue`; 6 (foreign sessions) and 7 (`forget --holder` of `creating`/`partial`): the `missing`/`unlinked` half in `wtctl-adopt-forget-holders`; the rest not covered. |
+| #75 liveness | 1: `cs-pending-run`; 2: `cs-start-killed`; 3: `liveness-kills` (supervisor only: claude lives on and `supervisor_lost` is set; exec only: a headless claude dies with the wrapper by `PR_SET_PDEATHSIG`, the run and the park are `lost`), `as-wrapper-dead-child-alive` (the wrapper-dead-child-alive row, with a SIGTERM-ignoring stub: exec SIGKILLed, claude-session reports wrapper dead, child alive, no outcome; the supervisor ends, the agent stays `live` with `supervisor_lost` and `needs_attention: lost`, set once; `stop` ends the orphan and parks it `killed`; the interactive-window variant, `as-wrapper-dead-child-alive-window`: the stub ignores SIGTERM and SIGHUP, SIGKILL of exec leaves the child running and the window dead, the agent stays `live` with `supervisor_lost`, `stop` parks it `killed`), `as-dead-pane-reconcile`, and with a real claude in a window `window-wrapper-dead-child-alive-real` (the claude dies with its terminal: see Results); 4 (no second `post-park` from a late reconcile): `liveness-kills` (after `stop` of the supervisor-only run, and after the `lost` park of the exec-only run), `as-wrapper-dead-child-alive` (after the `stop` park); 5: `as-stub-lifecycle`, `fork-inplace-holder`, `resume-continue`; 6 (foreign sessions) and 7 (`forget --holder` of `creating`/`partial`): the `missing`/`unlinked` half in `wtctl-adopt-forget-holders`; the rest not covered. |
 | #78 overrides | `cs-dry-run-shapes` (claude-session half), `wtctl-remove-status` (wtctl half). The human `--override-escalation` is covered for `launch` (agent-spawn's own `pre-launch`, `as-prelaunch-hooks`), `resume` towards claude-session (`as-launch-phase-hooks`) and towards wtctl (`as-wtctl-create-failures`), and for `wtctl create` (`wtctl-create-hooks`), always with an explicit `--actor human:tester`. `termctl open --override-escalation` with a changed hook and the slow `pre-teardown` hook: not covered. |
 | #79 dead panes | `termctl-default-server`, `termctl-keep-on-exit`, `as-dead-pane-reconcile` |
 | #80 reset-lease | `as-reconcile-reset-lease` (the TTY path needs a real terminal; a racing second reconcile is not provoked) |
@@ -212,19 +214,18 @@ with it.
 ## Not covered
 
 What the unbilled live suite cannot check, with the reason. The billed candidates are for a later
-wave (each needs a real Claude Code session or a host capability this host lacks); #100 tracks the billed and host-dependent ones, and macOS is tracked by #37.
+wave (each needs a real Claude Code session or a host capability this host lacks); each item below is tracked by the issue named in its row (#100 is closed by the wave-3 run), and macOS is tracked by #37.
 
 | Item | Why it is not an unbilled scenario | Candidate session cost |
 |---|---|---|
-| `adopted_at` against real claude timing for a launched, resumed, automatically resumed and promoted run | `as-adopted-at` checks the supervisor's bookkeeping (a date-time once claude-session reports `phase: session`, written once, ordered) with a stub; only a real Claude Code shows the real timing of `SessionStart` relative to adoption. The null case for a launch-phase veto is covered unbilled (`as-launch-phase-hooks`). | piggyback on `headless-launch-wait`, `resume-continue`, `report-resume-chain` and `promotion-escalation` (read `show --json` `runs[].adopted_at` in them): no new sessions |
-| The park reason of an unreported interactive session closed at its window (window close or kill-pane before the session filed a report) | The real model files its report in its first turn, so the case was never observable in a billed run, and no unbilled scenario drives it (not exercised). | one interactive session with a prompt that keeps it busy past the close, about 1 session / 1 turn |
-| The wrapper-dead-child-alive row with a real billed Claude (headless and window) | A real headless claude dies with its wrapper (`PR_SET_PDEATHSIG`) and honors SIGTERM; only the stubs reach the row. The window variant with a real interactive claude would show whether it survives the wrapper. | 1 interactive session / about 3 turns |
-| Real sandbox behavior of isolated (third-party-reading) runs | The host has no `bwrap` or `socat`; `fork-throwaway` passes `--sandbox preferred`. Needs a host with both installed. | 1 to 2 sessions on such a host |
+| `adopted_at` against real claude timing: a launched, resumed, automatically resumed and promoted run | Billed assertions (`billed.check_adopted_at`) sit in `headless-launch-wait`, `resume-continue`, `report-resume-chain` and `promotion-escalation`. Run live on 2026-11-20: `headless-launch-wait`, `report-resume-chain` (launched and automatically resumed runs) and `promotion-escalation` (launched and promoted runs). **`resume-continue` (the plain resumed run) was not re-run live** because the 8-session budget of that run was spent; its assertions use the same helper and the unbilled `as-adopted-at` covers a resumed run with a stub. The null case for a run that ended in its launch phase has no billed scenario (it would need an extra session): it stays in the unbilled `as-launch-phase-hooks`. | 2 sessions to re-run `resume-continue` (#117) |
+| A late `reconcile` after the window-close parks of wave 3 delivers no second `post-park` (#75 item 4) | The `liveness-kills` scenario checks it for its parks; `interactive-window-close-unreported` and `window-wrapper-dead-child-alive-real` do not configure a `post-park` hook or count its runs. Adding it needs a hook config in those two scenarios (#116). | none (a hook config on the existing sessions) |
+| Real sandbox behavior of isolated (third-party-reading) runs | The host has no `bwrap` or `socat`; `fork-throwaway` passes `--sandbox preferred`. Needs a host with both installed (#111). | 1 to 2 sessions on such a host |
 | macOS | Out of scope of the Linux suite: tracked by issue #37, not #100. | not applicable |
-| `termctl open --override-escalation` with a changed hook; the `locked` termctl error | Need a termctl hook config and concurrent label commands the suite does not set up. | none |
-| The slow `pre-teardown` hook (agent-spawn's own hook) | Not exercised: no scenario configures a `pre-teardown` hook that outlasts its timeout before a `teardown`; it needs only an agent-spawn config entry and a sleeping script, no other tool. | none |
-| wtctl `create` `busy`; `--input-file` copies (claude-session); `wait --interval`; `remove` killed mid-delete and exit 1 `partial`; the `creating` record state; a human `--yes` at a TTY | Not exercised: no test in `tests/live` triggers them (they need an injected git failure, a concurrent create, an input fixture or a TTY); the per-issue table names each. | none |
-| A digest-only or anchors-only wtctl baseline change | Needs an anchor mutation. | none |
+| `termctl open --override-escalation` with a changed hook; the `locked` termctl error | Need a termctl hook config and concurrent label commands the suite does not set up (`--override-escalation`: #112; `locked`: #114). | none |
+| The slow `pre-teardown` hook (agent-spawn's own hook) | Not exercised: no scenario configures a `pre-teardown` hook that outlasts its timeout before a `teardown`; it needs only an agent-spawn config entry and a sleeping script, no other tool (#113). | none |
+| wtctl `create` `busy`; `--input-file` copies (claude-session); `wait --interval`; `remove` killed mid-delete and exit 1 `partial`; the `creating` record state; a human `--yes` at a TTY | Not exercised: no test in `tests/live` triggers them (they need an injected git failure, a concurrent create, an input fixture or a TTY); the per-issue table names each (#116). | none |
+| A digest-only or anchors-only wtctl baseline change | Needs an anchor mutation (#115). | none |
 
 ## Stub claude
 
@@ -299,7 +300,7 @@ termctl 0.25.0, wtctl 0.32.0, tmux 3.5a, git 2.34.1, jobsctl (installed, used by
   issue #37).
 - **`as-wrapper-dead-child-alive`** (added after the first runs, 2026-11-20, claude-session
   0.45.2, termctl 0.25.0, wtctl 0.32.2 (an `origin/main` build from `git archive`; its
-  `--version` prints the `0.0.0` placeholder, the package metadata says 0.32.2), tmux 3.5a):
+  `--version` printed the `0.0.0` placeholder in 0.32.x, the package metadata said 0.32.2; the `0.0.0` remark applies to the 0.32.x runs only. `wtctl --version` was not re-checked against the 1.0.0 build used in the wave-3 run (a checkout of wtctl at 1.0.0 printed `wtctl 1.0.0`)), tmux 3.5a):
   passed. The stub child ignores SIGTERM but records each one, and the test waits for its ready
   file before killing anything. SIGKILL of exec leaves the child alive (the one SIGTERM it
   received came from `PR_SET_PDEATHSIG` at that moment, and it ignored it); claude-session
@@ -322,6 +323,11 @@ termctl 0.25.0, wtctl 0.32.0, tmux 3.5a, git 2.34.1, jobsctl (installed, used by
   - `as-wtctl-create-failures`: launch over the same wtctl: 11 parks `vetoed` without attention; 13 parks `escalated` with `escalated_by: wtctl` and `resume --override-escalation --actor human:tester` reaches `wtctl create` and the launch runs; 12 `bootstrap_failed` passes through as exit 12 with `lower_code: bootstrap_failed`, stores the worktree record, and the resume continues with it without a second worktree or a second bootstrap; `show` `repo_config_changed` reports `changed_classes: ["claude"]` for an added `CLAUDE.md`; `teardown` of that worktree with only the claude class changed is decided by `wtctl remove` (exit 0, or exit 20 with a reason that is never `repo_config_changed`; the test accepts either).
   - `wtctl-reuse-mismatch` (from #99, not re-run by its reviewers) passed against the real wtctl: its priming `create` without `--actor` is accepted.
   No divergence from the docs or the product was found; the corrections made while writing the scenarios were to the harness's own stub (`claude-session report` takes `--reason-file`, not `--reason`).
+- **Wave 3, billed** (2026-11-20, claude 2.1.328 `--model haiku`, claude-session 0.45.2, termctl 0.25.0, wtctl 1.0.0 (an `origin/main` build from `git archive`, the unbilled wave was re-run with it: 165 passed, 5 skipped, Python 3.12), tmux 3.5a; the login copy of `AS_LIVE_COPY_LOGIN=1`; 8 haiku sessions in all, the session budget of that run, so no re-run of anything else):
+  - `interactive-window-close-unreported` passed (1 session): a long no-tools turn is still `working` when the window is closed and no report exists; the agent parks `killed`, `needs_attention` null, last end reason `forwarded_hup`; claude-session records outcome `killed`, end reason `forwarded_hup`, exit code 15, no report. This is what interface.md's outcome table says; no divergence.
+  - `window-wrapper-dead-child-alive-real` (2 sessions: a first run failed on the test's own expectation, then passed after the test was fixed): SIGKILL of the recorded `exec` pid, in a window with a real interactive claude that had finished its first turn. **Observed: the real claude does not survive.** It exits within the test's 20 s look (the pane's process `supervise` ends when `exec` dies and the pane hangs up, and claude gets the hangup), so the wrapper-dead-child-alive state is not reached with a real claude; claude-session records `wrapper_alive: false`, `child_alive: false`, outcome `done`, end reason `wrapper_lost` (the model had already filed its report in its first turn, "a reported run keeps its outcome"), and the agent parks `done` without attention and without `supervisor_lost`. When the session has not reported, the outcome table's `lost` row would apply (parked `lost`, attention `lost`); that case was not observed because the real model reports in its first turn. The test accepts either row of the table for a dead claude (and the `live` with `supervisor_lost` then `stop` row for a surviving one) and fails only if the agent contradicts the outcome claude-session recorded. The first run's expectation (`lost`) was a test bug, not a product divergence.
+  - `adopted_at` against real timing passed in `headless-launch-wait`, `report-resume-chain` and `promotion-escalation` (`resume-continue` was not run, see Not covered): a date-time, non-null for every run, not before the agent's creation, non-decreasing, not after the run's own end and not earlier than the previous run's end (supervised runs only, with 1 s of slack), inside the test's wall-clock window, and unchanged after a later action (`reconcile`, the park). Observed: the adopted time follows the run's start by a few seconds, for example 16:18:18.660 to 16:18:23.166 for a one-turn headless run.
+  - Sessions in the run: 1 (unreported) + 2 (wrapper-dead, two attempts) + 1 + 2 + 2 = 8.
 - **Billed scenarios**: the first run passed 9 of the 10 scenarios it ran and, after the harness
   fixes, every rerun scenario passed (see [First billed run](#first-billed-run) for what is and
   is not recorded about which ran when). The 13 billed scenarios passed live:
@@ -339,8 +345,8 @@ termctl 0.25.0, wtctl 0.32.0, tmux 3.5a, git 2.34.1, jobsctl (installed, used by
   claude lives, the run is not finalized, the agent parks `killed` after `stop`; exec-only
   SIGKILL: claude dies with the wrapper through claude-session's parent-death SIGTERM, the run
   ends `lost`, the agent parks `lost` with `needs_attention: lost`, `supervisor_lost` false).
-- **Usage**: 42 haiku sessions in the first run (budget 45) and 13 in the rerun (budget 14), 55
-  in all, model haiku only. No API key was used: the login was copied to a private directory
+- **Usage** (2026-11-19): 42 haiku sessions in the first run (budget 45) and 13 in the rerun (budget 14), 55
+  in all, model haiku only; wave 3 (2026-11-20) used 8 more, 63 in all. No API key was used: the login was copied to a private directory
   (`AS_LIVE_COPY_LOGIN=1`) and deleted at each teardown.
 
 Real-tool facts confirmed live without billing: A8 (the termctl pid is tmux's `pane_pid` and the
@@ -354,9 +360,8 @@ and `--permission-profile=-x` (exit 2, invalid flag value; the fake agrees).
 
 Still open or not covered, each tracked:
 
-- the items of [Not covered](#not-covered) (real-sandbox behavior, the park reason of an unreported
-  interactive session killed at its window, `adopted_at` against real timing, the wrapper-dead row
-  with a real claude): #100 (billed or host-dependent);
+- the items of [Not covered](#not-covered) (real-sandbox behavior #111, the `resume-continue` live re-run of
+  `adopted_at` #117, and the items that need no Claude session #112 to #116);
 - the wtctl reuse mismatch: fixed by #99 (refused as `worktree_mismatch`; checked by `wtctl-reuse-mismatch`);
 - macOS: #37;
 - recorded-only: the `placement here` terminal check, the live upgrade of a running supervisor,
