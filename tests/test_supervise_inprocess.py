@@ -145,6 +145,10 @@ def test_a_run_that_ended_in_its_launch_phase_keeps_a_null_adoption_time(
 ) -> None:
     rig = rig_for()
     fakebin.script("claude-session", "exec", outcome="vetoed")
+    # `status` is scripted as well: unscripted, the fake reports a `done` session-phase run for
+    # the window between the adoption and the end of the (vetoed) run, and a supervisor poll
+    # landing in it (a loaded machine) rightly marks the run started.
+    fakebin.script("claude-session", "status", outcome="vetoed")
     rig.supervisor.run()
     with Store.open(rig.state, create=False) as store:
         run = store.get_run(rig.agent_id, 1)
