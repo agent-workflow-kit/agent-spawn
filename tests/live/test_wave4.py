@@ -132,6 +132,9 @@ def test_a_slow_pre_teardown_hook_times_out_and_vetoes_the_teardown(world: World
     )
 
     # a human override lifts an escalation only: a timeout still vetoes, and the hook ran again
+    # (the first run's pid files are removed so pid_of waits for the second run's own pids)
+    hook_pid.unlink()
+    sleeper.unlink()
     again = world.spawn_json("teardown", aid, "--override-escalation", *HUMAN, ok=(11,), timeout=90)
     check(
         again["error"]["code"] == "vetoed" and ran.read_text().count("slow") == 2,
@@ -1195,7 +1198,9 @@ def test_wait_has_no_interval_flag_and_cron_install_interval_is_one_to_fifty_nin
             f"claude-session.cron.interval.{interval}", (bad.returncode, bad.stdout[-200:])
         )
         check(
-            bad.returncode == 2 and "--interval" in bad.stdout,
+            bad.returncode == 2
+            and "--interval" in bad.stdout
+            and (interval == "abc" or "1 and 59" in bad.stdout),
             f"cron install --interval {interval} is a usage error whose message names --interval (and, for 0 and 60, the 1 to 59 range)",
             "claude-session interface.md cron install (--interval 1 to 59, else exit 2)",
             (bad.returncode, bad.stdout[-200:]),
@@ -1204,6 +1209,7 @@ def test_wait_has_no_interval_flag_and_cron_install_interval_is_one_to_fifty_nin
     # tripwire stub would exit 70)
     write_fake_crontab(world.bin / "crontab", world.crontab_table)
     for interval in ("1", "59"):
+        world.crontab_table.unlink(missing_ok=True)
         good = world.tool("claude-session", "cron", "install", "--interval", interval, "--json")
         table = world.crontab_table.read_text() if world.crontab_table.exists() else ""
         check(
@@ -1262,7 +1268,10 @@ def run_on_tty(
         except BaseException:
             if child.poll() is None:
                 os.killpg(child.pid, signal.SIGKILL)
-            child.wait(timeout=5)
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
             raise
     finally:
         os.close(master)
@@ -1524,9 +1533,16 @@ def test_wtctl_prints_its_release_version(world: World) -> None:
     have = parse_version(done.stdout)
     minimum = parse_version(MINIMUMS["wtctl"])
     assert minimum is not None
-    if have is None or have == (0, 0, 0) or have < minimum:
+    check(
+        have is not None,
+        "wtctl --version prints a version that parses",
+        "wtctl interface.md Global flags (--version)",
+        (done.returncode, done.stdout, done.stderr),
+    )
+    assert have is not None
+    if have == (0, 0, 0) or have < minimum:
         pytest.skip(
-            f"wtctl prints {done.stdout.strip()!r}: an unknown or pre-release version "
+            f"wtctl prints {done.stdout.strip()!r}: a pre-release version "
             "(0.0.0 or below the minimum); this test is for released installs"
         )
     found = re.fullmatch(r"wtctl (\d+)\.(\d+)\.(\d+)\S*", done.stdout.strip())
