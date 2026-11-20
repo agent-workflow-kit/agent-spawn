@@ -355,9 +355,10 @@ def check_reused(plan: CreatePlan, record: WtRecord) -> None:
         details={
             "cause": "worktree_mismatch",
             "retryable": False,
-            "hint": f"wtctl show {record.id}; a human frees the name or branch, or forgets the "
-            f"record, and releases the dead holder with `wtctl forget {record.id} --holder "
-            f"{plan.agent_id}` (a held record blocks `wtctl remove`), then launches again",
+            "hint": f"wtctl show {record.id}; a human frees the name or branch and releases the "
+            f"dead holder with `wtctl forget {record.id} --holder {plan.agent_id}` (a held record "
+            f"blocks `wtctl remove`), or forgets the record outright (`wtctl forget {record.id}`), "
+            "then launches again",
         },
     )
 

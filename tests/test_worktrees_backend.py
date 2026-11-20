@@ -543,6 +543,7 @@ def test_the_same_holder_with_a_new_name_and_an_explicit_branch_gets_the_old_rec
     hint = str((error.details or {}).get("hint"))
     assert hint.startswith(f"wtctl show {old.id}; a human frees")
     assert f"wtctl forget {old.id} --holder {AGENT}" in hint  # the dead holder is released too
+    assert f"or forgets the record outright (`wtctl forget {old.id}`)" in hint
     for text in ("'new'", "'old'", "feat/x", old.id):
         assert text in str(error)
     assert saved(fakebin) == before  # nothing created, changed or removed
