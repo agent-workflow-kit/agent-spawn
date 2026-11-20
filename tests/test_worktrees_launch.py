@@ -221,11 +221,15 @@ def test_a_bad_repo_id_exits_2(env: Env, fakebin: Fakebin) -> None:
 def test_worktree_new_with_a_cwd_runs_in_that_directory_of_the_worktree(
     env: Env, fakebin: Fakebin
 ) -> None:
-    done = env.run(*LAUNCH, "--repo", REPO, "--worktree", "new", "--cwd", "pkg")
+    # claude-session refuses a --cwd that does not exist (the fake does too): `pkg` must be there.
+    root = Path(fake_throwaway(fakebin)["path"]).parent.parent
+    tree_dir = root / "worktrees" / REPO.split("/", 1)[0] / "team" / "project" / "pkg-tree"
+    (tree_dir / "pkg").mkdir(parents=True)
+    done = env.run(*LAUNCH, "--repo", REPO, "--worktree", "new", "--worktree-name", "pkg-tree",
+                   "--cwd", "pkg")  # fmt: skip
     assert done.returncode == 0, (done.stdout, done.stderr)
     agent_id = result_json(done)["agent"]["agent_id"]
-    record = next(iter(records(fakebin).values()))
-    expected = os.path.join(os.path.realpath(record["path"]), "pkg")
+    expected = os.path.join(os.path.realpath(tree_dir), "pkg")
     assert env.agent(agent_id)["cwd"] == expected
     assert f"--cwd={expected}" in real_starts(fakebin)[-1]
 
