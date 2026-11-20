@@ -133,7 +133,7 @@ def test_a_fork_passes_a_nonexistent_cwd_for_claude_session_to_refuse(
     source = launched(env)
     missing = str(tmp_path / "does" / "not" / "exist")
     done = env.run("resume", source, "--fork", "--cwd", missing, "--json", "--wait")
-    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert done.returncode == 1, (done.stdout, done.stderr)  # claude-session exits 2
     assert f"--cwd={missing}" in starts(fakebin)[-1]
 
 
