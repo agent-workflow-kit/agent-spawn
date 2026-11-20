@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import signal
+import sqlite3
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -28,6 +29,7 @@ from .billed import pid_gone
 from .harness import LiveError, World, check, process_token, wait_for
 from .test_agent_spawn_hooks import HUMAN, hook_config, launch_args, write_script
 from .test_agent_spawn_stub import agent_of, show, stub_setup, wait_status
+from .test_wtctl import Wt
 
 SC = pytest.mark.live_scenario
 
@@ -467,3 +469,191 @@ def test_agent_spawn_label_add_reports_a_locked_pane_and_resyncs_later(world: Wo
         (kinds, panes_of(world, aid)[0]["labels"]),
     )
     world.spawn_json("stop", aid, "--grace", "2s", timeout=60)
+
+
+def wtctl_db_update(world: World, sql: str, *params: str) -> None:
+    """Edit wtctl's private ``state.db`` (the harness world's own): the only way to present the
+    states wtctl's own docs describe but a test cannot make with git alone (a digest that
+    disagrees with the recorded rows; a file system that presents a new ``st_dev``)."""
+    found = list((world.state / "wtctl").rglob("state.db"))
+    check(len(found) == 1, "the world has exactly one wtctl state.db", "harness isolation", found)
+    db = sqlite3.connect(str(found[0]))
+    try:
+        db.execute(sql, params)
+        db.commit()
+    finally:
+        db.close()
+
+
+@SC("wtctl-baseline-no-classes")
+def test_a_digest_only_and_an_anchor_only_baseline_change(world: World) -> None:
+    """wtctl interface.md Baseline check (a change is exit 20 ``repo_config_changed`` and the error
+    carries ``items`` and ``details.changed_classes``), Baseline accept (a moved anchor is shown
+    with the changed items; ``--expect-digest``) and Integrity (``unlinked``). Observed here, and
+    the agent-spawn side is ``as-wtctl-baseline-no-classes``: a recorded digest that disagrees with
+    the recorded rows is ``repo_config_changed`` with only ``digest`` and ``recorded_digest`` (no
+    ``items``, no ``changed_classes``); a moved anchor identity is NOT a baseline change for
+    ``baseline check`` (integrity refuses it first: ``unlinked``) and surfaces as
+    ``repo_config_changed`` with ``details.anchors`` and no ``changed_classes`` only from
+    ``baseline accept --expect-digest``. #115, #36 #25."""
+    wt = Wt(world)
+    made = wt.create("nb1", "ag-aaaa")["record"]
+    rid = made["id"]
+    clean = wt.run("baseline", "check", rid)
+    check(clean.returncode == 0, "a fresh record's baseline is unchanged", "#36 #25", clean.stdout)
+
+    # digest only
+    wtctl_db_update(world, "update records set baseline_digest = ? where id = ?", "0" * 64, rid)
+    done = wt.run("baseline", "check", rid)
+    world.observe("wtctl.baseline.digest-only", (done.returncode, done.stdout))
+    error = json.loads(done.stdout)["error"]
+    check(
+        done.returncode == 20
+        and error["code"] == "refused"
+        and error["reason"] == "repo_config_changed"
+        and sorted(error["details"]) == ["digest", "recorded_digest"]
+        and "items" not in error
+        and error["details"]["recorded_digest"] == "0" * 64,
+        "a digest that disagrees with the recorded rows is refused repo_config_changed with only the two digests: no items and no changed_classes",
+        "wtctl interface.md Baseline check (exit 20, reason repo_config_changed; items and details only when rows differ)",
+        error,
+    )
+    status = wt.run("status", rid)
+    world.observe("wtctl.baseline.digest-only.status", (status.returncode, status.stdout[:600]))
+    check(
+        json.loads(status.stdout)["reason"] == "repo_config_changed"
+        and json.loads(status.stdout)["would_remove"] is False,
+        "status treats the digest-only change as a baseline refusal: remove would refuse repo_config_changed",
+        "wtctl interface.md Baseline (remove refuses repo_config_changed)",
+        status.stdout[:400],
+    )
+    accepted = wt.run("baseline", "accept", rid, "--yes", "--actor", "human:tester")
+    check(
+        accepted.returncode == 0
+        and wt.run("baseline", "check", rid).returncode == 0
+        and json.loads(accepted.stdout)["items"] == [],
+        "a human baseline accept re-records the digest (no items to show) and the check is clean again",
+        "wtctl interface.md baseline accept",
+        accepted.stdout[:300],
+    )
+
+    # anchor only: dir_id, then the clone's common_id
+    for column, anchor in (("dir_id", "worktree_dir"), ("common_id", "common_dir")):
+        wtctl_db_update(world, f"update records set {column} = ? where id = ?", "1:2", rid)
+        done = wt.run("baseline", "check", rid)
+        world.observe(f"wtctl.baseline.anchor-only.{column}.check", (done.returncode, done.stdout))
+        error = json.loads(done.stdout)["error"]
+        check(
+            done.returncode == 20 and error["reason"] == "unlinked",
+            f"a moved {column} is refused unlinked by baseline check (integrity runs first), not repo_config_changed",
+            "wtctl interface.md Baseline check (integrity first: unlinked), Mount points",
+            error,
+        )
+        refused = wt.run(
+            "baseline", "accept", rid, "--yes", "--actor", "human:tester", "--expect-digest", "f" * 64
+        )
+        world.observe(f"wtctl.baseline.anchor-only.{column}.accept", (refused.returncode, refused.stdout))
+        error = json.loads(refused.stdout)["error"]
+        details = error["details"]
+        check(
+            refused.returncode == 20
+            and error["reason"] == "repo_config_changed"
+            and "changed_classes" not in details
+            and "items" not in error
+            and [a["anchor"] for a in details["anchors"] if a["changed"]] == [anchor]
+            and details["digest"] == details["recorded_digest"],
+            f"baseline accept --expect-digest with only {anchor} moved: repo_config_changed with details.anchors, no items and no changed_classes",
+            "wtctl interface.md baseline accept (a moved anchor is shown with the changed items; the digest is rechecked)",
+            error,
+        )
+        ok = wt.run("baseline", "accept", rid, "--yes", "--actor", "human:tester")
+        check(
+            ok.returncode == 0 and wt.run("baseline", "check", rid).returncode == 0,
+            f"a human accept re-records the moved {column} and the check is clean again",
+            "wtctl interface.md baseline accept (re-recorded with them)",
+            ok.stdout[:300],
+        )
+
+
+@SC("as-wtctl-baseline-no-classes")
+def test_agent_spawn_show_and_teardown_for_a_baseline_change_without_classes(world: World) -> None:
+    """interface.md ``show`` (``repo_config_changed`` from ``wtctl baseline check`` of the agent's
+    own record, for information) and Teardown order step 4 (wtctl's refusal is passed through):
+    for a digest-only change (``changed_classes`` absent: the wrapper maps it to ``changed: true``
+    with no classes and no items) and for a moved anchor (``baseline check`` says ``unlinked``,
+    so ``show`` reports no ``repo_config_changed`` and warns that the baseline was not checked).
+    The teardown of both is refused by wtctl and passes through; after a human ``wtctl baseline
+    accept`` the teardown goes through. #115."""
+    wt = stub_setup(world, "exit 0")
+    launched = world.spawn_json(*new_worktree_launch(wt), ok=(14,))
+    aid = agent_of(launched)["agent_id"]
+    rid = agent_of(launched)["worktree"]["record_id"]
+    check(
+        show(world, aid)["repo_config_changed"]["changed"] is False,
+        "an untouched worktree shows repo_config_changed.changed false",
+        "interface.md show (repo_config_changed)",
+    )
+
+    # digest only
+    wtctl_db_update(world, "update records set baseline_digest = ? where id = ?", "0" * 64, rid)
+    shown = show(world, aid)
+    world.observe("agent-spawn.show.digest-only", shown["repo_config_changed"])
+    check(
+        shown["repo_config_changed"] == {"changed": True, "changed_classes": [], "items": []},
+        "a digest-only change shows repo_config_changed changed true with no classes and no items",
+        "interface.md show (repo_config_changed: {changed, changed_classes, items})",
+        shown["repo_config_changed"],
+    )
+    refused = world.spawn_json("teardown", aid, ok=(20,))
+    world.observe("agent-spawn.teardown.digest-only", refused["error"])
+    check(
+        refused["error"]["tool"] == "wtctl"
+        and refused["error"]["lower_error"]["reason"] == "repo_config_changed",
+        "teardown passes wtctl's repo_config_changed refusal of the digest-only change through (exit 20)",
+        "interface.md Teardown order step 4 (wtctl refusals are passed through)",
+        refused["error"],
+    )
+    check(
+        show(world, aid)["agent"]["status"] == "parked"
+        and Path(agent_of(launched)["worktree"]["path"]).is_dir(),
+        "the refused teardown left the agent parked and the worktree in place",
+        "interface.md Teardown order (a refusal that changed nothing returns the agent to parked)",
+    )
+    ok = wt.run("baseline", "accept", rid, "--yes", "--actor", "human:tester")
+    check(ok.returncode == 0, "the human accept clears the digest-only change", "wtctl baseline accept", ok.stdout[:300])
+
+    # a moved anchor
+    wtctl_db_update(world, "update records set dir_id = ? where id = ?", "1:2", rid)
+    shown = show(world, aid)
+    world.observe("agent-spawn.show.anchor-only", (shown["repo_config_changed"], shown["warnings"]))
+    check(
+        shown["repo_config_changed"] is None
+        and any("baseline was not checked" in w for w in shown["warnings"]),
+        "a moved anchor makes baseline check refuse unlinked: show has no repo_config_changed and warns that it was not checked",
+        "interface.md show (for information); wtctl Baseline check (integrity first)",
+        (shown["repo_config_changed"], shown["warnings"]),
+    )
+    refused = world.spawn_json("teardown", aid, ok=(20,))
+    world.observe("agent-spawn.teardown.anchor-only", refused["error"])
+    check(
+        refused["error"]["tool"] == "wtctl" and refused["error"]["lower_error"]["reason"] == "unlinked",
+        "teardown passes wtctl's unlinked refusal of the moved anchor through (exit 20)",
+        "interface.md Teardown order step 4 (wtctl refusals are passed through)",
+        refused["error"],
+    )
+    ok = wt.run("baseline", "accept", rid, "--yes", "--actor", "human:tester")
+    check(ok.returncode == 0, "the human accept re-records the anchor", "wtctl baseline accept", ok.stdout[:300])
+    torn = world.spawn_json("teardown", aid)
+    check(
+        [w["action"] for w in torn["worktrees"]] == ["removed"],
+        "after the accept the teardown removes the worktree",
+        "interface.md Teardown order step 4",
+        torn["worktrees"],
+    )
+
+
+def new_worktree_launch(wt: Any) -> list[str]:
+    return [
+        "launch", "--mode", "headless", "--prompt", "reply ok", "--model", "haiku",
+        "--repo", wt.repo.repo_id, "--worktree", "new", "--wait",
+    ]  # fmt: skip

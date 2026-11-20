@@ -174,6 +174,14 @@ _ALL = [
         covers=("#100", "#36 #8 wtctl"),
     ),
     _s(
+        "wtctl-baseline-no-classes",
+        "tools",
+        "a digest-only baseline change (repo_config_changed with only the digests), a moved anchor "
+        "(baseline check says unlinked; accept --expect-digest shows details.anchors, no classes)",
+        "wtctl git",
+        covers=("#115", "#36 #25", "wtctl interface.md Baseline check, Baseline accept"),
+    ),
+    _s(
         "wtctl-collisions-reuse",
         "tools",
         "explicit --name collisions per case, reuse by the same holder",
@@ -333,6 +341,14 @@ _ALL = [
         "change lands on the agent and the session, a warning reports locked, reconcile pushes it",
         "claude-session termctl tmux",
         covers=("#114", "interface.md label add, Reconcile label re-sync"),
+    ),
+    _s(
+        "as-wtctl-baseline-no-classes",
+        "tools",
+        "show repo_config_changed and teardown for a digest-only baseline change and a moved anchor "
+        "of the agent's worktree record",
+        "claude-session wtctl git",
+        covers=("#115", "interface.md show, Teardown order step 4"),
     ),
     _s(
         "as-cron-fake-crontab",
