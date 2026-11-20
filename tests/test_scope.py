@@ -244,3 +244,30 @@ def test_a_non_linux_preflight_runs_nothing(with_systemd_run: str) -> None:
     with pytest.raises(CliError):
         scope.preflight(gw, AGENT)
     assert gw.run_calls == []
+
+
+# --- when scope hosting applies ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("detach", "windowed", "here", "expected"),
+    [
+        ("scope", False, False, True),  # a detached supervisor: every headless run
+        ("scope", True, False, False),  # a window hosts it
+        ("scope", False, True, False),  # `--placement here` runs it in the launcher
+        ("setsid", False, False, False),  # the default
+    ],
+)
+def test_only_a_detached_supervisor_with_scope_configured_is_scope_hosted(
+    detach: str, windowed: bool, here: bool, expected: bool
+) -> None:
+    from types import SimpleNamespace
+
+    from agent_spawn.launch import Launch
+
+    fake = SimpleNamespace(
+        windowed=windowed,
+        here=here,
+        config=SimpleNamespace(supervisor=SimpleNamespace(detach=detach)),
+    )
+    assert Launch.scope_hosted.fget(fake) is expected  # type: ignore[attr-defined]

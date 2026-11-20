@@ -70,9 +70,8 @@ def crontab_tripwire(
     stub_dir = tmp_path_factory.mktemp("crontab-tripwire")
     for name in GUARDED_TOOLS:
         stub = stub_dir / name
-        stub.write_text(
-            f"#!/bin/sh\necho '{name}: a test reached the real {name} (tripwire stub)' >&2\nexit 70\n"
-        )
+        message = f"{name}: a test reached the real {name} (tripwire stub)"
+        stub.write_text(f"#!/bin/sh\necho '{message}' >&2\nexit 70\n")
         stub.chmod(0o755)
     monkeypatch.setenv("PATH", f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}")
 

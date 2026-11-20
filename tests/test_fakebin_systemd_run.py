@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -14,9 +15,21 @@ BASE = ["--user", "--scope", "--quiet", "--collect"]
 BUS = {"XDG_RUNTIME_DIR": "/run/user/1000"}
 
 
-def start(fakebin: Fakebin, unit: str, *command: str, extra: list[str] | None = None, env=None):  # type: ignore[no-untyped-def]
+def start(
+    fakebin: Fakebin,
+    unit: str,
+    *command: str,
+    extra: list[str] | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return fakebin.run(
-        "systemd-run", *BASE, f"--unit={unit}", *(extra or []), "--", *command, env=env or BUS
+        "systemd-run",
+        *BASE,
+        f"--unit={unit}",
+        *(extra or []),
+        "--",
+        *command,
+        env=BUS if env is None else env,
     )
 
 
@@ -57,7 +70,7 @@ def test_the_command_has_no_blocked_signals_and_ignores_sigpipe_and_sigxfsz(
     assert done.stdout.splitlines() == ["[]", "True True"]
 
 
-def test_a_blocked_mask_of_the_caller_is_cleared(fakebin: Fakebin, tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_a_blocked_mask_of_the_caller_is_cleared(fakebin: Fakebin, tmp_path: Path) -> None:
     script = tmp_path / "caller.py"
     script.write_text(
         "import os, signal, sys\n"
@@ -91,7 +104,7 @@ def test_without_a_user_manager_address_it_fails_like_the_real_one(fakebin: Fake
     assert fakebin.invocations("systemd-run")[0].exit_code == 1
 
 
-def test_a_live_unit_name_cannot_be_started_twice(fakebin: Fakebin, tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_a_live_unit_name_cannot_be_started_twice(fakebin: Fakebin, tmp_path: Path) -> None:
     ready = tmp_path / "ready"
     proc = subprocess.Popen(
         [
