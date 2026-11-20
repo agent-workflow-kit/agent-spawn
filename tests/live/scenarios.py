@@ -210,6 +210,14 @@ _ALL = [
         covers=("#36 #20-#23", "#36 #25", "#36 #26", "#36 #15", "#36 #12"),
     ),
     _s(
+        "wtctl-reuse-mismatch",
+        "tools",
+        "agent-spawn refuses the record the real wtctl reuses for the same holder under another "
+        "--name and an explicit --branch (the first unbilled run's observation), nothing started",
+        "claude-session wtctl termctl tmux git",
+        covers=("#99", "wtctl interface.md Create order, Retry after a crash"),
+    ),
+    _s(
         "as-cron-fake-crontab",
         "tools",
         "cron install and uninstall against a fake crontab that is first on PATH",
