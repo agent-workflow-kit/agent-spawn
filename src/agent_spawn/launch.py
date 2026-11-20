@@ -54,6 +54,7 @@ from .output import (
     PayloadKind,
     error_outcome,
     result_object,
+    safe_text,
 )
 from .records import RecordsError, append_audit, append_log
 from .session_backend import (
@@ -432,6 +433,7 @@ class Launch:
         if getattr(args, "override_escalation", False) and not self.inv.actor.startswith("human:"):
             # The CLI already gates this flag; this keeps the handler safe when called directly.
             raise CliError.usage("--override-escalation needs an actor human:<user>")
+        self.scope_host_check()
         worktree = args.worktree or "none"
         if worktree not in ("new", "none") and not os.path.isabs(worktree):
             raise CliError.usage("--worktree needs new, none or an absolute path")
@@ -535,6 +537,12 @@ class Launch:
         """The detached supervisor is started in a transient scope (config
         ``supervisor.detach: scope``; a window or ``--placement here`` never is)."""
         return not self.windowed and not self.here and self.config.supervisor.detach == "scope"
+
+    def scope_host_check(self) -> None:
+        """A usage check: scope hosting needs Linux (exit 2 ``config_invalid``), whatever else is
+        wrong, so it is refused before any classification or lower-tool call."""
+        if self.scope_hosted:
+            scope.check_host(self.gateway)
 
     def scope_preflight(self, agent_id: str, *, dry_run: bool = False) -> None:
         """Launch step 1, scope preflight: with scope hosting, the host and the tool, then (not in
@@ -1623,9 +1631,8 @@ class Launch:
                 # the same supervise argv, started through `systemd-run --user --scope`: the
                 # process stays the supervisor (it execs in place), so the identity recorded
                 # below is unchanged (interface.md, Supervision, Scope hosting)
-                argv = scope.supervisor_argv(
-                    self.systemd_run or scope.resolve_systemd_run(), agent_id, result.run, argv
-                )
+                assert self.systemd_run is not None  # the preflight of step 1 resolved it
+                argv = scope.supervisor_argv(self.systemd_run, agent_id, result.run, argv)
             self.detached = procs.spawn_detached(
                 argv,
                 log_path=os.path.join(supervise_dir, f"{agent_id}.log"),
@@ -1642,7 +1649,7 @@ class Launch:
             self.sig.raising = False  # from here a signal is forwarded, not a reason to cancel
             self.detached.acknowledge()
             self.supervised = True
-        except (procs.DetachedForkError, OSError, StoreError, ValueError, CliError) as error:
+        except (procs.DetachedForkError, OSError, StoreError, ValueError) as error:
             self.sig.raising = True
             self.placement_failed(result, error)
             raise  # placement_failed raises; unreachable
@@ -1961,6 +1968,11 @@ class Launch:
             error.agent_id = agent_id
             error.decision_ids = list(self.decision_ids)
             raise error
+        self.log(
+            "warning",
+            level="warn",
+            message=f"could not start the detached supervisor: {safe_text(str(error))[:500]}",
+        )
         raise CliError(
             "launch_failed",
             f"could not start the detached supervisor ({type(error).__name__})",

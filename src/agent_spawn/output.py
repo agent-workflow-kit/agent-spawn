@@ -290,6 +290,8 @@ class CliError(Exception):
             )
         if cause == "worktree_state" and (code != "failed" or tool != "agent-spawn"):
             raise ValueError("worktree_state is agent-spawn's failed")
+        if cause == "scope_unavailable" and (code != "failed" or tool != "agent-spawn"):
+            raise ValueError("scope_unavailable is agent-spawn's failed")
         self.code = code
         self.message = message
         self.exit_code = exit_code

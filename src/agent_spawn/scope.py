@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from collections.abc import Sequence
 
 from . import gateway
@@ -25,8 +26,9 @@ from .output import CliError, safe_text
 
 #: A scope unit: the agent id and the run number, so it is unique per started supervisor.
 UNIT = re.compile(r"agent-spawn-ag-[a-z2-7]{8}-r[0-9]{1,9}")
-#: The unit of the preflight probe.
-PROBE_UNIT = re.compile(r"agent-spawn-probe-ag-[a-z2-7]{8}")
+#: The unit of one preflight probe: the agent id, the launcher's PID and a monotonic nanosecond
+#: stamp in hex, so two probes (back to back, or from two processes) never share a name.
+PROBE_UNIT = re.compile(r"agent-spawn-probe-ag-[a-z2-7]{8}-[0-9]{1,10}-[0-9a-f]{1,16}")
 AGENT_ID = re.compile(r"ag-[a-z2-7]{8}")
 PROBE_TIMEOUT = 30.0
 MESSAGE_LIMIT = 500
@@ -48,8 +50,12 @@ def unit_name(agent_id: str, run: int) -> str:
     return name
 
 
-def probe_unit_name(agent_id: str) -> str:
-    name = f"agent-spawn-probe-{agent_id}"
+def probe_unit_name(agent_id: str, *, pid: int | None = None, stamp: int | None = None) -> str:
+    """A fresh probe unit name (``pid`` and ``stamp`` are the launcher's and a monotonic
+    nanosecond count; given only by tests); ``ValueError`` for anything outside the grammar."""
+    pid = os.getpid() if pid is None else pid
+    stamp = time.monotonic_ns() if stamp is None else stamp
+    name = f"agent-spawn-probe-{agent_id}-{pid}-{stamp:x}"
     if PROBE_UNIT.fullmatch(name) is None:
         raise ValueError(f"invalid probe unit name {name!r}")
     return name
@@ -118,9 +124,17 @@ def preflight(gw: gateway.Gateway, agent_id: str, *, env: dict[str, str] | None 
     """Launch step 1, scope preflight: prove a transient scope can be started before anything is
     created, by running ``true`` in a probe scope. Returns systemd-run's absolute path."""
     systemd_run = check_static(gw)
-    if AGENT_ID.fullmatch(agent_id) is None:
-        raise ValueError(f"invalid agent id {agent_id!r}")
-    argv = [systemd_run, *_flags(probe_unit_name(agent_id)), "--", _true()]
+    try:
+        if AGENT_ID.fullmatch(agent_id) is None:
+            raise ValueError(f"invalid agent id {agent_id!r}")
+        unit = probe_unit_name(agent_id)
+    except ValueError as exc:
+        raise CliError(
+            "failed",
+            f"cannot name the scope probe: {safe_text(str(exc))[:MESSAGE_LIMIT]}",
+            details={"retryable": False},
+        ) from None
+    argv = [systemd_run, *_flags(unit), "--", _true()]
     try:
         done = gw.run(argv, timeout=PROBE_TIMEOUT, env=dict(os.environ) if env is None else env)
     except FileNotFoundError:

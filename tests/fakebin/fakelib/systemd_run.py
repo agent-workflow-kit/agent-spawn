@@ -5,9 +5,11 @@ it and ``exec``s the command in place, so the command runs with ``systemd-run``'
 fake does the same without a manager: it records the unit under its PID in
 ``<FAKEBIN_LOG>.scopes.json`` (a unit whose recorded PID is still alive makes a second start
 exit 1 ``Unit ... already exists``; a unit whose process is gone is free again, as a scope
-vanishes when its last process exits), clears the signal mask, ignores SIGPIPE and SIGXFSZ, adds
-``INVOCATION_ID`` to the environment and ``exec``s the command. The ``exec`` leaves no ``exit``
-record in the log (there is no process left to write it).
+vanishes when its last process exits), adds ``INVOCATION_ID`` to the environment and ``exec``s the
+command. It leaves the signal mask and the signal dispositions as the caller set them (observed
+on systemd 249: ``SigBlk`` and ``SigIgn`` of the command equal the caller's when the command is
+exec'd directly; only a shell between them, such as ``sh -c``, clears the mask). The ``exec``
+leaves no ``exit`` record in the log (there is no process left to write it).
 
 Accepted: ``--user`` and ``--scope`` (both required), ``--quiet``/``-q``, ``--collect``/``-c``,
 ``--unit=NAME``/``--unit NAME``/``-u NAME`` (required: agent-spawn always names its units),
@@ -116,10 +118,11 @@ def dispatch(ctx: Context) -> tuple[int, object, str]:
         os.replace(tmp, path)
     sys.stdout.flush()
     sys.stderr.flush()
-    # what the real program was observed to do before its exec (systemd 249)
-    signal.pthread_sigmask(signal.SIG_SETMASK, set())
-    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
-    signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+    # The real program was observed to leave the mask and the dispositions alone (systemd 249).
+    # The fake is a Python process, which ignores SIGPIPE and SIGXFSZ at startup: restore the
+    # defaults so the command sees what the caller passed on, not an artifact of the fake.
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    signal.signal(signal.SIGXFSZ, signal.SIG_DFL)
     env = dict(os.environ)
     env["INVOCATION_ID"] = "0123456789abcdef0123456789abcdef"
     try:

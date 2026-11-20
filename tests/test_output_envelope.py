@@ -103,6 +103,22 @@ def test_details_reject_unknown_keys() -> None:
         CliError.of("failed", "m", details={"secret": "x"})
 
 
+@pytest.mark.parametrize(
+    ("code", "tool"), [("launch_failed", "agent-spawn"), ("failed", "wtctl"), ("failed", "termctl")]
+)
+def test_scope_unavailable_is_agent_spawns_failed_only(code: str, tool: str) -> None:
+    kwargs: dict[str, Any] = {"lower_code": "x", "lower_error": {}} if tool != "agent-spawn" else {}
+    with pytest.raises(ValueError, match="scope_unavailable"):
+        CliError(
+            code,
+            "m",
+            tool=tool,
+            details={"cause": "scope_unavailable", "retryable": False},
+            **kwargs,
+        )
+    _check(CliError("failed", "m", details={"cause": "scope_unavailable", "retryable": False}))
+
+
 def test_agent_spawn_errors_never_carry_a_lower_code() -> None:
     with pytest.raises(ValueError, match="lower_code"):
         CliError.of("failed", "m", lower_code="busy")

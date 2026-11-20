@@ -324,6 +324,7 @@ class Resume(Launch):
                 raise CliError.usage("--placement here needs a terminal on stdin and stdout")
         if self.windowed:
             self.termctl_backend()  # tool resolution: exit 12 tool_missing before any change
+        self.scope_host_check()  # exit 2 config_invalid off Linux, before any change
         self.plan_override(row)
         self.plan_skill(store, row)
         self.plan_flags()
@@ -881,6 +882,9 @@ class Resume(Launch):
     ) -> Outcome:
         assert self.store is not None and self.backend is not None
         identity = self.store.holder_identity()
+        # Scope preflight first: a failing probe creates and changes nothing (no fork record, no
+        # lifecycle entry, no copies, no worktree).
+        self.scope_preflight(proposed)
         # The lifecycle entry (step 3), then the copies (step 4): a failure of either restores
         # the pre-resume row or deletes the fork.
         if self.fork:
@@ -1070,7 +1074,6 @@ class Resume(Launch):
                 name=self.args.name or source_row["name"],
                 term_placement=source_row.get("term_placement"),
             )
-        self.scope_preflight(run_id)
         if self.fork:
             self.update_cwd(run_id, cwd)  # an abandoned fork's holds are found by its cwd
         self.take_holds(run_id, cwd)  # step 6

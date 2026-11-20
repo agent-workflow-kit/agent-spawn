@@ -78,9 +78,29 @@ def test_unit_name_refuses_a_bad_run_number(run: object) -> None:
 
 
 def test_probe_unit_name_has_its_own_prefix_and_is_validated() -> None:
-    assert scope.probe_unit_name(AGENT) == "agent-spawn-probe-ag-abcdefg2"
+    assert (
+        scope.probe_unit_name(AGENT, pid=42, stamp=0xABC) == "agent-spawn-probe-ag-abcdefg2-42-abc"
+    )
     with pytest.raises(ValueError):
         scope.probe_unit_name("ag-abc")
+    with pytest.raises(ValueError):
+        scope.probe_unit_name(AGENT, stamp=-1)
+
+
+def test_probe_unit_names_are_unique_per_call_and_match_the_grammar() -> None:
+    names = {scope.probe_unit_name(AGENT) for _ in range(200)}
+    assert len(names) == 200  # back to back probes of one agent never collide
+    assert all(scope.PROBE_UNIT.fullmatch(n) for n in names)
+
+
+def test_probe_names_differ_between_processes() -> None:
+    assert scope.probe_unit_name(AGENT, pid=1, stamp=7) != scope.probe_unit_name(
+        AGENT, pid=2, stamp=7
+    )
+
+
+def test_the_probe_timeout_is_thirty_seconds() -> None:
+    assert scope.PROBE_TIMEOUT == 30.0
 
 
 # --- argv -------------------------------------------------------------------------------------
@@ -168,14 +188,9 @@ def test_preflight_runs_one_probe_scope_with_the_callers_environment(with_system
     gw.run_results[with_systemd_run] = lambda argv: done()
     assert scope.preflight(gw, AGENT, env={"XDG_RUNTIME_DIR": "/run/user/1"}) == with_systemd_run
     [call] = gw.run_calls
-    assert call[:6] == [
-        with_systemd_run,
-        "--user",
-        "--scope",
-        "--quiet",
-        "--collect",
-        "--unit=agent-spawn-probe-ag-abcdefg2",
-    ]
+    assert call[:5] == [with_systemd_run, "--user", "--scope", "--quiet", "--collect"]
+    assert call[5].startswith("--unit=") and scope.PROBE_UNIT.fullmatch(call[5][7:])
+    assert call[5].startswith("--unit=agent-spawn-probe-ag-abcdefg2-")
     assert call[6] == "--" and call[7].endswith("true") and len(call) == 8
     assert gw.run_envs == [{"XDG_RUNTIME_DIR": "/run/user/1"}]
     assert gw.run_timeouts == [scope.PROBE_TIMEOUT]
@@ -232,10 +247,27 @@ def test_a_vanished_systemd_run_is_tool_missing(with_systemd_run: str) -> None:
     assert info.value.code == "tool_missing"
 
 
-def test_preflight_refuses_a_bad_agent_id_before_running_anything(with_systemd_run: str) -> None:
+def test_preflight_refuses_a_bad_agent_id_as_an_error_envelope_before_running_anything(
+    with_systemd_run: str,
+) -> None:
     gw = FakeGateway()
-    with pytest.raises(ValueError):
+    with pytest.raises(CliError) as info:  # never a bare ValueError (an internal error, exit 70)
         scope.preflight(gw, "ag-abc; rm")
+    assert (info.value.code, info.value.exit_code, info.value.tool) == ("failed", 12, "agent-spawn")
+    assert gw.run_calls == []
+
+
+def test_preflight_turns_a_probe_name_failure_into_an_error_envelope(
+    with_systemd_run: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(agent_id: str) -> str:
+        raise ValueError("invalid probe unit name 'x'")
+
+    monkeypatch.setattr(scope, "probe_unit_name", refuse)
+    gw = FakeGateway()
+    with pytest.raises(CliError) as info:
+        scope.preflight(gw, AGENT)
+    assert info.value.code == "failed" and "invalid probe unit name" in info.value.message
     assert gw.run_calls == []
 
 

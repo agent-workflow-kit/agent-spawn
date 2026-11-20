@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import signal
 import subprocess
 import sys
 import time
@@ -57,24 +58,16 @@ def test_the_environment_is_the_callers_plus_invocation_id(fakebin: Fakebin) -> 
     assert done.stdout.split() == ["1", "0123456789abcdef0123456789abcdef"]
 
 
-def test_the_command_has_no_blocked_signals_and_ignores_sigpipe_and_sigxfsz(
-    fakebin: Fakebin,
-) -> None:
-    code = (
-        "import signal;"
-        "print(sorted(signal.pthread_sigmask(signal.SIG_BLOCK, [])));"
-        "print(signal.getsignal(signal.SIGPIPE) == signal.SIG_IGN,"
-        " signal.getsignal(signal.SIGXFSZ) == signal.SIG_IGN)"
-    )
-    done = start(fakebin, "agent-spawn-x", sys.executable, "-c", code)
-    assert done.stdout.splitlines() == ["[]", "True True"]
-
-
-def test_a_blocked_mask_of_the_caller_is_cleared(fakebin: Fakebin, tmp_path: Path) -> None:
+def status_lines(
+    fakebin: Fakebin, tmp_path: Path, blocked: set[int], ignored: set[int]
+) -> dict[str, int]:
+    """SigBlk and SigIgn (as integers) of ``grep`` exec'd directly through the fake, whose caller
+    set ``blocked`` and ``ignored`` first."""
     script = tmp_path / "caller.py"
     script.write_text(
         "import os, signal, sys\n"
-        "signal.pthread_sigmask(signal.SIG_SETMASK, {signal.SIGTERM, signal.SIGHUP})\n"
+        f"signal.pthread_sigmask(signal.SIG_SETMASK, {sorted(int(n) for n in blocked)!r})\n"
+        f"for n in {sorted(int(n) for n in ignored)!r}: signal.signal(n, signal.SIG_IGN)\n"
         "os.execv(sys.argv[1], sys.argv[1:])\n"
     )
     done = subprocess.run(
@@ -86,7 +79,8 @@ def test_a_blocked_mask_of_the_caller_is_cleared(fakebin: Fakebin, tmp_path: Pat
             "--unit=agent-spawn-x",
             "--",
             "grep",
-            "SigBlk",
+            "-E",
+            "Sig(Blk|Ign)",
             "/proc/self/status",
         ],
         env=fakebin.env(BUS),
@@ -94,7 +88,31 @@ def test_a_blocked_mask_of_the_caller_is_cleared(fakebin: Fakebin, tmp_path: Pat
         text=True,
         check=False,
     )
-    assert done.stdout.split()[1] == "0000000000000000"
+    pairs = [line.split() for line in done.stdout.splitlines()]
+    return {name.rstrip(":"): int(value, 16) for name, value in pairs}
+
+
+def bits(*signals: int) -> int:
+    return sum(1 << (int(n) - 1) for n in signals)
+
+
+def test_the_callers_blocked_mask_is_preserved_across_the_exec(
+    fakebin: Fakebin, tmp_path: Path
+) -> None:
+    # observed on systemd 249 (SigBlk 0x4003 for TERM, HUP and INT): the early-signal protection
+    # of spawn_detached(keep_blocked=...) carries through systemd-run
+    got = status_lines(fakebin, tmp_path, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}, set())
+    assert got["SigBlk"] == bits(signal.SIGTERM, signal.SIGHUP, signal.SIGINT) == 0x4003
+
+
+def test_the_callers_dispositions_are_preserved_and_nothing_is_ignored_on_its_own(
+    fakebin: Fakebin, tmp_path: Path
+) -> None:
+    # the baseline is what the caller passes on (a test runner may ignore a signal of its own)
+    baseline = status_lines(fakebin, tmp_path, set(), set())["SigIgn"]
+    assert baseline & bits(signal.SIGPIPE, signal.SIGXFSZ) == 0  # not Python's own startup habit
+    got = status_lines(fakebin, tmp_path, set(), {signal.SIGUSR1})
+    assert got["SigIgn"] == baseline | bits(signal.SIGUSR1)
 
 
 def test_without_a_user_manager_address_it_fails_like_the_real_one(fakebin: Fakebin) -> None:

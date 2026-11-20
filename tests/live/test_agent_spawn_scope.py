@@ -3,9 +3,10 @@
 No Claude Code: ``claude`` is a shell stub, as in ``test_agent_spawn_stub.py``. The one thing this
 suite touches outside its private world is the user's own systemd user manager, and only through
 transient scopes: ``systemd-run --user --scope`` starts the unit ``agent-spawn-<agent_id>-r<run>``
-(and the probe unit ``agent-spawn-probe-<agent_id>``), and the test stops exactly that unit by its
-exact name at the end, also after a failure or a timeout. Nothing else of the manager is read or
-changed.
+(and the probe unit ``agent-spawn-probe-<agent_id>-<pid>-<stamp>``, which exits at once), and the
+test stops exactly the units of this world's agents by their exact names at the end, also after a
+failure, a timeout or a launch that never returned an agent id (the ids are read from the world's
+state directory). Nothing else of the manager is read or changed.
 
 What this verifies: the scope starts, the recorded supervisor PID is the supervisor itself (exec
 in place) and is a member of the scope's cgroup, liveness sees it, ``stop`` ends the run and the
@@ -20,6 +21,7 @@ of a real login session under ``KillUserProcesses=yes`` (the host's logind keeps
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -67,16 +69,65 @@ def manager(bus: str, *args: str, timeout: float = 30) -> subprocess.CompletedPr
     )
 
 
+AGENT_ID = re.compile(r"ag-[a-z2-7]{8}")
+
+
+def list_units(bus: str, pattern: str) -> list[str]:
+    """The unit names the manager lists for ``pattern`` (read-only; a listing that fails is an
+    error, never an empty answer: the final "nothing is left" check must not be vacuous)."""
+    done = manager(
+        bus, "systemctl", "--user", "list-units", "--all", "--no-legend", "--plain", pattern
+    )
+    assert done.returncode == 0, f"systemctl list-units {pattern} failed: {done.stderr.strip()}"
+    return [line.split()[0] for line in done.stdout.splitlines() if line.strip()]
+
+
 def unit_listed(bus: str, unit: str) -> bool:
-    """Whether the manager still lists exactly this unit (read-only; the name has no wildcard)."""
-    done = manager(bus, "systemctl", "--user", "list-units", "--all", "--no-legend", unit)
-    return unit in done.stdout
+    """Whether the manager still lists exactly this unit (the name has no wildcard)."""
+    return unit in list_units(bus, unit)
 
 
 def stop_unit(bus: str, unit: str) -> None:
     """Stop exactly ``unit`` (never a pattern); a unit that is already gone is fine."""
     if unit_listed(bus, unit):
         manager(bus, "systemctl", "--user", "stop", unit)
+
+
+def world_agent_ids(world: World, *known: str) -> set[str]:
+    """The agent ids of this world: the given ones and every id a launch left a directory or a
+    log for in the world's state directory (so a launch that failed before returning one is
+    covered)."""
+    ids = {k for k in known if AGENT_ID.fullmatch(k)}
+    base = world.state / "agent-spawn"
+    for sub in ("supervise", "outcomes", "prompts"):
+        directory = base / sub
+        if directory.is_dir():
+            for entry in directory.iterdir():
+                found = AGENT_ID.match(entry.name)
+                if found:
+                    ids.add(found.group(0))
+    return ids
+
+
+def units_of(bus: str, agent_ids: set[str]) -> list[str]:
+    """Every unit of these agents that the manager lists: the supervisor scope
+    ``agent-spawn-<id>-r<n>`` and the probe scope ``agent-spawn-probe-<id>-<pid>-<stamp>``,
+    matched against their exact grammars (the listing glob only narrows the read)."""
+    found: list[str] = []
+    for agent_id in sorted(agent_ids):
+        for glob, exact in (
+            (f"agent-spawn-{agent_id}-r*.scope", rf"agent-spawn-{agent_id}-r[0-9]{{1,9}}"),
+            (
+                f"agent-spawn-probe-{agent_id}-*.scope",
+                rf"agent-spawn-probe-{agent_id}-[0-9]{{1,10}}-[0-9a-f]{{1,16}}",
+            ),
+        ):
+            found += [
+                name
+                for name in list_units(bus, glob)
+                if re.fullmatch(exact, name.removesuffix(".scope"))
+            ]
+    return found
 
 
 def require_scope(world: World) -> str:
@@ -129,6 +180,7 @@ def test_a_scope_hosted_supervisor_runs_in_its_own_scope_and_stop_ends_it(world:
         agent_spawn_config="supervisor:\n  detach: scope\n",
     )
     unit = ""
+    aid = ""
     try:
         launched = world.spawn_json(
             "launch",
@@ -219,7 +271,10 @@ def test_a_scope_hosted_supervisor_runs_in_its_own_scope_and_stop_ends_it(world:
             f"the manager to drop {unit} after its last process exited",
         )
     finally:
-        if unit:
-            stop_unit(bus, unit)
-        stuck: list[Any] = [u for u in ([unit] if unit else []) if unit_listed(bus, u)]
+        # every unit this world's agents may have started, by exact name, even when the launch
+        # failed before returning an agent id
+        ours = units_of(bus, world_agent_ids(world, aid))
+        for name in ours:
+            stop_unit(bus, name)
+        stuck: list[Any] = units_of(bus, world_agent_ids(world, aid))
         check(not stuck, "no unit of this scenario is left running", "docs/live-testing.md", stuck)

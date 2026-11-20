@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from agent_spawn import gateway
+from agent_spawn import gateway, procs
 from tests import isolation
 from tests.fakebin.harness import Fakebin
 from tests.private_tmux import PrivateTmux
@@ -58,6 +58,20 @@ def no_real_crontab(monkeypatch: pytest.MonkeyPatch) -> None:
         return real_run(self, argv, **kwargs)
 
     monkeypatch.setattr(gateway.SystemGateway, "run", guarded)
+
+    # The scope-hosted supervisor is started by `procs.spawn_detached` (not the gateway's `run`):
+    # the same rule, on the absolute path it execs.
+    real_spawn = procs.spawn_detached
+
+    def guarded_spawn(argv: Sequence[str], **kwargs: Any) -> Any:
+        if argv and os.path.basename(argv[0]) in GUARDED_TOOLS:
+            if not Path(argv[0]).resolve().is_relative_to(fakes):
+                raise AssertionError(
+                    f"a test would start the real {os.path.basename(argv[0])}: {argv[0]}"
+                )
+        return real_spawn(argv, **kwargs)
+
+    monkeypatch.setattr(procs, "spawn_detached", guarded_spawn)
 
 
 @pytest.fixture(autouse=True)
