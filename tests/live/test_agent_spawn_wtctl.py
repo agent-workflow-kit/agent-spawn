@@ -12,8 +12,8 @@ from pathlib import Path
 import pytest
 
 from .harness import World, check
-from .test_agent_spawn_hooks import HUMAN, launch_args, write_script
-from .test_agent_spawn_stub import agent_of, show, stub_setup
+from .test_agent_spawn_hooks import HUMAN, write_script
+from .test_agent_spawn_stub import show, stub_setup
 from .test_wtctl import Wt
 from .test_wtctl_hooks import wt_config
 
@@ -42,8 +42,12 @@ def test_launch_over_a_vetoing_escalating_and_bootstrap_failing_wtctl(world: Wor
     escalation (13) and hook veto (11), ``bootstrap_failed``), #36 #8 wtctl, #78."""
     wt = stub_setup(world, "exit 0")
     ran = world.root / "ran.log"
-    veto = write_script(world, "veto.sh", f"cat > /dev/null; echo veto >> {ran}; echo 'wt says no' >&2; exit 1\n")
-    escalate = write_script(world, "escalate.sh", f"cat > /dev/null; echo escalate >> {ran}; exit 13\n")
+    veto = write_script(
+        world, "veto.sh", f"cat > /dev/null; echo veto >> {ran}; echo 'wt says no' >&2; exit 1\n"
+    )
+    escalate = write_script(
+        world, "escalate.sh", f"cat > /dev/null; echo escalate >> {ran}; exit 13\n"
+    )
 
     # 11: parked vetoed, no attention, nothing started, no record
     wt_config(world, wt, hooks={"pre-create": [(veto, None)]})
@@ -58,7 +62,10 @@ def test_launch_over_a_vetoing_escalating_and_bootstrap_failing_wtctl(world: Wor
         err,
     )
     check(
-        shown["status"] == "parked" and shown["park_reason"] == "vetoed" and shown["needs_attention"] is None and shown["worktree"] is None,
+        shown["status"] == "parked"
+        and shown["park_reason"] == "vetoed"
+        and shown["needs_attention"] is None
+        and shown["worktree"] is None,
         "the agent parks vetoed without attention and records no worktree",
         "interface.md Launch order step 4",
         {k: shown[k] for k in ("status", "park_reason", "needs_attention", "worktree")},
@@ -93,7 +100,10 @@ def test_launch_over_a_vetoing_escalating_and_bootstrap_failing_wtctl(world: Wor
     resumed = world.spawn_json("resume", eid, "--override-escalation", *HUMAN, "--wait", ok=(14,))
     records = active_records(wt)
     after = show(world, eid)
-    world.observe("agent-spawn.wtctl-escalation.resumed", {k: resumed.get(k) for k in ("outcome", "exit_code")})
+    world.observe(
+        "agent-spawn.wtctl-escalation.resumed",
+        {k: resumed.get(k) for k in ("outcome", "exit_code")},
+    )
     check(
         len(records) == 1
         and eid in records[0]["holders"]
@@ -132,7 +142,10 @@ def test_launch_over_a_vetoing_escalating_and_bootstrap_failing_wtctl(world: Wor
     )
     # teardown: the claude class alone is a warning for wtctl remove, not a refusal
     torn = world.agent_spawn("teardown", eid, "--json")
-    world.observe("agent-spawn.teardown.claude-class", (torn.returncode, torn.stdout[-400:]))
+    world.observe(
+        "agent-spawn.teardown.claude-class",
+        (torn.returncode, json.loads(torn.stdout).get("error", {}).get("reason")),
+    )
     check(
         torn.returncode in (0, 20),
         "teardown with only the claude class changed is decided by wtctl remove (warning, or the dirty check for the untracked file)",

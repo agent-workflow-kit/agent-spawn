@@ -18,10 +18,15 @@ import pytest
 
 from .billed import pid_gone
 from .harness import World, check, wait_for
-from .test_wtctl import AUTO, Wt, wt  # noqa: F401  (the fixture)
+from .test_wtctl import AUTO, Wt
 
 SC = pytest.mark.live_scenario
 HUMAN = "human:tester"
+
+
+@pytest.fixture
+def wt(world: World) -> Wt:
+    return Wt(world)
 
 
 def write_script(world: World, name: str, body: str) -> Path:
@@ -82,9 +87,19 @@ def test_pre_create_hook_veto_timeout_escalation_and_human_override(wt: Wt, worl
     ``--override-escalation``, a ``create`` killed on timeout, a human override), #100."""
     ran = world.root / "ran.log"
     payload = world.root / "payload.json"
-    veto = write_script(world, "veto.sh", f"cat > {payload}; echo veto >> {ran}; echo 'no creates today' >&2; exit 1\n")
-    escalate = write_script(world, "escalate.sh", f"cat > /dev/null; echo escalate >> {ran}; echo 'ask a human' >&2; exit 13\n")
-    slow = write_script(world, "slow.sh", f"cat > /dev/null; echo $$ > {world.root / 'slow.pid'}; sleep 120\n")
+    veto = write_script(
+        world,
+        "veto.sh",
+        f"cat > {payload}; echo veto >> {ran}; echo 'no creates today' >&2; exit 1\n",
+    )
+    escalate = write_script(
+        world,
+        "escalate.sh",
+        f"cat > /dev/null; echo escalate >> {ran}; echo 'ask a human' >&2; exit 13\n",
+    )
+    slow = write_script(
+        world, "slow.sh", f"cat > /dev/null; echo $$ > {world.root / 'slow.pid'}; sleep 120\n"
+    )
 
     wt_config(world, wt, hooks={"pre-create": [(veto, None)]})
     vetoed = wt.run(*create_args(wt, "v1"), f"--actor={AUTO}")
@@ -97,13 +112,16 @@ def test_pre_create_hook_veto_timeout_escalation_and_human_override(wt: Wt, worl
     world.observe("wtctl.pre-create.veto", err_of(vetoed))
     body = json.loads(payload.read_text())
     check(
-        body["hook"] == "pre-create" and body["object_type"] == "worktree" and body["repo"] == wt.repo.repo_id,
+        body["hook"] == "pre-create"
+        and body["object_type"] == "worktree"
+        and body["repo"] == wt.repo.repo_id,
         "the pre-create payload names the hook, the object type and the repo",
         "wtctl interface.md Hooks (payload)",
         {k: body.get(k) for k in ("hook", "object_type", "repo")},
     )
     check(
-        wt.ok("list")["records"] == [] and not (world.root / "wtctl" / "worktrees").exists()
+        wt.ok("list")["records"] == []
+        and not (world.root / "wtctl" / "worktrees").exists()
         or not any((world.root / "wtctl" / "worktrees").rglob("v1")),
         "a vetoed create leaves no record and no worktree directory",
         "wtctl interface.md Create order (nothing is written to the clone before pre-create)",
@@ -124,7 +142,11 @@ def test_pre_create_hook_veto_timeout_escalation_and_human_override(wt: Wt, worl
         "wtctl interface.md Hooks Outcomes (exit 13 escalated)",
         (escalated.returncode, escalated.stdout[-300:]),
     )
-    check(wt.ok("list")["records"] == [], "an escalated create changed nothing", "wtctl interface.md Hooks Outcomes (having changed nothing)")
+    check(
+        wt.ok("list")["records"] == [],
+        "an escalated create changed nothing",
+        "wtctl interface.md Hooks Outcomes (having changed nothing)",
+    )
     non_human = wt.run(*create_args(wt, "e1"), "--override-escalation", f"--actor={AUTO}")
     check(
         non_human.returncode == 2,
@@ -154,7 +176,11 @@ def test_pre_create_hook_veto_timeout_escalation_and_human_override(wt: Wt, worl
     # a per-invocation hook runs after the configured ones
     wt_config(world, wt)
     ran.write_text("")
-    inv = wt.run(*create_args(wt, "i1"), f"--hook=pre-create=cat > /dev/null; echo hook-cmd >> {ran}; exit 1", f"--actor={AUTO}")
+    inv = wt.run(
+        *create_args(wt, "i1"),
+        f"--hook=pre-create=cat > /dev/null; echo hook-cmd >> {ran}; exit 1",
+        f"--actor={AUTO}",
+    )
     check(
         inv.returncode == 11 and ran.read_text().split() == ["hook-cmd"],
         "a --hook pre-create=CMD of the invocation can veto",
@@ -183,7 +209,9 @@ def test_pre_create_hook_veto_timeout_escalation_and_human_override(wt: Wt, worl
 
 
 @SC("wtctl-bootstrap-failed")
-def test_a_failing_bootstrap_step_keeps_the_record_and_a_human_rerun_succeeds(wt: Wt, world: World) -> None:
+def test_a_failing_bootstrap_step_keeps_the_record_and_a_human_rerun_succeeds(
+    wt: Wt, world: World
+) -> None:
     """wtctl interface.md Bootstrap and Exit codes (``bootstrap_failed``: exit 12, the record is
     kept and ``details.record`` carries it; the first failing step stops the rest; ``bootstrap``
     re-run is human-only (13 without a human actor); a re-run that succeeds records the baseline),
@@ -204,11 +232,14 @@ def test_a_failing_bootstrap_step_keeps_the_record_and_a_human_rerun_succeeds(wt
     )
     record = (err.get("details") or {}).get("record")
     check(
-        isinstance(record, dict) and record.get("name") == "bs1" and "ag-hook" in record.get("holders", []),
+        isinstance(record, dict)
+        and record.get("name") == "bs1"
+        and "ag-hook" in record.get("holders", []),
         "the error carries the whole record in details.record (name and holder)",
         "interface.md Launch order step 4 (bootstrap_failed: details.record, wtctl's whole record object)",
         err.get("details"),
     )
+    assert isinstance(record, dict)  # the check above failed otherwise
     check(
         marker.read_text().split() == ["seen"],
         "the first failing step stopped the remaining steps",
@@ -217,7 +248,10 @@ def test_a_failing_bootstrap_step_keeps_the_record_and_a_human_rerun_succeeds(wt
     )
     listed = wt.ok("list")["records"]
     check(
-        len(listed) == 1 and listed[0]["id"] == record["id"] and listed[0]["state"] == "active" and Path(listed[0]["path"]).is_dir(),
+        len(listed) == 1
+        and listed[0]["id"] == record["id"]
+        and listed[0]["state"] == "active"
+        and Path(listed[0]["path"]).is_dir(),
         "the record and worktree are kept (active) after a bootstrap failure",
         "wtctl interface.md Create order (bootstrap runs after the record exists; post-create fires after bootstrap_failed)",
         listed,
@@ -264,7 +298,12 @@ def test_remove_merged_head_lets_a_squash_merged_branch_go(wt: Wt, world: World)
     world.git("push", "-q", "origin", f"HEAD:refs/heads/{branch}", cwd=path)
     # let wtctl's mirror see the branch, then delete it on the remote (the squash merge)
     seen = wt.run("status", rec["id"], "--holder=ag-mh")
-    check(seen.returncode == 0, "status refreshes the mirror", "wtctl interface.md status", seen.stdout[-300:])
+    check(
+        seen.returncode == 0,
+        "status refreshes the mirror",
+        "wtctl interface.md status",
+        seen.stdout[-300:],
+    )
     world.git("--git-dir", str(wt.repo.origin), "update-ref", "-d", f"refs/heads/{branch}")
     status = wt.run("status", rec["id"], "--holder=ag-mh")
     st = json.loads(status.stdout)
@@ -276,7 +315,9 @@ def test_remove_merged_head_lets_a_squash_merged_branch_go(wt: Wt, world: World)
         "wtctl interface.md Content checks (unpushed_head)",
         (refused.returncode, refused.stdout[-300:]),
     )
-    wrong = wt.run("remove", rec["id"], "--yes", "--holder=ag-mh", f"--actor={AUTO}", "--merged-head", "0" * 40)
+    wrong = wt.run(
+        "remove", rec["id"], "--yes", "--holder=ag-mh", f"--actor={AUTO}", "--merged-head", "0" * 40
+    )
     check(
         wrong.returncode == 20 and err_of(wrong)["reason"] == "unpushed",
         "a --merged-head that is not HEAD does not lift the check",
@@ -285,9 +326,14 @@ def test_remove_merged_head_lets_a_squash_merged_branch_go(wt: Wt, world: World)
     )
     dry = wt.run("remove", rec["id"], "--dry-run", "--holder=ag-mh", "--merged-head", head)
     world.observe("wtctl.remove.merged-head.dry-run", json.loads(dry.stdout).get("would_remove"))
-    removed = wt.run("remove", rec["id"], "--yes", "--holder=ag-mh", f"--actor={AUTO}", "--merged-head", head)
+    removed = wt.run(
+        "remove", rec["id"], "--yes", "--holder=ag-mh", f"--actor={AUTO}", "--merged-head", head
+    )
     out = json.loads(removed.stdout)
-    world.observe("wtctl.remove.merged-head", {k: out.get(k) for k in ("branch_deleted", "branch_kept_reason", "warnings")})
+    world.observe(
+        "wtctl.remove.merged-head",
+        {k: out.get(k) for k in ("branch_deleted", "branch_kept_reason", "warnings")},
+    )
     check(
         removed.returncode == 0 and not path.exists(),
         "with the verified --merged-head the worktree is removed",
@@ -295,7 +341,8 @@ def test_remove_merged_head_lets_a_squash_merged_branch_go(wt: Wt, world: World)
         (removed.returncode, removed.stdout[-400:]),
     )
     check(
-        out["branch_deleted"] is True and branch not in world.git("branch", "--list", cwd=wt.repo.clone),
+        out["branch_deleted"] is True
+        and branch not in world.git("branch", "--list", cwd=wt.repo.clone),
         "the branch whose tip equals --merged-head is deleted",
         "wtctl interface.md Remove order step 10",
         {k: out.get(k) for k in ("branch_deleted", "branch_kept_reason")},

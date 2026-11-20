@@ -107,12 +107,20 @@ def test_agent_spawn_pre_launch_hook_veto_escalation_timeout_and_override(world:
     payload = world.root / "payload.json"
     ran = world.root / "ran.log"
     veto = write_script(
-        world, "veto.sh", f"cat > {payload}; echo ran-veto >> {ran}; echo 'blocked by policy' >&2; exit 1\n"
+        world,
+        "veto.sh",
+        f"cat > {payload}; echo ran-veto >> {ran}; echo 'blocked by policy' >&2; exit 1\n",
     )
     escalate = write_script(
-        world, "escalate.sh", f"cat > {payload}; echo ran-escalate >> {ran}; echo 'needs a human' >&2; exit 13\n"
+        world,
+        "escalate.sh",
+        f"cat > {payload}; echo ran-escalate >> {ran}; echo 'needs a human' >&2; exit 13\n",
     )
-    slow = write_script(world, "slow.sh", f"cat > /dev/null; echo $$ > {world.root / 'slow.pid'}; echo ran-slow >> {ran}; sleep 120\n")
+    slow = write_script(
+        world,
+        "slow.sh",
+        f"cat > /dev/null; echo $$ > {world.root / 'slow.pid'}; echo ran-slow >> {ran}; sleep 120\n",
+    )
     wt = stub_setup(world, "exit 0", agent_spawn_config=hook_config("pre-launch", (veto, None)))
 
     # a veto: exit 11, the envelope names the hook and carries its stderr, nothing was created
@@ -136,14 +144,18 @@ def test_agent_spawn_pre_launch_hook_veto_escalation_timeout_and_override(world:
         and body["reads_third_party"] is False,
         "the pre-launch payload names the hook, has no object id and override_escalation false",
         "interface.md Hooks (pre-launch payload: object_id null in pre-launch)",
-        {k: body.get(k) for k in ("hook", "tool", "object_id", "override_escalation", "reads_third_party")},
+        {
+            k: body.get(k)
+            for k in ("hook", "tool", "object_id", "override_escalation", "reads_third_party")
+        },
     )
     nothing_created(world, "after a veto")
 
     # an escalation: exit 13, code escalated
     world.write_config(
         "agent-spawn",
-        "auto_report_resume: false\nhandoff_timeout: 30s\n" + hook_config("pre-launch", (escalate, None)),
+        "auto_report_resume: false\nhandoff_timeout: 30s\n"
+        + hook_config("pre-launch", (escalate, None)),
     )
     escalated = world.spawn_json(*launch_args(wt), ok=(13,))
     check(
@@ -160,12 +172,15 @@ def test_agent_spawn_pre_launch_hook_veto_escalation_timeout_and_override(world:
     runs_before = ran.read_text().count("ran-escalate")
     refused_flag = world.spawn_json(*launch_args(wt, "--override-escalation"), ok=(2,))
     check(
-        refused_flag["error"]["code"] == "usage" and ran.read_text().count("ran-escalate") == runs_before,
+        refused_flag["error"]["code"] == "usage"
+        and ran.read_text().count("ran-escalate") == runs_before,
         "--override-escalation without a TTY or a human actor exits 2 before any hook runs",
         "interface.md Global flags (Human-only flags)",
         refused_flag["error"],
     )
-    non_human = world.spawn_json(*launch_args(wt, "--override-escalation", "--actor", "auto:bot"), ok=(2,))
+    non_human = world.spawn_json(
+        *launch_args(wt, "--override-escalation", "--actor", "auto:bot"), ok=(2,)
+    )
     check(
         non_human["error"]["code"] == "usage",
         "an explicit non-human actor is refused for --override-escalation",
@@ -192,11 +207,13 @@ def test_agent_spawn_pre_launch_hook_veto_escalation_timeout_and_override(world:
     ran.write_text("")
     world.write_config(
         "agent-spawn",
-        "auto_report_resume: false\nhandoff_timeout: 30s\n" + hook_config("pre-launch", (escalate, None), (veto, None)),
+        "auto_report_resume: false\nhandoff_timeout: 30s\n"
+        + hook_config("pre-launch", (escalate, None), (veto, None)),
     )
     both = world.spawn_json(*launch_args(wt), ok=(11,))
     check(
-        both["error"]["code"] == "vetoed" and ran.read_text().split() == ["ran-escalate", "ran-veto"],
+        both["error"]["code"] == "vetoed"
+        and ran.read_text().split() == ["ran-escalate", "ran-veto"],
         "an escalating hook does not stop the next hook, and the later veto wins (exit 11)",
         "interface.md Hooks Execution (an exit 13 escalates but the later hooks still run; a later veto overrides)",
         (both["error"]["code"], ran.read_text()),
@@ -284,7 +301,10 @@ esac
     vetoed = world.spawn_json(*launch_args(wt, "--wait"), ok=(11,))
     aid = agent_of(vetoed)["agent_id"]
     run = vetoed["run"]
-    world.observe("agent-spawn.cs-veto", {k: vetoed.get(k) for k in ("phase", "outcome", "end_reason", "exit_code")})
+    world.observe(
+        "agent-spawn.cs-veto",
+        {k: vetoed.get(k) for k in ("phase", "outcome", "end_reason", "exit_code")},
+    )
     check(
         vetoed["phase"] == "launch"
         and vetoed["outcome"] == "vetoed"
@@ -359,7 +379,9 @@ esac
     )
 
     # resume --override-escalation: human-only, then goes to claude-session and the run starts
-    refused = world.spawn_json("resume", eid, "--override-escalation", "--mode", "headless", "--prompt", "ok", ok=(2,))
+    refused = world.spawn_json(
+        "resume", eid, "--override-escalation", "--mode", "headless", "--prompt", "ok", ok=(2,)
+    )
     check(
         refused["error"]["code"] == "usage",
         "resume --override-escalation without a human actor exits 2",
@@ -368,7 +390,15 @@ esac
     )
     # a vetoed agent has no escalation to override (escalated_by null): the flag exits 2 for it
     no_target = world.spawn_json(
-        "resume", aid, "--override-escalation", *HUMAN, "--mode", "headless", "--prompt", "ok", ok=(2,)
+        "resume",
+        aid,
+        "--override-escalation",
+        *HUMAN,
+        "--mode",
+        "headless",
+        "--prompt",
+        "ok",
+        ok=(2,),
     )
     check(
         no_target["error"]["code"] == "usage",
@@ -377,10 +407,21 @@ esac
         no_target["error"],
     )
     resumed = world.spawn_json(
-        "resume", eid, "--override-escalation", *HUMAN, "--mode", "headless", "--prompt", "ok", "--wait", ok=(14,)
+        "resume",
+        eid,
+        "--override-escalation",
+        *HUMAN,
+        "--mode",
+        "headless",
+        "--prompt",
+        "ok",
+        "--wait",
+        ok=(14,),
     )
     check(
-        resumed["run"]["agent_id"] == eid and resumed["agent"]["run"] == 2 and resumed["outcome"] == "exited-unreported",
+        resumed["run"]["agent_id"] == eid
+        and resumed["agent"]["run"] == 2
+        and resumed["outcome"] == "exited-unreported",
         "with the override the escalated launch continues: run 2 starts (the stub exits 0: 14)",
         "interface.md Escalation overrides (claude-session start --resume --override-escalation, only when the last run ended escalated)",
         {k: resumed.get(k) for k in ("outcome", "exit_code")},
@@ -438,7 +479,10 @@ def test_wait_and_launch_wait_exit_the_outcome_code_of_every_outcome(world: Worl
             "interface.md wait (a parked agent returns at once with its last outcome)",
             (waited.get("outcome"), agent_of(waited)["park_reason"]),
         )
-        world.observe(f"agent-spawn.wait.{name}", {k: done.get(k) for k in ("outcome", "end_reason", "exit_code")})
+        world.observe(
+            f"agent-spawn.wait.{name}",
+            {k: done.get(k) for k in ("outcome", "end_reason", "exit_code")},
+        )
 
     # timeout: claude-session's --timeout is a pending_cause; the stub dies of SIGTERM
     mode.write_text("loop")
@@ -464,7 +508,9 @@ def test_wait_and_launch_wait_exit_the_outcome_code_of_every_outcome(world: Worl
     world.track(int(state["supervisor"]["pid"]), tree=True)
     stuck = world.spawn_json("wait", laid, "--timeout", "2s", ok=(22,))
     check(
-        stuck["timed_out"] is True and stuck["run"] is None and show(world, laid)["agent"]["status"] == "live",
+        stuck["timed_out"] is True
+        and stuck["run"] is None
+        and show(world, laid)["agent"]["status"] == "live",
         "wait --timeout on a live agent exits 22 (timed_out true, run null) and leaves the agent live",
         "interface.md wait (--timeout expiring first exits 22)",
         {k: stuck.get(k) for k in ("timed_out", "run")},
@@ -496,7 +542,9 @@ def test_wait_and_launch_wait_exit_the_outcome_code_of_every_outcome(world: Worl
     os.kill(exec_pid, signal.SIGKILL)  # the exact exec pid agent-spawn recorded, identity just read
     lost = world.spawn_json("wait", xid, "--timeout", "90s", ok=(17,), timeout=120)
     check(
-        lost["outcome"] == "lost" and agent_of(lost)["park_reason"] == "lost" and agent_of(lost)["needs_attention"] == "lost",
+        lost["outcome"] == "lost"
+        and agent_of(lost)["park_reason"] == "lost"
+        and agent_of(lost)["needs_attention"] == "lost",
         "a headless run whose wrapper was SIGKILLed with a SIGTERM-honoring child ends lost: wait exits 17, parked lost with attention lost",
         "interface.md Outcome table (lost 17); #36 #75 3 (First billed run: exec-only SIGKILL)",
         {k: lost.get(k) for k in ("outcome", "end_reason")},
@@ -543,7 +591,9 @@ def parsed(runs: list[dict[str, Any]], key: str = "adopted_at") -> list[datetime
 
 
 @SC("as-adopted-at")
-def test_adopted_at_is_set_for_launched_resumed_auto_resumed_and_promoted_runs(world: World) -> None:
+def test_adopted_at_is_set_for_launched_resumed_auto_resumed_and_promoted_runs(
+    world: World,
+) -> None:
     """#91 / #100: ``show --json`` ``runs[].adopted_at`` is a date-time for a launched run, a
     resumed run, the automatic report resume and a promoted run (the run's Started time, written
     once by the supervisor when claude-session reports ``phase: session``), never earlier than the
@@ -554,7 +604,11 @@ def test_adopted_at_is_set_for_launched_resumed_auto_resumed_and_promoted_runs(w
     real Claude start (the billed candidates in docs/live-testing.md, Not covered)."""
     root = world.root
     mode = root / "amode"
-    wt = stub_setup(world, ADOPTED_STUB.format(root=root, result=RESULT_LINE), agent_spawn_config="kinds:\n  implement:\n    promote: false\n")
+    wt = stub_setup(
+        world,
+        ADOPTED_STUB.format(root=root, result=RESULT_LINE),
+        agent_spawn_config="kinds:\n  implement:\n    promote: false\n",
+    )
     world.write_config(
         "agent-spawn",
         "auto_report_resume: true\nhandoff_timeout: 30s\nkinds:\n  implement:\n    promote: false\n",

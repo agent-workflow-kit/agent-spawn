@@ -760,8 +760,18 @@ def test_a_wrapper_killed_under_a_signal_ignoring_child_in_a_window(world: World
         f"trap 'echo term >> {sig_log}' TERM; trap 'echo hup >> {sig_log}' HUP; touch {ready}; while :; do sleep 0.2; done",
     )
     launched = world.spawn_json(
-        "launch", "--mode", "interactive", "--prompt", "reply ok", "--model", "haiku",
-        "--worktree", "none", "--cwd", str(wt.repo.clone), timeout=120,
+        "launch",
+        "--mode",
+        "interactive",
+        "--prompt",
+        "reply ok",
+        "--model",
+        "haiku",
+        "--worktree",
+        "none",
+        "--cwd",
+        str(wt.repo.clone),
+        timeout=120,
     )
     agent = agent_of(launched)
     aid, csid = agent["agent_id"], agent["csession_id"]
@@ -780,7 +790,9 @@ def test_a_wrapper_killed_under_a_signal_ignoring_child_in_a_window(world: World
         world.pids.append((child, child_token))
     wrapper_token = process_token(wrapper)
     argv = _argv_of(wrapper)
-    world.observe("window-wrapper-dead.before", (state["supervisor"], run["wrapper_pid"], run["child_pid"]))
+    world.observe(
+        "window-wrapper-dead.before", (state["supervisor"], run["wrapper_pid"], run["child_pid"])
+    )
     check(
         argv is not None and "exec" in argv and state["supervisor"].get("exec_pid") == wrapper,
         "the exec pid agent-spawn recorded is the live claude-session exec wrapper",
@@ -788,20 +800,32 @@ def test_a_wrapper_killed_under_a_signal_ignoring_child_in_a_window(world: World
         (argv, state["supervisor"]),
     )
     os.kill(wrapper, signal.SIGKILL)
-    wait_for(lambda: process_token(wrapper) != wrapper_token or Path(f"/proc/{wrapper}/stat").read_text().rsplit(")", 1)[-1].split()[0] == "Z", 20, "wrapper dead")
+    wait_for(
+        lambda: (
+            process_token(wrapper) != wrapper_token
+            or Path(f"/proc/{wrapper}/stat").read_text().rsplit(")", 1)[-1].split()[0] == "Z"
+        ),
+        20,
+        "wrapper dead",
+    )
     after = wait_for(
         lambda: (r := _run_status(world, csid)).get("wrapper_alive") is False and r,
         30,
         "claude-session to see the wrapper dead",
     )
     check(
-        after["child_alive"] is True and process_token(child) == child_token and after["outcome"] is None,
+        after["child_alive"] is True
+        and process_token(child) == child_token
+        and after["outcome"] is None,
         "wrapper dead, child alive, no outcome: an interactive child has no parent-death signal and the stub ignores SIGHUP/SIGTERM",
         "claude-session interface.md Signals (PR_SET_PDEATHSIG is headless only) / #97",
         {k: after.get(k) for k in ("outcome", "child_alive", "wrapper_alive")},
     )
     lost = wait_status_flag(world, aid)
-    world.observe("window-wrapper-dead.agent", {k: lost["agent"][k] for k in ("status", "needs_attention", "supervisor_lost")})
+    world.observe(
+        "window-wrapper-dead.agent",
+        {k: lost["agent"][k] for k in ("status", "needs_attention", "supervisor_lost")},
+    )
     check(
         lost["agent"]["status"] == "live"
         and lost["agent"]["supervisor_lost"] is True
@@ -809,7 +833,12 @@ def test_a_wrapper_killed_under_a_signal_ignoring_child_in_a_window(world: World
         and (lost["supervisor"] or {}).get("alive") is False,
         "the supervisor ended on its own; agent-spawn keeps the agent live with supervisor_lost and attention lost (the window variant of the headless row)",
         "interface.md Liveness (a still-live session under a dead supervisor) / #36 #75 3 / #97",
-        (lost["agent"]["status"], lost["agent"]["supervisor_lost"], lost["agent"]["needs_attention"], lost["supervisor"]),
+        (
+            lost["agent"]["status"],
+            lost["agent"]["supervisor_lost"],
+            lost["agent"]["needs_attention"],
+            lost["supervisor"],
+        ),
     )
     panes = world.json_tool("termctl", "list", "--label", f"agent={aid}", "--dead")["panes"]
     check(
@@ -839,7 +868,8 @@ def test_a_wrapper_killed_under_a_signal_ignoring_child_in_a_window(world: World
     check(
         session_stop["ended"] is True
         and session_stop["outcome"] == "killed"
-        and [(s["pid"], s["signal"]) for s in session_stop["signals"]] == [(child, "SIGTERM"), (child, "SIGKILL")],
+        and [(s["pid"], s["signal"]) for s in session_stop["signals"]]
+        == [(child, "SIGTERM"), (child, "SIGKILL")],
         "stop ends the orphan (SIGTERM ignored, SIGKILL after the grace) and the run is killed",
         "claude-session interface.md stop (signals)",
         {k: session_stop.get(k) for k in ("ended", "outcome", "signals")},
