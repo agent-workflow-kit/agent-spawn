@@ -237,7 +237,9 @@ def test_a_reused_record_under_another_name_is_refused_and_left_alone(world: Wor
     wrapper = world.root / "wtctl-prime"
     # the wrapper needs the repo id, known once the Wt (its repo) exists
     wt = stub_setup(world, "exit 0")
-    wrapper.write_text(PRIME_WTCTL.format(real=world.tools["wtctl"].path, repo=wt.repo.repo_id))
+    real = world.tools["wtctl"]
+    assert real is not None
+    wrapper.write_text(PRIME_WTCTL.format(real=real.path, repo=wt.repo.repo_id))
     wrapper.chmod(0o700)
     world.write_config(
         "agent-spawn",

@@ -343,9 +343,7 @@ def check_reused(plan: CreatePlan, record: WtRecord) -> None:
     if plan.branch is not None:
         planned = _branch_key(plan.branch)
         if record.branch is None or not planned or _branch_key(record.branch) != planned:
-            problems.append(
-                f"its branch is {_shown(record.branch)}, planned {_shown(plan.branch)}"
-            )
+            problems.append(f"its branch is {_shown(record.branch)}, planned {_shown(plan.branch)}")
     elif plan.detach and record.branch is not None:
         problems.append(f"its branch is {_shown(record.branch)}, planned none (--detach)")
     if not problems:
