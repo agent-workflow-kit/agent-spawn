@@ -6,7 +6,7 @@ delivered. A missing database is an empty list (nothing is created).
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .agent_lookup import (
@@ -21,7 +21,7 @@ from .commands.base import Invocation
 from .ids import ID_CHARS, check_agent_id_text
 from .labels import Label, parse_user_label
 from .output import CliError, Outcome, PayloadKind, safe_text
-from .records import RecordsError, append_log
+from .records import RecordsError, append_log_unless_recent
 from .session_backend import STATES
 from .store import Store, StoreError
 from .store_schema import STATUSES
@@ -30,17 +30,26 @@ from .validate import GrammarError, parse_since
 __all__ = ["list_agents"]
 
 
-def _log_unreadable(inv: Invocation, agent_id: str, error: CliError) -> None:
-    """A row whose process entry cannot be read stays as it is in the listing; the log says so."""
+# An unreadable row is logged once per this long (docs/interface.md, Liveness): ``list`` is
+# read-only and polled, so it never writes a line per call.
+UNREADABLE_LOG_WINDOW = timedelta(hours=1)
+
+
+def _log_unreadable(unreadable: list[tuple[str, CliError]], inv: Invocation) -> None:
+    """Rows whose process entry cannot be read stay as they are in the listing; the log says so,
+    once per agent and reason per window (one tail read and one write for all of them)."""
+    entries = [
+        {
+            "event": "warning",
+            "level": "warn",
+            "agent_id": agent_id,
+            "message": "liveness_unreadable",
+            "details": {"cause": "liveness_unreadable", "reason": safe_text(error.message)},
+        }
+        for agent_id, error in unreadable
+    ]
     try:
-        append_log(
-            state_dir_of(inv),
-            "warning",
-            level="warn",
-            agent_id=agent_id,
-            message="liveness_unreadable",
-            details={"cause": "liveness_unreadable", "reason": safe_text(error.message)},
-        )
+        append_log_unless_recent(state_dir_of(inv), entries, within=UNREADABLE_LOG_WINDOW)
     except (RecordsError, ValueError, OSError):
         pass  # a log that cannot be written never fails a listing
 
@@ -164,14 +173,17 @@ def _select(
         # agent); it records its changes and delivers no hook. A row whose process entry cannot
         # be read is listed as it is: unreadable is an error, never "dead".
         live = liveness_for(inv, store)
+        unreadable: list[tuple[str, CliError]] = []
         for row in store.list_agents(statuses=("launching", "live")):
             try:
                 live.check(row["agent_id"])
             except CliError as error:
                 if error.exit_code == 12:
                     # unreadable process entry (documented): listed unchanged, and logged
-                    _log_unreadable(inv, row["agent_id"], error)
+                    unreadable.append((row["agent_id"], error))
                 continue
+        if unreadable:
+            _log_unreadable(unreadable, inv)
         rows = [row for row in store.list_agents() if _matches(row, ids, wanted)]
         rows.sort(key=lambda row: row["agent_id"])
         rows.sort(key=lambda row: row["created"], reverse=True)
