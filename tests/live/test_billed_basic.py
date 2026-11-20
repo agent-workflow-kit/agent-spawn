@@ -16,11 +16,13 @@ import pytest
 
 from .billed import (
     bsetup,
+    check_adopted_at,
     cs_status,
     expect_parked,
     expected_park_after_hangup,
     launch_headless,
     launch_window,
+    now_utc,
     pid_gone,
     show,
     track_agent,
@@ -43,6 +45,7 @@ def test_headless_launch_wait_end_to_end(billed_world: World) -> None:
     wt = bsetup(world, spawn_extra=f'hooks:\n  post-park:\n    - cmd: "cat > {hook_out}"\n')
     result_file = world.root / "out" / "result.json"
     result_file.parent.mkdir()
+    started = now_utc()
     done = launch_headless(
         world,
         wt,
@@ -134,6 +137,21 @@ def test_headless_launch_wait_end_to_end(billed_world: World) -> None:
     )
     shown = show(world, aid)
     check(shown["runs"][0]["first_working_at"], "show records first_working_at", "design.md D42")
+    # #91 / #100: adopted_at against the real claude-session timing, then written once (a later
+    # reconcile does not touch it)
+    adopted = check_adopted_at(shown, (started, now_utc()), runs=1, where="headless-launch-wait")
+    world.spawn_json("reconcile", ok=(0, 12))
+    check_adopted_at(
+        show(world, aid),
+        (started, now_utc()),
+        runs=1,
+        where="headless-launch-wait after reconcile",
+        first=adopted,
+    )
+    world.observe(
+        "adopted_at.headless-launch-wait",
+        (shown["runs"][0]["adopted_at"], shown["runs"][0]["ended_at"]),
+    )
     outcome_files = list(Path(status["csession_dir"]).rglob("*outcome*"))
     world.observe("claude-session.session-dir.outcome-files", [p.name for p in outcome_files])
     world.spawn_json("teardown", aid)
@@ -212,6 +230,7 @@ def test_no_implicit_done_run_and_the_automatic_report_resume_carry_the_flag(
     # file a report. Switch it off so run 1 really ends without one (claude-session
     # interface.md, Kind profile fields; design.md "backstop: false").
     wt = bsetup(world, cs_extra="kinds:\n  implement:\n    backstop: false\n")
+    started = now_utc()
     done = launch_headless(
         world,
         wt,
@@ -225,7 +244,8 @@ def test_no_implicit_done_run_and_the_automatic_report_resume_carry_the_flag(
         ok=(0, 14, 16, 17, 18),
     )
     aid = done["agent"]["agent_id"]
-    runs = show(world, aid)["runs"]
+    chain = show(world, aid)
+    runs = chain["runs"]
 
     def outcome_of(entry: dict) -> object:
         # a runs[] entry holds the run's outcome object under "outcome" (observed live), whose own
@@ -262,7 +282,20 @@ def test_no_implicit_done_run_and_the_automatic_report_resume_carry_the_flag(
         "#36 #88 (carry through the automatic report resume)",
         status["run"]["implicit_done"],
     )
-    final = show(world, aid)["agent"]
+    adopted = check_adopted_at(chain, (started, now_utc()), runs=2, where="report-resume-chain")
+    world.spawn_json("reconcile", ok=(0, 12))
+    later = show(world, aid)
+    check_adopted_at(
+        later,
+        (started, now_utc()),
+        runs=2,
+        where="report-resume-chain after reconcile",
+        first=adopted,
+    )
+    world.observe(
+        "adopted_at.report-resume-chain", [(r["adopted_at"], r["ended_at"]) for r in chain["runs"]]
+    )
+    final = later["agent"]
     world.observe(
         "report-resume.final",
         {k: final[k] for k in ("status", "park_reason", "last_outcome", "last_end_reason")},

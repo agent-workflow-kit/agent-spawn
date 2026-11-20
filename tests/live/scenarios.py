@@ -449,6 +449,24 @@ _ALL = [
         turns=6,
         covers=("#36 #75 3", "#36 #75 4", "design.md B9", "FIDELITY.md wrapper_alive"),
     ),
+    _s(
+        "interactive-window-close-unreported",
+        "billed-3",
+        "an unreported interactive session (long no-tools turn) whose window is closed mid-turn: parked killed without attention, no report",
+        "claude claude-session termctl tmux",
+        sessions=1,
+        turns=1,
+        covers=("#100", "#36 issue: unreported window close", "interface.md Outcome table"),
+    ),
+    _s(
+        "window-wrapper-dead-child-alive-real",
+        "billed-3",
+        "SIGKILL of exec under a real interactive claude in a window: the observed fate of claude, and the agent state that must follow from it",
+        "claude claude-session termctl tmux",
+        sessions=1,
+        turns=3,
+        covers=("#100", "#97", "#36 #75 3", "interface.md Liveness"),
+    ),
     # ---- recorded but not automated --------------------------------------------------------
     _s(
         "placement-here-terminal",
