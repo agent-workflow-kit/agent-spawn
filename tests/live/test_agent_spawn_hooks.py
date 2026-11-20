@@ -4,8 +4,8 @@ wtctl, termctl and tmux, with a stub ``claude`` (wave 2 of #100; no Claude sessi
 The stub is the only fake: claude-session runs it like the real binary, so everything that depends
 on claude-session's real outcome mapping (a report filed through ``claude-session report`` is
 ingested when the stub exits, a ``--timeout`` ends a run ``timeout``, a SIGKILLed wrapper leaves
-the run ``lost``) is the real tool's. What the stub cannot reproduce (Claude's own hook events,
-its session timing) is listed in docs/live-testing.md, "Not covered".
+the run ``lost``) is the real tool's. What the stub does not show (real Claude's session timing) is listed in
+docs/live-testing.md, "Not covered".
 
 Human-only flags (``--override-escalation``) are driven the way the harness drives every
 human-only gate: the children have no TTY on stdin, so the test passes an explicit
@@ -17,6 +17,8 @@ human-only gate: the children have no TTY on stdin, so the test passes an explic
 from __future__ import annotations
 
 import json
+import os
+import signal
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,7 +26,7 @@ from typing import Any
 import pytest
 
 from .billed import pid_gone
-from .harness import World, check, wait_for
+from .harness import World, check, process_token, wait_for
 from .test_agent_spawn_stub import agent_of, show, stub_setup, wait_status
 from .test_wtctl import Wt
 
@@ -178,6 +180,7 @@ def test_agent_spawn_pre_launch_hook_veto_escalation_timeout_and_override(world:
         "interface.md Global flags (Human-only flags)",
         refused_flag["error"],
     )
+    nothing_created(world, "after the flag refusal without a human actor")
     non_human = world.spawn_json(
         *launch_args(wt, "--override-escalation", "--actor", "auto:bot"), ok=(2,)
     )
@@ -187,6 +190,7 @@ def test_agent_spawn_pre_launch_hook_veto_escalation_timeout_and_override(world:
         "interface.md Global flags (an explicit non-human --actor is refused)",
         non_human["error"],
     )
+    nothing_created(world, "after the flag refusal with a non-human actor")
 
     # with a human actor the escalation counts as allow; the payload says so; the launch runs
     done = world.spawn_json(*launch_args(wt, "--override-escalation", *HUMAN, "--wait"), ok=(14,))
@@ -218,6 +222,7 @@ def test_agent_spawn_pre_launch_hook_veto_escalation_timeout_and_override(world:
         "interface.md Hooks Execution (an exit 13 escalates but the later hooks still run; a later veto overrides)",
         (both["error"]["code"], ran.read_text()),
     )
+    nothing_created(world, "after a later veto over an escalation", (overridden_id,))
     still = world.spawn_json(*launch_args(wt, "--override-escalation", *HUMAN), ok=(11,))
     check(
         still["error"]["code"] == "vetoed",
@@ -225,6 +230,7 @@ def test_agent_spawn_pre_launch_hook_veto_escalation_timeout_and_override(world:
         "interface.md Escalation overrides (a veto still vetoes)",
         still["error"],
     )
+    nothing_created(world, "after --override-escalation did not lift a veto", (overridden_id,))
 
     # a timeout vetoes; the hook's process group is ended
     ran.write_text("")
@@ -283,6 +289,7 @@ def test_claude_session_pre_launch_veto_timeout_escalation_and_adopted_at(world:
     overrides) and is human-only."""
     gate = world.root / "gate.mode"
     gate.write_text("veto")
+    slow_pid = world.root / "cs-slow.pid"
     script = write_script(
         world,
         "cs-gate.sh",
@@ -290,13 +297,15 @@ def test_claude_session_pre_launch_veto_timeout_escalation_and_adopted_at(world:
 case "$(cat {gate})" in
   veto) echo 'cs says no' >&2; exit 1 ;;
   escalate) echo 'cs wants a human' >&2; exit 13 ;;
-  slow) sleep 120 ;;
+  slow) echo $$ > {slow_pid}; sleep 120 ;;
   *) exit 0 ;;
 esac
 """,
     )
     wt = stub_setup(world, "exit 0")
-    world.claude_session_config("lost_grace: 120s\n" + hook_config("pre-launch", (script, 1)))
+    # a generous timeout for the hooks that must not time out (a loaded host must not turn a plain
+    # exit 1 into hook_timeout); only the deliberately slow case below uses 1 s
+    world.claude_session_config("lost_grace: 120s\n" + hook_config("pre-launch", (script, 10)))
 
     vetoed = world.spawn_json(*launch_args(wt, "--wait"), ok=(11,))
     aid = agent_of(vetoed)["agent_id"]
@@ -344,6 +353,7 @@ esac
 
     # a timeout vetoes (hook_timeout)
     gate.write_text("slow")
+    world.claude_session_config("lost_grace: 120s\n" + hook_config("pre-launch", (script, 1)))
     slow = world.spawn_json(*launch_args(wt, "--wait"), ok=(11,), timeout=90)
     check(
         slow["outcome"] == "vetoed" and slow["end_reason"] == "hook_timeout",
@@ -356,6 +366,15 @@ esac
         "adopted_at is null after a hook_timeout too",
         "interface.md show (launch phase end)",
     )
+    slow_hook = int(slow_pid.read_text())
+    wait_for(lambda: pid_gone(slow_hook), 20, "the timed-out claude-session hook's process to end")
+    check(
+        world.spawn_json("wait", agent_of(slow)["agent_id"], ok=(11,))["end_reason"]
+        == "hook_timeout",
+        "wait of the hook_timeout run exits 11 again with end reason hook_timeout",
+        "interface.md Exit codes (11 for waiting commands)",
+    )
+    world.claude_session_config("lost_grace: 120s\n" + hook_config("pre-launch", (script, 10)))
 
     # an escalation parks the agent escalated by claude-session (exit 13)
     gate.write_text("escalate")
@@ -435,6 +454,24 @@ esac
         timestamps(after),
     )
     world.observe("agent-spawn.adopted_at.resumed-after-escalation", timestamps(after))
+    # the agent has a session, but its last run ended exited-unreported, not escalated: no target
+    not_escalated = world.spawn_json(
+        "resume",
+        eid,
+        "--override-escalation",
+        *HUMAN,
+        "--mode",
+        "headless",
+        "--prompt",
+        "ok",
+        ok=(2,),
+    )
+    check(
+        not_escalated["error"]["code"] == "usage",
+        "resume --override-escalation of an agent with a session whose last run did not end escalated exits 2",
+        "interface.md Escalation overrides (claude-session's override only when the last run ended escalated)",
+        not_escalated["error"],
+    )
     log = world.state / "claude-session" / "audit.jsonl"
     audits = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
     world.observe(
@@ -532,14 +569,25 @@ def test_wait_and_launch_wait_exit_the_outcome_code_of_every_outcome(world: Worl
     state = wait_status(world, xid, "live")
     world.track(int(state["supervisor"]["pid"]), tree=True)
     exec_pid = int(wait_for(lambda: show(world, xid)["supervisor"]["exec_pid"], 20, "the exec pid"))
-    from .harness import process_token
-
     token = process_token(exec_pid)
     check(token is not None, "exec is a live process", "interface.md Supervision")
-    import os
-    import signal
-
-    os.kill(exec_pid, signal.SIGKILL)  # the exact exec pid agent-spawn recorded, identity just read
+    # the stub child of this run: tracked by pid plus start-time token, so teardown ends it even if a check fails
+    child_pid = int(
+        wait_for(
+            lambda: (
+                world.json_tool("claude-session", "status", agent_of(lost_live)["csession_id"])
+                .get("run", {})
+                .get("child_pid")
+            ),
+            30,
+            "the stub child's pid",
+        )
+    )
+    child_token = process_token(child_pid)
+    if child_token is not None:
+        world.pids.append((child_pid, child_token))
+    if process_token(exec_pid) == token:  # identity re-read immediately before the signal
+        os.kill(exec_pid, signal.SIGKILL)  # the exact exec pid agent-spawn recorded
     lost = world.spawn_json("wait", xid, "--timeout", "90s", ok=(17,), timeout=120)
     check(
         lost["outcome"] == "lost"
@@ -607,8 +655,8 @@ def test_adopted_at_is_set_for_launched_resumed_auto_resumed_and_promoted_runs(
     wt = stub_setup(
         world,
         ADOPTED_STUB.format(root=root, result=RESULT_LINE),
-        agent_spawn_config="kinds:\n  implement:\n    promote: false\n",
     )
+    # the automatic report resume on, and implement runs not promoted (rewritten once, not twice)
     world.write_config(
         "agent-spawn",
         "auto_report_resume: true\nhandoff_timeout: 30s\nkinds:\n  implement:\n    promote: false\n",
@@ -667,8 +715,9 @@ def test_adopted_at_is_set_for_launched_resumed_auto_resumed_and_promoted_runs(
     check(
         len(auto_show["runs"]) == 2
         and auto_show["runs"][1]["auto_resumed"] is True
-        and all(is_date_time(r["adopted_at"]) for r in auto_show["runs"]),
-        "the first run ended no_report, the automatic report resume is run 2 and both runs have a date-time adopted_at",
+        and all(is_date_time(r["adopted_at"]) for r in auto_show["runs"])
+        and parsed(auto_show["runs"])[0] <= parsed(auto_show["runs"])[1],
+        "the first run ended no_report, the automatic report resume is run 2 and both runs have a date-time adopted_at, in order",
         "interface.md show (... the automatic report resume); Outcome table (exited-unreported headless: automatic report resume once); #91",
         (flags, timestamps(auto_show)),
     )

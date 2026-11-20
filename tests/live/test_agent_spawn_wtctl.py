@@ -41,13 +41,8 @@ def test_launch_over_a_vetoing_escalating_and_bootstrap_failing_wtctl(world: Wor
     with the stored record), the exit codes 11, 13 and 12 of ``launch``. #100 (wtctl ``create``
     escalation (13) and hook veto (11), ``bootstrap_failed``), #36 #8 wtctl, #78."""
     wt = stub_setup(world, "exit 0")
-    ran = world.root / "ran.log"
-    veto = write_script(
-        world, "veto.sh", f"cat > /dev/null; echo veto >> {ran}; echo 'wt says no' >&2; exit 1\n"
-    )
-    escalate = write_script(
-        world, "escalate.sh", f"cat > /dev/null; echo escalate >> {ran}; exit 13\n"
-    )
+    veto = write_script(world, "veto.sh", "cat > /dev/null; echo 'wt says no' >&2; exit 1\n")
+    escalate = write_script(world, "escalate.sh", "cat > /dev/null; exit 13\n")
 
     # 11: parked vetoed, no attention, nothing started, no record
     wt_config(world, wt, hooks={"pre-create": [(veto, None)]})

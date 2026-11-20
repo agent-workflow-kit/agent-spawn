@@ -181,8 +181,10 @@ _ALL = [
     _s(
         "wtctl-baseline-check",
         "tools",
-        "baseline check by record id, partial/missing records, list realpaths",
+        "baseline check by record id, partial/missing records, list realpaths, a change of only "
+        "the claude class",
         "wtctl git",
+        tests=2,
         covers=("#36 #25", "#36 #21"),
     ),
     _s(

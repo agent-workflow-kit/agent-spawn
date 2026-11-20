@@ -121,16 +121,21 @@ def test_pre_create_hook_veto_timeout_escalation_and_human_override(wt: Wt, worl
     )
     check(
         wt.ok("list")["records"] == []
-        and not (world.root / "wtctl" / "worktrees").exists()
-        or not any((world.root / "wtctl" / "worktrees").rglob("v1")),
+        and (
+            not (world.root / "wtctl" / "worktrees").exists()
+            or not any((world.root / "wtctl" / "worktrees").rglob("v1"))
+        ),
         "a vetoed create leaves no record and no worktree directory",
         "wtctl interface.md Create order (nothing is written to the clone before pre-create)",
         wt.ok("list"),
     )
     check(
-        wt.repo.clone.joinpath(".git").is_dir()
-        and "wt/v1" not in world.git("branch", "--list", cwd=wt.repo.clone),
-        "a vetoed create leaves no branch in the clone",
+        [
+            b.lstrip("* ").strip()
+            for b in world.git("branch", "--list", cwd=wt.repo.clone).splitlines()
+        ]
+        == ["main"],
+        "a vetoed create leaves no branch in the clone (only main)",
         "wtctl interface.md Create order step 13 (the branch is created after pre-create)",
     )
 
@@ -240,6 +245,13 @@ def test_a_failing_bootstrap_step_keeps_the_record_and_a_human_rerun_succeeds(
         err.get("details"),
     )
     assert isinstance(record, dict)  # the check above failed otherwise
+    step = (err.get("details") or {}).get("step")
+    check(
+        isinstance(step, dict) and step.get("argv") == [str(fail)] and step.get("exit") == 3,
+        "details.step names the failing step: its argv and exit code",
+        "interface.md Launch order step 4 (bootstrap_failed: details.step); wtctl interface.md Bootstrap",
+        err.get("details", {}).get("step"),
+    )
     check(
         marker.read_text().split() == ["seen"],
         "the first failing step stopped the remaining steps",
@@ -286,8 +298,10 @@ def test_remove_merged_head_lets_a_squash_merged_branch_go(wt: Wt, world: World)
     verified ``--merged-head``) and Remove order step 10 (the branch is deleted when its tip is
     pushed or equals ``--merged-head``): a worktree commit pushed to origin and then deleted there
     (a squash-merge) is ``unpushed`` without ``--merged-head`` and removable with it; a sha that is
-    not the HEAD is refused; the branch is deleted. #36 #8 wtctl (not covered: ``remove
-    --merged-head``), #100."""
+    not the HEAD (the pushed base commit) is refused; the branch is deleted. Depends on wtctl's
+    mirror keeping the pushed commit after the remote branch is deleted (the wtctl version is
+    observed). #36 #8 wtctl (not covered: ``remove --merged-head``), #100."""
+    world.observe("wtctl.version", wt.run("--version").stdout.strip())
     rec = wt.create("mh1", "ag-mh")["record"]
     path = Path(rec["path"])
     (path / "feature.txt").write_text("feature\n")
@@ -315,12 +329,15 @@ def test_remove_merged_head_lets_a_squash_merged_branch_go(wt: Wt, world: World)
         "wtctl interface.md Content checks (unpushed_head)",
         (refused.returncode, refused.stdout[-300:]),
     )
+    # a real commit the mirror has seen (the pushed base, on origin/main) that is not HEAD: only
+    # the "equals HEAD" guard can refuse it, since the commit itself is pushed
+    base = world.git("rev-parse", "HEAD~1", cwd=path)
     wrong = wt.run(
-        "remove", rec["id"], "--yes", "--holder=ag-mh", f"--actor={AUTO}", "--merged-head", "0" * 40
+        "remove", rec["id"], "--yes", "--holder=ag-mh", f"--actor={AUTO}", "--merged-head", base
     )
     check(
         wrong.returncode == 20 and err_of(wrong)["reason"] == "unpushed",
-        "a --merged-head that is not HEAD does not lift the check",
+        "a --merged-head that is a pushed commit but not HEAD does not lift the check",
         "wtctl interface.md Content checks (accepted only when it equals HEAD)",
         (wrong.returncode, wrong.stdout[-300:]),
     )
