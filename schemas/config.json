@@ -150,6 +150,22 @@
       "required": [],
       "default": {}
     },
+    "supervisor": {
+      "type": "object",
+      "properties": {
+        "detach": {
+          "enum": [
+            "setsid",
+            "scope"
+          ],
+          "default": "setsid",
+          "description": "How a headless run's detached supervisor is hosted: setsid (double fork and setsid) or scope (the same, then systemd-run --user --scope, for hosts whose logind kills user processes at logout; Linux with systemd only)."
+        }
+      },
+      "additionalProperties": false,
+      "required": [],
+      "default": {}
+    },
     "kinds": {
       "type": "object",
       "propertyNames": {

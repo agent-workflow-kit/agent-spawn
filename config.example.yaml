@@ -55,6 +55,14 @@ reconcile:
   # reports them (teardown closes them either way).
   close_dead_panes_after: null
 
+supervisor:
+  # How a headless run's detached supervisor is hosted. setsid: double fork and setsid (it stays
+  # in the login session's cgroup, so a host whose logind has KillUserProcesses=yes ends it at
+  # logout). scope: the same, started through `systemd-run --user --scope` so it lives in its
+  # own transient scope (Linux with systemd only; the host also needs lingering enabled).
+  # With scope, a launch fails up front when systemd-run or the user manager is unavailable.
+  detach: setsid
+
 # Per-kind settings. Kind names follow claude-session's grammar.
 # promote: when a headless run of this kind ends blocked or needs-input, resume it once
 # interactively in a window (default false; --promote/--no-promote override it per agent). Example:
