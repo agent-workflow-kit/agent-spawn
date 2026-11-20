@@ -127,6 +127,15 @@ _ALL = [
         covers=("#36 #28", "#36 #8 termctl focus"),
     ),
     _s(
+        "termctl-locked",
+        "tools",
+        "termctl label add with the server's flock held by the test: exit 12 locked after about "
+        "10 s (cause timeout), nothing changed, dry run and list unaffected, a lock file that "
+        "cannot be used (cause unusable) fails at once",
+        "termctl tmux",
+        covers=("#114", "#36 #8 termctl", "termctl interface.md Locking"),
+    ),
+    _s(
         "wtctl-create-list-show",
         "tools",
         "create, list, show: names, branches, paths, shapes, --flag=value, errors",
@@ -316,6 +325,14 @@ _ALL = [
         "claude-session termctl tmux",
         tests=2,
         covers=("#112", "#36 #78", "interface.md Escalation overrides"),
+    ),
+    _s(
+        "as-label-locked",
+        "tools",
+        "agent-spawn label add on a live window agent while termctl's server lock is held: the "
+        "change lands on the agent and the session, a warning reports locked, reconcile pushes it",
+        "claude-session termctl tmux",
+        covers=("#114", "interface.md label add, Reconcile label re-sync"),
     ),
     _s(
         "as-cron-fake-crontab",

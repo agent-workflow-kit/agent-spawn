@@ -11,9 +11,15 @@ can provide is its own scenario, ``as-human-yes-tty``).
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import os
 import signal
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -285,3 +291,179 @@ def test_the_override_resume_from_another_cwd(world: World) -> None:
     world.spawn_json("resume", eid, "--override-escalation", *HUMAN, timeout=120)
     state = wait_status(world, eid, "live")
     world.track(int(state["supervisor"]["pid"]), tree=True)
+
+
+def lock_file_of(world: World, socket_path: str) -> Path:
+    """termctl's per-server lock file: ``locks/<first 16 hex digits of sha256(socket_path)>.lock``
+    in its state directory (termctl interface.md, Audit and log, Locking)."""
+    digest = hashlib.sha256(socket_path.encode()).hexdigest()[:16]
+    return world.state / "termctl" / "locks" / f"{digest}.lock"
+
+
+@contextmanager
+def held_lock(path: Path) -> Iterator[None]:
+    """Hold the exclusive ``flock`` termctl's label, rename, mark and unmark commands wait for, the
+    way a concurrent termctl command would (the kernel makes no difference between holders)."""
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the flock
+
+
+@SC("termctl-locked")
+def test_termctl_locked_is_provoked_with_the_servers_lock_held(world: World) -> None:
+    """termctl interface.md Audit and log (Locking: ``rename``, ``mark``, ``unmark``, ``label add``
+    and ``label remove`` hold an exclusive ``flock`` on ``locks/<16 hex of sha256(socket_path)>.lock``
+    and wait at most 10 s, then exit 12 ``locked`` with ``details.cause: timeout``; a lock file that
+    cannot be used is ``cause: unusable`` with ``path`` and ``problem``; a dry run takes no lock;
+    read-only commands take none). Provoked deterministically: the test holds the same ``flock``
+    itself, so no second termctl has to be raced. #114, #36 #8 termctl (the ``locked`` error)."""
+    opened = world.json_tool(
+        "termctl", "open", "--name", "lk", "--label", "k=v", "--", "sh", "-c", "sleep 600"
+    )
+    pane = opened["id"]
+    world.pids.append((int(opened["pid"]), process_token(int(opened["pid"])) or ""))
+    socket_path = opened["socket_path"]
+    # a first label change creates the lock file (and its directory)
+    world.json_tool("termctl", "label", "add", pane, "a=b")
+    lock = lock_file_of(world, socket_path)
+    check(
+        lock.exists(),
+        "a label change leaves the server's lock file under the state directory's locks/",
+        "termctl interface.md Audit and log (Locking: locks/<first 16 hex digits of sha256(socket_path)>.lock)",
+        sorted(str(p) for p in (world.state / "termctl").rglob("*")),
+    )
+
+    with held_lock(lock):
+        started = time.monotonic()
+        refused = world.tool("termctl", "--json", "label", "add", pane, "c=d", timeout=60)
+        waited = time.monotonic() - started
+        world.observe("termctl.locked.timeout", (refused.returncode, round(waited, 1), refused.stdout))
+        error = json.loads(refused.stdout)["error"]
+        check(
+            refused.returncode == 12
+            and error["code"] == "locked"
+            and error["details"]["cause"] == "timeout"
+            and error["details"]["socket_path"] == socket_path,
+            "label add with the server lock held exits 12 locked, details.cause timeout and the socket path",
+            "termctl interface.md Errors (locked: details socket_path and cause), Audit and log (Locking)",
+            error,
+        )
+        check(
+            9.0 <= waited < 25.0,
+            "termctl waited for the lock about 10 seconds before giving up",
+            "termctl interface.md Audit and log (waits at most 10 seconds for the lock)",
+            round(waited, 2),
+        )
+        labels = [p["labels"] for p in world.json_tool("termctl", "list")["panes"]]
+        check(
+            labels == [["a=b", "k=v"]] or labels == [["k=v", "a=b"]] or sorted(labels[0]) == ["a=b", "k=v"],
+            "the refused label change changed nothing on the pane",
+            "termctl interface.md Locking (the lock guards the read-modify-write)",
+            labels,
+        )
+        # a dry run takes no lock and a read-only command takes none
+        dry = world.tool("termctl", "--json", "label", "add", pane, "c=d", "--dry-run")
+        check(
+            dry.returncode == 0 and json.loads(dry.stdout)["dry_run"] is True,
+            "a dry run never exits 12: it takes no lock",
+            "termctl interface.md Dry runs (a dry run takes no lock)",
+            (dry.returncode, dry.stdout[-300:]),
+        )
+        listed = world.tool("termctl", "--json", "list")
+        check(listed.returncode == 0, "list takes no lock", "termctl interface.md Locking", listed.stderr)
+
+    # released: the same command succeeds (the lock is not left behind by the refused one)
+    ok = world.json_tool("termctl", "label", "add", pane, "c=d")
+    check(
+        ok["changed"] is True and "c=d" in ok["labels"],
+        "after the holder let go the same label change succeeds",
+        "termctl interface.md Locking (the kernel releases a flock with its holder)",
+        ok,
+    )
+
+    # a lock file that cannot be used: cause unusable with path and problem (no wait); a root
+    # user opens a mode-000 file anyway, so the harness only provokes it for other users
+    if os.geteuid() == 0:
+        world.json_tool("termctl", "close", pane, "--force", "--actor", "human:tester")
+        return
+    lock.chmod(0)
+    try:
+        started = time.monotonic()
+        unusable = world.tool("termctl", "--json", "label", "add", pane, "e=f", timeout=60)
+        quick = time.monotonic() - started
+        world.observe("termctl.locked.unusable", (unusable.returncode, unusable.stdout))
+        error = json.loads(unusable.stdout)["error"]
+        check(
+            unusable.returncode == 12
+            and error["code"] == "locked"
+            and error["details"]["cause"] == "unusable"
+            and error["details"]["path"].endswith(lock.name)
+            and error["details"]["problem"],
+            "an unreadable lock file exits 12 locked with details.cause unusable, a path and a problem",
+            "termctl interface.md Errors (locked details: cause unusable, path, problem)",
+            error,
+        )
+        check(
+            quick < 8.0,
+            "an unusable lock fails at once instead of waiting 10 seconds",
+            "termctl interface.md Locking (unusable is not a timeout)",
+            round(quick, 2),
+        )
+    finally:
+        lock.chmod(0o600)
+    world.json_tool("termctl", "close", pane, "--force", "--actor", "human:tester")
+
+
+@SC("as-label-locked")
+def test_agent_spawn_label_add_reports_a_locked_pane_and_resyncs_later(world: World) -> None:
+    """interface.md ``label add`` (a change is mirrored to the pane of a live window with
+    ``termctl label add``; a mirror failure is a warning and queues the change for re-sync) and
+    Reconcile, label re-sync (``labels_resynced``): with termctl's server lock held, the real
+    termctl answers ``locked`` after its 10 s wait, agent-spawn keeps the change on the agent and
+    the session, warns, and a later ``reconcile`` pushes it once the lock is free. #114: how
+    agent-spawn reports ``locked``."""
+    wt = stub_setup(world, "while :; do sleep 0.2; done")
+    launched = world.spawn_json(*window_launch_args(wt), timeout=120)
+    aid = agent_of(launched)["agent_id"]
+    state = wait_status(world, aid, "live")
+    world.track(int(state["supervisor"]["pid"]), tree=True)
+    pane = panes_of(world, aid)[0]
+    lock = lock_file_of(world, pane["socket_path"])
+    world.json_tool("termctl", "label", "add", pane["id"], "warm=up")  # creates the lock file
+    with held_lock(lock):
+        changed = world.spawn_json("label", "add", aid, "team=blue", timeout=90)
+    world.observe("agent-spawn.label-add.locked", changed)
+    check(
+        changed["changed"] is True
+        and "team=blue" in changed["labels"]
+        and any("termctl label add failed (exit 12)" in w and "queued" in w for w in changed["warnings"]),
+        "label add with the pane's server lock held succeeds on the agent and warns that termctl's "
+        "label add failed with exit 12 (locked) and the change is queued",
+        "interface.md label add (a mirror failure is a warning and queues the change); termctl Locking",
+        changed,
+    )
+    csid = show(world, aid)["agent"]["csession_id"]
+    check(
+        "team=blue" in world.json_tool("claude-session", "status", csid)["labels"],
+        "the session mirror took the change although the pane push failed",
+        "interface.md label add (mirrored to the session)",
+    )
+    check(
+        "team=blue" not in panes_of(world, aid)[0]["labels"],
+        "the pane does not carry the label yet (termctl refused it)",
+        "termctl interface.md Locking (a locked command changes nothing)",
+        panes_of(world, aid)[0]["labels"],
+    )
+    synced = world.spawn_json("reconcile", ok=(0, 12))
+    kinds = [c["kind"] for c in synced["changes"]]
+    world.observe("agent-spawn.reconcile.labels", synced)
+    check(
+        "labels_resynced" in kinds and "team=blue" in panes_of(world, aid)[0]["labels"],
+        "a reconcile after the lock is free pushes the queued label to the pane",
+        "interface.md Reconcile (labels_resynced, Label re-sync scope)",
+        (kinds, panes_of(world, aid)[0]["labels"]),
+    )
+    world.spawn_json("stop", aid, "--grace", "2s", timeout=60)
