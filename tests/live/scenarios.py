@@ -226,6 +226,31 @@ _ALL = [
         covers=("#99", "wtctl interface.md Create order, Retry after a crash"),
     ),
     _s(
+        "as-prelaunch-hooks",
+        "tools",
+        "agent-spawn's own pre-launch hook: veto 11, escalation 13, timeout, later veto over an "
+        "escalation, human-only --override-escalation; nothing is created",
+        "claude-session",
+        covers=("#100", "interface.md Hooks, Escalation overrides", "#36 #78"),
+    ),
+    _s(
+        "as-launch-phase-hooks",
+        "tools",
+        "claude-session's pre-launch veto, timeout and escalation through agent-spawn (11, 11, 13), "
+        "adopted_at null for a launch-phase end and a date-time for the resumed run, resume "
+        "--override-escalation",
+        "claude-session",
+        covers=("#100", "#91 adopted_at", "interface.md Outcome table, Escalation overrides"),
+    ),
+    _s(
+        "as-wait-exit-codes",
+        "tools",
+        "wait and launch --wait exit codes 0, 13, 14, 15, 16, 17, 18, 22 and 10 against real "
+        "claude-session outcomes produced by a stub claude",
+        "claude-session",
+        covers=("#100", "interface.md Exit codes, Outcome table", "#36 #8 claude-session"),
+    ),
+    _s(
         "as-cron-fake-crontab",
         "tools",
         "cron install and uninstall against a fake crontab that is first on PATH",
