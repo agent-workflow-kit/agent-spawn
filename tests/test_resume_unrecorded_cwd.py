@@ -13,8 +13,10 @@ import pytest
 
 from tests.conftest import Isolation
 from tests.fakebin.harness import Fakebin
-from tests.launch_support import result_json, script_done_run
+from tests.launch_support import Env, result_json, script_done_run
 from tests.private_tmux import PrivateTmux
+from tests.test_resume_hardening import LAUNCH as PLAIN_LAUNCH
+from tests.test_resume_hardening import refuse_start
 from tests.test_windows import LAUNCH, fail_real_open
 from tests.window_support import WindowEnv
 
@@ -122,3 +124,25 @@ def test_a_recorded_cwd_that_became_a_symlink_is_refused(
     error = json.loads(done.stdout)["error"]
     assert done.returncode == 12 and error["details"]["cause"] == "cwd_changed", done.stdout
     assert resume_starts(fakebin) == []
+
+
+def test_a_sessionless_relaunch_with_a_missing_cwd_is_refused_not_run_in_the_callers(
+    fakebin: Fakebin, isolation_env: Isolation, tmp_path: Path
+) -> None:
+    env = Env(fakebin, isolation_env)
+    repo, other = make_repo(tmp_path, "repo"), make_repo(tmp_path, "other")
+    refuse_start(fakebin)
+    first = env.run(*PLAIN_LAUNCH, "--cwd", str(repo), cwd=other)
+    assert first.returncode == 20, (first.stdout, first.stderr)
+    (agent,) = env.agents()
+    assert agent["csession_id"] is None
+    (repo / ".git").rmdir()
+    repo.rmdir()
+    refuse_start(fakebin)
+    done = env.run("resume", agent["agent_id"], "--json", "--wait", cwd=other)
+    starts = [
+        a for a in fakebin.argvs("claude-session") if a[0] == "start" and "--dry-run" not in a
+    ]
+    error = json.loads(done.stdout)["error"]
+    assert done.returncode == 12 and error["details"]["cause"] == "cwd_missing", done.stdout
+    assert len(starts) == 1  # only the refused first launch reached claude-session
