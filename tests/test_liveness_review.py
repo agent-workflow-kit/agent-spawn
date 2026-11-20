@@ -26,6 +26,7 @@ from agent_spawn.launch import Launch, SignalState
 from agent_spawn.liveness import Checked, Liveness, row_moved
 from agent_spawn.output import CliError
 from agent_spawn.procs import ProcessIdentity
+from agent_spawn.records import append_log
 from agent_spawn.session_backend import SessionBackend
 from agent_spawn.store import Store
 from agent_spawn.worktrees import WtctlBackend
@@ -578,22 +579,21 @@ def test_a_row_that_reads_again_and_breaks_again_inside_the_window_is_not_logged
     assert len(unreadable_log(env)) == 1
 
 
-def test_a_changed_reason_for_the_same_row_is_logged_as_a_new_line(
-    env: Env,
-    unreadable: ProcessIdentity,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+def test_a_different_reason_for_the_same_row_is_logged_as_a_new_line(
+    env: Env, unreadable: ProcessIdentity, capsys: pytest.CaptureFixture[str]
 ) -> None:
     seed(env, supervisor=unreadable)
-    list_agents(capsys)
-    real = procs.is_alive
-
-    def other(identity: ProcessIdentity, *args: Any, **kwargs: Any) -> bool:
-        if identity.pid == UNREADABLE_PID:
-            raise procs.ProcessIdentityError("a different reason")
-        return real(identity, *args, **kwargs)
-
-    monkeypatch.setattr(procs, "is_alive", other)
+    append_log(
+        env.state_dir,
+        "warning",
+        level="warn",
+        agent_id=AGENT,
+        message="liveness_unreadable",
+        details={
+            "cause": "liveness_unreadable",
+            "reason": "the launcher's process entry could not be read",
+        },
+    )
     list_agents(capsys)
     reasons = [line["details"]["reason"] for line in unreadable_log(env)]
     assert len(reasons) == 2 and reasons[0] != reasons[1]
