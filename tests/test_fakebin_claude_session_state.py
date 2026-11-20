@@ -13,6 +13,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -61,7 +62,7 @@ def hanging_exec(
 # --- signals (R1, R13, R18) ------------------------------------------------------------------
 
 
-def send_together(proc: subprocess.Popen[str], numbers: tuple[signal.Signals, ...]) -> None:
+def send_together(proc: subprocess.Popen[Any], numbers: tuple[signal.Signals, ...]) -> None:
     """Deliver ``numbers`` to ``proc`` (the PID this test launched) as one burst.
 
     The process is stopped first (and seen stopped), so every signal is pending when it is
