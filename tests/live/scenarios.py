@@ -363,7 +363,7 @@ _ALL = [
         "as-label-locked",
         "tools",
         "agent-spawn label add on a live window agent while termctl's server lock is held: the "
-        "change lands on the agent and the session, a warning reports locked, reconcile pushes it",
+        "change lands on the agent and the session, a warning reports `termctl label add failed (exit 12)`, reconcile pushes it",
         "claude-session termctl tmux",
         covers=("#114", "interface.md label add, Reconcile label re-sync"),
     ),
@@ -391,7 +391,7 @@ _ALL = [
     _s(
         "as-input-files",
         "tools",
-        "launch --input-file: the stub reads the staged copy (readable, write-denied), agent-spawn's "
+        "launch --input-file: the stub reads the staged copy (readable), agent-spawn's "
         "private copy is deleted, a resume's own input replaces the set, claude-session refuses "
         "an oversized, duplicate, badly named or '-' input",
         "claude-session",

@@ -4,7 +4,7 @@ session, no credentials, no billing).
 
 Human-only flags are driven the way the harness drives every human-only gate: the children have no
 TTY on stdin, so the tests pass an explicit ``--actor human:<user>`` (the one TTY case that a pty
-can provide is its own scenario, ``as-human-yes-tty``).
+can provide is its own scenario, ``tty-human-gates``).
 """
 
 # ruff: noqa: E501  (assertion messages are prose: assumption, then the document line)
@@ -29,7 +29,16 @@ from typing import Any
 import pytest
 
 from .billed import pid_gone, signal_exact
-from .harness import LiveError, World, check, process_token, wait_for
+from .harness import (
+    MINIMUMS,
+    LiveError,
+    World,
+    check,
+    parse_version,
+    process_token,
+    wait_for,
+    write_fake_crontab,
+)
 from .test_agent_spawn_hooks import HUMAN, hook_config, launch_args, write_script
 from .test_agent_spawn_stub import agent_of, show, stub_setup, wait_status
 from .test_claude_session import cs, cs_raw, prepare, start_args
@@ -37,6 +46,14 @@ from .test_wtctl import AUTO, Wt
 from .test_wtctl_hooks import create_args, err_of, wt_config
 
 SC = pytest.mark.live_scenario
+
+#: ``claude-session wait`` of a run that ended by ``stop``: observed with claude-session 0.45.2.
+WAIT_AFTER_STOP_EXIT = 12
+
+
+class KnownDivergence(LiveError):
+    """Raised at the single point where a known, filed product or tool divergence shows. The strict
+    expected failures name it in ``raises=``, so any other failure of the same test is a real one."""
 
 
 def parked_stub_agent(world: World, wt: Any) -> str:
@@ -60,13 +77,22 @@ def test_a_slow_pre_teardown_hook_times_out_and_vetoes_the_teardown(world: World
     timeout veto (Escalation overrides). #113."""
     ran = world.root / "ran.log"
     sleeper = world.root / "sleep.pid"
+    hook_pid = world.root / "hook.pid"
+    # the pids are written first, so a slow machine cannot end the hook before they exist
     slow = write_script(
         world,
         "slow-teardown.sh",
-        f"cat > /dev/null\necho $$ > {world.root / 'hook.pid'}\necho slow >> {ran}\n"
-        f"sleep 120 &\necho $! > {sleeper}\nwait\n",
+        f"echo $$ > {hook_pid}\nsleep 120 &\necho $! > {sleeper}\necho slow >> {ran}\n"
+        "cat > /dev/null\nwait\n",
     )
-    wt = stub_setup(world, "exit 0", agent_spawn_config=hook_config("pre-teardown", (slow, 1)))
+    wt = stub_setup(world, "exit 0", agent_spawn_config=hook_config("pre-teardown", (slow, 3)))
+
+    def pid_of(path: Path) -> int:
+        text = wait_for(
+            lambda: path.exists() and path.read_text().strip(), 20, f"{path.name} to be written"
+        )
+        return int(text)
+
     aid = parked_stub_agent(world, wt)
     before = show(world, aid)["agent"]
 
@@ -79,9 +105,11 @@ def test_a_slow_pre_teardown_hook_times_out_and_vetoes_the_teardown(world: World
         "interface.md Hooks Execution (a timeout vetoes), Exit codes (11 a pre-teardown hook vetoed)",
         error,
     )
-    for name in ("hook.pid", "sleep.pid"):
-        pid = int((world.root / name).read_text())
-        wait_for(lambda pid=pid: pid_gone(pid), 20, f"the timed-out hook's {name} process to end")
+    for path in (hook_pid, sleeper):
+        pid = pid_of(path)
+        wait_for(
+            lambda pid=pid: pid_gone(pid), 20, f"the timed-out hook's {path.name} process to end"
+        )
     after = show(world, aid)["agent"]
     check(
         after["status"] == "parked" and after["teardown_step"] is None,
@@ -90,10 +118,10 @@ def test_a_slow_pre_teardown_hook_times_out_and_vetoes_the_teardown(world: World
         {k: after[k] for k in ("status", "teardown_step")},
     )
     check(
-        after["worktree"] == before["worktree"]
-        and after["csession_id"] == before["csession_id"]
+        after["csession_id"] == before["csession_id"]
         and after["needs_attention"] == before["needs_attention"],
-        "nothing after the hook ran: the worktree, the session and the attention are unchanged",
+        "nothing after the hook ran: the agent's session and attention are unchanged "
+        "(the launch uses --worktree none, so no worktree is checked)",
         "interface.md Teardown order (the hook is step 3, before any removal)",
         {"before": before, "after": after},
     )
@@ -111,11 +139,11 @@ def test_a_slow_pre_teardown_hook_times_out_and_vetoes_the_teardown(world: World
         "interface.md Escalation overrides (a veto still vetoes)",
         (again["error"]["code"], ran.read_text()),
     )
-    for name in ("hook.pid", "sleep.pid"):
+    for path in (hook_pid, sleeper):
         wait_for(
-            lambda name=name: pid_gone(int((world.root / name).read_text())),
+            lambda path=path: pid_gone(pid_of(path)),
             20,
-            f"the second run's {name} process to end",
+            f"the second run's {path.name} process to end",
         )
 
     # a hook that finishes inside its timeout lets the teardown go on
@@ -275,8 +303,8 @@ def test_termctl_open_escalation_is_overridden_by_a_human_resume(world: World) -
 @SC("as-termctl-override-escalation")
 @pytest.mark.xfail(
     strict=True,
-    raises=LiveError,
-    reason="product bug, reported with #112: resuming a launch whose pending run was canceled "
+    raises=KnownDivergence,
+    reason="product bug agent-spawn#119: resuming a launch whose pending run was canceled "
     "(termctl escalated before the session was adopted) runs claude-session start --resume in the "
     "caller's cwd, not the agent's recorded cwd; from a directory outside the repository "
     "claude-session refuses it (exit 12, end reason git_dir_changed)",
@@ -286,15 +314,27 @@ def test_the_override_resume_from_another_cwd(world: World) -> None:
     human override of a termctl escalation must work wherever the human runs ``resume``. It does
     not from a directory outside the repository (the harness's default cwd): the canceled pending
     run recorded no cwd, so claude-session resumes in the caller's cwd and refuses the changed git
-    directory. strict: when the product is fixed this test starts passing and must be
+    directory (agent-spawn#119). The test raises ``KnownDivergence`` only at that point (the
+    escalated launch exited 13, the resume exited 12 with ``git_dir_changed``); anything else is a
+    real failure. strict: when the product is fixed this test starts passing and must be
     promoted to a plain test."""
     escalate = write_script(world, "pre-open-escalate.sh", "cat > /dev/null; exit 13\n")
     wt = stub_setup(world, "while :; do sleep 0.2; done")
     world.write_config("termctl", hook_config("pre-open", (escalate, None)))
     escalated = world.spawn_json(*window_launch_args(wt), ok=(13,), timeout=120)
     eid = escalated["error"]["agent_id"]
-    world.write_config("termctl", hook_config("pre-open", (escalate, None)))
-    world.spawn_json("resume", eid, "--override-escalation", *HUMAN, timeout=120)
+    resumed = world.agent_spawn(
+        "resume", eid, "--override-escalation", *HUMAN, "--json", timeout=120
+    )
+    world.observe(
+        "agent-spawn.termctl-escalation.resume-other-cwd",
+        (resumed.returncode, resumed.stdout[-600:]),
+    )
+    if resumed.returncode == 12 and "git_dir_changed" in resumed.stdout + resumed.stderr:
+        raise KnownDivergence(
+            "resume --override-escalation from another cwd exits 12 git_dir_changed (agent-spawn#119): "
+            + resumed.stdout[-300:]
+        )
     state = wait_status(world, eid, "live")
     world.track(int(state["supervisor"]["pid"]), tree=True)
 
@@ -367,9 +407,7 @@ def test_termctl_locked_is_provoked_with_the_servers_lock_held(world: World) -> 
         )
         labels = [p["labels"] for p in world.json_tool("termctl", "list")["panes"]]
         check(
-            labels == [["a=b", "k=v"]]
-            or labels == [["k=v", "a=b"]]
-            or sorted(labels[0]) == ["a=b", "k=v"],
+            len(labels) == 1 and sorted(labels[0]) == ["a=b", "k=v"],
             "the refused label change changed nothing on the pane",
             "termctl interface.md Locking (the lock guards the read-modify-write)",
             labels,
@@ -457,8 +495,8 @@ def test_agent_spawn_label_add_reports_a_locked_pane_and_resyncs_later(world: Wo
         and any(
             "termctl label add failed (exit 12)" in w and "queued" in w for w in changed["warnings"]
         ),
-        "label add with the pane's server lock held succeeds on the agent and warns that termctl's "
-        "label add failed with exit 12 (locked) and the change is queued",
+        "label add with the pane's server lock held succeeds on the agent and warns "
+        "'termctl label add failed (exit 12)' and that the change is queued",
         "interface.md label add (a mirror failure is a warning and queues the change); termctl Locking",
         changed,
     )
@@ -714,8 +752,23 @@ class Background:
             )
         world.track(self.child.pid)
 
+    def kill(self) -> None:
+        """End the group this class created (the child is its leader), if it still runs."""
+        if self.child.poll() is None:
+            os.killpg(self.child.pid, signal.SIGKILL)
+            try:
+                self.child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
     def finish(self, timeout: float = 60) -> tuple[int, str]:
-        code = self.child.wait(timeout=timeout)
+        try:
+            code = self.child.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.kill()
+            raise LiveError(
+                f"the background command did not finish within {timeout:.0f}s"
+            ) from None
         return code, self.out.read_text()
 
 
@@ -825,11 +878,18 @@ def test_a_concurrent_create_and_a_command_on_a_creating_record_are_busy(world: 
                 "wtctl interface.md Record states (A live creator), Locking",
                 (held.returncode, round(waited, 1), held.stdout[-300:]),
             )
+        still = [r for r in wt.ok("list")["records"] if r["id"] == rid]
         check(
-            wt.ok("show", rid) is not None and wt.ok("list", "--repo", wt.repo.repo_id) is not None,
-            "the busy commands changed nothing (reads still work)",
-            "wtctl interface.md Locking",
+            len(still) == 1
+            and still[0]["state"] == "creating"
+            and still[0]["holders"] == ["ag-c1"],
+            "the busy remove and forget changed nothing: the record is still creating with the creator's holder",
+            "wtctl interface.md Locking, Record states (A live creator)",
+            still,
         )
+    except BaseException:
+        first.kill()
+        raise
     finally:
         hook_go.write_text("go")
         step_go.write_text("go")
@@ -861,12 +921,22 @@ def test_a_remove_that_leaves_an_entry_is_partial_and_teardown_stays_sticky(worl
     completes). The failure is made without git or root: the worktree's parent directory loses its
     write bit, so wtctl deletes the tree but cannot remove the directory itself. #116 (``remove``
     exit 1 ``partial``); the killed-mid-delete half is not covered (see docs/live-testing.md)."""
+    if os.geteuid() == 0:
+        pytest.skip(
+            "root ignores a directory's missing write bit: the partial remove cannot be provoked"
+        )
     wt = stub_setup(world, "exit 0")
     launched = world.spawn_json(*new_worktree_launch(wt), ok=(14,))
     aid = agent_of(launched)["agent_id"]
     record = agent_of(launched)["worktree"]
     path = Path(record["path"])
     parent = path.parent
+    check(
+        parent.resolve().is_relative_to(world.root.resolve()),
+        "the directory to make unwritable lies inside the private world",
+        "docs/live-testing.md Isolation",
+        parent,
+    )
     parent.chmod(0o555)
     try:
         first = world.spawn_json("teardown", aid, ok=(12,))
@@ -961,14 +1031,18 @@ def test_input_files_are_copied_staged_carried_and_refused_by_claude_session(wor
     lines = seen.read_text().splitlines()
     world.observe("agent-spawn.input-file.seen", lines)
     check(
-        len(lines) == 1
-        and lines[0].endswith("/inputs/1/note.txt " + lines[0].split()[1] + " first input")
+        len(lines) == 1 and len(lines[0].split()) == 4,
+        "the stub listed exactly one input: path, mode and the two words of its content",
+        "claude-session interface.md Launch flags (--input-file)",
+        lines,
+    )
+    check(
+        lines[0].endswith("/inputs/1/note.txt " + lines[0].split()[1] + " first input")
         and int(lines[0].split()[1], 8) & 0o400 != 0
         and int(lines[0].split()[1], 8) & 0o077 == 0,
         "the run could read inputs/1/note.txt with the original content from an owner-only file "
-        "(mode 0600: the 'write-denied' of the doc is the sandbox's deny rule for isolated runs, "
-        "not a read-only file mode, and is not checked here: the host has no bwrap)",
-        "claude-session interface.md Launch flags (--input-file: copied, readable, write-denied)",
+        "(mode 0600; the sandbox's write deny for isolated runs is not checked here: the host has no bwrap)",
+        "claude-session interface.md Launch flags (--input-file: copied, readable)",
         lines,
     )
     status = world.json_tool("claude-session", "status", csid)
@@ -1007,6 +1081,9 @@ def test_input_files_are_copied_staged_carried_and_refused_by_claude_session(wor
 
     # refusals: exit 2, nothing allocated (direct claude-session)
     work = prepare(world, "lost_grace: 600s\ninput_max_bytes: 16\n")
+    # the default prompt file is larger than 16 bytes: shrink it, or every start would be refused
+    # for the prompt and the refusals below would prove nothing about --input-file
+    (world.root / "prompt.md").write_text("ok\n")
     sessions = len(world.json_tool("claude-session", "list")["sessions"])
     big = fixtures / "big.txt"
     big.write_text("x" * 17)
@@ -1015,25 +1092,30 @@ def test_input_files_are_copied_staged_carried_and_refused_by_claude_session(wor
     (nested / "note.txt").write_text("dup\n")
     bad_name = fixtures / "bad name.txt"
     bad_name.write_text("x\n")
-    for what, extra in (
-        ("an input over input_max_bytes", ("--input-file", str(big))),
+    for what, extra, keyword in (
+        ("an input over input_max_bytes", ("--input-file", str(big)), "input_max_bytes"),
         (
             "duplicate input basenames",
             ("--input-file", str(note), "--input-file", str(nested / "note.txt")),
+            "duplicate",
         ),
         (
             "an input whose basename is outside the artifact-name grammar",
             ("--input-file", str(bad_name)),
+            "must match",
         ),
-        ("--input-file -", ("--input-file", "-")),
+        ("--input-file -", ("--input-file", "-"), "not supported"),
     ):
         done = cs_raw(world, *start_args(world, work, "agent=ag-input", *extra))
         world.observe(
             f"claude-session.input-file.refused.{what}", (done.returncode, done.stdout[-200:])
         )
         check(
-            done.returncode == 2 and json.loads(done.stdout)["error"]["code"] == "usage",
-            f"{what} exits 2 usage",
+            done.returncode == 2
+            and json.loads(done.stdout)["error"]["code"] == "usage"
+            and keyword in json.loads(done.stdout)["error"]["message"]
+            and "--prompt-file" not in json.loads(done.stdout)["error"]["message"],
+            f"{what} exits 2 usage with a message naming the input problem ({keyword!r}), not the prompt",
             "claude-session interface.md Exit codes (2: input-file names, --input-file -, files over input_max_bytes)",
             (done.returncode, done.stdout[-300:]),
         )
@@ -1042,6 +1124,18 @@ def test_input_files_are_copied_staged_carried_and_refused_by_claude_session(wor
         "no session was allocated by the refused starts",
         "claude-session interface.md Launch order (usage errors allocate nothing)",
     )
+    # positive control: the same work dir and prompt with a small input starts, so the refusals
+    # above come from the inputs and not from the setup
+    small = fixtures / "small.txt"
+    small.write_text("ok\n")
+    control = cs_raw(world, *start_args(world, work, "agent=ag-input", "--input-file", str(small)))
+    check(
+        control.returncode == 0,
+        "the same start with a small, well-named input succeeds (positive control)",
+        "claude-session interface.md Launch flags (--input-file)",
+        (control.returncode, control.stdout[-300:]),
+    )
+    world.note_session(json.loads(control.stdout)["csession_id"])
 
 
 @SC("cs-wait-interval")
@@ -1081,23 +1175,42 @@ def test_wait_has_no_interval_flag_and_cron_install_interval_is_one_to_fifty_nin
     begun = time.monotonic()
     done = cs_raw(world, "wait", csid, "--timeout", "30s")
     world.observe(
-        "claude-session.wait.after-stop", (done.returncode, round(time.monotonic() - begun, 2))
+        "claude-session.wait.after-stop",
+        (done.returncode, round(time.monotonic() - begun, 2), done.stdout[-400:]),
     )
     check(
-        done.returncode != 22 and time.monotonic() - begun < 20,
-        "wait of an ended run returns at once with its outcome",
-        "claude-session interface.md wait",
+        done.returncode == WAIT_AFTER_STOP_EXIT
+        and time.monotonic() - begun < 20
+        and json.loads(done.stdout)["outcome"] == "not-started"
+        and json.loads(done.stdout)["run_exit_code"] == WAIT_AFTER_STOP_EXIT,
+        "wait of a run that ended by stop returns at once with exit 12 and the run's outcome not-started",
+        "claude-session interface.md wait (exit code of the run's outcome)",
         (done.returncode, done.stdout[-300:]),
     )
     for interval in ("0", "60", "abc"):
         bad = world.tool(
             "claude-session", "cron", "install", "--interval", interval, "--dry-run", "--json"
         )
+        world.observe(
+            f"claude-session.cron.interval.{interval}", (bad.returncode, bad.stdout[-200:])
+        )
         check(
-            bad.returncode == 2,
-            f"cron install --interval {interval} is a usage error",
+            bad.returncode == 2 and "--interval" in bad.stdout,
+            f"cron install --interval {interval} is a usage error whose message names --interval (and, for 0 and 60, the 1 to 59 range)",
             "claude-session interface.md cron install (--interval 1 to 59, else exit 2)",
             (bad.returncode, bad.stdout[-200:]),
+        )
+    # the bounds are accepted (against a fake crontab: a valid interval does read the table, the
+    # tripwire stub would exit 70)
+    write_fake_crontab(world.bin / "crontab", world.crontab_table)
+    for interval in ("1", "59"):
+        good = world.tool("claude-session", "cron", "install", "--interval", interval, "--json")
+        table = world.crontab_table.read_text() if world.crontab_table.exists() else ""
+        check(
+            good.returncode == 0 and f"*/{interval} * * * * " in table,
+            f"cron install --interval {interval} is accepted and the job runs every {interval} minute(s)",
+            "claude-session interface.md cron install (--interval 1 to 59)",
+            (good.returncode, good.stdout[-300:], table[-300:]),
         )
 
 
@@ -1114,31 +1227,43 @@ def run_on_tty(
     terminal's master side up front (the line discipline holds it until the program reads). stdout
     and stderr stay pipes, so ``--json`` output is captured. On a timeout exactly the group this
     call created is killed."""
+    env = world.env()
     master, slave = pty.openpty()
-    child = subprocess.Popen(
-        list(argv),
-        env=world.env(),
-        cwd=cwd if cwd is not None else world.root / "repos",
-        stdin=slave,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    os.close(slave)
     try:
-        if typed:
-            os.write(master, typed.encode())
-        out, err = child.communicate(timeout=world.timeout(timeout))
-    except subprocess.TimeoutExpired:
-        os.killpg(child.pid, signal.SIGKILL)
-        child.communicate()
-        raise LiveError(f"timed out after {timeout:.0f}s on a tty: {' '.join(argv[:4])}") from None
-    except BaseException:
-        if child.poll() is None:
+        try:
+            child = subprocess.Popen(
+                list(argv),
+                env=env,
+                cwd=cwd if cwd is not None else world.root / "repos",
+                stdin=slave,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+        finally:
+            os.close(slave)
+        try:
+            if typed:
+                os.write(master, typed.encode())
+            out, err = child.communicate(timeout=world.timeout(timeout))
+        except subprocess.TimeoutExpired:
             os.killpg(child.pid, signal.SIGKILL)
-        child.wait()
-        raise
+            try:
+                child.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                for pipe in (child.stdout, child.stderr):
+                    if pipe is not None:
+                        pipe.close()
+                child.wait(timeout=5)
+            raise LiveError(
+                f"timed out after {timeout:.0f}s on a tty: {' '.join(argv[:4])}"
+            ) from None
+        except BaseException:
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait(timeout=5)
+            raise
     finally:
         os.close(master)
     return subprocess.CompletedProcess(list(argv), child.returncode, out, err)
@@ -1211,6 +1336,7 @@ def test_human_gates_and_yes_at_a_real_terminal(world: World) -> None:
         world, [*spawn, *launch_args(stub, "--override-escalation", "--wait")], timeout=120
     )
     world.observe("agent-spawn.tty.override", (ran.returncode, ran.stdout[-300:]))
+    parked_id = json.loads(ran.stdout)["agent"]["agent_id"]
     body = json.loads(payload.read_text())
     check(
         ran.returncode == 14
@@ -1220,15 +1346,26 @@ def test_human_gates_and_yes_at_a_real_terminal(world: World) -> None:
         "interface.md Global flags (Human-only flags; default actor human:<me.name> when stdin is a TTY), Escalation overrides",
         (ran.returncode, {k: body.get(k) for k in ("override_escalation", "actor")}),
     )
+    # the cli gate itself: teardown --force is human-only, an explicit auto actor is refused at a TTY
+    gated = run_on_tty(world, [*spawn, "teardown", parked_id, "--force", "--actor", "auto:bot"])
+    world.observe("agent-spawn.tty.teardown-force-auto", (gated.returncode, gated.stdout[-300:]))
+    check(
+        gated.returncode == 2
+        and json.loads(gated.stdout)["error"]["code"] == "usage"
+        and show(world, parked_id)["agent"]["status"] == "parked",
+        "teardown --force with --actor auto:bot is refused at a TTY (exit 2 usage) and changes nothing",
+        "interface.md Global flags (Human-only flags: an explicit non-human --actor is refused even at a TTY)",
+        (gated.returncode, gated.stdout[-300:]),
+    )
 
 
 @SC("wtctl-baseline-no-classes")
 @pytest.mark.xfail(
     strict=True,
-    raises=LiveError,
-    reason="product gap, reported with #115/#116: wtctl 1.0.0 does not audit baseline accept "
-    "(its source carries TODO(#5) at commands/baseline_accept.py) although interface.md Audit and "
-    "log lists the baseline_accept action",
+    raises=KnownDivergence,
+    reason="wtctl gap, wtctl#5 (closed; the TODO(#5) in baseline_accept.py remains; no open issue): "
+    "wtctl 1.0.0 does not audit baseline accept although interface.md Audit and log lists the "
+    "baseline_accept action",
 )
 def test_baseline_accept_is_audited(world: World) -> None:
     """wtctl interface.md Audit and log (``audit.jsonl`` actions: ``baseline_accept`` with the old
@@ -1248,6 +1385,10 @@ def test_baseline_accept_is_audited(world: World) -> None:
         done.stdout[-300:],
     )
     records = json.loads(wt.run("export", "--audit").stdout)
+    if "baseline_accept" not in [r["action"] for r in records]:
+        raise KnownDivergence(
+            f"the accept succeeded but the audit records lack baseline_accept (wtctl#5): {records}"
+        )
     check(
         [r["action"] for r in records] == ["baseline_accept"]
         and records[0]["actor"] == "human:tester",
@@ -1310,6 +1451,7 @@ def test_a_late_reconcile_after_a_window_close_park_writes_no_second_post_park(
     wait_for(lambda: runs() >= 1, 15, "post-park to run for the window-close park")
     world.spawn_json("reconcile", ok=(0, 12))
     world.spawn_json("reconcile", ok=(0, 12))
+    time.sleep(3)  # bounded settle: a second delivery would be asynchronous
     check(
         runs() == 1,
         "post-park ran exactly once for the window-close park; late reconciles delivered no second one",
@@ -1359,6 +1501,7 @@ def test_a_late_reconcile_after_a_window_close_park_writes_no_second_post_park(
     )
     wait_for(lambda: runs() >= before + 1, 15, "post-park to run for the lost park")
     world.spawn_json("reconcile", ok=(0, 12))
+    time.sleep(3)  # bounded settle: a second delivery would be asynchronous
     check(
         runs() == before + 1,
         "post-park ran once for the lost park; a late reconcile delivered no second one",
@@ -1372,12 +1515,23 @@ def test_a_late_reconcile_after_a_window_close_park_writes_no_second_post_park(
 def test_wtctl_prints_its_release_version(world: World) -> None:
     """wtctl interface.md Global flags (``--version`` prints ``wtctl <version>``). The 0.32.x
     builds printed the hard-coded ``0.0.0`` placeholder, so the harness recorded the version as
-    unknown; a released 1.0.0 prints its real version (#116). This test is for released installs:
-    it fails on a build that prints the placeholder, and the harness's own reading of the version
-    (``tools-versions``) must agree with it."""
+    unknown; a released 1.0.0 prints its real version (#116). This test is for released installs: it
+    skips (never fails, as docs/live-testing.md says of unknown versions) on a build that prints
+    ``0.0.0`` or is below the minimum, fails when a version of 1.0.0 or later prints another line,
+    and the harness's own reading of the version (``tools-versions``) must agree with it."""
     done = world.tool("wtctl", "--version")
-    found = re.fullmatch(r"wtctl (\d+)\.(\d+)\.(\d+)\S*", done.stdout.strip())
     world.observe("wtctl.version", done.stdout.strip())
+    have = parse_version(done.stdout)
+    minimum = parse_version(MINIMUMS["wtctl"])
+    assert minimum is not None
+    if have is None or have == (0, 0, 0) or have < minimum:
+        pytest.skip(
+            f"wtctl prints {done.stdout.strip()!r}: an unknown or pre-release version "
+            "(0.0.0 or below the minimum); this test is for released installs"
+        )
+    found = re.fullmatch(r"wtctl (\d+)\.(\d+)\.(\d+)\S*", done.stdout.strip())
+    if have < (1, 0, 0) and (done.returncode != 0 or found is None):
+        pytest.skip(f"wtctl {have} predates the 1.0.0 version line: {done.stdout.strip()!r}")
     check(
         done.returncode == 0 and found is not None,
         "wtctl --version prints 'wtctl <major>.<minor>.<patch>'",
@@ -1386,12 +1540,6 @@ def test_wtctl_prints_its_release_version(world: World) -> None:
     )
     assert found is not None
     parsed = tuple(int(g) for g in found.groups())
-    check(
-        parsed != (0, 0, 0),
-        "wtctl --version is not the 0.0.0 placeholder of the 0.32.x builds (run the suite against a released wtctl)",
-        "docs/live-testing.md Results (wtctl 0.32.x printed 0.0.0); wtctl 1.0.0 prints wtctl 1.0.0",
-        done.stdout.strip(),
-    )
     tool = world.tools["wtctl"]
     check(
         tool is not None and tool.version == parsed,
