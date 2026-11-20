@@ -17,8 +17,9 @@ import json
 import os
 import signal
 import sqlite3
+import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,8 @@ from .billed import pid_gone
 from .harness import LiveError, World, check, process_token, wait_for
 from .test_agent_spawn_hooks import HUMAN, hook_config, launch_args, write_script
 from .test_agent_spawn_stub import agent_of, show, stub_setup, wait_status
-from .test_wtctl import Wt
+from .test_wtctl import AUTO, Wt
+from .test_wtctl_hooks import create_args, err_of, wt_config
 
 SC = pytest.mark.live_scenario
 
@@ -657,3 +659,240 @@ def new_worktree_launch(wt: Any) -> list[str]:
         "launch", "--mode", "headless", "--prompt", "reply ok", "--model", "haiku",
         "--repo", wt.repo.repo_id, "--worktree", "new", "--wait",
     ]  # fmt: skip
+
+
+class Background:
+    """A child the test starts and waits for later (a ``wtctl create`` held at a barrier). Its pid
+    is tracked so the world's teardown ends it (exact pid plus start token) even if a check
+    fails; output goes to files, never to a pipe nobody reads."""
+
+    def __init__(self, world: World, argv: Sequence[str]) -> None:
+        self.out = world.root / f"bg-{len(list(world.root.glob('bg-*.out')))}.out"
+        self.err = self.out.with_suffix(".err")
+        with self.out.open("w") as out, self.err.open("w") as err:
+            self.child = subprocess.Popen(
+                list(argv),
+                env=world.env(),
+                cwd=world.root / "repos",
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=err,
+                start_new_session=True,
+            )
+        world.track(self.child.pid)
+
+    def finish(self, timeout: float = 60) -> tuple[int, str]:
+        code = self.child.wait(timeout=timeout)
+        return code, self.out.read_text()
+
+
+def barrier_script(world: World, name: str, started: Path, go: Path, then: str = "") -> Path:
+    """A hook or bootstrap step that announces itself and waits (bounded, 60 s) for ``go``."""
+    return write_script(
+        world,
+        name,
+        f"cat > /dev/null 2>&1 < /dev/null\necho x >> {started}\ni=0\n"
+        f"while [ ! -e {go} ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done\n{then}",
+    )
+
+
+@SC("wtctl-create-busy")
+def test_a_concurrent_create_and_a_command_on_a_creating_record_are_busy(world: World) -> None:
+    """wtctl interface.md Create order (step 4: the per-clone lease is held through step 13, so a
+    concurrent ``create`` exits 12 ``busy`` having allocated no record id; step 12: the record is
+    ``creating`` under its record lease through step 16, and the clone lease is released before
+    bootstrap) and Locking (a command waits ``lease_wait`` for a held lease, then 12 ``busy``),
+    States (``A live creator``: ``remove`` and ``forget`` on a ``creating`` record wait, then
+    ``busy``). The creator is a real ``wtctl create`` held at a barrier: first inside a
+    ``pre-create`` hook (clone lease held), then inside a bootstrap step (record ``creating``,
+    clone lease released). #116 (``create`` ``busy``, the ``creating`` state)."""
+    wt = Wt(world)
+    hook_started, hook_go = world.root / "hook.started", world.root / "hook.go"
+    step_started, step_go = world.root / "step.started", world.root / "step.go"
+    hook = barrier_script(world, "barrier-hook.sh", hook_started, hook_go)
+    step = barrier_script(world, "barrier-step.sh", step_started, step_go)
+    wt_config(world, wt, hooks={"pre-create": [(hook, None)]}, steps=[step])
+    config = world.config_home / "wtctl" / "config.yaml"
+    config.write_text(config.read_text() + "lease_wait: 2s\n")
+
+    first = Background(
+        world,
+        [str(world.bin / "wtctl"), "--json", "create", "--repo", wt.repo.repo_id, "--name", "c1",
+         "--holder", "ag-c1", "--actor", "auto:agent-spawn"],
+    )  # fmt: skip
+    try:
+        wait_for(hook_started.exists, 30, "the first create to reach its pre-create hook")
+        check(
+            wt.ok("list")["records"] == [],
+            "no record exists while the creator is still in its pre-create hook (step 11 precedes step 12)",
+            "wtctl interface.md Create order steps 11, 12",
+        )
+
+        # 1. a concurrent create waits lease_wait for the per-clone lease and exits 12 busy
+        started = time.monotonic()
+        busy = wt.run(*create_args(wt, "c2"), f"--actor={AUTO}", timeout=60)
+        waited = time.monotonic() - started
+        world.observe("wtctl.create.busy", (busy.returncode, round(waited, 1), busy.stdout))
+        check(
+            busy.returncode == 12 and err_of(busy)["code"] == "busy",
+            "a create while another create holds the clone lease exits 12 with error.code busy",
+            "wtctl interface.md Create order step 4, Exit codes (busy is 12)",
+            (busy.returncode, busy.stdout[-300:]),
+        )
+        check(
+            2.0 <= waited < 20.0,
+            "the busy create waited lease_wait (2 s) first",
+            "wtctl interface.md Locking (a command waits up to lease_wait)",
+            round(waited, 2),
+        )
+        check(
+            hook_started.read_text().count("x") == 1 and wt.ok("list")["records"] == [],
+            "the busy create ran no hook and left no record",
+            "wtctl interface.md Create order step 4 (busy allocated no record id)",
+        )
+
+        # 2. let the creator on: it is now in its bootstrap step, a creating record
+        hook_go.write_text("go")
+        wait_for(step_started.exists, 30, "the first create to reach its bootstrap step")
+        records = wt.ok("list")["records"]
+        world.observe("wtctl.creating.record", records)
+        check(
+            [r["state"] for r in records] == ["creating"] and records[0]["holders"] == ["ag-c1"],
+            "while its bootstrap runs the record is creating and holds the creator's holder",
+            "wtctl interface.md Create order step 12, Record states (creating)",
+            records,
+        )
+        rid = records[0]["id"]
+        shown = wt.ok("show", rid)
+        check(
+            (shown.get("record") or shown)["state"] == "creating",
+            "show reports the creating state too",
+            "wtctl interface.md Record states",
+            shown,
+        )
+        # the clone lease is free again: another create goes through (without bootstrap)
+        other = wt.ok(*create_args(wt, "c3"), "--no-bootstrap", f"--actor={AUTO}")
+        check(
+            other["record"]["state"] == "active",
+            "a create without bootstrap succeeds while the first create is bootstrapping (the clone lease was released before bootstrap)",
+            "wtctl interface.md Create order step 4 (held through step 13, released before bootstrap)",
+            other["record"],
+        )
+        # commands on the creating record wait for its lease and then are busy
+        for args in (
+            ("remove", rid, "--yes", "--actor", "human:tester"),
+            ("forget", rid, "--actor", "human:tester"),
+        ):
+            started = time.monotonic()
+            held = wt.run(*args, timeout=60)
+            waited = time.monotonic() - started
+            check(
+                held.returncode == 12 and err_of(held)["code"] == "busy" and waited >= 2.0,
+                f"{args[0]} of a creating record whose creator is alive waits lease_wait then exits 12 busy",
+                "wtctl interface.md Record states (A live creator), Locking",
+                (held.returncode, round(waited, 1), held.stdout[-300:]),
+            )
+        check(
+            wt.ok("show", rid) is not None and wt.ok("list", "--repo", wt.repo.repo_id) is not None,
+            "the busy commands changed nothing (reads still work)",
+            "wtctl interface.md Locking",
+        )
+    finally:
+        hook_go.write_text("go")
+        step_go.write_text("go")
+    code, out = first.finish(timeout=60)
+    created = json.loads(out)
+    check(
+        code == 0 and created["record"]["state"] == "active" and created["record"]["id"] == rid,
+        "the held create finishes normally once released: the same record, now active",
+        "wtctl interface.md Create order steps 14-16",
+        (code, out[-300:]),
+    )
+    later = wt.run(*create_args(wt, "c2"), f"--actor={AUTO}", "--no-bootstrap")
+    check(
+        later.returncode == 0,
+        "the create that was busy succeeds once the lease is free (no stale lease)",
+        "wtctl interface.md Locking",
+        later.stdout[-300:],
+    )
+
+
+@SC("as-teardown-partial")
+def test_a_remove_that_leaves_an_entry_is_partial_and_teardown_stays_sticky(world: World) -> None:
+    """wtctl interface.md Remove order step 9 (Failure: an entry that cannot be deleted leaves the
+    record ``partial`` and the command exits 1, ``error.code: partial``, ``details.remaining_path``)
+    and agent-spawn interface.md Teardown order step 4 (partial and unknown outcomes are sticky:
+    wtctl exit 1 ``partial`` is exit 12 ``partial``, the agent stays ``tearing_down`` at
+    ``worktree_partial``, a retry over a ``partial`` record stays there, ``reconcile`` reports
+    ``teardown_incomplete``, a human's ``wtctl remove`` finishes the record and the retry
+    completes). The failure is made without git or root: the worktree's parent directory loses its
+    write bit, so wtctl deletes the tree but cannot remove the directory itself. #116 (``remove``
+    exit 1 ``partial``); the killed-mid-delete half is not covered (see docs/live-testing.md)."""
+    wt = stub_setup(world, "exit 0")
+    launched = world.spawn_json(*new_worktree_launch(wt), ok=(14,))
+    aid = agent_of(launched)["agent_id"]
+    record = agent_of(launched)["worktree"]
+    path = Path(record["path"])
+    parent = path.parent
+    parent.chmod(0o555)
+    try:
+        first = world.spawn_json("teardown", aid, ok=(12,))
+        world.observe("agent-spawn.teardown.partial", first["error"])
+        error = first["error"]
+        check(
+            error["code"] == "partial"
+            and error["tool"] == "wtctl"
+            and error["lower_code"] == "partial"
+            and error["lower_error"]["details"]["remaining_path"] == str(path),
+            "wtctl exit 1 partial is passed through as agent-spawn exit 12 partial, tool wtctl, naming the remaining path",
+            "interface.md Teardown order step 4 (Partial and unknown outcomes are sticky)",
+            error,
+        )
+        stuck = show(world, aid)["agent"]
+        check(
+            stuck["status"] == "tearing_down" and stuck["teardown_step"] == "worktree_partial",
+            "the agent stays tearing_down with the marker worktree_partial",
+            "interface.md Teardown order step 4; Lifecycle (never back to parked over such a record)",
+            {k: stuck[k] for k in ("status", "teardown_step")},
+        )
+        check(
+            wt.ok("show", record["record_id"])["state"] == "partial",
+            "wtctl shows the record partial",
+            "wtctl interface.md Remove order step 9 (Failure)",
+        )
+        # a retry over the still-partial record stays put (it never calls remove again)
+        second = world.spawn_json("teardown", aid, ok=(12,))
+        check(
+            second["error"]["code"] == "partial",
+            "a retry while the record is still partial exits 12 partial again",
+            "interface.md Teardown order step 4 (state partial -> the agent stays tearing_down, exit 12 partial)",
+            second["error"],
+        )
+        reconciled = world.spawn_json("reconcile", ok=(0, 12))
+        incomplete = [c for c in reconciled["changes"] if c["kind"] == "teardown_incomplete"]
+        world.observe("agent-spawn.reconcile.teardown-incomplete", incomplete)
+        check(
+            len(incomplete) == 1
+            and incomplete[0]["details"]["teardown_step"] == "worktree_partial"
+            and incomplete[0]["details"]["partial_record"] == record["record_id"],
+            "reconcile reports teardown_incomplete with the worktree_partial step and the record",
+            "interface.md Reconcile (teardown_incomplete has details.teardown_step and details.partial_record)",
+            reconciled["changes"],
+        )
+    finally:
+        parent.chmod(0o755)
+    # a human finishes the partial record; the retried teardown then completes
+    finished = wt.run("remove", record["record_id"], "--yes", "--actor", "human:tester")
+    check(
+        finished.returncode == 0,
+        "a human wtctl remove finishes the partial record",
+        "wtctl interface.md Partial records (human-only)",
+        (finished.returncode, finished.stdout[-300:]),
+    )
+    torn = world.spawn_json("teardown", aid)
+    check(
+        show(world, aid)["agent"]["status"] == "torn_down" and torn["session_forgotten"] is True,
+        "after the human finished the record the retried teardown completes: torn_down",
+        "interface.md Teardown order step 4 (a tombstone completes the record and teardown continues)",
+        torn,
+    )

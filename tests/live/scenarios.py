@@ -182,6 +182,15 @@ _ALL = [
         covers=("#115", "#36 #25", "wtctl interface.md Baseline check, Baseline accept"),
     ),
     _s(
+        "wtctl-create-busy",
+        "tools",
+        "a create held in a pre-create hook: a concurrent create is busy (12) after lease_wait; held "
+        "in bootstrap: the record is creating, remove and forget are busy, a create without "
+        "bootstrap goes through",
+        "wtctl git",
+        covers=("#116", "wtctl interface.md Create order, Locking"),
+    ),
+    _s(
         "wtctl-collisions-reuse",
         "tools",
         "explicit --name collisions per case, reuse by the same holder",
@@ -349,6 +358,15 @@ _ALL = [
         "of the agent's worktree record",
         "claude-session wtctl git",
         covers=("#115", "interface.md show, Teardown order step 4"),
+    ),
+    _s(
+        "as-teardown-partial",
+        "tools",
+        "wtctl remove exits 1 partial (the worktree's parent loses its write bit): teardown is "
+        "exit 12 partial and sticky, reconcile reports teardown_incomplete, a human remove then a "
+        "retry completes",
+        "claude-session wtctl git",
+        covers=("#116", "wtctl interface.md Remove order step 9", "interface.md Teardown order step 4"),
     ),
     _s(
         "as-cron-fake-crontab",
