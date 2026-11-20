@@ -5,7 +5,7 @@ Code (`claude --model haiku`), tmux, claude-session, termctl, wtctl, git and, wh
 jobsctl. It re-checks every relied-on third-party behavior that the fakes in `tests/fakebin/`
 only assume ([FIDELITY.md](../tests/fakebin/FIDELITY.md)) and that the design records as
 "assumed, check live" ([design.md](design.md), Live verification). It is **opt-in**, never part
-of `make verify` and never run in CI. The suite has passed on Linux against the real tools (see [Results](#results)); what it does not cover is tracked in issues #97, #99, #100 and #37.
+of `make verify` and never run in CI. The suite has passed on Linux against the real tools (see [Results](#results)); what it does not cover is tracked in issues #97, #100 and #37.
 
 Some scenarios cost API usage (about seventy haiku turns in total, see [Cost](#cost)); the rest
 start no Claude Code at all.

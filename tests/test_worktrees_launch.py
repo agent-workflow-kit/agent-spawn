@@ -472,7 +472,9 @@ def test_a_reused_record_that_is_not_the_planned_worktree_is_refused_untouched(
         error["details"]["cause"] == "worktree_mismatch" and error["details"]["retryable"] is False
     )
     kept = next(iter(records(fakebin).values()))
-    assert kept["id"] in error["message"] and kept["id"] in error["details"]["hint"]
+    assert kept["id"] in error["message"]
+    assert error["details"]["hint"].startswith(f"wtctl show {kept['id']}; a human frees")
+    assert f"wtctl forget {kept['id']} --holder {row['agent_id']}" in error["details"]["hint"]
     assert (row["park_reason"], row["needs_attention"]) == ("launch_failed", "launch_failed")
     assert row["csession_id"] is None and row["wt_record_id"] is None and row["wt_path"] is None
     with env.store() as store:

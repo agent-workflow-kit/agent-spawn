@@ -540,7 +540,9 @@ def test_the_same_holder_with_a_new_name_and_an_explicit_branch_gets_the_old_rec
     assert (error.code, error.exit_code, error.tool) == ("launch_failed", 12, "agent-spawn")
     assert (error.details or {}).get("cause") == "worktree_mismatch"
     assert (error.details or {}).get("retryable") is False
-    assert old.id in str((error.details or {}).get("hint"))
+    hint = str((error.details or {}).get("hint"))
+    assert hint.startswith(f"wtctl show {old.id}; a human frees")
+    assert f"wtctl forget {old.id} --holder {AGENT}" in hint  # the dead holder is released too
     for text in ("'new'", "'old'", "feat/x", old.id):
         assert text in str(error)
     assert saved(fakebin) == before  # nothing created, changed or removed
@@ -565,6 +567,7 @@ def reuse_with(fakebin: Fakebin, record: dict[str, Any], **plan_changes: Any) ->
         pytest.param({"branch": "Feat/x"}, {"branch": "feat/x"}, id="branch-case"),
         pytest.param({"branch": "feat/x "}, {"branch": "feat/x"}, id="branch-space"),
         pytest.param({"branch": "feat/y"}, {"branch": "feat/x"}, id="branch-other"),
+        pytest.param({"branch": "feat/x/"}, {"branch": "feat/x"}, id="branch-trailing-slash"),
         pytest.param({"branch": "refs/tags/feat/x"}, {"branch": "feat/x"}, id="branch-other-ref"),
         pytest.param({"branch": None}, {"branch": "feat/x"}, id="branch-null-but-planned"),
         pytest.param({"branch": "feat/x"}, {"detach": True}, id="branch-on-a-detach-plan"),
@@ -580,6 +583,9 @@ def test_a_reuse_that_is_not_the_planned_worktree_is_refused(
         reuse_with(fakebin, record, **plan_changes)
     assert (caught.value.code, caught.value.exit_code) == ("launch_failed", 12)
     assert (caught.value.details or {}).get("cause") == "worktree_mismatch"
+    if "branch" in record and record["branch"] is not None and "branch" in plan_changes:
+        # a branch mismatch names both the returned and the planned branch
+        assert record["branch"] in str(caught.value) and plan_changes["branch"] in str(caught.value)
 
 
 @pytest.mark.parametrize(

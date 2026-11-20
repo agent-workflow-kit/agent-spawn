@@ -1187,8 +1187,9 @@ class Launch:
         self, agent_id: str, plan: CreatePlan, *, override_escalation: bool = False
     ) -> WtRecord:
         """``wtctl create``; the record is stored from every result that names it: success (a
-        reused record included; ``owned`` is wtctl's) and ``bootstrap_failed`` (when it is this
-        agent's own record), before anything else can fail."""
+        matching reused record included; a mismatching one raises ``worktree_mismatch`` first;
+        ``owned`` is wtctl's) and ``bootstrap_failed`` (when it is this agent's own record),
+        before anything else can fail."""
         backend = self.wtctl_backend()
         assert backend is not None
         try:

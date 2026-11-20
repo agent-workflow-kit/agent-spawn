@@ -136,12 +136,16 @@ def test_resume_refuses_a_reused_record_that_is_not_the_planned_worktree(
     before, kept_records = env.agent(agent_id), records(fakebin)
     done = env.run("resume", agent_id, "--json")
     assert done.returncode == 12, (done.stdout, done.stderr)
-    error = json.loads(done.stdout)["error"]
+    body = json.loads(done.stdout)
+    schema_registry.validate(body, "agent-spawn/cli/error.json")
+    error = body["error"]
     assert error["code"] == "launch_failed" and error["details"]["cause"] == "worktree_mismatch"
     assert kept["id"] in error["message"] and "older" in error["message"]
     after = env.agent(agent_id)  # the pre-resume row is restored, the record is not adopted
     assert after["updated"] == before["updated"] and after["status"] == "parked"
     assert after["wt_record_id"] is None and after["csession_id"] is None
+    assert (after["park_reason"], after["needs_attention"]) == (
+        before["park_reason"], before["needs_attention"])  # fmt: skip
     assert records(fakebin) == kept_records
     assert not [c for c in wtctl_calls(fakebin) if c[0] in ("adopt", "forget", "remove")]
     with env.store() as store:
