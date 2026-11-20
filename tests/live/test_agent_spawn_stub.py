@@ -743,3 +743,118 @@ def wait_status_flag(world: World, agent_id: str, timeout: float = 60) -> dict[s
 
     wait_for(lost, timeout, f"agent {agent_id} to be supervisor_lost", interval=0.5)
     return box["show"]
+
+
+@SC("as-wrapper-dead-child-alive-window")
+def test_a_wrapper_killed_under_a_signal_ignoring_child_in_a_window(world: World) -> None:
+    """#97 follow-up (#100): the interactive-window variant of the wrapper-dead-child-alive row.
+    An interactive ``claude`` has no parent-death signal, and the stub ignores SIGTERM and SIGHUP,
+    so SIGKILL of ``exec`` (the pid agent-spawn recorded) leaves the child running in the window.
+    Everything else follows the headless row: the run has no outcome, the supervisor ends (and
+    its window process with it: a dead pane), the agent stays ``live`` with ``supervisor_lost``,
+    and ``stop`` parks it ``killed``."""
+    ready = world.root / "stub-ready"
+    sig_log = world.root / "stub-sig.log"
+    wt = stub_setup(
+        world,
+        f"trap 'echo term >> {sig_log}' TERM; trap 'echo hup >> {sig_log}' HUP; touch {ready}; while :; do sleep 0.2; done",
+    )
+    launched = world.spawn_json(
+        "launch", "--mode", "interactive", "--prompt", "reply ok", "--model", "haiku",
+        "--worktree", "none", "--cwd", str(wt.repo.clone), timeout=120,
+    )
+    agent = agent_of(launched)
+    aid, csid = agent["agent_id"], agent["csession_id"]
+    world.note_session(csid)
+    state = wait_status(world, aid, "live")
+    world.track(int(state["supervisor"]["pid"]), tree=True)
+    run = wait_for(
+        lambda: (r := _run_status(world, csid)).get("child_alive") and r.get("wrapper_alive") and r,
+        30,
+        "the stub child and its wrapper to be running",
+    )
+    wrapper, child = int(run["wrapper_pid"]), int(run["child_pid"])
+    wait_for(ready.exists, 20, "the stub to install its traps")
+    child_token = process_token(child)
+    if child_token is not None:
+        world.pids.append((child, child_token))
+    wrapper_token = process_token(wrapper)
+    argv = _argv_of(wrapper)
+    world.observe("window-wrapper-dead.before", (state["supervisor"], run["wrapper_pid"], run["child_pid"]))
+    check(
+        argv is not None and "exec" in argv and state["supervisor"].get("exec_pid") == wrapper,
+        "the exec pid agent-spawn recorded is the live claude-session exec wrapper",
+        "design.md D19 / claude-session status run.wrapper_pid",
+        (argv, state["supervisor"]),
+    )
+    os.kill(wrapper, signal.SIGKILL)
+    wait_for(lambda: process_token(wrapper) != wrapper_token or Path(f"/proc/{wrapper}/stat").read_text().rsplit(")", 1)[-1].split()[0] == "Z", 20, "wrapper dead")
+    after = wait_for(
+        lambda: (r := _run_status(world, csid)).get("wrapper_alive") is False and r,
+        30,
+        "claude-session to see the wrapper dead",
+    )
+    check(
+        after["child_alive"] is True and process_token(child) == child_token and after["outcome"] is None,
+        "wrapper dead, child alive, no outcome: an interactive child has no parent-death signal and the stub ignores SIGHUP/SIGTERM",
+        "claude-session interface.md Signals (PR_SET_PDEATHSIG is headless only) / #97",
+        {k: after.get(k) for k in ("outcome", "child_alive", "wrapper_alive")},
+    )
+    lost = wait_status_flag(world, aid)
+    world.observe("window-wrapper-dead.agent", {k: lost["agent"][k] for k in ("status", "needs_attention", "supervisor_lost")})
+    check(
+        lost["agent"]["status"] == "live"
+        and lost["agent"]["supervisor_lost"] is True
+        and lost["agent"]["needs_attention"] == "lost"
+        and (lost["supervisor"] or {}).get("alive") is False,
+        "the supervisor ended on its own; agent-spawn keeps the agent live with supervisor_lost and attention lost (the window variant of the headless row)",
+        "interface.md Liveness (a still-live session under a dead supervisor) / #36 #75 3 / #97",
+        (lost["agent"]["status"], lost["agent"]["supervisor_lost"], lost["agent"]["needs_attention"], lost["supervisor"]),
+    )
+    panes = world.json_tool("termctl", "list", "--label", f"agent={aid}", "--dead")["panes"]
+    check(
+        len(panes) == 1 and panes[0]["state"] == "dead" and panes[0]["exit_status"] == 1,
+        "the window's pane process (supervise) ended: the pane is dead (--keep-on-exit failed, exit status 1) while the child lives on",
+        "design.md D51 / #36 #27 (keep-on-exit failed)",
+        panes,
+    )
+    hups = sig_log.read_text().split() if sig_log.exists() else []
+    world.observe("window-wrapper-dead.signals", hups)
+    check(
+        hups.count("term") == 0 and hups.count("hup") <= 1,
+        "no liveness check signalled the orphan: at most the single SIGHUP of the dying pane, never a SIGTERM",
+        "interface.md Liveness (liveness never stops the run)",
+        hups,
+    )
+    changes = world.spawn_json("reconcile", ok=(0, 12))
+    check(
+        not [c for c in changes["changes"] if c["agent_id"] == aid and c["kind"] == "parked"]
+        and process_token(child) == child_token,
+        "reconcile does not park the live orphan nor signal it",
+        "interface.md Liveness (stop is the remedy)",
+        changes["changes"],
+    )
+    stopped = world.spawn_json("stop", aid, "--grace", "2s")
+    session_stop = stopped["session_stop"]
+    check(
+        session_stop["ended"] is True
+        and session_stop["outcome"] == "killed"
+        and [(s["pid"], s["signal"]) for s in session_stop["signals"]] == [(child, "SIGTERM"), (child, "SIGKILL")],
+        "stop ends the orphan (SIGTERM ignored, SIGKILL after the grace) and the run is killed",
+        "claude-session interface.md stop (signals)",
+        {k: session_stop.get(k) for k in ("ended", "outcome", "signals")},
+    )
+    wait_for(lambda: pid_gone(child), 30, "the stub child to be gone")
+    parked = wait_status(world, aid, "parked", 60)["agent"]
+    check(
+        parked["park_reason"] == "killed" and parked["supervisor_lost"] is False,
+        "stop parks the orphaned window agent killed and clears supervisor_lost",
+        "interface.md outcome table / Liveness",
+        {k: parked[k] for k in ("park_reason", "needs_attention", "supervisor_lost")},
+    )
+    world.spawn_json("teardown", aid, ok=(0, 20))
+    check(
+        not world.json_tool("termctl", "list", "--label", f"agent={aid}", "--dead")["panes"],
+        "teardown closes the dead window",
+        "design.md D14 step 5 / D51",
+    )

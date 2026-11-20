@@ -218,6 +218,14 @@ _ALL = [
         covers=("#36 #75 3", "#36 #75 4", "#97"),
     ),
     _s(
+        "as-wrapper-dead-child-alive-window",
+        "tools",
+        "interactive window variant: SIGKILL of exec under a signal-ignoring stub child in a real "
+        "termctl/tmux window",
+        "claude-session wtctl termctl tmux git",
+        covers=("#97", "#100"),
+    ),
+    _s(
         "wtctl-reuse-mismatch",
         "tools",
         "agent-spawn refuses the record the real wtctl reuses for the same holder under another "
@@ -249,6 +257,14 @@ _ALL = [
         "claude-session outcomes produced by a stub claude",
         "claude-session",
         covers=("#100", "interface.md Exit codes, Outcome table", "#36 #8 claude-session"),
+    ),
+    _s(
+        "as-adopted-at",
+        "tools",
+        "show runs[].adopted_at is a date-time for a launched, resumed, automatically resumed and "
+        "promoted run (stub claude; the real-timing check stays billed)",
+        "claude-session termctl tmux",
+        covers=("#100", "#91 adopted_at"),
     ),
     _s(
         "as-cron-fake-crontab",

@@ -510,3 +510,140 @@ def test_wait_and_launch_wait_exit_the_outcome_code_of_every_outcome(world: Worl
         "interface.md wait (exit 10 only for an unknown id or a tombstone without a run)",
         unknown.returncode,
     )
+
+
+RESULT_LINE = '{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":1,"total_cost_usd":0}'
+
+ADOPTED_STUB = """\
+mode=$(cat {root}/amode)
+case "$mode" in
+  loop) while :; do sleep 0.2; done ;;
+  done) echo "stub done" | claude-session report done --summary-file - > /dev/null; exit 0 ;;
+  autoresume)
+    if [ -e {root}/auto-mark ]; then
+      echo "stub done" | claude-session report done --summary-file - > /dev/null
+    else
+      touch {root}/auto-mark
+      echo '{result}'
+    fi
+    exit 0 ;;
+  promote)
+    if [ -e {root}/promote-mark ]; then
+      while :; do sleep 0.2; done
+    fi
+    touch {root}/promote-mark
+    echo "stub asks" | claude-session report needs-input --reason-file - > /dev/null
+    exit 0 ;;
+esac
+"""
+
+
+def parsed(runs: list[dict[str, Any]], key: str = "adopted_at") -> list[datetime]:
+    return [datetime.fromisoformat(r[key]) for r in runs]
+
+
+@SC("as-adopted-at")
+def test_adopted_at_is_set_for_launched_resumed_auto_resumed_and_promoted_runs(world: World) -> None:
+    """#91 / #100: ``show --json`` ``runs[].adopted_at`` is a date-time for a launched run, a
+    resumed run, the automatic report resume and a promoted run (the run's Started time, written
+    once by the supervisor when claude-session reports ``phase: session``), never earlier than the
+    agent's creation and not later than the run's end, and never changed by a later run. The stub
+    stands in for ``claude`` (its stream-json ``result`` line makes ``--no-implicit-done`` end
+    ``no_report``, which is what the automatic report resume answers); the null case of a
+    launch-phase veto is in ``as-launch-phase-hooks``. What this does NOT show is the timing of a
+    real Claude start (the billed candidates in docs/live-testing.md, Not covered)."""
+    root = world.root
+    mode = root / "amode"
+    wt = stub_setup(world, ADOPTED_STUB.format(root=root, result=RESULT_LINE), agent_spawn_config="kinds:\n  implement:\n    promote: false\n")
+    world.write_config(
+        "agent-spawn",
+        "auto_report_resume: true\nhandoff_timeout: 30s\nkinds:\n  implement:\n    promote: false\n",
+    )
+
+    # launched, then resumed
+    mode.write_text("loop")
+    live = world.spawn_json(*launch_args(wt))
+    aid = agent_of(live)["agent_id"]
+    world.note_session(agent_of(live)["csession_id"])
+    state = wait_status(world, aid, "live")
+    world.track(int(state["supervisor"]["pid"]), tree=True)
+    runs = state["runs"]
+    check(
+        len(runs) == 1 and is_date_time(runs[0]["adopted_at"]) and runs[0]["ended_at"] is None,
+        "a live launched run already has a date-time adopted_at and no end",
+        "interface.md show (adopted_at: the run's Started time); #91",
+        runs,
+    )
+    first = runs[0]["adopted_at"]
+    created = state["agent"]["created"]
+    check(
+        datetime.fromisoformat(created) <= datetime.fromisoformat(first),
+        "adopted_at is not earlier than the agent's creation",
+        "interface.md show; #91",
+        (created, first),
+    )
+    world.spawn_json("stop", aid, "--grace", "2s")
+    wait_status(world, aid, "parked")
+    mode.write_text("done")
+    resumed = world.spawn_json("resume", aid, "--mode", "headless", "--prompt", "ok", "--wait")
+    after = show(world, aid)
+    stamps = parsed(after["runs"])
+    check(
+        resumed["agent"]["run"] == 2
+        and len(stamps) == 2
+        and after["runs"][0]["adopted_at"] == first
+        and stamps[0] <= stamps[1],
+        "a resumed run has its own date-time adopted_at; run 1's value is unchanged (written once)",
+        "interface.md show (written once and never changed, for every run of the chain including a resume)",
+        timestamps(after),
+    )
+    check(
+        stamps[0] <= datetime.fromisoformat(after["runs"][0]["ended_at"]) <= stamps[1],
+        "run 1 ended between its adoption and the next run's",
+        "interface.md show",
+        [(r["adopted_at"], r["ended_at"]) for r in after["runs"]],
+    )
+
+    # the automatic report resume: headless, --no-implicit-done, a result but no report
+    mode.write_text("autoresume")
+    auto = world.spawn_json(*launch_args(wt, "--wait", "--no-implicit-done"), ok=(0,), timeout=120)
+    auto_show = show(world, agent_of(auto)["agent_id"])
+    flags = [(r["run"], r["auto_resumed"], r["outcome"]) for r in auto_show["runs"]]
+    world.observe("agent-spawn.adopted_at.auto-resume", flags)
+    check(
+        len(auto_show["runs"]) == 2
+        and auto_show["runs"][1]["auto_resumed"] is True
+        and all(is_date_time(r["adopted_at"]) for r in auto_show["runs"]),
+        "the first run ended no_report, the automatic report resume is run 2 and both runs have a date-time adopted_at",
+        "interface.md show (... the automatic report resume); Outcome table (exited-unreported headless: automatic report resume once); #91",
+        (flags, timestamps(auto_show)),
+    )
+
+    # a promoted run: headless needs-input, promotion into a window
+    mode.write_text("promote")
+    promoted = world.spawn_json(*launch_args(wt, "--promote"))
+    pid_ = agent_of(promoted)["agent_id"]
+    world.note_session(agent_of(promoted)["csession_id"])
+
+    def promoted_live() -> dict[str, Any] | None:
+        shown = show(world, pid_)
+        runs_ = shown["runs"]
+        if len(runs_) >= 2 and runs_[1]["adopted_at"] and shown["agent"]["status"] == "live":
+            return shown
+        return None
+
+    shown = wait_for(promoted_live, 90, "the promoted run to be live in its window")
+    sup = shown["supervisor"]
+    world.track(int(sup["pid"]), tree=True)
+    check(
+        shown["runs"][1]["promoted"] is True
+        and shown["runs"][1]["mode"] == "interactive"
+        and is_date_time(shown["runs"][0]["adopted_at"])
+        and parsed(shown["runs"])[0] <= parsed(shown["runs"])[1],
+        "the promoted run (run 2, interactive) has a date-time adopted_at after run 1's",
+        "interface.md show (... and a promoted run); Promotion; #91",
+        timestamps(shown),
+    )
+    world.observe("agent-spawn.adopted_at.promoted", timestamps(shown))
+    world.spawn_json("stop", pid_, "--grace", "2s")
+    wait_status(world, pid_, "parked", 60)
