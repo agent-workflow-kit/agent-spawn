@@ -141,6 +141,30 @@ _ALL = [
         covers=("#36 #20", "#36 #22", "#36 #21"),
     ),
     _s(
+        "wtctl-create-hooks",
+        "tools",
+        "pre-create hook veto 11, timeout, escalation 13, human --override-escalation, later veto "
+        "over an escalation, per-invocation --hook",
+        "wtctl git",
+        covers=("#100", "#36 #8 wtctl", "wtctl interface.md Hooks"),
+    ),
+    _s(
+        "wtctl-bootstrap-failed",
+        "tools",
+        "a failing bootstrap step: exit 12 bootstrap_failed with details.record, the record kept, "
+        "human-only bootstrap re-run",
+        "wtctl git",
+        covers=("#100", "#36 #8 wtctl", "interface.md Launch order step 4"),
+    ),
+    _s(
+        "wtctl-remove-merged-head",
+        "tools",
+        "remove --merged-head for a squash-merged branch: unpushed without it, removed with it, "
+        "the branch deleted",
+        "wtctl git",
+        covers=("#100", "#36 #8 wtctl"),
+    ),
+    _s(
         "wtctl-collisions-reuse",
         "tools",
         "explicit --name collisions per case, reuse by the same holder",
@@ -265,6 +289,14 @@ _ALL = [
         "promoted run (stub claude; the real-timing check stays billed)",
         "claude-session termctl tmux",
         covers=("#100", "#91 adopted_at"),
+    ),
+    _s(
+        "as-wtctl-create-failures",
+        "tools",
+        "launch over a vetoing (11), escalating (13, resume --override-escalation) and "
+        "bootstrap-failing (12, resume continues) wtctl; repo_config_changed for a claude-only change",
+        "claude-session wtctl git",
+        covers=("#100", "#36 #8 wtctl", "#36 #78", "#36 #25"),
     ),
     _s(
         "as-cron-fake-crontab",
