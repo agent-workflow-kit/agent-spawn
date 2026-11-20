@@ -108,6 +108,7 @@ DETAIL_CAUSES = frozenset(
         "listen_failed",
         "classification_mismatch",
         "classification_unknown",
+        "worktree_mismatch",
         "worktree_state",
         None,
     }
@@ -274,10 +275,10 @@ class CliError(Exception):
         if reason in ("third_party_cwd", "third_party_run") and tool != "agent-spawn":
             raise ValueError("third-party refusals come from agent-spawn")
         cause = (details or {}).get("cause")
-        if cause in ("classification_mismatch", "classification_unknown") and (
+        if cause in ("classification_mismatch", "classification_unknown", "worktree_mismatch") and (
             code != "launch_failed" or tool != "agent-spawn"
         ):
-            raise ValueError("classification causes are agent-spawn's launch_failed")
+            raise ValueError("classification and worktree_mismatch causes are agent-spawn's launch_failed")
         if cause == "worktree_state" and (code != "failed" or tool != "agent-spawn"):
             raise ValueError("worktree_state is agent-spawn's failed")
         self.code = code

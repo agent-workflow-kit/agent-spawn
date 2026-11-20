@@ -314,7 +314,7 @@ Still open or not covered, each tracked:
 - real-sandbox behavior (the host has no bwrap or socat) and the park reason of an unreported
   interactive session killed at its window (never observed): #100;
 - the wrapper-dead-child-alive liveness state: #97;
-- the wtctl reuse mismatch: #99;
+- the wtctl reuse mismatch: fixed by #99 (refused as `worktree_mismatch`; checked by `wtctl-reuse-mismatch`);
 - wave-2 coverage (the "Not covered" items in the table above): #100;
 - macOS: #37;
 - recorded-only: the `placement here` terminal check, the live upgrade of a running supervisor,
