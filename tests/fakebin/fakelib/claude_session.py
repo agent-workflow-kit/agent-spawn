@@ -1087,6 +1087,7 @@ def do_wait(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
 def do_status(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
     if len(p.positionals) != 1:
         ctx.usage("status takes exactly one session id")
+    ctx.check_scripted_error("status")  # a status that cannot be read (#119)
     run_arg = p.get("--run")
     run_number = None if run_arg is None else python_int(ctx, "--run", run_arg)
     session_id = session_ref(ctx, p.positionals[0])

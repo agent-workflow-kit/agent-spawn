@@ -157,7 +157,7 @@
             }
           },
           "additionalProperties": false,
-          "description": "agent-spawn's own context only (hint: a suggested next step): cancel_failed and cancel_code (the pending run could not be canceled after a failed classification check, and why), status (torn_down, session_missing, or the agent's status for attach), cause (interrupted, no_pane_pid, pane_gone, classification_mismatch, classification_unknown, worktree_mismatch, worktree_state), retryable (e.g. wtctl busy), original_failure ({code, reason, message} of the failure that aborted a fork whose hold release then failed). Lower tools' details are in lower_error."
+          "description": "agent-spawn's own context only (hint: a suggested next step): cancel_failed and cancel_code (the pending run could not be canceled after a failed classification check, and why), status (torn_down, session_missing, or the agent's status for attach), cause (interrupted, no_pane_pid, pane_gone, classification_mismatch, classification_unknown, worktree_mismatch, worktree_state, cwd_missing, cwd_changed), retryable (e.g. wtctl busy), original_failure ({code, reason, message} of the failure that aborted a fork whose hold release then failed). Lower tools' details are in lower_error."
         },
         "candidates": {
           "type": "array",
