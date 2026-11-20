@@ -467,8 +467,10 @@ esac
         ok=(2,),
     )
     check(
-        not_escalated["error"]["code"] == "usage",
-        "resume --override-escalation of an agent with a session whose last run did not end escalated exits 2",
+        not_escalated["error"]["code"] == "usage"
+        and not_escalated["error"].get("lower_error") is None
+        and not_escalated["error"].get("tool") != "claude-session",
+        "resume --override-escalation of an agent with a session whose last run did not end escalated exits 2 (agent-spawn's own refusal, not claude-session's)",
         "interface.md Escalation overrides (claude-session's override only when the last run ended escalated)",
         not_escalated["error"],
     )
