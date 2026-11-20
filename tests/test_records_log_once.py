@@ -79,16 +79,31 @@ def test_a_record_dated_slightly_ahead_still_suppresses(tmp_path: Path) -> None:
     assert once(tmp_path, [entry()]) == 0
 
 
+def test_a_record_dated_exactly_at_the_slack_edge_suppresses(tmp_path: Path) -> None:
+    once(tmp_path, [entry()], NOW + records._FUTURE_SLACK)
+    assert once(tmp_path, [entry()]) == 0
+
+
+def test_a_record_dated_one_second_past_the_slack_edge_does_not_suppress(tmp_path: Path) -> None:
+    once(tmp_path, [entry()], NOW + records._FUTURE_SLACK + timedelta(seconds=1))
+    assert once(tmp_path, [entry()]) == 1
+
+
 def test_a_record_dated_beyond_the_slack_ahead_does_not_suppress(tmp_path: Path) -> None:
     once(tmp_path, [entry()], NOW + timedelta(minutes=2))
     assert once(tmp_path, [entry()]) == 1
 
 
 def test_a_first_line_cut_by_the_tail_is_not_seen(tmp_path: Path) -> None:
+    # The cut lands exactly on the ``{`` of a complete, identical record that follows a junk
+    # prefix on the same line: only the skip to the next newline keeps it from being seen.
     once(tmp_path, [entry()])
-    size = (tmp_path / "log.jsonl").stat().st_size
-    assert once(tmp_path, [entry()], NOW + timedelta(seconds=1), tail_bytes=size - 1) == 1
-    assert len(lines(tmp_path)) == 2
+    log = tmp_path / "log.jsonl"
+    record_line = log.read_bytes()
+    log.write_bytes(b"junk" + record_line)
+    got = once(tmp_path, [entry()], NOW + timedelta(seconds=1), tail_bytes=len(record_line))
+    assert got == 1
+    assert log.read_bytes().count(b"\n") == 2
 
 
 def test_a_first_line_the_tail_covers_whole_is_seen(tmp_path: Path) -> None:
