@@ -1070,6 +1070,7 @@ class Resume(Launch):
                 name=self.args.name or source_row["name"],
                 term_placement=source_row.get("term_placement"),
             )
+        self.scope_preflight(run_id)
         if self.fork:
             self.update_cwd(run_id, cwd)  # an abandoned fork's holds are found by its cwd
         self.take_holds(run_id, cwd)  # step 6
@@ -1801,6 +1802,8 @@ class Resume(Launch):
                     term_placement=row.get("term_placement"),
                 )
                 term_plan = self.termctl_backend().placements(window)
+            if refuse is None:
+                self.scope_preflight(run_id, dry_run=True)
             return self.dry_plan(
                 row,
                 cs_argv,

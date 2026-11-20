@@ -37,7 +37,7 @@ from typing import Any
 
 from . import gateway as gw
 from . import hooks as hooklib
-from . import lifecycle, procs, third_party
+from . import lifecycle, procs, scope, third_party
 from . import worktrees as wtlib
 from .agent_view import agent_object, chain_first_working_at, outcome_object
 from .config import Config
@@ -383,6 +383,7 @@ class Launch:
         self.window_socket: str | None = None  # the tmux server the preflight named
         self.term_argv: list[str] | None = None
         self.stored_termctl: str | None = None  # the absolute termctl path stored with the agent
+        self.systemd_run: str | None = None  # resolved by the scope preflight (scope hosting)
         self.term_override = False  # --override-escalation goes to `termctl open` (resume)
 
     # -- logging ------------------------------------------------------------------------------
@@ -528,6 +529,22 @@ class Launch:
     def windowed(self) -> bool:
         """A window will host the supervisor: interactive mode with placement ``window``."""
         return self.mode == "interactive" and (self.args.placement or "window") == "window"
+
+    @property
+    def scope_hosted(self) -> bool:
+        """The detached supervisor is started in a transient scope (config
+        ``supervisor.detach: scope``; a window or ``--placement here`` never is)."""
+        return not self.windowed and not self.here and self.config.supervisor.detach == "scope"
+
+    def scope_preflight(self, agent_id: str, *, dry_run: bool = False) -> None:
+        """Launch step 1, scope preflight: with scope hosting, the host and the tool, then (not in
+        a dry run, which starts nothing) a probe scope. Nothing is checked with ``setsid``."""
+        if not self.scope_hosted:
+            return
+        if dry_run:
+            self.systemd_run = scope.check_static(self.gateway)
+        else:
+            self.systemd_run = scope.preflight(self.gateway, agent_id)
 
     def termctl_backend(self) -> TermBackend:
         """termctl, resolved once (exit 12 ``tool_missing`` before anything changes): config's
@@ -905,6 +922,7 @@ class Launch:
                 self.window_preflight(
                     proposed, classification.run_kind, labels.texts(), cwd, self_path
                 )
+            self.scope_preflight(proposed)
             self.run_pre_launch(labels, classification, cwd, self.copies)
             # The hooks' decision ids join every later call of the launcher.
             self.backend.decision_ids = list(self.decision_ids)
@@ -984,6 +1002,8 @@ class Launch:
                 agent_id, classification.run_kind, labels.texts(), cwd, resolve_self()
             )
             term_plan = self.termctl_backend().placements(window)
+        if would_refuse is None:
+            self.scope_preflight(agent_id, dry_run=True)
         outcome_path = os.path.join(self.state_dir, "outcomes", agent_id, "TOKEN.json")
         relay = relay_hook(resolve_self(), self.state_dir, self.inv.config_file or "")
         argv = [
@@ -1599,6 +1619,13 @@ class Launch:
             row["config_path"],
         ]
         try:
+            if self.scope_hosted:
+                # the same supervise argv, started through `systemd-run --user --scope`: the
+                # process stays the supervisor (it execs in place), so the identity recorded
+                # below is unchanged (interface.md, Supervision, Scope hosting)
+                argv = scope.supervisor_argv(
+                    self.systemd_run or scope.resolve_systemd_run(), agent_id, result.run, argv
+                )
             self.detached = procs.spawn_detached(
                 argv,
                 log_path=os.path.join(supervise_dir, f"{agent_id}.log"),
@@ -1615,7 +1642,7 @@ class Launch:
             self.sig.raising = False  # from here a signal is forwarded, not a reason to cancel
             self.detached.acknowledge()
             self.supervised = True
-        except (procs.DetachedForkError, OSError, StoreError) as error:
+        except (procs.DetachedForkError, OSError, StoreError, ValueError, CliError) as error:
             self.sig.raising = True
             self.placement_failed(result, error)
             raise  # placement_failed raises; unreachable

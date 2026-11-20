@@ -112,6 +112,7 @@ DETAIL_CAUSES = frozenset(
         "worktree_state",
         "cwd_missing",
         "cwd_changed",
+        "scope_unavailable",
         None,
     }
 )
