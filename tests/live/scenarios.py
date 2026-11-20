@@ -422,6 +422,15 @@ _ALL = [
         covers=("#36 #34", "FIDELITY.md crontab"),
     ),
     _s(
+        "as-scope-supervisor",
+        "tools",
+        "a scope-hosted detached supervisor (supervisor.detach: scope) against the real systemd-run "
+        "--user: its own cgroup, the recorded PID, liveness, stop, the unit vanishing (skips "
+        "without a systemd user manager; the end of a real login session is not verified)",
+        "claude-session",
+        covers=("#40", "interface.md Supervision (Scope hosting)", "FIDELITY.md systemd-run"),
+    ),
+    _s(
         "as-reconcile-reset-lease",
         "tools",
         "reconcile --reset-lease on a real corrupted state.db row",
