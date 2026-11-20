@@ -775,6 +775,7 @@ def note(signum, _frame):
         os._exit(0)
 for number in (signal.SIGTERM, signal.SIGCONT, signal.SIGHUP):
     signal.signal(number, note)
+open(path, "a").close()  # the handlers are installed: the file existing means "ready"
 deadline = time.monotonic() + 120
 while time.monotonic() < deadline and os.getppid() == parent:
     time.sleep(0.05)
@@ -783,7 +784,8 @@ while time.monotonic() < deadline and os.getppid() == parent:
 
 def spawn_child(ctx: Context) -> subprocess.Popen[bytes]:
     """A real child of the fake ``exec`` (a stand-in for ``claude``): it records the signals it
-    gets in a file named by the ``child_started`` record, and ends on SIGTERM."""
+    gets in a file named by the ``child_started`` record, and ends on SIGTERM. The file exists
+    (empty) once the child's handlers are installed: a signal sent before then kills it."""
     path = os.path.join(os.environ.get("FAKEBIN_LOG", "/tmp") + ".child-signals")
     child = subprocess.Popen(
         [sys.executable, "-c", CHILD_SCRIPT, path, str(os.getpid())], stdin=subprocess.DEVNULL

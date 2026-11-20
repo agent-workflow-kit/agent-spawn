@@ -379,6 +379,9 @@ def test_sigterm_chain_reaches_exec_and_its_child_even_when_exec_is_stopped(
     agent_id = env.agents()[0]["agent_id"]
     track_agent(env, proc_tracker, agent_id)
     started = fakebin.records("child_started")[0]
+    # The child records its signals in this file once its handlers are installed: a SIGTERM that
+    # beats them kills it with nothing recorded.
+    env.wait_for(lambda: Path(started["signals_file"]).exists(), "the child's handlers")
     child = procs.read_identity(started["pid"])
     assert child is not None
     proc_tracker.record(child)
