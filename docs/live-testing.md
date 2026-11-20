@@ -222,7 +222,7 @@ with it.
 ## Not covered
 
 What the unbilled live suite cannot check, with the reason. The billed candidates are for a later
-wave (each needs a real Claude Code session or a host capability this host lacks); each item below is tracked by the issue named in its row, except the first row (untracked, no scenario planned), the wtctl audit gap (wtctl#5, closed, no open issue) (#100 is closed by the wave-3 run; the wave-4 run covered #112 to #115 and most of #116, whose remaining items are the rows above), and macOS is tracked by #37.
+wave (each needs a real Claude Code session or a host capability this host lacks); each item below is tracked by the issue named in its row, except the null `adopted_at` row (untracked, no scenario planned) and the wtctl audit gap (wtctl#5, closed, no open issue); macOS is tracked by #37. (#100 is closed by the wave-3 run; the wave-4 run covered #112 to #115 and most of #116, whose remaining items are the rows below.)
 
 | Item | Why it is not an unbilled scenario | Candidate session cost |
 |---|---|---|
