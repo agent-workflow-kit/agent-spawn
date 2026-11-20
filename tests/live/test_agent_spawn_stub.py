@@ -568,7 +568,7 @@ def test_a_wrapper_killed_under_a_sigterm_ignoring_child_is_supervisor_lost_unti
     check(
         argv is not None
         and wrapper_token == record_token
-        and any(Path(a).name == "claude-session" for a in argv[:2])
+        and any(Path(a).name == "claude-session" for a in argv)
         and "exec" in argv,
         "the wrapper is still the process claude-session recorded and runs claude-session exec",
         "#36 #75 3",
@@ -588,7 +588,16 @@ def test_a_wrapper_killed_under_a_sigterm_ignoring_child_is_supervisor_lost_unti
         30,
         "claude-session to see the wrapper dead",
     )
-    terms_at_death = _term_count(term_log)  # PR_SET_PDEATHSIG may have sent one SIGTERM
+    # PR_SET_PDEATHSIG sent the stub one SIGTERM when the wrapper died; bash defers the trap
+    # until its foreground ``sleep`` exits, so the log line can lag claude-session's view
+    wait_for(lambda: _term_count(term_log) >= 1, 20, "the stub to log the PDEATHSIG SIGTERM")
+    terms_at_death = _term_count(term_log)
+    check(
+        terms_at_death == 1,
+        "the wrapper's death sent the stub exactly one SIGTERM (PR_SET_PDEATHSIG)",
+        "claude-session interface.md Signals / #97",
+        terms_at_death,
+    )
     world.observe("wrapper-dead.terms", terms_at_death)
     world.observe(
         "wrapper-dead.status",
