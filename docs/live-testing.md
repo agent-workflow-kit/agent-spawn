@@ -277,16 +277,23 @@ Run date 2026-11-19, Linux 5.15, claude 2.1.328 (`--model haiku`), claude-sessio
 termctl 0.25.0, wtctl 0.32.0, tmux 3.5a, git 2.34.1, jobsctl (installed, used by
 `jobsctl-cancel-force`). The suite has passed on Linux:
 
-- **Unbilled wave** (`LIVE_SCENARIOS=unbilled`): 154 passed, 4 skipped (the recorded-only
+- **Unbilled wave** (`LIVE_SCENARIOS=unbilled`): 154 passed (before `as-wrapper-dead-child-alive`), 4 skipped (the recorded-only
   scenarios `placement-here-terminal`, `upgrade-live-supervisor` and `real-crontab`, and `macos`,
   issue #37).
 - **`as-wrapper-dead-child-alive`** (added after the first runs, 2026-11-20, claude-session
-  0.45.2, termctl 0.25.0, wtctl built from `origin/main`, tmux 3.5a): passed. With a stub child
-  that ignores SIGTERM, SIGKILL of exec leaves the child alive; claude-session reports
-  `wrapper_alive: false`, `child_alive: true` and no outcome; the agent-spawn supervisor reads no
-  outcome and ends; the agent stays `live` with `supervisor_lost: true` and
-  `needs_attention: lost`; `stop` ends the orphan (SIGTERM, then SIGKILL; exit 15) and parks it
-  `killed` with `supervisor_lost` cleared. The fake-level twin is
+  0.45.2, termctl 0.25.0, wtctl 0.32.2 (an `origin/main` build from `git archive`; its
+  `--version` prints the `0.0.0` placeholder, the package metadata says 0.32.2), tmux 3.5a):
+  passed. The stub child ignores SIGTERM but records each one, and the test waits for its ready
+  file before killing anything. SIGKILL of exec leaves the child alive (the one SIGTERM it
+  received came from `PR_SET_PDEATHSIG` at that moment, and it ignored it); claude-session
+  reports `wrapper_alive: false`, `child_alive: true` and no outcome; the agent-spawn supervisor
+  reads no outcome and ends; the agent stays `live` with `supervisor_lost: true` and
+  `needs_attention: lost`, set once; liveness checks (`show`, `list`, `reconcile`) send the stub
+  no further SIGTERM. `agent-spawn stop --grace 2s` exits 0; claude-session's `stop` result
+  (`session_stop`) has `ended: true`, `run_exit_code: 15` (the `killed` outcome code, not a
+  `stop` exit code), `outcome: killed`, `end_reason: stopped` and signals only the child, SIGTERM
+  then SIGKILL; the stub logged that one more SIGTERM. The agent parks `killed` with
+  `supervisor_lost` cleared and `post-park` runs once. The fake-level twin is
   `tests/test_liveness_processes.py` (`test_a_sigkilled_exec_under_a_surviving_child_...`).
 - **Billed scenarios**: the first run passed 9 of the 10 scenarios it ran and, after the harness
   fixes, every rerun scenario passed (see [First billed run](#first-billed-run) for what is and

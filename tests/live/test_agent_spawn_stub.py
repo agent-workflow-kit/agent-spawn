@@ -483,6 +483,19 @@ def test_a_killed_supervisor_leaves_a_dead_pane_that_reconcile_closes(world: Wor
     check(done is not None, "teardown after the pane was closed succeeds", "design.md D14 step 5")
 
 
+def _argv_of(pid: int) -> list[str] | None:
+    """The argv of ``pid`` as separate elements, or ``None`` when it is gone."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    return [a.decode(errors="replace") for a in raw.split(b"\0") if a]
+
+
+def _term_count(path: Path) -> int:
+    return len(path.read_text().splitlines()) if path.exists() else 0
+
+
 def _run_status(world: World, csid: str) -> dict[str, Any]:
     return world.json_tool("claude-session", "status", csid)["run"]
 
@@ -500,9 +513,12 @@ def test_a_wrapper_killed_under_a_sigterm_ignoring_child_is_supervisor_lost_unti
     time, and ``stop`` ends the orphan (SIGTERM ignored, then SIGKILL after the grace) and parks
     it ``killed``. Signals go to the exact PIDs claude-session and agent-spawn recorded."""
     hook_log = world.root / "post-park.log"
+    ready = world.root / "stub-ready"
+    term_log = world.root / "stub-term.log"
+    # the stub ignores SIGTERM but records each one, and signals once the trap is installed
     wt = stub_setup(
         world,
-        "trap '' TERM; while :; do sleep 0.2; done",
+        f"trap 'echo term >> {term_log}' TERM; touch {ready}; while :; do sleep 0.2; done",
         agent_spawn_config=f'hooks:\n  post-park:\n    - cmd: "cat > /dev/null; echo ran >> {hook_log}"\n',
     )
     launched = world.spawn_json(
@@ -530,14 +546,17 @@ def test_a_wrapper_killed_under_a_sigterm_ignoring_child_is_supervisor_lost_unti
         "the stub child and its wrapper to be running",
     )
     wrapper, child = int(run["wrapper_pid"]), int(run["child_pid"])
+    record_token = process_token(wrapper)
     child_token = process_token(child)
+    if child_token is not None:
+        world.pids.append((child, child_token))  # cleanup tracks it before any check can fail
     check(
         child_token is not None and wrapper != child,
         "the wrapper and the stub child are two live processes",
         "claude-session interface.md status run fields (wrapper_pid, child_pid)",
         (wrapper, child),
     )
-    world.pids.append((child, child_token or ""))
+    wait_for(ready.exists, 20, "the stub to install its SIGTERM trap")
     check(
         state["supervisor"].get("exec_pid") == wrapper,
         "the exec pid agent-spawn recorded is claude-session's wrapper pid",
@@ -545,8 +564,16 @@ def test_a_wrapper_killed_under_a_sigterm_ignoring_child_is_supervisor_lost_unti
         (state["supervisor"].get("exec_pid"), wrapper),
     )
     wrapper_token = process_token(wrapper)
-    cmdline = Path(f"/proc/{wrapper}/cmdline").read_bytes()
-    check(b"exec" in cmdline, "the wrapper is claude-session exec", "#36 #75 3", cmdline[:120])
+    argv = _argv_of(wrapper)
+    check(
+        argv is not None
+        and wrapper_token == record_token
+        and any(Path(a).name == "claude-session" for a in argv[:2])
+        and "exec" in argv,
+        "the wrapper is still the process claude-session recorded and runs claude-session exec",
+        "#36 #75 3",
+        (argv, record_token, wrapper_token),
+    )
     os.kill(wrapper, signal.SIGKILL)  # exact PID recorded by claude-session, identity checked above
     wait_for(
         lambda: (
@@ -561,6 +588,8 @@ def test_a_wrapper_killed_under_a_sigterm_ignoring_child_is_supervisor_lost_unti
         30,
         "claude-session to see the wrapper dead",
     )
+    terms_at_death = _term_count(term_log)  # PR_SET_PDEATHSIG may have sent one SIGTERM
+    world.observe("wrapper-dead.terms", terms_at_death)
     world.observe(
         "wrapper-dead.status",
         {k: after.get(k) for k in ("outcome", "end_reason", "wrapper_alive", "child_alive")},
@@ -626,14 +655,40 @@ def test_a_wrapper_killed_under_a_sigterm_ignoring_child_is_supervisor_lost_unti
         len(flagged),
     )
     check(
-        process_token(child) == child_token,
-        "no liveness check signalled the orphan",
+        process_token(child) == child_token and _term_count(term_log) == terms_at_death,
+        "no liveness check signalled the orphan: the stub received no SIGTERM after its "
+        "wrapper died",
         "interface.md Liveness (liveness never stops the run)",
+        (_term_count(term_log), terms_at_death),
     )
     # the remedy: stop ends the orphan (SIGTERM is ignored, so SIGKILL after the grace)
-    stopped = world.spawn_json("stop", aid, "--grace", "2s", ok=(0, 12))
+    stopped = world.spawn_json("stop", aid, "--grace", "2s")
     world.observe("wrapper-dead.stop", stopped)
+    session_stop = stopped["session_stop"]
+    check(
+        stopped["action"] == "session_stop"
+        and session_stop["ended"] is True
+        and session_stop["run_exit_code"] == 15
+        and session_stop["outcome"] == "killed"
+        and session_stop["end_reason"] == "stopped",
+        "stop exits 0 and claude-session's stop reports the run ended killed (run_exit_code 15)",
+        "interface.md stop (session_stop is claude-session's stop result) / outcome table",
+        {k: session_stop.get(k) for k in ("ended", "run_exit_code", "outcome", "end_reason")},
+    )
+    check(
+        [(s["pid"], s["role"], s["signal"]) for s in session_stop["signals"]]
+        == [(child, "child", "SIGTERM"), (child, "child", "SIGKILL")],
+        "stop signalled only the orphaned child, SIGTERM first, then SIGKILL after the grace",
+        "claude-session interface.md stop (signals)",
+        session_stop["signals"],
+    )
     wait_for(lambda: pid_gone(child), 30, "the stub child to be gone")
+    check(
+        _term_count(term_log) == terms_at_death + 1,
+        "the stub received exactly one more SIGTERM, from stop, and survived it until SIGKILL",
+        "claude-session interface.md stop (SIGTERM, then SIGKILL after the grace)",
+        (_term_count(term_log), terms_at_death),
+    )
     final = _run_status(world, csid)
     check(
         final["outcome"] is not None and final["child_alive"] is False,
