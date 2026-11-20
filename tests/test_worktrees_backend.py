@@ -3,6 +3,7 @@ the records of a cwd."""
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -508,3 +509,132 @@ def test_only_create_can_be_vetoed_or_escalated(
     with pytest.raises(wt.WtctlError) as created:
         api.create(plan())
     assert wt.failure_kind(created.value) == ("vetoed" if exit_code == 11 else "escalated")
+
+
+# --- a reused record must be the planned worktree (#99) ----------------------------------------
+
+
+def saved(fakebin: Fakebin) -> dict[str, Any]:
+    path = Path(str(fakebin.log) + ".records.json")
+    return json.loads(path.read_text()) if path.exists() else {}  # type: ignore[no-any-return]
+
+
+def test_a_matching_reuse_is_accepted_and_changes_nothing(fakebin: Fakebin) -> None:
+    api = backend(fakebin)
+    first, first_reused = api.create(plan(name="n1", branch="feat/x"))
+    again, reused = api.create(plan(name="n1", branch="feat/x"))  # the retry after a crash
+    assert (first_reused, reused) == (False, True)
+    assert again == first and len(saved(fakebin)) == 1
+
+
+def test_the_same_holder_with_a_new_name_and_an_explicit_branch_gets_the_old_record_refused(
+    fakebin: Fakebin,
+) -> None:
+    api = backend(fakebin)
+    old, _ = api.create(plan(name="old", branch="feat/x"))
+    before = saved(fakebin)
+    with pytest.raises(CliError) as caught:
+        # wtctl answers with the OLD record (reused: true, name "old"): the fake models it
+        api.create(plan(name="new", branch="feat/x"))
+    error = caught.value
+    assert (error.code, error.exit_code, error.tool) == ("launch_failed", 12, "agent-spawn")
+    assert (error.details or {}).get("cause") == "worktree_mismatch"
+    assert (error.details or {}).get("retryable") is False
+    assert old.id in str((error.details or {}).get("hint"))
+    for text in ("'new'", "'old'", "feat/x", old.id):
+        assert text in str(error)
+    assert saved(fakebin) == before  # nothing created, changed or removed
+    assert [c[0] for c in fakebin.argvs("wtctl")] == ["create", "create"]
+
+
+def reuse_with(fakebin: Fakebin, record: dict[str, Any], **plan_changes: Any) -> wt.WtRecord:
+    """A create that wtctl answers with ``reused: true`` and the planned record changed by
+    ``record`` (a reply the fake would not produce itself)."""
+    fakebin.script("wtctl", "create", merge={"reused": True, "record": record})
+    return backend(fakebin).create(plan(**plan_changes))[0]
+
+
+@pytest.mark.parametrize(
+    ("record", "plan_changes"),
+    [
+        pytest.param({"name": AGENT.upper()}, {}, id="name-case"),
+        pytest.param({"name": f"{AGENT} "}, {}, id="name-trailing-space"),
+        pytest.param({"name": f" {AGENT}"}, {}, id="name-leading-space"),
+        pytest.param({"name": None}, {}, id="name-null"),
+        pytest.param({"name": ""}, {}, id="name-empty"),
+        pytest.param({"branch": "Feat/x"}, {"branch": "feat/x"}, id="branch-case"),
+        pytest.param({"branch": "feat/x "}, {"branch": "feat/x"}, id="branch-space"),
+        pytest.param({"branch": "feat/y"}, {"branch": "feat/x"}, id="branch-other"),
+        pytest.param({"branch": "refs/tags/feat/x"}, {"branch": "feat/x"}, id="branch-other-ref"),
+        pytest.param({"branch": None}, {"branch": "feat/x"}, id="branch-null-but-planned"),
+        pytest.param({"branch": "feat/x"}, {"detach": True}, id="branch-on-a-detach-plan"),
+        pytest.param({"holders": ["ag-zzzzzzzz"]}, {}, id="another-holder-only"),
+        pytest.param({"holders": []}, {}, id="no-holders"),
+        pytest.param({"object_type": "throwaway"}, {}, id="throwaway"),
+    ],
+)
+def test_a_reuse_that_is_not_the_planned_worktree_is_refused(
+    fakebin: Fakebin, record: dict[str, Any], plan_changes: dict[str, Any]
+) -> None:
+    with pytest.raises(CliError) as caught:
+        reuse_with(fakebin, record, **plan_changes)
+    assert (caught.value.code, caught.value.exit_code) == ("launch_failed", 12)
+    assert (caught.value.details or {}).get("cause") == "worktree_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("record", "plan_changes"),
+    [
+        pytest.param({"branch": "refs/heads/feat/x"}, {"branch": "feat/x"}, id="record-qualified"),
+        pytest.param({"branch": "feat/x"}, {"branch": "refs/heads/feat/x"}, id="plan-qualified"),
+        pytest.param({"branch": None}, {}, id="template-built-branch-not-compared"),
+        pytest.param({"branch": "wt/whatever"}, {}, id="template-branch-any-value"),
+        pytest.param({"base": "other", "ref": "b" * 40}, {"base": "main"}, id="base-not-compared"),
+        pytest.param({"holders": ["ag-zzzzzzzz", AGENT]}, {}, id="another-holder-too"),
+    ],
+)
+def test_a_reuse_that_is_the_planned_worktree_is_accepted(
+    fakebin: Fakebin, record: dict[str, Any], plan_changes: dict[str, Any]
+) -> None:
+    got = reuse_with(fakebin, record, **plan_changes)
+    assert got.name == AGENT
+
+
+def test_a_create_that_is_not_reused_is_not_compared(fakebin: Fakebin) -> None:
+    # the check is only for `reused: true`: a fresh record is the one the plan asked for
+    fakebin.script("wtctl", "create", merge={"reused": False, "record": {"name": "other"}})
+    record, reused = backend(fakebin).create(plan())
+    assert reused is False and record.name == "other"
+
+
+def test_a_reused_flag_that_is_not_the_boolean_true_is_not_a_reuse(fakebin: Fakebin) -> None:
+    fakebin.script("wtctl", "create", merge={"reused": "true", "record": {"name": "other"}})
+    _, reused = backend(fakebin).create(plan())
+    assert reused is False
+
+
+def test_the_record_carries_its_branch_and_tolerates_a_null_or_absent_one() -> None:
+    base: dict[str, Any] = {
+        "id": "wt-aaaaaaaa",
+        "path": "/x/y",
+        "object_type": "worktree",
+        "state": "active",
+        "name": "n",
+        "owned": True,
+        "holders": [],
+    }
+    parsed = wt.parse_record({**base, "branch": "feat/x"})
+    assert parsed is not None and parsed.branch == "feat/x"
+    for extra in ({}, {"branch": None}):
+        parsed = wt.parse_record({**base, **extra})
+        assert parsed is not None and parsed.branch is None
+    assert wt.parse_record({**base, "branch": 5}) is None
+    assert wt.parse_record({**base, "branch": ["a"]}) is None
+
+
+def test_a_bare_refs_heads_prefix_never_matches() -> None:
+    record = wt.WtRecord(
+        "wt-aaaaaaaa", "/x/y", "worktree", "active", AGENT, True, (AGENT,), "refs/heads/"
+    )
+    with pytest.raises(CliError):
+        wt.check_reused(plan(branch="refs/heads/"), record)

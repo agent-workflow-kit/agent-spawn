@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from . import gateway as gw
-from .output import CliError, from_lower_tool
+from .output import CliError, cut_utf8, from_lower_tool
 from .validate import REPO_ID
 
 TOOL = "wtctl"
@@ -126,7 +126,7 @@ def check_abs_path(value: str, what: str) -> str:
 @dataclass(frozen=True)
 class WtRecord:
     """The fields of a wtctl record agent-spawn reads (``id``, ``path``, ``object_type``,
-    ``state``, ``name``, ``owned`` and ``holders``)."""
+    ``state``, ``name``, ``branch``, ``owned`` and ``holders``)."""
 
     id: str
     path: str
@@ -135,6 +135,7 @@ class WtRecord:
     name: str | None
     owned: bool | None
     holders: tuple[str, ...]
+    branch: str | None = None  # null for a detached worktree or a throwaway
 
     @property
     def live(self) -> bool:
@@ -156,6 +157,7 @@ def parse_record(data: object) -> WtRecord | None:
     name = data.get("name")
     owned = data.get("owned")
     holders = data.get("holders")
+    branch = data.get("branch")
     if not isinstance(record_id, str) or RECORD_ID.fullmatch(record_id) is None:
         return None
     if not isinstance(path, str) or "\0" in path or not os.path.isabs(path):
@@ -168,6 +170,8 @@ def parse_record(data: object) -> WtRecord | None:
         return None
     if owned is not None and not isinstance(owned, bool):
         return None
+    if branch is not None and not isinstance(branch, str):
+        return None
     if not isinstance(holders, list) or not all(isinstance(h, str) for h in holders):  # pyright: ignore[reportUnknownVariableType]
         return None
     return WtRecord(
@@ -178,6 +182,7 @@ def parse_record(data: object) -> WtRecord | None:
         name,
         owned,
         tuple(holders),  # pyright: ignore[reportUnknownArgumentType]
+        branch,
     )
 
 
@@ -305,6 +310,59 @@ def planned_name(agent_id: str, worktree_name: str | None) -> str:
     return worktree_name if worktree_name else agent_id
 
 
+_HEADS = "refs/heads/"
+
+
+def _branch_key(branch: str) -> str:
+    """A branch as compared: a leading ``refs/heads/`` is ignored, nothing else is normalized."""
+    return branch[len(_HEADS) :] if branch.startswith(_HEADS) else branch
+
+
+def _shown(value: str | None) -> str:
+    return "none" if value is None else cut_utf8(repr(value), 200)
+
+
+def check_reused(plan: CreatePlan, record: WtRecord) -> None:
+    """Refuse a ``reused: true`` ``create`` result that is not the worktree ``plan`` asked for.
+
+    wtctl returns a live record the holder already has without comparing the retry's other
+    flags (its Create order, "Retry after a crash"), so the same holder with a new ``--name``
+    and an explicit ``--branch`` an earlier record holds gets that earlier record back. The
+    record must be a worktree this agent holds, named exactly as planned, and (with ``--branch``)
+    on the planned branch; ``--detach`` needs a record with no branch. Without ``--branch`` and
+    ``--detach`` the branch is wtctl's template-built one and is not compared; ``--base`` and
+    ``--ref`` are never compared. The record is never touched (interface.md, Launch order, 4).
+    """
+    problems: list[str] = []
+    if record.object_type != "worktree":
+        problems.append(f"it is a {record.object_type}, not a worktree")
+    if plan.agent_id not in record.holders:
+        problems.append("it does not list this agent as a holder")
+    if record.name != plan.name:
+        problems.append(f"its name is {_shown(record.name)}, planned {_shown(plan.name)}")
+    if plan.branch is not None:
+        planned = _branch_key(plan.branch)
+        if record.branch is None or not planned or _branch_key(record.branch) != planned:
+            problems.append(
+                f"its branch is {_shown(record.branch)}, planned {_shown(plan.branch)}"
+            )
+    elif plan.detach and record.branch is not None:
+        problems.append(f"its branch is {_shown(record.branch)}, planned none (--detach)")
+    if not problems:
+        return
+    raise CliError(
+        "launch_failed",
+        f"wtctl reused the record {record.id} (name {_shown(record.name)}, branch "
+        f"{_shown(record.branch)}) but it is not the planned worktree: {'; '.join(problems)}",
+        details={
+            "cause": "worktree_mismatch",
+            "retryable": False,
+            "hint": f"wtctl show {record.id}; a human frees the name or branch, or forgets the "
+            "record, then launches again",
+        },
+    )
+
+
 class WtctlBackend:
     """wtctl as agent-spawn uses it.
 
@@ -429,7 +487,10 @@ class WtctlBackend:
         record = parse_record(reply.data.get("record") if reply.data is not None else None)
         if record is None or reply.data is None:
             raise self._unusable("a create result")
-        return record, reply.data.get("reused") is True
+        reused = reply.data.get("reused") is True
+        if reused:
+            check_reused(plan, record)
+        return record, reused
 
     def create_dry_run(self, plan: CreatePlan) -> dict[str, Any]:
         """``create --dry-run --json`` verbatim (the dry run's ``worktree_plan``)."""
