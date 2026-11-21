@@ -120,6 +120,7 @@ FLAGS: dict[str, dict[str, str | None]] = {
     "cron install": {"--interval": "10", "--env-file": "/tmp/env", "--dry-run": None},
     "cron uninstall": {"--dry-run": None},
     "export": {"--since": "1d", "--action": "stop"},
+    "validate": {"--probe": None},
     "browse": {"--focus": "ag-abcdefgh", "--result-file": "/tmp/r.json"},
     "supervise": {"--host": None, "--handoff": "/tmp/s", "--handoff-timeout": "30"},
 }
@@ -145,6 +146,7 @@ MIN_ARGV: dict[str, list[str]] = {
     "cron uninstall": ["cron", "uninstall"],
     "export": ["export"],
     "browse": ["browse"],
+    "validate": ["validate"],
     "supervise": [*INTERNAL_GLOBALS, "supervise", "ag-abcdefgh"],
 }
 

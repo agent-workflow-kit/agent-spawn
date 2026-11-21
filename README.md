@@ -37,6 +37,7 @@ L2 (composite). Works fully standalone; it does not need the `awkit` harness. A 
 | `agent-spawn reconcile` / `cron install\|uninstall` | Repair state; schedule reconcile |
 | `agent-spawn export` | Audit records |
 | `agent-spawn browse` | TUI |
+| `agent-spawn validate [--probe]` | Offline, read-only check of the config and the lower tools (for `awkit doctor`) |
 
 Exit codes follow the awkit design guide (0, 1, 2, 10–21, session outcomes 14–18); agent-spawn adds 22 (a wait timed out), 130 and 143 (interrupted). `launch`, `resume` and `wait` accept `--result-file` to receive the JSON result in a file (for `--placement here`, whose stdout is the terminal). See [docs/interface.md](docs/interface.md#exit-codes).
 

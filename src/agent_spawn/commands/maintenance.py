@@ -65,6 +65,12 @@ def export(inv: Invocation) -> Outcome:
     return Outcome(0, selected, PayloadKind.COMMAND, human)
 
 
+def validate(inv: Invocation) -> Outcome:
+    from ..checking import validate_command
+
+    return validate_command(inv)
+
+
 def browse(inv: Invocation) -> Outcome:
     from ..tui.launcher import browse as run_browse
 

@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-spawn/cli/validate.json",
+  "title": "agent-spawn validate --json",
+  "type": "object",
+  "properties": {
+    "probe": {
+      "type": "boolean",
+      "description": "Whether --probe was given (the tools were run with --version)."
+    },
+    "config": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "$ref": "../defs.json#/$defs/abs_path",
+          "description": "The absolute config file in use (the default path when no file exists)."
+        },
+        "files": {
+          "type": "array",
+          "maxItems": 257,
+          "description": "The files that were read: the config file when it exists, then the config.d drop-ins in order.",
+          "items": {
+            "$ref": "../defs.json#/$defs/abs_path"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": ["path", "files"]
+    },
+    "checks": {
+      "type": "object",
+      "properties": {
+        "state_dir": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "$ref": "../defs.json#/$defs/abs_path"
+            },
+            "status": {
+              "enum": ["ok", "absent"],
+              "description": "ok: a directory the user can enter and write to. absent: it does not exist but would be created (a nearest existing ancestor is such a directory). Anything else is exit 12 failed."
+            }
+          },
+          "additionalProperties": false,
+          "required": ["path", "status"]
+        },
+        "tools": {
+          "type": "object",
+          "properties": {
+            "claude-session": {
+              "$ref": "#/$defs/tool"
+            },
+            "termctl": {
+              "$ref": "#/$defs/tool"
+            },
+            "wtctl": {
+              "$ref": "#/$defs/tool"
+            }
+          },
+          "additionalProperties": false,
+          "required": ["claude-session", "termctl", "wtctl"]
+        }
+      },
+      "additionalProperties": false,
+      "required": ["state_dir", "tools"]
+    },
+    "warnings": {
+      "type": "array",
+      "description": "Empty when there is nothing to say. Each entry is an object, unlike the string warnings of other commands (as wtctl validate).",
+      "items": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "enum": [
+              "termctl_missing",
+              "systemd_run_missing",
+              "tool_version_unknown",
+              "tool_too_old",
+              "implicit_done_unavailable"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 400,
+            "x-untrusted": true,
+            "description": "Human-readable; embeds config values (escaped and cut to 200 characters)."
+          },
+          "key": {
+            "type": "string",
+            "description": "The config key the warning is about, e.g. termctl_cmd."
+          }
+        },
+        "additionalProperties": false,
+        "required": ["code", "message"]
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": ["probe", "config", "checks", "warnings"],
+  "$defs": {
+    "tool": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "enum": ["ok", "missing", "disabled"],
+          "description": "missing: only termctl (the others exit 12 tool_missing). disabled: wtctl_cmd is null."
+        },
+        "path": {
+          "oneOf": [
+            {
+              "$ref": "../defs.json#/$defs/abs_path"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The resolved program; null unless status is ok."
+        },
+        "version": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+          "description": "From <tool> --version; null without --probe or when it could not be read (a tool_version_unknown warning)."
+        },
+        "minimum": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        }
+      },
+      "additionalProperties": false,
+      "required": ["status", "path", "version", "minimum"]
+    }
+  }
+}

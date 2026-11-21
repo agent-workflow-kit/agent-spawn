@@ -612,6 +612,39 @@ Writes or removes the managed crontab block `# agent-spawn managed`, which runs 
 
 `agent-spawn browse [--focus <agent_id>] [--result-file <path>]`: [TUI](#tui).
 
+### `validate`
+
+```text
+agent-spawn validate [--probe] [--quiet] [--json]
+```
+
+Checks the configuration and the environment without changing anything, for the harness's `doctor`. It is **offline and read-only**: no network call, no prompt (it never reads stdin, whatever the terminal), no `state.db` (not opened), no lease, no write or creation of any path (the state directory, `log.jsonl`, `audit.jsonl` and the config's own directory included), and no hook. Without `--probe` it starts **no process at all**: the lower tools are found, never run. It accepts no other flag of its own (`--dry-run` exits 2).
+
+In order:
+
+1. **Config.** The configuration is loaded and validated as every command does ([Config](#config)), before the command runs. A problem exits 2, `config_invalid`, naming the file and the key; nothing else is checked. A missing default file is the built-in defaults, so `config.files` is then empty.
+2. **State directory.** `$XDG_STATE_HOME/agent-spawn` ([Files](#files)) is examined with `stat` and `access` (real uid), never created. It is `ok` when it is a directory the user can enter and write to; `absent` when it does not exist and its nearest existing ancestor is such a directory (the first command that writes creates it); anything else (not a directory, not writable, a symbolic link that dangles) exits 12, `failed`, message starting `state_dir:`.
+3. **Tools.** `claude_session_cmd`, `wtctl_cmd` and `termctl_cmd` are each resolved as a launch does (`resolve_tool`: the program of the argv, an absolute or relative path with a `/` as given, else the first `PATH` match, which must be a regular file the user can execute; the rest of the argv is never examined, run or printed). `claude-session` is always needed and `wtctl` is needed whenever the records of a cwd are, which is every launch, so one of them that does not resolve exits 12, `tool_missing` (`error.tool` is the first one missing in the order claude-session, wtctl; the message names every missing one). `wtctl_cmd: null` is `disabled` (standalone use) and is not a problem. `termctl` is needed only for windows, so a missing one is a `termctl_missing` **warning**: headless agents work without it. Paths stored with an existing agent are not consulted (`validate` has no agent).
+4. **Scope host.** With `supervisor.detach: scope`, a `systemd-run` that is not on `PATH` is a `systemd_run_missing` warning (it is run by headless launches only; the transient scope itself is never started).
+
+**`--probe`** adds live checks of what step 3 found, still read-only and offline: each resolved tool is run once as `<argv> --version` (stdin `/dev/null`, cwd `/`, the caller's environment, 10 seconds, output capped by the gateway), which by the tools' interfaces answers before any other check and touches no state. The first line of stdout must be exactly `<tool> X.Y.Z` (three plain numeric parts, as `claude-session --version`, `termctl --version` and `wtctl --version` print); that version is compared with the minimum release of [Platform notes](#platform-notes) (0.1.0). Everything else about the run is a warning, never a failure, as claude-session treats an unreadable `claude --version`: a non-zero exit, a timeout, output that is not that line, a program that cannot start, or version `0.0.0` (a source tree, unknown) is `tool_version_unknown`; a version below 0.1.0 is `tool_too_old`; a claude-session below 0.43.0 (and at least 0.1.0) is `implicit_done_unavailable` (only a call that gives `--implicit-done` or `--no-implicit-done` is affected). Without `--probe` `version` is `null` and none of these three warnings can occur. A tool that hangs costs at most its 10 seconds and is killed by its own PID only.
+
+`--json` prints one object ([schemas/cli/validate.json](../schemas/cli/validate.json)):
+
+```json
+{"probe": false,
+ "config": {"path": "/home/u/.config/agent-spawn/config.yaml", "files": []},
+ "checks": {"state_dir": {"path": "/home/u/.local/state/agent-spawn", "status": "absent"},
+            "tools": {"claude-session": {"status": "ok", "path": "/usr/bin/claude-session", "version": null, "minimum": "0.1.0"},
+                      "termctl": {"status": "ok", "path": "/usr/bin/termctl", "version": null, "minimum": "0.1.0"},
+                      "wtctl": {"status": "ok", "path": "/usr/bin/wtctl", "version": null, "minimum": "0.1.0"}}},
+ "warnings": []}
+```
+
+`config.path` is the absolute file in use and `config.files` the files that were read (the file, if it exists, then the drop-ins). `tools.<name>.status` is `ok`, `missing` (only for `termctl`, since the others exit) or `disabled` (`wtctl_cmd: null`); `path` is null unless `ok`. `warnings` is always present and empty when there is nothing to say; each entry is an object `{"code", "message", "key"?}` as in wtctl's `validate` (other commands' warnings are plain strings), `code` being one of the codes above and `key` the config key (`termctl_cmd`, `supervisor.detach`). A caller that only needs a verdict reads the exit code and whether `warnings` is non-empty. Without `--json`, a summary on stdout and one `agent-spawn: warning: <key>: <message>` line per warning on stderr (`--quiet` hides them); with `--json` the lines go to stderr as well. Config values are untrusted text: messages escape them like all human output and cut them to 200 characters; `--json` output is ASCII. Nothing from the config is executed except, under `--probe`, the resolved tool programs.
+
+Exit 0, 1, 2, 12 (an error envelope on stdout with `--json`).
+
 ### Internal commands
 
 `supervise <agent_id> [--host] [--handoff <socket> --handoff-timeout <seconds>] --state-dir <path> --config <path>` ([Supervision](#supervision); `--host` for a promotion window and it requires `--handoff`, otherwise exit 2; the host also refuses (exit 2) unless the promoted run names this very process as its host pane process, [Promotion](#promotion)) and `--state-dir <path> --config <path> _session-event` ([State relay](#state-relay)). Not for direct use; `supervise` refuses (exit 2) when the agent's record does not expect it, while `_session-event` never exits non-zero ([State relay](#state-relay)). Every internal argv carries the absolute state dir and the resolved absolute config path (the default path when no file existed at launch; a missing file then means built-in defaults); internal processes never derive the state dir from `XDG_STATE_HOME`.
@@ -632,10 +665,10 @@ Writes or removes the managed crontab block `# agent-spawn managed`, which runs 
 |---|---|
 | 0 | success; for waiting commands: the last run reported done (or, without `--wait`, the run started) |
 | 1 | internal error |
-| 2 | usage error, invalid config, human-only flag without a human actor, `reconcile --reset-lease` together with `--dry-run` |
+| 2 | usage error, invalid config (also from `validate`), human-only flag without a human actor, `reconcile --reset-lease` together with `--dry-run` |
 | 10 | agent not found or torn down; the agent's session is missing (`details.status: session_missing`); a lower tool's not-found passed through |
 | 11 | a `pre-launch`/`pre-teardown` hook vetoed; a lower tool's veto passed through; self-labeling check failed; for waiting commands: the run's launch was vetoed |
-| 12 | expected failure: `tool_missing`, `handoff_failed`, `no_window`, `no_run`, `worktree_gone`, `partial`, `failed`, `schema_newer`, `launch_failed` (including `details.cause` `classification_mismatch`, `classification_unknown`, `worktree_mismatch`, `cwd_missing` and `cwd_changed`); `failed` with `details.cause: worktree_state` or `scope_unavailable`; a lower tool's expected failure (`code: failed`, its code in `lower_code`); for waiting commands: the run never started |
+| 12 | expected failure: `tool_missing` (also from `validate`: claude-session, or wtctl unless `wtctl_cmd` is null), `failed` from `validate` for an unusable state directory, `handoff_failed`, `no_window`, `no_run`, `worktree_gone`, `partial`, `failed`, `schema_newer`, `launch_failed` (including `details.cause` `classification_mismatch`, `classification_unknown`, `worktree_mismatch`, `cwd_missing` and `cwd_changed`); `failed` with `details.cause: worktree_state` or `scope_unavailable`; a lower tool's expected failure (`code: failed`, its code in `lower_code`); for waiting commands: the run never started |
 | 13 | a pre-hook escalated; a lower tool's escalation or confirmation required; for waiting commands: the run ended blocked or needs-input (not promoted), or its launch escalated |
 | 14–18 | waiting commands: exited-unreported, killed, timeout, lost, failed |
 | 20 | refused; `reason` is agent-spawn's `live`, `tearing_down`, `third_party_cwd`, `third_party_run`, or a lower tool's reason passed through (`tainted`, `repo_config_changed` from wtctl at teardown, `held`, `dirty`, `unpushed`, `in_use`, `unlinked`, `locked`, `main_worktree`, `branch_in_use`, `branch_exists`, `path_exists`, `not_owned`, ...) |
