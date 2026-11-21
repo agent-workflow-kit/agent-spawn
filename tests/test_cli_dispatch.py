@@ -37,6 +37,7 @@ OWNERS = {
     "cron uninstall": 34,
     "export": 7,
     "browse": 38,
+    "validate": 109,
     "supervise": 12,
 }
 
@@ -59,6 +60,7 @@ IMPLEMENTED = {
     "stop",
     "supervise",
     "teardown",
+    "validate",
     "wait",
 }  # commands whose issue has landed (no longer stubs)
 

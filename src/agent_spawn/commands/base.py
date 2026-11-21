@@ -37,6 +37,7 @@ class Invocation:
     warnings: list[str] = field(default_factory=lambda: [])
     config: Config | None = None
     config_file: str | None = None
+    config_files: tuple[str, ...] = ()  # the files the config was read from (``validate``)
 
 
 Handler = Callable[[Invocation], Outcome]

@@ -343,6 +343,12 @@ def _add_cron_install(parser: Any) -> None:
     parser.add_argument("--dry-run", action="store_true")
 
 
+def _add_validate(parser: Any) -> None:
+    parser.add_argument(
+        "--probe", action="store_true", help="also run each lower tool with --version"
+    )
+
+
 def _add_export(parser: Any) -> None:
     parser.add_argument("--since", type=_since, metavar="TIME|DURATION")
     _repeatable(parser, "--action", "ACTION", "match an action (ORed)")
@@ -415,6 +421,7 @@ def build_parser() -> SpawnParser:
     add(commands, "prune", "prune", _add_prune, "tear down old parked agents")
     add(commands, "reconcile", "reconcile", _add_reconcile, "recover from crashes and races")
     add(commands, "export", "export", _add_export, "print audit records")
+    add(commands, "validate", "validate", _add_validate, "check the config and the lower tools")
     add(commands, "browse", "browse", _add_browse, "browse agents in a TUI")
     add(commands, "supervise", "supervise", _add_supervise, None)
 
@@ -631,6 +638,7 @@ def parse_invocation(argv: Sequence[str]) -> Invocation:
         result_file=result_file,
         config=loaded.config,
         config_file=loaded.path,
+        config_files=loaded.files,
     )
 
 
@@ -648,7 +656,7 @@ def _head(argv: Sequence[str]) -> list[str]:
 # The public command names (the first word of each parser key); a test keeps it equal to the parser.
 _COMMAND_NAMES = (
     "ack attach browse cron export label launch list prune reconcile resume show stop "
-    "supervise teardown wait"
+    "supervise teardown validate wait"
 ).split()
 
 

@@ -1,0 +1,13 @@
+{
+  "probe": false,
+  "config": {"path": "<CONFIG>/agent-spawn/config.yaml", "files": []},
+  "checks": {
+    "state_dir": {"path": "<STATE>/agent-spawn", "status": "absent"},
+    "tools": {
+      "claude-session": {"status": "ok", "path": "<BIN>/claude-session", "version": null, "minimum": "0.1.0"},
+      "termctl": {"status": "ok", "path": "<BIN>/termctl", "version": null, "minimum": "0.1.0"},
+      "wtctl": {"status": "ok", "path": "<BIN>/wtctl", "version": null, "minimum": "0.1.0"}
+    }
+  },
+  "warnings": []
+}
