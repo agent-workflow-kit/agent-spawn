@@ -1,13 +1,16 @@
 """Usage errors exit 2 with the envelope, also on argparse's own error path."""
 
+import importlib.metadata
 import json
 from typing import Any
 
 import pytest
 
-from agent_spawn import __version__, cli
+import agent_spawn
+from agent_spawn import cli
 from tests import schema_registry
 from tests.cli_samples import MIN_ARGV
+from tests.pyproject_version import pyproject_version
 
 ERROR_SCHEMA = "agent-spawn/cli/error.json"
 
@@ -125,7 +128,28 @@ def test_subcommand_help_exits_0(capsys: pytest.CaptureFixture[str]) -> None:
 def test_version_prints_the_version_and_exits_0(capsys: pytest.CaptureFixture[str]) -> None:
     code, out, _ = _run(capsys, ["--version"])
     assert code == 0
-    assert out.strip() == f"agent-spawn {__version__}"
+    assert out == f"agent-spawn {pyproject_version()}\n"
+
+
+def test_version_falls_back_to_the_placeholder_without_the_distribution(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def missing(name: str) -> str:
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", missing)
+    code, out, _ = _run(capsys, ["--version"])
+    assert code == 0
+    assert out == "agent-spawn 0.0.0\n"
+    assert agent_spawn.__version__ == "0.0.0"
+
+
+def test_version_is_not_read_for_other_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(name: str) -> str:
+        raise AssertionError("the version must be read only for --version")
+
+    monkeypatch.setattr(importlib.metadata, "version", boom)
+    cli.build_parser().parse_args(["list"])
 
 
 def test_every_minimal_argv_passes_the_usage_checks() -> None:
