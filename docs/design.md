@@ -167,6 +167,7 @@ Notes from review pass 1: the handoff now also checks the peer's start time and 
 | `hooks` | design-guide hook execution, selectors, payloads, the outbox and its delivery lease |
 | `output` | result objects, error envelopes (`lower_error`), `--result-file` writes (no-follow, atomic) |
 | `browse` | Textual TUI (last stage) |
+| `checking` | `validate` (interface.md, [`validate`](interface.md#validate)): config and environment verdict for the harness's `doctor`. Offline and read-only by construction: it never opens `state.db` or creates the state directory, and runs a process only under `--probe` (`<tool> --version` through the gateway, 10 s). Tool lookup is `launch.resolve_tool`, so it agrees with what a launch finds. Same envelope as wtctl's `validate` (`checks` plus an object `warnings` list); missing required tool is `tool_missing` (12), an unusable state directory `failed` (12), a missing termctl a warning (only windows need it) |
 
 ### Data model (`state.db`)
 
