@@ -196,7 +196,55 @@ def _human(payload: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _show_unchecked(inv: Invocation) -> Outcome:
+    """``show --no-liveness``: the stored row and runs only. No liveness check, no process
+    probe, no claude-session or wtctl call, nothing written or migrated; what needs one of
+    those (``session``, ``supervisor.alive``, ``third_party_run``, ``repo_config_changed``) is
+    null."""
+    store = open_existing(inv, migrate=False, readonly=True)
+    try:
+        resolved = resolve_existing(store, inv.args.agent_id)
+    except BaseException:
+        if store is not None:
+            store.close()
+        raise
+    assert store is not None
+    try:
+        with store:
+            row = store.get_agent(resolved.agent_id)
+            if row is None:
+                raise CliError.of("not_found", "no such agent")
+            supervisor = None
+            sup, exec_proc = row.get("supervisor"), row.get("exec_proc")
+            if sup is not None and row["status"] != "torn_down":
+                supervisor = {
+                    "pid": sup.pid,
+                    "alive": None,
+                    "exec_pid": None if exec_proc is None else exec_proc.pid,
+                }
+            try:
+                agent = agent_object(store, row)
+                runs = run_objects(store, row)
+            except CORRUPT_ROW:
+                raise unusable_row(resolved.agent_id) from None
+    except StoreError as error:
+        raise store_failed(error) from None
+    payload = {
+        "agent": agent,
+        "runs": runs,
+        "session": None,
+        "supervisor": supervisor,
+        "third_party_run": None,
+        "repo_config_changed": None,
+        "warnings": [],
+        "liveness_checked": False,
+    }
+    return Outcome(0, payload, PayloadKind.COMMAND, _human(payload) + "\n  (liveness not checked)")
+
+
 def show(inv: Invocation) -> Outcome:
+    if inv.args.no_liveness:
+        return _show_unchecked(inv)
     store = open_existing(inv)
     try:
         resolved = resolve_existing(store, inv.args.agent_id)

@@ -124,7 +124,9 @@ def list_agents(inv: Invocation) -> Outcome:
         except GrammarError as exc:
             raise CliError.usage(str(exc)) from None
 
-    store = open_existing(inv)
+    # --no-liveness reads the stored state: nothing is migrated, probed or written
+    unchecked: bool = bool(args.no_liveness)
+    store = open_existing(inv, migrate=not unchecked, readonly=unchecked)
     agents: list[dict[str, Any]] = []
     if store is not None:
         try:
@@ -133,7 +135,11 @@ def list_agents(inv: Invocation) -> Outcome:
         except StoreError as error:
             raise store_failed(error) from None
     human = "\n".join(human_line(agent) for agent in agents) if agents else "no agents"
-    return Outcome(0, {"agents": agents}, PayloadKind.COMMAND, human)
+    payload: dict[str, Any] = {"agents": agents}
+    if unchecked:
+        payload["liveness_checked"] = False
+        human += "\n(liveness not checked)"
+    return Outcome(0, payload, PayloadKind.COMMAND, human)
 
 
 def _select(
@@ -172,18 +178,19 @@ def _select(
         # The inline liveness check of the live and launching rows runs first (it may park an
         # agent); it records its changes and delivers no hook. A row whose process entry cannot
         # be read is listed as it is: unreadable is an error, never "dead".
-        live = liveness_for(inv, store)
-        unreadable: list[tuple[str, CliError]] = []
-        for row in store.list_agents(statuses=("launching", "live")):
-            try:
-                live.check(row["agent_id"])
-            except CliError as error:
-                if error.exit_code == 12:
-                    # unreadable process entry (documented): listed unchanged, and logged
-                    unreadable.append((row["agent_id"], error))
-                continue
-        if unreadable:
-            _log_unreadable(unreadable, inv)
+        if not args.no_liveness:
+            live = liveness_for(inv, store)
+            unreadable: list[tuple[str, CliError]] = []
+            for row in store.list_agents(statuses=("launching", "live")):
+                try:
+                    live.check(row["agent_id"])
+                except CliError as error:
+                    if error.exit_code == 12:
+                        # unreadable process entry (documented): listed unchanged, and logged
+                        unreadable.append((row["agent_id"], error))
+                    continue
+            if unreadable:
+                _log_unreadable(unreadable, inv)
         rows = [row for row in store.list_agents() if _matches(row, ids, wanted)]
         rows.sort(key=lambda row: row["agent_id"])
         rows.sort(key=lambda row: row["created"], reverse=True)
