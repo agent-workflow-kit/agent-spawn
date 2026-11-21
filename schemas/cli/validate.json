@@ -12,7 +12,7 @@
       "type": "object",
       "properties": {
         "path": {
-          "$ref": "../defs.json#/$defs/abs_path",
+          "$ref": "#/$defs/path",
           "description": "The absolute config file in use (the default path when no file exists)."
         },
         "files": {
@@ -20,7 +20,7 @@
           "maxItems": 257,
           "description": "The files that were read: the config file when it exists, then the config.d drop-ins in order.",
           "items": {
-            "$ref": "../defs.json#/$defs/abs_path"
+            "$ref": "#/$defs/path"
           }
         }
       },
@@ -34,7 +34,7 @@
           "type": "object",
           "properties": {
             "path": {
-              "$ref": "../defs.json#/$defs/abs_path"
+              "$ref": "#/$defs/path"
             },
             "status": {
               "enum": ["ok", "absent"],
@@ -98,6 +98,11 @@
   "additionalProperties": false,
   "required": ["probe", "config", "checks", "warnings"],
   "$defs": {
+    "path": {
+      "type": "string",
+      "pattern": "^/",
+      "description": "An absolute path as the tool holds it (any characters, a newline included; the human output escapes them)."
+    },
     "tool": {
       "type": "object",
       "properties": {
@@ -108,7 +113,7 @@
         "path": {
           "oneOf": [
             {
-              "$ref": "../defs.json#/$defs/abs_path"
+              "$ref": "#/$defs/path"
             },
             {
               "type": "null"
@@ -118,12 +123,12 @@
         },
         "version": {
           "type": ["string", "null"],
-          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+          "pattern": "^[0-9]{1,9}\\.[0-9]{1,9}\\.[0-9]{1,9}$",
           "description": "From <tool> --version; null without --probe or when it could not be read (a tool_version_unknown warning)."
         },
         "minimum": {
           "type": "string",
-          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+          "pattern": "^[0-9]{1,9}\\.[0-9]{1,9}\\.[0-9]{1,9}$"
         }
       },
       "additionalProperties": false,

@@ -22,6 +22,7 @@ from tests.launch_support import Env
 GOLDEN = Path(__file__).parent / "golden"
 SCHEMA = "agent-spawn/cli/validate.json"
 TOOLS = ("claude-session", "termctl", "wtctl")
+KEYS = {"claude_session_cmd", "termctl_cmd", "wtctl_cmd"}
 
 
 @pytest.fixture
@@ -228,6 +229,18 @@ def test_scope_without_systemd_run_is_a_warning(env: Env, tmp_path: Path) -> Non
     code, body, _ = run_json(env, extra_env={"PATH": str(bare)})
     assert code == 0, body
     assert [w["code"] for w in body["warnings"]] == ["systemd_run_missing"]
+    assert body["warnings"][0]["key"] == "supervisor.detach"
+    done = env.run("validate", extra_env={"PATH": str(bare)})
+    assert done.stderr.startswith("agent-spawn: warning: supervisor.detach:")
+
+
+def test_default_detach_without_systemd_run_is_silent(env: Env, tmp_path: Path) -> None:
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    for name in (*TOOLS, "python3"):
+        (bare / name).symlink_to(env.fakebin.bin_dir / name)
+    code, body, err = run_json(env, extra_env={"PATH": str(bare)})
+    assert code == 0 and body["warnings"] == [] and err == ""
 
 
 def test_a_tool_path_with_hostile_text_is_escaped(env: Env) -> None:
@@ -237,6 +250,45 @@ def test_a_tool_path_with_hostile_text_is_escaped(env: Env) -> None:
     assert done.returncode == 0
     assert "\x1b" not in done.stderr and "‮" not in done.stderr
     assert len(done.stderr) < 600
+
+
+def test_a_long_value_is_cut_to_200_characters(env: Env) -> None:
+    env.config.parent.mkdir(parents=True)
+    env.config.write_text('termctl_cmd: ["/no/' + "x" * 500 + '"]\n')
+    _, body, _ = run_json(env)
+    message = body["warnings"][0]["message"]
+    assert message.startswith("/no/" + "x" * 196 + "... ")
+
+
+def test_human_output_escapes_hostile_paths(env: Env, tmp_path: Path) -> None:
+    tool = script(tmp_path, "cs\x1b[1m\nforged", "exit 0\n")
+    named = tmp_path / "c\x1b[31m\u202e.yaml"
+    named.write_text(f"claude_session_cmd: [{json.dumps(tool)}]\n")
+    done = env.run(
+        "validate",
+        "--config",
+        str(named),
+        extra_env={"XDG_STATE_HOME": str(tmp_path / "st\nate\x1b[2J")},
+    )
+    assert done.returncode == 0, done.stderr
+    assert "\x1b" not in done.stdout and "\u202e" not in done.stdout
+    assert len(done.stdout.splitlines()) == 6
+
+
+def test_state_and_tool_paths_with_a_newline_still_match_the_schema(
+    env: Env, tmp_path: Path
+) -> None:
+    code, body, _ = run_json(env, extra_env={"XDG_STATE_HOME": str(tmp_path / "a\nb")})
+    assert code == 0
+    assert "\n" in body["checks"]["state_dir"]["path"]
+    schema_registry.validate(body, SCHEMA)
+
+
+def test_summary_counts_warnings(env: Env, tmp_path: Path) -> None:
+    env.config.parent.mkdir(parents=True)
+    env.config.write_text(f"termctl_cmd: [{tmp_path}/gone]\n")
+    done = env.run("validate")
+    assert done.returncode == 0 and done.stdout.rstrip().endswith("\nok, 1 warning(s)")
 
 
 # --- read-only ---------------------------------------------------------------------------------
@@ -296,6 +348,38 @@ def test_unwritable_state_dir_fails(env: Env) -> None:
     assert code == 12 and body["error"]["message"].startswith("state_dir:")
 
 
+def test_dangling_link_at_the_state_path_fails(env: Env, tmp_path: Path) -> None:
+    env.iso.state.mkdir(exist_ok=True)
+    env.state_dir.symlink_to(tmp_path / "nowhere")
+    code, body, _ = run_json(env)
+    assert code == 12 and body["error"]["message"].startswith("state_dir:")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes everywhere")
+def test_unwritable_ancestor_of_an_absent_state_dir_fails(env: Env, tmp_path: Path) -> None:
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    ro.chmod(0o500)
+    try:
+        code, body, _ = run_json(env, extra_env={"XDG_STATE_HOME": str(ro / "sub" / "deeper")})
+    finally:
+        ro.chmod(0o700)
+    assert code == 12 and body["error"]["message"].startswith("state_dir:")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root searches everywhere")
+def test_stat_error_on_the_state_dir_fails(env: Env, tmp_path: Path) -> None:
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o600)
+    try:
+        code, body, _ = run_json(env, extra_env={"XDG_STATE_HOME": str(locked / "x")})
+    finally:
+        locked.chmod(0o700)
+    assert code == 12 and body["error"]["message"].startswith("state_dir:")
+    assert "cannot examine" in body["error"]["message"]
+
+
 # --- --probe -----------------------------------------------------------------------------------
 
 
@@ -325,7 +409,29 @@ def test_probe_flags_a_version_below_the_minimum(env: Env) -> None:
     code, body, _ = run_json(env, "--probe", extra_env={"FAKEBIN_VERSION": "0.0.9"})
     assert code == 0
     assert {w["code"] for w in body["warnings"]} == {"tool_too_old"}
+    assert {w["key"] for w in body["warnings"]} == KEYS
     assert len(body["warnings"]) == 3
+
+
+def test_probe_unknown_version_warns_for_every_tool_with_its_key(env: Env) -> None:
+    code, body, _ = run_json(env, "--probe", extra_env={"FAKEBIN_VERSION": "0.0.0"})
+    assert code == 0
+    assert {w["code"] for w in body["warnings"]} == {"tool_version_unknown"}
+    assert {w["key"] for w in body["warnings"]} == KEYS and len(body["warnings"]) == 3
+
+
+@pytest.mark.parametrize(
+    ("version", "codes"),
+    [
+        ("0.1.0", ["implicit_done_unavailable"]),
+        ("0.42.9", ["implicit_done_unavailable"]),
+        ("0.43.0", []),
+    ],
+)
+def test_implicit_done_boundary(env: Env, version: str, codes: list[str]) -> None:
+    code, body, _ = run_json(env, "--probe", extra_env={"FAKEBIN_VERSION": version})
+    assert code == 0
+    assert [w["code"] for w in body["warnings"]] == codes
 
 
 @pytest.mark.parametrize(
@@ -341,6 +447,10 @@ def test_probe_flags_a_version_below_the_minimum(env: Env) -> None:
         "printf '\\377\\376 \\000'",
         "",
         "echo 'claude-session 1.2.3' >&2; exit 1",
+        "echo 'claude-session 1.2.3'; exit 1",
+        "echo banner; echo 'claude-session 1.2.3'",
+        "echo 'claude-sessionX 1.2.3'",
+        "echo 'claude-session 1." + "9" * 6000 + ".1'",
     ],
 )
 def test_probe_trouble_is_a_warning_never_a_failure(env: Env, tmp_path: Path, body: str) -> None:
@@ -361,6 +471,37 @@ def test_probe_accepts_a_good_version_from_a_script(env: Env, tmp_path: Path) ->
     code, out, _ = run_json(env, "--probe", extra_env={"FAKEBIN_VERSION": "0.43.0"})
     assert code == 0 and out["warnings"] == []
     assert out["checks"]["tools"]["claude-session"]["version"] == "1.2.3"
+
+
+def test_probe_reads_only_the_first_line(env: Env, tmp_path: Path) -> None:
+    tool = script(tmp_path, "cs", "echo 'claude-session 1.2.3'; echo extra\n")
+    env.config.parent.mkdir(parents=True)
+    env.config.write_text(f"claude_session_cmd: [{tool}]\n")
+    code, out, _ = run_json(env, "--probe", extra_env={"FAKEBIN_VERSION": "0.43.0"})
+    assert code == 0 and out["warnings"] == []
+    assert out["checks"]["tools"]["claude-session"]["version"] == "1.2.3"
+
+
+def test_probe_timeout_is_ten_seconds() -> None:
+    assert checking.PROBE_TIMEOUT == 10
+
+
+def test_probe_with_an_invalid_config_exits_2_before_probing(env: Env) -> None:
+    env.config.parent.mkdir(parents=True)
+    env.config.write_text("not_a_key: 1\n")
+    assert run_json(env, "--probe")[0] == 2
+    for name in TOOLS:
+        assert env.fakebin.argvs(name) == []
+
+
+def test_a_missing_termctl_is_not_probed(env: Env, tmp_path: Path) -> None:
+    env.config.parent.mkdir(parents=True)
+    env.config.write_text(f"termctl_cmd: [{tmp_path}/gone]\n")
+    code, body, _ = run_json(env, "--probe", extra_env={"FAKEBIN_VERSION": "0.43.0"})
+    assert code == 0
+    assert [w["code"] for w in body["warnings"]] == ["termctl_missing"]
+    assert body["checks"]["tools"]["termctl"]["version"] is None
+    assert env.fakebin.argvs("termctl") == []
 
 
 def test_probe_passes_the_extra_argv_then_version(env: Env, tmp_path: Path) -> None:

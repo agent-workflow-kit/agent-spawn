@@ -8,7 +8,6 @@ was already loaded (and refused with ``config_invalid``) by the CLI before this 
 
 from __future__ import annotations
 
-import errno
 import os
 import re
 import shutil
@@ -28,7 +27,7 @@ __all__ = ["validate_command"]
 PROBE_TIMEOUT = 10.0
 MINIMUM = (0, 1, 0)
 IMPLICIT_DONE_MINIMUM = (0, 43, 0)
-_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+_VERSION = re.compile(r"[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}")
 _SHOWN = 200  # config values in messages are cut to this many characters
 
 
@@ -76,12 +75,8 @@ def check_state_dir(path: str) -> str:
         except FileNotFoundError:
             if os.path.lexists(parent):
                 raise _failed(f"state_dir: {_show(parent)} is a dangling symbolic link") from None
-            if parent == os.path.dirname(parent):
-                raise _failed(f"state_dir: no directory above {_show(path)}") from None
             parent = os.path.dirname(parent)
         except OSError as exc:
-            if exc.errno == errno.ENOTDIR:
-                raise _failed(f"state_dir: {_show(parent)} is not a directory") from None
             raise _failed(f"state_dir: cannot examine {_show(parent)}: {exc.strerror}") from None
 
 
