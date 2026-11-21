@@ -8,7 +8,6 @@ import json
 import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -36,7 +35,10 @@ CHILD = """
 import os, signal, sys, time
 marker, ready, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 release = os.path.join(os.path.dirname(marker), "release")
+ping = marker + ".ping"
 termed = False
+def on_ping(signum, frame):
+    open(ping, "w").write("ping")
 def on_term(signum, frame):
     global termed
     open(marker, "w").write("term")
@@ -44,6 +46,7 @@ def on_term(signum, frame):
     if mode == "exit":
         sys.exit(0)
 signal.signal(signal.SIGTERM, on_term)
+signal.signal(signal.SIGWINCH, on_ping)
 open(ready, "w").write("ready")
 for _ in range(1200):
     if termed and mode == "release" and os.path.exists(release):
@@ -110,6 +113,22 @@ def park(env: Env, **fields: Any) -> None:
     with Store.open(env.state_dir, create=False) as store:
         values: dict[str, Any] = {"park_reason": "killed", "needs_attention": None, **fields}
         assert lifecycle.park(store, AGENT, **values) is not None
+
+
+def assert_never_signaled(env: Env, identity: ProcessIdentity, marker: Path) -> None:
+    """The stand-in got no SIGTERM, and is still running.
+
+    A signal that was sent is already pending in the stand-in, so a round trip through it is the
+    barrier: it is sent a SIGWINCH (its handlers run in signal-number order, SIGTERM first), and
+    its ``ping`` file (or, were a SIGTERM there, the marker) shows both were dealt with."""
+    handle = procs.open_verified(identity)
+    assert handle is not None, "the stand-in is gone"
+    with handle:
+        assert handle.send(signal.SIGWINCH)
+    ping = marker.parent / "marker.ping"
+    env.wait_for(lambda: ping.exists() or marker.exists(), "the stand-in to answer the ping")
+    assert not marker.exists()
+    assert procs.is_alive(identity)
 
 
 def release(marker: Path) -> None:
@@ -406,9 +425,7 @@ def test_a_process_with_another_start_time_is_never_signaled(
     assert done.returncode == 0
     check_stop(body)
     assert body["action"] == "none" and body["agent"]["status"] == "parked"
-    time.sleep(0.3)
-    assert not marker.exists()
-    assert procs.is_alive(real)
+    assert_never_signaled(env, real, marker)
 
 
 def test_a_launching_fork_deleted_by_its_launcher_is_removed(
@@ -516,8 +533,7 @@ def test_a_signal_is_not_sent_when_the_row_changed_after_the_plan(
     finally:
         assert stop.store is not None
         stop.store.close()
-    time.sleep(0.2)
-    assert not marker.exists() and procs.is_alive(supervisor)
+    assert_never_signaled(env, supervisor, marker)
 
 
 def test_the_signal_goes_out_when_the_row_still_names_the_process(
@@ -855,8 +871,7 @@ def test_dry_run_of_a_signal_action_signals_nothing(
     assert done.returncode == 0, done.stderr
     check_stop(body)
     assert body["action"] == "signal_supervisor" and body["dry_run"] is True
-    time.sleep(0.3)
-    assert not marker.exists() and procs.is_alive(supervisor)
+    assert_never_signaled(env, supervisor, marker)
     assert agent_row(env)["status"] == "live" and audits(env) == []
 
 

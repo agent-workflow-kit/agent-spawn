@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Fake systemd-run for agent-spawn tests; see tests/fakebin/FIDELITY.md."""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
+
+from tests.fakebin.fakelib.systemd_run import main  # noqa: E402
+
+sys.exit(main(sys.argv[1:]))

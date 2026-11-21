@@ -85,7 +85,7 @@ def test_defaults_equal_the_schema_defaults() -> None:
     for key, spec in SCHEMA["properties"].items():
         if key == "handoff_timeout":
             assert dumped[key] == 30.0
-        elif key in ("me", "prune", "hooks", "reconcile"):
+        elif key in ("me", "prune", "hooks", "reconcile", "supervisor"):
             # nested defaults: the schema's per-property defaults
             for sub, sub_spec in spec["properties"].items():
                 if "default" in sub_spec:
@@ -724,3 +724,34 @@ def test_close_dead_panes_after_takes_a_duration(tmp_path: Path, text: str, seco
 def test_close_dead_panes_after_refuses_zero_negative_and_text(tmp_path: Path, value: str) -> None:
     message = invalid(tmp_path, f"reconcile: {{close_dead_panes_after: {value}}}\n")
     assert "close_dead_panes_after" in message
+
+
+# --- supervisor.detach ------------------------------------------------------------------------
+
+
+def test_supervisor_detach_defaults_to_setsid(tmp_path: Path) -> None:
+    assert load(tmp_path).supervisor.detach == "setsid"
+
+
+@pytest.mark.parametrize("value", ["setsid", "scope"])
+def test_supervisor_detach_takes_setsid_or_scope(tmp_path: Path, value: str) -> None:
+    assert load(tmp_path, f"supervisor: {{detach: {value}}}\n").supervisor.detach == value
+
+
+@pytest.mark.parametrize("value", ["Scope", "systemd", "''", "null", "true", "1", "'scope\\n'"])
+def test_supervisor_detach_refuses_everything_else(tmp_path: Path, value: str) -> None:
+    message = invalid(tmp_path, f"supervisor: {{detach: {value}}}\n")
+    assert "detach" in message
+
+
+def test_supervisor_refuses_unknown_keys(tmp_path: Path) -> None:
+    assert "unit" in invalid(tmp_path, "supervisor: {detach: scope, unit: x}\n")
+
+
+def test_supervisor_detach_is_in_the_schema() -> None:
+    import jsonschema
+
+    jsonschema.validate({"supervisor": {"detach": "scope"}}, SCHEMA)
+    for bad in ("systemd", None, 1):
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate({"supervisor": {"detach": bad}}, SCHEMA)

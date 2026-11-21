@@ -384,6 +384,7 @@ class Store:
         busy_timeout: float = DEFAULT_BUSY_TIMEOUT,
         migrations: Sequence[Migration] = MIGRATIONS,
         identity: ProcessIdentity | None = None,
+        readonly: bool = False,
     ) -> Store:
         """Open (and with ``create``, make) the state dir and ``state.db``.
 
@@ -393,9 +394,20 @@ class Store:
         older schema is migrated. A missing database with ``create=False`` is ``StoreMissing``.
         ``state.db`` and its sidecars must be regular, single-link files of this user, never
         symlinks; a database replaced while it is opened is refused.
+
+        With ``readonly`` (``migrate`` must be false, ``create`` is ignored) the database is
+        opened ``mode=ro`` and nothing is written: no journal-mode or synchronous change, no
+        migration, no checkpoint, no chmod, no directory made. An existing ``-wal`` is read and
+        left as it is; SQLite may create the empty ``-wal``/``-shm`` of a WAL database for the
+        reader. Where SQLite cannot open it read-only (a read-only directory) and there is no
+        ``-wal``, it is opened ``immutable``.
         """
         gw = gateway or get_gateway()
         uid = gw.getuid()
+        if readonly:
+            if migrate:
+                raise ValueError("a read-only open cannot migrate")
+            return cls._open_readonly(Path(state_dir), gw, uid, busy_timeout, len(migrations))
         path, file_id = _prepare_files(Path(state_dir), create=create, uid=uid)
         _check_version(_peek_version(path, file_id, busy_timeout), len(migrations), migrate=migrate)
         conn = _connect(str(path), busy_timeout)
@@ -417,6 +429,37 @@ class Store:
         _count_open_store(1)
         store._counted = True
         return store
+
+    @classmethod
+    def _open_readonly(
+        cls, state_dir: Path, gw: Gateway, uid: int, busy_timeout: float, wanted: int
+    ) -> Store:
+        path, file_id = _locate_readonly(state_dir, uid)
+        timeout = min(busy_timeout, 1.0)
+        quoted = urllib.parse.quote(str(path))
+        wal = Path(f"{path}-wal")
+        conn = _connect(f"file:{quoted}?mode=ro", timeout, uri=True)
+        try:
+            try:
+                version = _read_version(conn, path)
+            except sqlite3.OperationalError as exc:
+                # SQLite could not make the -shm of a WAL database (read-only directory or
+                # file). Without a -wal there is nothing to recover, so read it as it is;
+                # never with a -wal: frames not yet checkpointed would be ignored.
+                if isinstance(_map(exc), StoreBusy) or wal.exists() or wal.is_symlink():
+                    raise
+                conn.close()
+                conn = _connect(f"file:{quoted}?mode=ro&immutable=1", timeout, uri=True)
+                version = _read_version(conn, path)
+            _check_same_file(path, file_id)
+            _check_version(version, wanted, migrate=False)
+        except BaseException as exc:
+            conn.close()
+            mapped = _translate(exc)
+            if mapped is not exc:
+                raise mapped from exc
+            raise
+        return cls(conn, path, gw)
 
     def _setup(
         self,
@@ -1360,6 +1403,21 @@ class Store:
         assert stored is not None
         return stored
 
+    def mark_run_adopted(self, lease: Lease, agent_id: str, run: int, when: float) -> bool:
+        """Record when the supervisor adopted run ``run`` (``started_at``, shown as ``adopted_at``).
+
+        Written once: only a NULL column is set, so the first time stays and a repeated call
+        changes nothing (``False``). A run with no row is not created (``False``)."""
+        with self.transaction():
+            self._require_lease(lease, f"agent:{agent_id}")
+            self._require_agent(agent_id)
+            cursor = self._conn.execute(
+                "UPDATE agent_runs SET started_at = ? "
+                "WHERE agent_id = ? AND run = ? AND started_at IS NULL",
+                (when, agent_id, run),
+            )
+            return cursor.rowcount == 1
+
     def _get_run(self, agent_id: str, run: int) -> dict[str, Any] | None:
         row = self._conn.execute(
             "SELECT * FROM agent_runs WHERE agent_id = ? AND run = ?", (agent_id, run)
@@ -1656,6 +1714,42 @@ def _prepare_files(state_dir: Path, *, create: bool, uid: int) -> tuple[Path, tu
         for suffix in _SIDECARS:
             _check_leaf(Path(str(db) + suffix), uid, sidecar=True)
         return db, file_id
+    except (OSError, ValueError) as exc:
+        raise StoreError(f"cannot prepare state directory {state_dir}: {exc}") from exc
+
+
+def _locate_readonly(state_dir: Path, uid: int) -> tuple[Path, tuple[int, int]]:
+    """``_prepare_files`` for a read: the same checks (regular, single-link, own, no symlink)
+    by ``lstat``, but nothing is made, opened or tightened."""
+    try:
+        directory = Path(os.path.realpath(state_dir))
+        try:
+            info = os.stat(directory)
+        except FileNotFoundError:
+            raise StoreMissing(f"no state directory {directory}") from None
+        if not stat.S_ISDIR(info.st_mode):
+            raise StoreError(f"{directory} is not a directory")
+        if info.st_uid != uid:
+            raise StoreError(f"{directory} is not owned by this user")
+        db = directory / DB_NAME
+        try:
+            dbinfo = os.lstat(db)
+        except FileNotFoundError:
+            raise StoreMissing(f"no database {db}") from None
+        if stat.S_ISLNK(dbinfo.st_mode):
+            raise StoreError(f"{db} is a symbolic link: refusing to follow it")
+        _check_info(dbinfo, db, uid)
+        for suffix in _SIDECARS:
+            side = Path(str(db) + suffix)
+            try:
+                sinfo = os.lstat(side)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(sinfo.st_mode):
+                raise StoreError(f"{side} is a symbolic link: refusing to follow it")
+            if sinfo.st_nlink != 0:
+                _check_info(sinfo, side, uid)
+        return db, (dbinfo.st_dev, dbinfo.st_ino)
     except (OSError, ValueError) as exc:
         raise StoreError(f"cannot prepare state directory {state_dir}: {exc}") from exc
 

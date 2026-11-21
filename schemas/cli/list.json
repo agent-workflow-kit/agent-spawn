@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "agent-spawn/cli/list.json",
   "title": "agent-spawn list --json",
-  "description": "Agents ordered by created descending, ties by agent_id. Without --status, torn-down agents are excluded.",
+  "description": "Agents ordered by created descending, ties by agent_id. Without --status, torn-down agents are excluded. With --no-liveness the object also carries liveness_checked: false.",
   "type": "object",
   "properties": {
     "agents": {
@@ -10,6 +10,10 @@
       "items": {
         "$ref": "../defs.json#/$defs/agent"
       }
+    },
+    "liveness_checked": {
+      "const": false,
+      "description": "Present only with --no-liveness: no liveness check ran and nothing was recorded; every field is the stored state."
     }
   },
   "additionalProperties": false,

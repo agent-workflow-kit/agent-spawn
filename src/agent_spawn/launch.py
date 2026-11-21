@@ -37,7 +37,7 @@ from typing import Any
 
 from . import gateway as gw
 from . import hooks as hooklib
-from . import lifecycle, procs, third_party
+from . import lifecycle, procs, scope, third_party
 from . import worktrees as wtlib
 from .agent_view import agent_object, chain_first_working_at, outcome_object
 from .config import Config
@@ -54,6 +54,7 @@ from .output import (
     PayloadKind,
     error_outcome,
     result_object,
+    safe_text,
 )
 from .records import RecordsError, append_audit, append_log
 from .session_backend import (
@@ -383,6 +384,7 @@ class Launch:
         self.window_socket: str | None = None  # the tmux server the preflight named
         self.term_argv: list[str] | None = None
         self.stored_termctl: str | None = None  # the absolute termctl path stored with the agent
+        self.systemd_run: str | None = None  # resolved by the scope preflight (scope hosting)
         self.term_override = False  # --override-escalation goes to `termctl open` (resume)
 
     # -- logging ------------------------------------------------------------------------------
@@ -431,6 +433,7 @@ class Launch:
         if getattr(args, "override_escalation", False) and not self.inv.actor.startswith("human:"):
             # The CLI already gates this flag; this keeps the handler safe when called directly.
             raise CliError.usage("--override-escalation needs an actor human:<user>")
+        self.scope_host_check()
         worktree = args.worktree or "none"
         if worktree not in ("new", "none") and not os.path.isabs(worktree):
             raise CliError.usage("--worktree needs new, none or an absolute path")
@@ -528,6 +531,28 @@ class Launch:
     def windowed(self) -> bool:
         """A window will host the supervisor: interactive mode with placement ``window``."""
         return self.mode == "interactive" and (self.args.placement or "window") == "window"
+
+    @property
+    def scope_hosted(self) -> bool:
+        """The detached supervisor is started in a transient scope (config
+        ``supervisor.detach: scope``; a window or ``--placement here`` never is)."""
+        return not self.windowed and not self.here and self.config.supervisor.detach == "scope"
+
+    def scope_host_check(self) -> None:
+        """A usage check: scope hosting needs Linux (exit 2 ``config_invalid``), whatever else is
+        wrong, so it is refused before any classification or lower-tool call."""
+        if self.scope_hosted:
+            scope.check_host(self.gateway)
+
+    def scope_preflight(self, agent_id: str, *, dry_run: bool = False) -> None:
+        """Launch step 1, scope preflight: with scope hosting, the host and the tool, then (not in
+        a dry run, which starts nothing) a probe scope. Nothing is checked with ``setsid``."""
+        if not self.scope_hosted:
+            return
+        if dry_run:
+            self.systemd_run = scope.check_static(self.gateway)
+        else:
+            self.systemd_run = scope.preflight(self.gateway, agent_id)
 
     def termctl_backend(self) -> TermBackend:
         """termctl, resolved once (exit 12 ``tool_missing`` before anything changes): config's
@@ -905,6 +930,7 @@ class Launch:
                 self.window_preflight(
                     proposed, classification.run_kind, labels.texts(), cwd, self_path
                 )
+            self.scope_preflight(proposed)
             self.run_pre_launch(labels, classification, cwd, self.copies)
             # The hooks' decision ids join every later call of the launcher.
             self.backend.decision_ids = list(self.decision_ids)
@@ -984,6 +1010,8 @@ class Launch:
                 agent_id, classification.run_kind, labels.texts(), cwd, resolve_self()
             )
             term_plan = self.termctl_backend().placements(window)
+        if would_refuse is None:
+            self.scope_preflight(agent_id, dry_run=True)
         outcome_path = os.path.join(self.state_dir, "outcomes", agent_id, "TOKEN.json")
         relay = relay_hook(resolve_self(), self.state_dir, self.inv.config_file or "")
         argv = [
@@ -1187,8 +1215,9 @@ class Launch:
         self, agent_id: str, plan: CreatePlan, *, override_escalation: bool = False
     ) -> WtRecord:
         """``wtctl create``; the record is stored from every result that names it: success (a
-        reused record included; ``owned`` is wtctl's) and ``bootstrap_failed`` (when it is this
-        agent's own record), before anything else can fail."""
+        matching reused record included; a mismatching one raises ``worktree_mismatch`` first;
+        ``owned`` is wtctl's) and ``bootstrap_failed`` (when it is this agent's own record),
+        before anything else can fail."""
         backend = self.wtctl_backend()
         assert backend is not None
         try:
@@ -1598,6 +1627,12 @@ class Launch:
             row["config_path"],
         ]
         try:
+            if self.scope_hosted:
+                # the same supervise argv, started through `systemd-run --user --scope`: the
+                # process stays the supervisor (it execs in place), so the identity recorded
+                # below is unchanged (interface.md, Supervision, Scope hosting)
+                assert self.systemd_run is not None  # the preflight of step 1 resolved it
+                argv = scope.supervisor_argv(self.systemd_run, agent_id, result.run, argv)
             self.detached = procs.spawn_detached(
                 argv,
                 log_path=os.path.join(supervise_dir, f"{agent_id}.log"),
@@ -1614,7 +1649,7 @@ class Launch:
             self.sig.raising = False  # from here a signal is forwarded, not a reason to cancel
             self.detached.acknowledge()
             self.supervised = True
-        except (procs.DetachedForkError, OSError, StoreError) as error:
+        except (procs.DetachedForkError, OSError, StoreError, ValueError) as error:
             self.sig.raising = True
             self.placement_failed(result, error)
             raise  # placement_failed raises; unreachable
@@ -1933,6 +1968,11 @@ class Launch:
             error.agent_id = agent_id
             error.decision_ids = list(self.decision_ids)
             raise error
+        self.log(
+            "warning",
+            level="warn",
+            message=f"could not start the detached supervisor: {safe_text(str(error))[:500]}",
+        )
         raise CliError(
             "launch_failed",
             f"could not start the detached supervisor ({type(error).__name__})",

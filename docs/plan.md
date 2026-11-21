@@ -81,7 +81,7 @@ Status: planned, 2026-11-02. Implements [interface.md](interface.md) (normative)
 **Goal**: Every relied-on third-party behavior is re-checked against real Claude Code, tmux, the real sibling tools and jobsctl; macOS paths are checked.
 **Success Criteria**: a `live` suite (deselected by default, never in CI) covering: full interactive launch in a window and window close; headless escalation with promotion and continuation; resume and fork into a throwaway; teardown with real wtctl; `jobsctl cancel --force` through a job running `launch --wait`; `claude` resumable after kill-pane and SIGTERM (spike D). The macOS checklist (headless, `--placement here`, `--worktree none`, kqueue waits, `LOCAL_PEERPID` handoff) passes manually and is recorded in design.md "Live verification".
 **Tests**: the live scenarios above, each with `claude --model haiku` and small bounds.
-**Status**: Not Started
+**Status**: In Progress (live suite done: the suite and `make live` / `make live-list` are written, see [live-testing.md](live-testing.md); it has passed on Linux against the real tools on 2026-11-19, unbilled and billed, closing #36; the stage stays In Progress because what remains is tracked in #99 and #100; the headless wrapper-dead-child-alive state is covered by `as-wrapper-dead-child-alive`, the interactive-window variant is not; the macOS checklist is issue #37)
 
 ## Stage 6: TUI (0.6)
 
@@ -99,5 +99,5 @@ Status: planned, 2026-11-02. Implements [interface.md](interface.md) (normative)
 - **0.5** (stage 5): live suite and macOS checks.
 - **0.6** (stage 6): `browse`.
 - **1.0**: stages 0–6 done; the v1 review, ticket and response slices have run through agent-spawn without interface changes; the live suite and the macOS checklist passed; the interface is declared stable (a deliberate breaking-change commit per architecture section 18.3).
-- **1.x** (additive): a cgroup- or scope-based detached supervisor option (`systemd-run --user --scope`) for hosts with `KillUserProcesses=yes`; agent-spawn `pre-resume` hook if a policy needs one; a second termctl placement target when termctl supports panes.
+- **1.x** (additive): a scope-based detached supervisor option (`supervisor.detach: scope`, `systemd-run --user --scope`) for hosts with `KillUserProcesses=yes` (issue #40, D54); agent-spawn `pre-resume` hook if a policy needs one; a second termctl placement target when termctl supports panes.
 - **2.0**: a second agent session backend (binding C, architecture section 3.5), or any non-additive state or interface change.

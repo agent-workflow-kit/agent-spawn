@@ -268,6 +268,66 @@ def _abs(path: str | None) -> str | None:
     return None if path is None else os.path.join(os.getcwd(), path)
 
 
+def git_dir_of(path: str | None) -> str | None:
+    """The git directory the real tool stores per session (``git rev-parse --git-common-dir``,
+    made absolute; None for "no git dir"): the nearest ancestor's ``.git`` directory, or the
+    directory a ``.git`` file names (its ``commondir`` when it has one). No git is run."""
+    if path is None or path == "session-dir":
+        return None
+    here = os.path.realpath(path)
+    while True:
+        dot = os.path.join(here, ".git")
+        if os.path.isdir(dot):
+            return os.path.realpath(dot)
+        if os.path.isfile(dot):
+            try:
+                text = Path(dot).read_text().strip()
+            except OSError:
+                return None
+            if text.startswith("gitdir:"):
+                gitdir = os.path.realpath(os.path.join(here, text.partition(":")[2].strip()))
+                common = os.path.join(gitdir, "commondir")
+                if os.path.isfile(common):
+                    return os.path.realpath(os.path.join(gitdir, Path(common).read_text().strip()))
+                return gitdir
+            return None
+        parent = os.path.dirname(here)
+        if parent == here:
+            return None
+        here = parent
+
+
+def recorded_cwd(entry: dict[str, Any]) -> str | None:
+    """The latest cwd any run of the session recorded (the real tool's ``last_cwd``: it is
+    recorded at ``exec``'s step 5, so a run canceled while pending has none)."""
+    by_run: dict[str, str] = entry.get("cwd_by_run") or {}
+    for number in sorted(by_run, key=int, reverse=True):
+        if by_run[number] is not None:
+            return by_run[number]
+    return None
+
+
+def start_cwd(ctx: Context, p: Parsed, entry: dict[str, Any] | None, fork: bool) -> str:
+    """The cwd ``start`` plans, as claude-session resolves it: a plain resume runs in the cwd a
+    run recorded (a different ``--cwd`` exits 2); a new session, a fork and a resume of a
+    session that never recorded one use ``--cwd`` or the caller's cwd, which must exist."""
+    given = p.get("--cwd")
+    if entry is not None and not fork:
+        recorded = recorded_cwd(entry)
+        if recorded is not None:
+            if given is not None and given != "session-dir":
+                wanted = os.path.realpath(os.path.join(os.getcwd(), given))
+                if wanted != os.path.realpath(recorded):
+                    ctx.usage(f"--cwd on a resume must be the previous run's cwd: {recorded}")
+            return recorded
+    if given == "session-dir":
+        return given
+    path = os.path.realpath(os.path.join(os.getcwd(), given or "."))
+    if not os.path.isdir(path):
+        ctx.usage(f"--cwd is not an existing directory: {given!r}")
+    return path
+
+
 def parse_duration(
     ctx: Context, flag: str, text: str, *, bound: bool = False, positive: bool = False
 ) -> float | None:
@@ -362,9 +422,23 @@ def check_launch_flags(ctx: Context, p: Parsed) -> None:
     if (turns := p.get("--max-turns")) is not None:
         if not 1 <= python_int(ctx, "--max-turns", turns) <= MAX_INTEGER:
             ctx.usage(f"--max-turns must be between 1 and {MAX_INTEGER}")
+    # Real 0.45.2: exit 2 "invalid flag value" (a model must be non-empty, without control
+    # characters; a profile name is ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ unless it is file-like).
+    # Name grammar only: the real tool also refuses a grammar-valid profile name that no built-in
+    # or configured profile defines (usage `invalid flag value`); that is not modeled.
     model = p.get("--model")
-    if model is not None and model.startswith("-"):
-        ctx.usage("--model must not start with '-'")
+    if model is not None and (
+        model == "" or model.startswith("-") or re.search(r"[\x00-\x1f\x7f-\x9f]", model)
+    ):
+        ctx.usage(f"invalid flag value: --model {model!r}")
+    profile = p.get("--permission-profile")
+    if (
+        profile is not None
+        and "/" not in profile
+        and not profile.endswith((".json", ".yaml", ".yml"))
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", profile) is None
+    ):
+        ctx.usage(f"invalid flag value: --permission-profile {profile!r}")
     hook_names: list[str] = []
     for hook in p.multi("--hook"):
         name, eq, _cmd = hook.partition("=")
@@ -521,6 +595,18 @@ def do_start(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
     ctx.check_scripted_error("start")
     new_id = existing if (existing is not None and not fork) else base32_id("cs-", counter("cs"))
     labels = sorted(set(p.multi("--label")))
+    source = load_sessions()[existing] if existing is not None else None
+    planned = start_cwd(ctx, p, source, fork)
+    git_dir = git_dir_of(planned)
+    if source is not None and not fork and "git_dir" in source and source["git_dir"] != git_dir:
+        ctx.fail(
+            12,
+            "launch_failed",
+            "the git directory changed since the session's first launch",
+            end_reason="git_dir_changed",
+            csession_id=new_id,
+            run=int(source.get("run", 0)) + 1,
+        )
 
     def record(data: dict[str, dict[str, Any]]) -> int:
         previous = data.get(new_id, {})
@@ -533,6 +619,9 @@ def do_start(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
             mode=p.get("--mode", previous.get("mode", mode)),
             repo=p.get("--repo", previous.get("repo")),
             forked_from=existing if fork else previous.get("forked_from"),
+            planned_cwd=planned,
+            git_dir=previous["git_dir"] if "git_dir" in previous and not fork else git_dir,
+            cwd_by_run=dict(previous.get("cwd_by_run") or {}) if not fork else {},
         )
         return run
 
@@ -666,6 +755,8 @@ def do_exec(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
                 "kind": p.get("--kind", "implement"),
                 "labels": sorted(set(p.multi("--label"))),
                 "repo": p.get("--repo"),
+                "cwd_by_run": {"1": os.path.realpath(os.getcwd())},
+                "git_dir": git_dir_of(os.getcwd()),
             },
         )
     extra = [flag for flag in p.flags if flag not in ADOPT_FLAGS]
@@ -687,6 +778,8 @@ def do_exec(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
         if data[session_id]["adopted"]:
             return False
         data[session_id]["adopted"] = True
+        # exec's step 5 records the cwd `start` planned
+        data[session_id].setdefault("cwd_by_run", {})[str(entry["run"])] = entry.get("planned_cwd")
         return True
 
     ctx.check_scripted_error("exec")
@@ -761,6 +854,7 @@ def note(signum, _frame):
         os._exit(0)
 for number in (signal.SIGTERM, signal.SIGCONT, signal.SIGHUP):
     signal.signal(number, note)
+open(path, "a").close()  # the handlers are installed: the file existing means "ready"
 deadline = time.monotonic() + 120
 while time.monotonic() < deadline and os.getppid() == parent:
     time.sleep(0.05)
@@ -769,8 +863,11 @@ while time.monotonic() < deadline and os.getppid() == parent:
 
 def spawn_child(ctx: Context) -> subprocess.Popen[bytes]:
     """A real child of the fake ``exec`` (a stand-in for ``claude``): it records the signals it
-    gets in a file named by the ``child_started`` record, and ends on SIGTERM."""
-    path = os.path.join(os.environ.get("FAKEBIN_LOG", "/tmp") + ".child-signals")
+    gets in a per-exec file (named by the ``child_started`` record), and ends on SIGTERM. The
+    file exists (empty) once the child's handlers are installed: a signal sent before then
+    kills it."""
+    log = os.environ.get("FAKEBIN_LOG", "/tmp")
+    path = f"{log}.child-signals.{os.getpid()}"
     child = subprocess.Popen(
         [sys.executable, "-c", CHILD_SCRIPT, path, str(os.getpid())], stdin=subprocess.DEVNULL
     )
@@ -990,6 +1087,7 @@ def do_wait(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
 def do_status(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
     if len(p.positionals) != 1:
         ctx.usage("status takes exactly one session id")
+    ctx.check_scripted_error("status")  # a status that cannot be read (#119)
     run_arg = p.get("--run")
     run_number = None if run_arg is None else python_int(ctx, "--run", run_arg)
     session_id = session_ref(ctx, p.positionals[0])
@@ -1031,7 +1129,7 @@ def do_status(ctx: Context, p: Parsed) -> tuple[int, Any, str]:
             "reads_third_party": False,
             "implicit_done": True,
             "mode": mode,
-            "cwd": None,
+            "cwd": (entry.get("cwd_by_run") or {}).get(str(run)),
             "repo": None,
             "model": None,
             "skill": None,

@@ -1,6 +1,6 @@
 """Compare the fakes with the real programs. `live`: never run in CI.
 
-Run with ``uv run pytest -m live tests/live`` after tmux, Claude Code or sibling-tool upgrades.
+Run with ``make live`` (``AS_LIVE=1``) after tmux, Claude Code or sibling-tool upgrades.
 Real programs are found on ``PATH`` (or ``LIVE_CLAUDE_SESSION``, ``LIVE_TERMCTL``,
 ``LIVE_WTCTL``, ``LIVE_TMUX``); a missing one skips its tests. Every call runs with the
 isolated ``HOME``/``XDG_*``/``TMUX_TMPDIR`` of the ``isolation_env`` fixture (the temporary
@@ -25,7 +25,7 @@ from tests.fakebin.fidelity_cases import ACCEPTED, CASES, DIVERGENCES
 from tests.fakebin.harness import Fakebin
 from tests.private_tmux import PrivateTmux
 
-pytestmark = pytest.mark.live
+pytestmark = [pytest.mark.live, pytest.mark.live_scenario("fidelity-argv")]
 
 ENV_NAMES = {
     "claude-session": "LIVE_CLAUDE_SESSION",

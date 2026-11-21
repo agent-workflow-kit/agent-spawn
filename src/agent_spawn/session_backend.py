@@ -221,8 +221,8 @@ def _check_spec(spec: RunSpec) -> None:
             raise ValueError("RunSpec.resume is not a csession_id")
         if spec.fork and spec.override_escalation:
             raise ValueError("--override-escalation cannot be combined with --fork")
-        if not spec.fork and spec.cwd is not None:
-            raise ValueError("a plain resume runs in the stored cwd; --cwd needs --fork")
+        # A plain resume's `cwd` is set only for a session no run recorded a cwd for (the
+        # caller then passes the agent's recorded one); claude-session refuses any other.
     if spec.max_turns is not None and (
         isinstance(spec.max_turns, bool) or not isinstance(spec.max_turns, int)
     ):

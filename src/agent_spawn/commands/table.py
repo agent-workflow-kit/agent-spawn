@@ -27,5 +27,6 @@ HANDLERS: dict[str, Handler] = {
     "cron uninstall": maintenance.cron_uninstall,
     "export": maintenance.export,
     "browse": maintenance.browse,
+    "validate": maintenance.validate,
     "supervise": internal.supervise,
 }

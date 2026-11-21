@@ -1,0 +1,694 @@
+"""The registry of live scenarios: what each one needs, costs and checks.
+
+Pure data, no I/O: ``make live-list`` prints it (``python -m tests.live``) without starting
+anything, and ``tests/test_live_harness.py`` checks that it agrees with the tests under
+``tests/live/`` (every test names a registered scenario, every scenario has a test).
+
+``sessions`` is the number of real Claude Code processes the scenario is expected to start
+(each one is counted by the ``claude`` wrapper the harness puts first on ``PATH``, and the
+suite fails before starting more than ``MAX_LIVE_SESSIONS``); ``turns`` is the number of model
+turns those sessions are expected to take: a tiny claude-session run takes about three (read the
+prompt file, run the report command, the final answer), a ``-p`` probe with ``--max-turns 1``
+one. Unbilled scenarios start no
+Claude Code at all: they use real tmux, termctl, wtctl and claude-session, and a stub
+``claude`` where a program named ``claude`` must exist.
+"""
+
+# ruff: noqa: E501  (assertion messages are prose: assumption, then the document line)
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+#: Waves, in the order they are meant to be run (``LIVE_SCENARIOS=wave:<name>``).
+WAVES = {
+    "tools": "unbilled: real tools, no Claude Code",
+    "billed-1": "billed: basic runs (headless, window, wait, flags)",
+    "billed-2": "billed: continuation (resume, fork, teardown, promotion)",
+    "billed-3": "billed: kills, signals, minimal environment, jobs",
+}
+
+
+@dataclass(frozen=True)
+class Scenario:
+    name: str
+    wave: str
+    summary: str
+    tools: tuple[str, ...]
+    sessions: int = 0
+    turns: int = 0
+    #: References the scenario confirms: issue comments (``#36 <PR>``), design.md spikes, FIDELITY.md.
+    covers: tuple[str, ...] = ()
+    #: Set when the scenario cannot run on Linux in this suite: the reason, recorded in the report.
+    skip: str | None = None
+    #: Tools that, when missing, skip the scenario instead of failing it.
+    optional: tuple[str, ...] = ()
+    #: Wall-clock bound of one test of the scenario, in seconds (default: the suite's).
+    timeout: int | None = None
+    #: Minimum claude-session version of the scenario (compared when the version is known).
+    min_claude_session: str | None = None
+    #: Number of tests of the scenario (``sessions`` is the total; each test may start its share).
+    tests: int = 1
+    extra: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def sessions_per_test(self) -> int:
+        return -(-self.sessions // self.tests)
+
+    @property
+    def billed(self) -> bool:
+        return self.sessions > 0
+
+
+def _s(name: str, wave: str, summary: str, tools: str, **kw: object) -> Scenario:
+    return Scenario(name, wave, summary, tuple(tools.split()), **kw)  # type: ignore[arg-type]
+
+
+_ALL = [
+    # ---- unbilled: tools -----------------------------------------------------------------
+    _s(
+        "tools-versions",
+        "tools",
+        "record every tool's version, check the minimums the design was verified with",
+        "claude claude-session termctl wtctl tmux git jobsctl",
+        optional=("jobsctl",),
+        covers=("#36 plan: version/minimum checks",),
+    ),
+    _s(
+        "fidelity-argv",
+        "tools",
+        "the fakes' argv grammar rows and tmux texts against the real programs (existing suite)",
+        "claude-session termctl tmux",
+        covers=("FIDELITY.md verified rows",),
+        optional=("claude-session", "termctl"),
+    ),
+    _s(
+        "tmux-real-server",
+        "tools",
+        "list-commands, -L with -S, unknown command text, start-server (the stale and missing socket "
+        "texts are checked by fidelity-argv)",
+        "tmux",
+        covers=("#36 #8 tmux", "FIDELITY.md tmux"),
+    ),
+    _s(
+        "termctl-open-pid",
+        "tools",
+        "open reports the pane pid (A8) incl. a wrapper shell that execs; dry run vs open; "
+        "bare open; label cap; argv cap",
+        "termctl tmux",
+        covers=("design.md A8", "#36 #26", "#36 #27", "#36 #8 termctl", "promotion check E"),
+    ),
+    _s(
+        "termctl-sighup-leader",
+        "tools",
+        "closing a pane delivers SIGHUP to the pane's process only (spike B1, B2)",
+        "termctl tmux",
+        covers=("design.md B1-B3", "#36 #8 termctl", "#36 #27"),
+    ),
+    _s(
+        "termctl-keep-on-exit",
+        "tools",
+        "keep-on-exit failed/always/never, exit_status, exit_signal, list --dead, close",
+        "termctl tmux",
+        covers=("design.md B6", "#36 #27 keep-on-exit", "promotion check F, G", "#36 #8 termctl"),
+    ),
+    _s(
+        "termctl-default-server",
+        "tools",
+        "default server selection order, empty list, socket_path, exact label match, close",
+        "termctl tmux",
+        covers=("#36 #79", "FIDELITY.md termctl list --dead"),
+    ),
+    _s(
+        "termctl-focus",
+        "tools",
+        "focus without a client (attach or no_client), unknown id, unknown client, sequential label add",
+        "termctl tmux",
+        covers=("#36 #28", "#36 #8 termctl focus"),
+    ),
+    _s(
+        "termctl-locked",
+        "tools",
+        "termctl label add with the server's flock held by the test: exit 12 locked after about "
+        "10 s (cause timeout), nothing changed, dry run and list unaffected, a lock file that "
+        "cannot be used (cause unusable) fails at once",
+        "termctl tmux",
+        covers=("#114", "#36 #8 termctl", "termctl interface.md Locking"),
+    ),
+    _s(
+        "wtctl-create-list-show",
+        "tools",
+        "create, list, show: names, branches, paths, shapes, --flag=value, errors",
+        "wtctl git",
+        covers=("#36 #20", "#36 #8 wtctl", "design.md wtctl behavior"),
+    ),
+    _s(
+        "wtctl-adopt-forget-holders",
+        "tools",
+        "adopt and forget by holder: existing, sorted holders, tombstones, actors",
+        "wtctl git",
+        covers=("#36 #20", "#36 #22", "#36 #21"),
+    ),
+    _s(
+        "wtctl-create-hooks",
+        "tools",
+        "pre-create hook veto 11, timeout, escalation 13, human --override-escalation, later veto "
+        "over an escalation, per-invocation --hook",
+        "wtctl git",
+        covers=("#100", "#36 #8 wtctl", "wtctl interface.md Hooks"),
+    ),
+    _s(
+        "wtctl-bootstrap-failed",
+        "tools",
+        "a failing bootstrap step: exit 12 bootstrap_failed with details.record, the record kept, "
+        "human-only bootstrap re-run",
+        "wtctl git",
+        covers=("#100", "#36 #8 wtctl", "interface.md Launch order step 4"),
+    ),
+    _s(
+        "wtctl-remove-merged-head",
+        "tools",
+        "remove --merged-head for a squash-merged branch: unpushed without it, removed with it, "
+        "the branch deleted",
+        "wtctl git",
+        covers=("#100", "#36 #8 wtctl"),
+    ),
+    _s(
+        "wtctl-baseline-no-classes",
+        "tools",
+        "a digest-only baseline change (repo_config_changed with only the digests), a moved anchor "
+        "(baseline check says unlinked; accept --expect-digest shows details.anchors, no classes)",
+        "wtctl git",
+        tests=2,
+        covers=("#115", "#36 #25", "wtctl interface.md Baseline check, Baseline accept"),
+    ),
+    _s(
+        "wtctl-create-busy",
+        "tools",
+        "a create held in a pre-create hook: a concurrent create is busy (12) after lease_wait; held "
+        "in bootstrap: the record is creating, remove and forget are busy, a create without "
+        "bootstrap goes through",
+        "wtctl git",
+        covers=("#116", "wtctl interface.md Create order, Locking"),
+    ),
+    _s(
+        "wtctl-version",
+        "tools",
+        "wtctl --version prints its real release version, not the 0.0.0 placeholder of 0.32.x",
+        "wtctl",
+        covers=("#116", "docs/live-testing.md Results"),
+    ),
+    _s(
+        "wtctl-collisions-reuse",
+        "tools",
+        "explicit --name collisions per case, reuse by the same holder",
+        "wtctl git",
+        covers=("#36 #20", "design.md wtctl behavior"),
+    ),
+    _s(
+        "wtctl-remove-status",
+        "tools",
+        "remove and status: held, tombstone, --flag=value, human-only order, force_overrides",
+        "wtctl git",
+        covers=("#36 #23", "#36 #22"),
+    ),
+    _s(
+        "wtctl-baseline-check",
+        "tools",
+        "baseline check by record id, partial/missing records, list realpaths, a change of only "
+        "the claude class",
+        "wtctl git",
+        tests=2,
+        covers=("#36 #25", "#36 #21"),
+    ),
+    _s(
+        "cs-pending-run",
+        "tools",
+        "claude-session start without adoption: pending status, list --label, stop, forget, "
+        "expiry never_adopted, verify-secret (11 pending, 0 for an adopted run's secret), label "
+        "exit 10, reconcile --dry-run",
+        "claude-session",
+        covers=("#36 #9", "#36 #14", "#36 #15", "#36 #75 1", "#36 #81", "promotion check B"),
+    ),
+    _s(
+        "cs-start-killed",
+        "tools",
+        "SIGKILL of start at many offsets never leaves an unlabeled session",
+        "claude-session",
+        covers=("#36 #75 2",),
+    ),
+    _s(
+        "cs-wait-interval",
+        "tools",
+        "claude-session wait has no --interval flag (exit 2; agent-spawn wait neither); cron install "
+        "--interval accepts 1 to 59 only",
+        "claude-session",
+        covers=("#116", "#36 #8 claude-session", "claude-session interface.md wait, cron install"),
+    ),
+    _s(
+        "cs-dry-run-shapes",
+        "tools",
+        "dry-run plans: implicit-done flags and origins, would_refuse, override-escalation "
+        "exit 2, abbreviations, values starting with '-'",
+        "claude-session",
+        min_claude_session="0.43.0",
+        covers=("#36 #9", "#36 #88", "#36 #78", "#36 #8 claude-session"),
+    ),
+    _s(
+        "cs-stop-grace",
+        "tools",
+        "stop default grace against claude-session's kill_grace with a SIGTERM-ignoring stub",
+        "claude-session",
+        covers=("#36 #19 DEFAULT_GRACE", "#36 #9 stop", "FIDELITY.md exec signals"),
+    ),
+    _s(
+        "promotion-subchecks",
+        "tools",
+        "the seven promotion sub-checks of the issue body, against real claude-session, "
+        "termctl and tmux with a stub claude",
+        "claude-session termctl tmux",
+        covers=("#36 #29", "design.md D30 D47", "#36 #73"),
+    ),
+    _s(
+        "as-stub-lifecycle",
+        "tools",
+        "agent-spawn against the real claude-session, wtctl, termctl and tmux with a stub "
+        "claude: launch, wait, show, list, ack, resume, fork, teardown with a real worktree",
+        "claude-session wtctl termctl tmux git",
+        covers=("#36 #20-#23", "#36 #25", "#36 #26", "#36 #15", "#36 #12"),
+    ),
+    _s(
+        "as-wrapper-dead-child-alive",
+        "tools",
+        "SIGKILL of exec under a SIGTERM-ignoring stub claude: wrapper dead, child alive, no "
+        "outcome, supervisor_lost once, stop parks it killed (the row liveness-kills cannot reach)",
+        "claude-session wtctl termctl tmux git",
+        covers=("#36 #75 3", "#36 #75 4", "#97"),
+    ),
+    _s(
+        "as-wrapper-dead-child-alive-window",
+        "tools",
+        "interactive window variant: SIGKILL of exec under a signal-ignoring stub child in a real "
+        "termctl/tmux window",
+        "claude-session wtctl termctl tmux git",
+        covers=("#97", "#100"),
+    ),
+    _s(
+        "wtctl-reuse-mismatch",
+        "tools",
+        "agent-spawn refuses the record the real wtctl reuses for the same holder under another "
+        "--name and an explicit --branch (the first unbilled run's observation), nothing started",
+        "claude-session wtctl termctl tmux git",
+        covers=("#99", "wtctl interface.md Create order, Retry after a crash"),
+    ),
+    _s(
+        "as-prelaunch-hooks",
+        "tools",
+        "agent-spawn's own pre-launch hook: veto 11, escalation 13, timeout, later veto over an "
+        "escalation, human-only --override-escalation; nothing is created",
+        "claude-session",
+        covers=("#100", "interface.md Hooks, Escalation overrides", "#36 #78"),
+    ),
+    _s(
+        "as-launch-phase-hooks",
+        "tools",
+        "claude-session's pre-launch veto, timeout and escalation through agent-spawn (11, 11, 13), "
+        "adopted_at null for a launch-phase end and a date-time for the resumed run, resume "
+        "--override-escalation",
+        "claude-session",
+        covers=("#100", "#91 adopted_at", "interface.md Outcome table, Escalation overrides"),
+    ),
+    _s(
+        "as-wait-exit-codes",
+        "tools",
+        "wait and launch --wait exit codes 0, 13, 14, 15, 16, 17, 18, 22 and 10 against real "
+        "claude-session outcomes produced by a stub claude",
+        "claude-session",
+        covers=("#100", "interface.md Exit codes, Outcome table", "#36 #8 claude-session"),
+    ),
+    _s(
+        "as-adopted-at",
+        "tools",
+        "show runs[].adopted_at is a date-time for a launched, resumed, automatically resumed and "
+        "promoted run (stub claude; the real-timing check stays billed)",
+        "claude-session termctl tmux",
+        covers=("#100", "#91 adopted_at"),
+    ),
+    _s(
+        "as-wtctl-create-failures",
+        "tools",
+        "launch over a vetoing (11), escalating (13, resume --override-escalation) and "
+        "bootstrap-failing (12, resume continues) wtctl; repo_config_changed for a claude-only change",
+        "claude-session wtctl git",
+        covers=("#100", "#36 #8 wtctl", "#36 #78", "#36 #25"),
+    ),
+    _s(
+        "as-slow-pre-teardown",
+        "tools",
+        "a pre-teardown hook that outlasts its timeout vetoes the teardown (11), its process "
+        "group is ended, the agent is parked unchanged; --override-escalation does not lift it",
+        "claude-session",
+        covers=("#113", "interface.md Hooks, Teardown order step 3"),
+    ),
+    _s(
+        "as-termctl-override-escalation",
+        "tools",
+        "a termctl pre-open hook escalates (launch parks escalated by termctl), resume "
+        "--override-escalation is human-only and, after the hook changed, opens the window",
+        "claude-session termctl tmux",
+        tests=2,
+        covers=("#112", "#36 #78", "interface.md Escalation overrides"),
+    ),
+    _s(
+        "as-label-locked",
+        "tools",
+        "agent-spawn label add on a live window agent while termctl's server lock is held: the "
+        "change lands on the agent and the session, a warning reports `termctl label add failed (exit 12)`, reconcile pushes it",
+        "claude-session termctl tmux",
+        covers=("#114", "interface.md label add, Reconcile label re-sync"),
+    ),
+    _s(
+        "as-wtctl-baseline-no-classes",
+        "tools",
+        "show repo_config_changed and teardown for a digest-only baseline change and a moved anchor "
+        "of the agent's worktree record",
+        "claude-session wtctl git",
+        covers=("#115", "interface.md show, Teardown order step 4"),
+    ),
+    _s(
+        "as-teardown-partial",
+        "tools",
+        "wtctl remove exits 1 partial (the worktree's parent loses its write bit): teardown is "
+        "exit 12 partial and sticky, reconcile reports teardown_incomplete, a human remove then a "
+        "retry completes",
+        "claude-session wtctl git",
+        covers=(
+            "#116",
+            "wtctl interface.md Remove order step 9",
+            "interface.md Teardown order step 4",
+        ),
+    ),
+    _s(
+        "as-input-files",
+        "tools",
+        "launch --input-file: the stub reads the staged copy (readable), agent-spawn's "
+        "private copy is deleted, a resume's own input replaces the set, claude-session refuses "
+        "an oversized, duplicate, badly named or '-' input",
+        "claude-session",
+        covers=("#116", "#36 #8 claude-session", "claude-session interface.md Launch flags"),
+    ),
+    _s(
+        "tty-human-gates",
+        "tools",
+        "a pseudo-terminal as stdin and no --actor: wtctl baseline accept asks [y/N], --yes skips "
+        "it and the actor defaults to human; agent-spawn --override-escalation is accepted, an "
+        "explicit auto actor refused",
+        "claude-session wtctl git",
+        covers=("#116", "wtctl interface.md Audit and log, Actor", "interface.md Global flags"),
+    ),
+    _s(
+        "as-window-close-post-park",
+        "tools",
+        "a killed window of an unreported session and a SIGKILLed exec under a stub that dies with "
+        "its terminal: parked killed and lost, post-park once, late reconciles deliver no second one",
+        "claude-session termctl tmux",
+        covers=("#116", "#36 #75 4", "interface.md Hooks, Reconcile"),
+    ),
+    _s(
+        "as-cron-fake-crontab",
+        "tools",
+        "cron install and uninstall against a fake crontab that is first on PATH",
+        "tmux",
+        covers=("#36 #34", "FIDELITY.md crontab"),
+    ),
+    _s(
+        "as-scope-supervisor",
+        "tools",
+        "a scope-hosted detached supervisor (supervisor.detach: scope) against the real systemd-run "
+        "--user: its own cgroup, the recorded PID, liveness, stop, the unit vanishing (skips "
+        "without a systemd user manager; the end of a real login session is not verified)",
+        "claude-session",
+        covers=("#40", "interface.md Supervision (Scope hosting)", "FIDELITY.md systemd-run"),
+    ),
+    _s(
+        "as-reconcile-reset-lease",
+        "tools",
+        "reconcile --reset-lease on a real corrupted state.db row",
+        "claude-session",
+        covers=("#36 #80", "design.md D52"),
+    ),
+    _s(
+        "as-browse-pilot",
+        "tools",
+        "browse (Textual pilot) over a real agent-spawn list payload",
+        "claude-session",
+        covers=("#36 #38 browse",),
+    ),
+    _s(
+        "as-dead-pane-reconcile",
+        "tools",
+        "teardown and reconcile close a dead pane on a real tmux server",
+        "claude-session termctl tmux",
+        covers=("#36 #79", "design.md D51"),
+    ),
+    # ---- billed --------------------------------------------------------------------------
+    _s(
+        "headless-launch-wait",
+        "billed-1",
+        "headless launch --wait: result object, relay states, status fields, outcome file",
+        "claude claude-session",
+        sessions=1,
+        turns=3,
+        covers=("#36 #9", "#36 #14", "#36 #15", "#36 #8 claude-session", "design.md D1 D43"),
+    ),
+    _s(
+        "interactive-window-close",
+        "billed-1",
+        "interactive launch in a real window; closing the window parks as claude-session recorded the end (done when the session had reported, killed otherwise)",
+        "claude claude-session termctl tmux",
+        sessions=1,
+        turns=3,
+        covers=("#36 #27", "#36 #26", "design.md D17 B9", "#36 issue: interactive launch"),
+    ),
+    _s(
+        "report-resume-chain",
+        "billed-1",
+        "--no-implicit-done run ends unreported; the automatic report resume carries the flag",
+        "claude claude-session",
+        sessions=2,
+        turns=6,
+        min_claude_session="0.43.0",
+        covers=("#36 #88", "#36 #9", "interface.md report resume"),
+    ),
+    _s(
+        "resume-continue",
+        "billed-2",
+        "headless resume continues the Claude session; list --label shows one session",
+        "claude claude-session",
+        sessions=2,
+        turns=6,
+        covers=("#36 #75 5", "#36 #9 resume", "issue: resume"),
+    ),
+    _s(
+        "fork-inplace-holder",
+        "billed-2",
+        "fork in place holds the worktree record; the original's teardown is held",
+        "claude claude-session wtctl git",
+        sessions=2,
+        turns=6,
+        covers=("#36 #21", "#36 #22", "#36 #23", "#36 #75 5", "issue: in-place fork holder"),
+    ),
+    _s(
+        "fork-throwaway",
+        "billed-2",
+        "fork into a throwaway with a third-party-reading run",
+        "claude claude-session wtctl git",
+        sessions=2,
+        turns=6,
+        covers=("#36 #21", "issue: fork into a throwaway", "design.md D49"),
+    ),
+    _s(
+        "teardown-wtctl-real",
+        "billed-2",
+        "teardown of a launched --worktree new agent with the real wtctl",
+        "claude claude-session wtctl git",
+        sessions=1,
+        turns=3,
+        covers=("#36 #23", "#36 #20", "issue: teardown with real wtctl"),
+    ),
+    _s(
+        "promotion-escalation",
+        "billed-2",
+        "headless run reports needs-input, is promoted into a window and continues (spike D5)",
+        "claude claude-session termctl tmux",
+        sessions=2,
+        turns=6,
+        covers=("design.md D5", "#36 #29", "#36 #73", "issue: headless escalation"),
+    ),
+    _s(
+        "resumable-after-kill-pane",
+        "billed-3",
+        "claude exits 0 on kill-pane and the session resumes (spike D1)",
+        "claude claude-session termctl tmux",
+        sessions=2,
+        turns=6,
+        covers=("design.md D1", "#36 issue: spike D"),
+    ),
+    _s(
+        "resumable-after-sigterm",
+        "billed-3",
+        "SIGTERM of an idle and of a mid-turn claude: exit 143, both resume (spikes D2, D3)",
+        "claude claude-session termctl tmux",
+        sessions=4,
+        turns=12,
+        tests=2,
+        covers=("design.md D2 D3", "#36 issue: spike D"),
+    ),
+    _s(
+        "minimal-environment",
+        "billed-3",
+        "claude authenticates with only PATH and the private HOME (spike D4)",
+        "claude",
+        sessions=1,
+        turns=1,
+        covers=("design.md D4",),
+    ),
+    _s(
+        "jobsctl-cancel-force",
+        "billed-3",
+        "jobsctl cancel --force of a job running launch --wait",
+        "claude claude-session jobsctl",
+        sessions=1,
+        turns=3,
+        optional=("jobsctl",),
+        covers=("issue: jobsctl cancel --force", "design.md D20 D44"),
+    ),
+    _s(
+        "liveness-kills",
+        "billed-3",
+        "SIGKILL of the supervisor only (claude lives on) and of exec only (a headless claude dies with the wrapper: run and park lost) against a real run",
+        "claude claude-session termctl tmux",
+        sessions=2,
+        turns=6,
+        covers=("#36 #75 3", "#36 #75 4", "design.md B9", "FIDELITY.md wrapper_alive"),
+    ),
+    _s(
+        "interactive-window-close-unreported",
+        "billed-3",
+        "an unreported interactive session (long no-tools turn) whose window is closed mid-turn: parked killed without attention, no report",
+        "claude claude-session termctl tmux",
+        sessions=1,
+        turns=1,
+        covers=("#100", "#36 issue: unreported window close", "interface.md Outcome table"),
+    ),
+    _s(
+        "window-wrapper-dead-child-alive-real",
+        "billed-3",
+        "SIGKILL of exec under a real interactive claude in a window: the observed fate of claude, and the agent state that must follow from it",
+        "claude claude-session termctl tmux",
+        sessions=1,
+        turns=3,
+        covers=("#100", "#97", "#36 #75 3", "interface.md Liveness"),
+    ),
+    # ---- recorded but not automated --------------------------------------------------------
+    _s(
+        "placement-here-terminal",
+        "billed-3",
+        "--placement here: termios, SIGWINCH, job control, hangup on a real terminal",
+        "claude claude-session",
+        skip="needs a human at a real terminal (job control, resize, hangup); not automatable",
+        covers=("#36 #74",),
+    ),
+    _s(
+        "upgrade-live-supervisor",
+        "billed-3",
+        "a newer agent-spawn migrating state.db under a live supervisor; older relay events",
+        "claude claude-session",
+        skip="needs two agent-spawn builds installed side by side; run by hand, see "
+        "docs/live-testing.md",
+        covers=("#36 #35",),
+    ),
+    _s(
+        "real-crontab",
+        "tools",
+        "cron install against the user's real crontab",
+        "tmux",
+        skip="never touches the real crontab: only the fake-crontab scenario runs",
+        covers=("FIDELITY.md crontab",),
+    ),
+    _s(
+        "macos",
+        "tools",
+        "macOS handoff peer check, kqueue waits",
+        "tmux",
+        skip="macOS is out of scope for the Linux live suite (issue #37)",
+        covers=("#37",),
+    ),
+]
+
+SCENARIOS: dict[str, Scenario] = {s.name: s for s in _ALL}
+if len(SCENARIOS) != len(_ALL):  # pragma: no cover - a registry typo, caught on import
+    raise RuntimeError("duplicate live scenario name")
+
+
+def expected_sessions(names: list[str] | None = None) -> int:
+    """Total billed sessions of the named scenarios (default: every runnable one)."""
+    chosen = [SCENARIOS[n] for n in names] if names else list(SCENARIOS.values())
+    return sum(s.sessions for s in chosen if s.skip is None)
+
+
+def expected_turns(names: list[str] | None = None) -> int:
+    chosen = [SCENARIOS[n] for n in names] if names else list(SCENARIOS.values())
+    return sum(s.turns for s in chosen if s.skip is None)
+
+
+def select(tokens: list[str]) -> list[str]:
+    """Scenario names matching ``LIVE_SCENARIOS`` tokens: a name, ``wave:<name>``, ``billed``,
+    ``unbilled`` or ``all``. An unknown token is an error (a typo must not select nothing)."""
+    chosen: list[str] = []
+    for token in tokens:
+        if token == "all":
+            found = list(SCENARIOS)
+        elif token == "billed":
+            found = [n for n, s in SCENARIOS.items() if s.billed]
+        elif token == "unbilled":
+            found = [n for n, s in SCENARIOS.items() if not s.billed]
+        elif token.startswith("wave:"):
+            wave = token[5:]
+            if wave not in WAVES:
+                raise ValueError(f"unknown wave {wave!r}; waves: {', '.join(WAVES)}")
+            found = [n for n, s in SCENARIOS.items() if s.wave == wave]
+        elif token in SCENARIOS:
+            found = [token]
+        else:
+            raise ValueError(f"unknown scenario {token!r} (see `make live-list`)")
+        chosen.extend(n for n in found if n not in chosen)
+    return chosen
+
+
+def parse_selection(text: str | None) -> list[str] | None:
+    """``LIVE_SCENARIOS`` (comma or space separated) as scenario names; ``None`` when unset."""
+    if text is None or not text.strip():
+        return None
+    return select([t for t in text.replace(",", " ").split() if t])
+
+
+def format_listing(max_sessions: int, names: list[str] | None = None) -> str:
+    """The text of ``make live-list``: every scenario with its expected billed sessions/turns."""
+    chosen = [SCENARIOS[n] for n in names] if names else list(SCENARIOS.values())
+    lines = [f"{'scenario':<28} {'wave':<9} {'sessions':>8} {'turns':>5}  tools / notes"]
+    for s in chosen:
+        note = f"SKIP: {s.skip}" if s.skip else " ".join(s.tools)
+        if s.optional and s.skip is None:
+            note += f" (optional: {' '.join(s.optional)})"
+        lines.append(f"{s.name:<28} {s.wave:<9} {s.sessions:>8} {s.turns:>5}  {note}")
+    runnable = [s.name for s in chosen if s.skip is None]
+    sessions = expected_sessions(runnable)
+    lines.append("")
+    lines.append(
+        f"{len(runnable)} runnable scenarios; expected billed sessions: {sessions} "
+        f"(MAX_LIVE_SESSIONS={max_sessions}), turns: {expected_turns(runnable)}"
+    )
+    if sessions > max_sessions:
+        lines.append("WARNING: the selection expects more sessions than MAX_LIVE_SESSIONS allows")
+    return "\n".join(lines)

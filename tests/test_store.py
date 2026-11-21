@@ -1087,6 +1087,24 @@ def test_runs_are_created_updated_and_ordered(store: Store) -> None:
     assert store.get_run(ID, 2) is not None and store.get_run(ID, 9) is None
 
 
+def test_a_run_is_adopted_once_and_the_first_time_is_kept(store: Store) -> None:
+    new_agent(store)
+    with store.lease(f"agent:{ID}") as lease:
+        store.put_run(lease, ID, 1, {"mode": "headless"})
+        assert store.mark_run_adopted(lease, ID, 1, 100.5) is True
+        assert store.mark_run_adopted(lease, ID, 1, 200.0) is False  # never rewritten
+        assert store.mark_run_adopted(lease, ID, 7, 300.0) is False  # no such run: no row made
+    assert store.get_run(ID, 1)["started_at"] == 100.5  # type: ignore[index]
+    assert store.get_run(ID, 7) is None
+
+
+def test_a_run_row_starts_without_an_adoption_time(store: Store) -> None:
+    new_agent(store)
+    with store.lease(f"agent:{ID}") as lease:
+        row = store.put_run(lease, ID, 1, {"mode": "headless"})
+    assert row["started_at"] is None
+
+
 def test_holds_keep_order_and_release_and_replace(store: Store) -> None:
     new_agent(store, wt_record_id="wt-1")
     with store.lease(f"agent:{ID}") as lease:

@@ -741,7 +741,9 @@ def test_absolute_paths_and_the_session_dir_literal_are_fine() -> None:
     argv_of(spec(resume=SESSION, fork=True, cwd="session-dir"))
 
 
-def test_a_plain_resume_takes_no_cwd() -> None:
+def test_a_plain_resume_takes_a_cwd_only_as_an_absolute_path() -> None:
+    # Set only for a session no run recorded a cwd for (#119); claude-session refuses the rest.
+    assert "--cwd=/w" in argv_of(spec(resume=SESSION, cwd="/w"))
     with pytest.raises(ValueError):
-        argv_of(spec(resume=SESSION, cwd="/w"))
-    argv_of(spec(resume=SESSION))
+        argv_of(spec(resume=SESSION, cwd="w"))
+    assert not [a for a in argv_of(spec(resume=SESSION)) if a.startswith("--cwd")]

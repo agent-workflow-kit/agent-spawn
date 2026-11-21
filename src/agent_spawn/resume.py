@@ -38,6 +38,7 @@ import os
 import secrets
 import shlex
 import shutil
+import stat
 import tempfile
 from collections.abc import Mapping, Sequence
 from typing import Any, NoReturn
@@ -156,6 +157,9 @@ class Resume(Launch):
         self.run_pass: dict[str, Any] = {}
         self.pass_override = False
         self.resume_cwd: str | None = None  # the cwd the run's pre-start checks use
+        self.raw_cwd: str | None = None  # the agent's cwd as recorded (a plain resume)
+        self.recorded_cwd: bool | None = None  # a run of the session recorded a cwd (cached)
+        self.cwd_final = False  # step 5 is done: the cwd of the run is settled (step 7's spec)
         self.expect_run_after: int | None = None
         self.entered = False  # a plain resume left `parked` (the pre-resume row is saved)
         self.fork_inserted = False
@@ -320,6 +324,7 @@ class Resume(Launch):
                 raise CliError.usage("--placement here needs a terminal on stdin and stdout")
         if self.windowed:
             self.termctl_backend()  # tool resolution: exit 12 tool_missing before any change
+        self.scope_host_check()  # exit 2 config_invalid off Linux, before any change
         self.plan_override(row)
         self.plan_skill(store, row)
         self.plan_flags()
@@ -444,7 +449,10 @@ class Resume(Launch):
             return wtlib.resolve_in(mode, given if isinstance(given, str) else None)
         recorded = row.get("cwd")
         if isinstance(recorded, str):
-            return recorded if recorded == third_party.SESSION_DIR else os.path.realpath(recorded)
+            self.raw_cwd = recorded  # as recorded: checked_cwd compares it with its realpath
+            if recorded == third_party.SESSION_DIR or "\0" in recorded:
+                return recorded  # a NUL byte is refused by the spec (checked_cwd), not resolved
+            return os.path.realpath(recorded)
         given = self.stored.get("cwd") if self.source_session is None else None
         if isinstance(given, str):
             return given if given == third_party.SESSION_DIR else os.path.realpath(given)
@@ -509,10 +517,85 @@ class Resume(Launch):
 
     def spec_cwd(self, cwd: str | None) -> str | None:
         if self.source_session is not None and not self.fork:
-            return None  # a plain resume runs in the stored cwd
+            if cwd is None or self.session_recorded_cwd():
+                return None  # a plain resume runs in the cwd a run recorded
+            # No run of the session recorded a cwd (a pending run canceled before exec's step 5):
+            # claude-session would take the caller's cwd, so the agent's own is passed.
+            return self.checked_cwd(self.raw_cwd if self.raw_cwd is not None else cwd)
         if cwd is None or cwd == third_party.SESSION_DIR or self.fork:
             return cwd  # a fork always passes its cwd: claude-session refuses a bad one
-        return cwd if os.path.isdir(cwd) else None  # a sessionless relaunch falls back to --repo
+        if self.worktree_mode() == "none" or self.cwd_final:
+            self.require_directory(cwd)  # a settled cwd is never replaced by the caller's
+            return cwd
+        if os.path.isdir(cwd):
+            return cwd
+        return None  # a worktree is created or adopted at step 5; the dry run goes without
+
+    def require_directory(self, cwd: str) -> None:
+        """``cwd`` must be an existing directory: ``cwd_missing`` when it is not (or a component
+        is not), ``cwd_changed`` when it cannot be looked at (a parent that is not searchable)."""
+        try:
+            mode = os.stat(cwd).st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            raise self.cwd_error(cwd, "cwd_missing", "is not a directory") from None
+        except ValueError:
+            raise self.cwd_error(cwd, "cwd_changed", "contains a NUL byte") from None
+        except OSError:
+            raise self.cwd_error(cwd, "cwd_changed", "cannot be accessed") from None
+        if not stat.S_ISDIR(mode):
+            raise self.cwd_error(cwd, "cwd_missing", "is not a directory")
+
+    def session_recorded_cwd(self) -> bool:
+        """Whether any run of the resumed session recorded a cwd (``status``: ``run.cwd``; null
+        until exec's step 5). An unreadable status counts as recorded: nothing changes then and
+        the later calls report the failure as they always did."""
+        if self.recorded_cwd is None:
+            assert self.backend is not None and self.source_session is not None
+            found = True
+            try:
+                status = self.backend.status(self.source_session)
+                found = status.run.cwd is not None
+                number = status.current_run - 1
+                while not found and number >= 1 and number > status.current_run - 50:
+                    found = self.backend.status(self.source_session, number).run.cwd is not None
+                    number -= 1
+                if not found and number >= 1:
+                    found = True  # too many runs to look through: leave the resume as it was
+            except CliError:
+                found = True
+            self.recorded_cwd = found
+        return self.recorded_cwd
+
+    def checked_cwd(self, cwd: str) -> str | None:
+        """The agent's recorded cwd, fit to run in: ``session-dir`` as it is, else a directory
+        that is still the recorded path (it was recorded as a realpath: a changed symlink
+        component or a relative or odd path is refused, never followed elsewhere)."""
+        if cwd == third_party.SESSION_DIR:
+            return cwd
+        if "\0" in cwd:
+            raise self.cwd_error(cwd, "cwd_changed", "contains a NUL byte")
+        if not os.path.isabs(cwd):
+            raise self.cwd_error(cwd, "cwd_changed", "is not an absolute path")
+        self.require_directory(cwd)
+        if os.path.realpath(cwd) != os.path.normpath(cwd):
+            raise self.cwd_error(cwd, "cwd_changed", "is no longer the directory that was recorded")
+        return os.path.normpath(cwd)
+
+    def cwd_error(self, cwd: str, cause: str, problem: str) -> CliError:
+        # An agent without a session cannot be forked (`no_run`): it is launched again instead.
+        hint = (
+            "restore the directory, or fork the agent into another one"
+            if self.source_session is not None
+            else "restore the directory, or launch the agent again with another --cwd"
+        )
+        return CliError(
+            "launch_failed",
+            f"the agent's working directory {cwd!r} {problem}"
+            if "\0" in cwd
+            else f"the agent's working directory {cwd} {problem}",
+            agent_id=self.agent_id or self.source_id or None,
+            details={"cause": cause, "retryable": False, "hint": hint},
+        )
 
     # -- prompt and input copies ------------------------------------------------------------
 
@@ -799,6 +882,9 @@ class Resume(Launch):
     ) -> Outcome:
         assert self.store is not None and self.backend is not None
         identity = self.store.holder_identity()
+        # Scope preflight first: a failing probe creates and changes nothing (no fork record, no
+        # lifecycle entry, no copies, no worktree).
+        self.scope_preflight(proposed)
         # The lifecycle entry (step 3), then the copies (step 4): a failure of either restores
         # the pre-resume row or deletes the fork.
         if self.fork:
@@ -965,6 +1051,8 @@ class Resume(Launch):
                 # call (`create` or `adopt`).
                 self.enforce_rules(True, None, [])
             cwd = self.resume_worktree(source_row, run_id)  # step 5
+            self.cwd_final = True  # the cwd is settled: it must be a directory (never the caller's)
+            self.require_directory(cwd)
         elif cwd is None and self.source_session is None:
             cwd = self.effective_cwd(classification)  # the plan's cwd, as launch step 4
         elif cwd is None:
@@ -1717,6 +1805,8 @@ class Resume(Launch):
                     term_placement=row.get("term_placement"),
                 )
                 term_plan = self.termctl_backend().placements(window)
+            if refuse is None:
+                self.scope_preflight(run_id, dry_run=True)
             return self.dry_plan(
                 row,
                 cs_argv,

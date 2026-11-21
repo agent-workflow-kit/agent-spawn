@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from agent_spawn import gateway
+from agent_spawn import gateway, procs
 from tests import isolation
 from tests.fakebin.harness import Fakebin
 from tests.private_tmux import PrivateTmux
@@ -20,6 +20,9 @@ pytest_plugins = ["pytester", "tests.procguard"]
 
 #: The real tmux, found before any test changes ``PATH`` (the fakes shadow it later).
 REAL_TMUX = shutil.which("tmux")
+
+#: Programs whose real binary must never run in a test.
+GUARDED_TOOLS = ("crontab", "systemd-run")
 
 
 @dataclass(frozen=True)
@@ -37,21 +40,38 @@ class Isolation:
 
 @pytest.fixture(autouse=True)
 def no_real_crontab(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fail any in-process ``crontab`` call that would reach the real program: the user's crontab
-    is their real scheduled-jobs file. Only the fake in ``tests/fakebin`` may answer."""
+    """Fail any in-process ``crontab`` or ``systemd-run`` call that would reach the real program:
+    the user's crontab is their real scheduled-jobs file and ``systemd-run`` starts units in
+    their real user manager. Only the fakes in ``tests/fakebin`` may answer."""
     real_run = gateway.SystemGateway.run
     fakes = Path(__file__).resolve().parent / "fakebin"
 
     def guarded(self: gateway.SystemGateway, argv: Sequence[str], **kwargs: Any) -> Any:
-        if argv and os.path.basename(argv[0]) == "crontab":
+        if argv and os.path.basename(argv[0]) in GUARDED_TOOLS:
             env = kwargs.get("env")
             search = (env if env is not None else os.environ).get("PATH", "")
             found = argv[0] if os.sep in argv[0] else shutil.which(argv[0], path=search)
             if found is not None and not Path(found).resolve().is_relative_to(fakes):
-                raise AssertionError(f"a test would run the real crontab: {found}")
+                raise AssertionError(
+                    f"a test would run the real {os.path.basename(argv[0])}: {found}"
+                )
         return real_run(self, argv, **kwargs)
 
     monkeypatch.setattr(gateway.SystemGateway, "run", guarded)
+
+    # The scope-hosted supervisor is started by `procs.spawn_detached` (not the gateway's `run`):
+    # the same rule, on the absolute path it execs.
+    real_spawn = procs.spawn_detached
+
+    def guarded_spawn(argv: Sequence[str], **kwargs: Any) -> Any:
+        if argv and os.path.basename(argv[0]) in GUARDED_TOOLS:
+            if not Path(argv[0]).resolve().is_relative_to(fakes):
+                raise AssertionError(
+                    f"a test would start the real {os.path.basename(argv[0])}: {argv[0]}"
+                )
+        return real_spawn(argv, **kwargs)
+
+    monkeypatch.setattr(procs, "spawn_detached", guarded_spawn)
 
 
 @pytest.fixture(autouse=True)
@@ -62,11 +82,11 @@ def crontab_tripwire(
     in-process guard (a child process, a test that builds its own environment from this one)
     still cannot reach the real program. Tests that need a crontab put the fake in front."""
     stub_dir = tmp_path_factory.mktemp("crontab-tripwire")
-    stub = stub_dir / "crontab"
-    stub.write_text(
-        "#!/bin/sh\necho 'crontab: a test reached the real crontab (tripwire stub)' >&2\nexit 70\n"
-    )
-    stub.chmod(0o755)
+    for name in GUARDED_TOOLS:
+        stub = stub_dir / name
+        message = f"{name}: a test reached the real {name} (tripwire stub)"
+        stub.write_text(f"#!/bin/sh\necho '{message}' >&2\nexit 70\n")
+        stub.chmod(0o755)
     monkeypatch.setenv("PATH", f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}")
 
 

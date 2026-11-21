@@ -6,7 +6,6 @@ import json
 import os
 import signal
 import subprocess
-import time
 from pathlib import Path
 from typing import Any
 
@@ -176,11 +175,22 @@ def test_sigkilled_waiter_leaves_agent_running(
     env.wait_for(lambda: any(a["status"] == "live" for a in _agents(env)), "a live agent")
     agent_id = env.agents()[0]["agent_id"]
     track_agent(env, proc_tracker, agent_id)
+    _wait_exec_hanging(env, fakebin, agent_id)
     waiter.kill()
     waiter.wait(timeout=10)
-    time.sleep(0.5)
     assert started(env, agent_id)
-    assert procs.is_alive(env.agent(agent_id)["supervisor"])
+    supervisor = env.agent(agent_id)["supervisor"]
+    assert procs.is_alive(supervisor)
+    # The supervisor still works: a SIGTERM to it is answered by the supervisor itself (it ends
+    # the run, outcome `killed`, end reason forwarded_term). One that died with its waiter could
+    # not, whatever the time it took: nothing here waits for time to pass.
+    handle = procs.open_verified(supervisor)
+    assert handle is not None
+    with handle:
+        assert handle.send(signal.SIGTERM)
+    env.wait_for(lambda: env.agent(agent_id)["status"] == "parked", "the agent to be parked", 60)
+    row = env.agent(agent_id)
+    assert row["park_reason"] == "killed" and row["last_outcome"]["end_reason"] == "forwarded_term"
 
 
 def _agents(env: Env) -> list[dict[str, Any]]:
@@ -194,7 +204,11 @@ def _wait_exec_hanging(env: Env, fakebin: Fakebin, agent_id: str) -> None:
     """The supervisor recorded its `exec` and the fake `exec` reached its hang (its signal
     handlers are installed), so a signal sent now cannot beat the chain being up: under load the
     `live` status can come before either."""
-    env.wait_for(lambda: env.agent(agent_id).get("exec_proc") is not None, "the supervisor's exec")
+    env.wait_for(
+        lambda: env.agent(agent_id).get("exec_proc") is not None,
+        "the supervisor's exec",
+        timeout=60,
+    )
     fakebin.wait_for_hang(env.agent(agent_id)["exec_proc"].pid, timeout=60)
 
 

@@ -19,7 +19,7 @@ import re
 import stat
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -29,11 +29,13 @@ __all__ = [
     "AUDIT_RESULTS",
     "LOG_EVENTS",
     "LOG_LEVELS",
+    "LOG_TAIL_BYTES",
     "MAX_RECORD_BYTES",
     "AuditRead",
     "RecordsError",
     "append_audit",
     "append_log",
+    "append_log_unless_recent",
     "format_ts",
     "read_audit",
 ]
@@ -43,6 +45,8 @@ FILE_MODE = 0o600
 LOG_NAME = "log.jsonl"
 AUDIT_NAME = "audit.jsonl"
 MAX_RECORD_BYTES = 256 * 1024
+# How much of the end of log.jsonl a "was this already logged" check reads, never more.
+LOG_TAIL_BYTES = 4 * 1024 * 1024
 
 LOG_LEVELS = frozenset({"debug", "info", "warn", "error"})
 LOG_EVENTS = frozenset(
@@ -229,8 +233,7 @@ def check_audit(record: Mapping[str, Any]) -> None:
 # --- appending -----------------------------------------------------------------------------------
 
 
-def append_log(
-    state_dir: str | os.PathLike[str],
+def _log_record(
     event: str,
     *,
     level: str = "info",
@@ -246,7 +249,6 @@ def append_log(
     details: Mapping[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Append one ``log.jsonl`` record and return it. Fields left ``None`` are omitted."""
     if isinstance(decision_ids, str):
         raise _fail("decision ids must be a list")
     record: dict[str, Any] = {
@@ -268,8 +270,132 @@ def append_log(
     }
     record.update({key: value for key, value in optional.items() if value is not None})
     _check_log(record)
+    return record
+
+
+def append_log(
+    state_dir: str | os.PathLike[str],
+    event: str,
+    *,
+    level: str = "info",
+    agent_id: str | None = None,
+    csession_id: str | None = None,
+    run: int | None = None,
+    actor: str | None = None,
+    decision_ids: Sequence[str] | None = None,
+    hook: str | None = None,
+    pid: int | None = None,
+    signal: str | None = None,
+    message: str | None = None,
+    details: Mapping[str, Any] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Append one ``log.jsonl`` record and return it. Fields left ``None`` are omitted."""
+    record = _log_record(
+        event,
+        level=level,
+        agent_id=agent_id,
+        csession_id=csession_id,
+        run=run,
+        actor=actor,
+        decision_ids=decision_ids,
+        hook=hook,
+        pid=pid,
+        signal=signal,
+        message=message,
+        details=details,
+        now=now,
+    )
     _append(Path(state_dir), LOG_NAME, _encode(record))
     return record
+
+
+_FUTURE_SLACK = timedelta(minutes=1)
+
+
+def _identity(record: Mapping[str, Any]) -> str:
+    """A record without its ``ts``: two records with the same identity say the same thing."""
+    return json.dumps(
+        {key: value for key, value in record.items() if key != "ts"},
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def _recent_identities(
+    fd: int, size: int, tail_bytes: int, floor: datetime, now: datetime
+) -> set[str]:
+    """Identities of the records in the last ``tail_bytes`` dated in ``(floor, now + 1 minute]``.
+
+    A record that starts before the tail is cut and skipped; torn, foreign and unparseable lines
+    are ignored (a line that is not a record can never suppress one).
+    """
+    start = max(0, size - tail_bytes)
+    chunk = os.pread(fd, size - start, start)
+    if start and (cut := chunk.find(b"\n")) >= 0:
+        chunk = chunk[cut + 1 :]
+    found: set[str] = set()
+    for raw in chunk.split(b"\n"):
+        if not raw.startswith(b"{"):
+            continue
+        try:
+            record = json.loads(raw)
+            moment = _parse_ts(record["ts"])
+            if floor < moment <= now + _FUTURE_SLACK:
+                found.add(_identity(record))
+        except (ValueError, KeyError, TypeError, RecursionError):
+            continue
+    return found
+
+
+def append_log_unless_recent(
+    state_dir: str | os.PathLike[str],
+    entries: Sequence[Mapping[str, Any]],
+    *,
+    within: timedelta,
+    now: datetime | None = None,
+    tail_bytes: int = LOG_TAIL_BYTES,
+) -> int:
+    """Append each entry (the keyword arguments of :func:`append_log`, ``event`` included) unless
+    an identical record (every field but ``ts``) is already in the last ``tail_bytes`` of the log
+    with a ``ts`` less than ``within`` old. Entries equal to each other are written once. Returns
+    the number written.
+
+    The check and the write happen under the one exclusive lock, so concurrent callers write a
+    line once between them, and all new lines go out in one write. Only the tail is read, so the
+    cost does not grow with the log; a repeat older than the tail is written again. Nothing is
+    ever created for an empty result.
+    """
+    moment = now or datetime.now(UTC)
+    new: dict[str, dict[str, Any]] = {}
+    for item in entries:
+        record = _log_record(now=moment, **dict(item))
+        new.setdefault(_identity(record), record)
+    if not new:
+        return 0
+    directory = Path(state_dir)
+    try:
+        _prepare_dir(directory)
+        fd = _open_checked(directory / LOG_NAME, _APPEND_FLAGS)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            size = os.fstat(fd).st_size
+            seen = _recent_identities(fd, size, tail_bytes, moment - within, moment)
+            fresh = [record for key, record in new.items() if key not in seen]
+            if not fresh:
+                return 0
+            line = b"".join(_encode(record) for record in fresh)
+            if size and os.pread(fd, 1, size - 1) != b"\n":
+                line = b"\n" + line
+            view = memoryview(line)
+            while view:
+                view = view[os.write(fd, view) :]
+            return len(fresh)
+        finally:
+            os.close(fd)  # drops the lock
+    except OSError as exc:
+        raise RecordsError(f"cannot append to {directory / LOG_NAME}: {exc}") from exc
 
 
 def append_audit(

@@ -21,7 +21,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, NoReturn
 
-from . import __version__, gateway, relay
+from . import gateway, relay
 from . import launch as launch_module
 from .commands.base import Invocation
 from .commands.table import HANDLERS
@@ -286,6 +286,20 @@ def _add_list(parser: Any) -> None:
     parser.add_argument("--mode", choices=("interactive", "headless"))
     parser.add_argument("--forked-from", type=agent_id_arg, metavar="AGENT_ID")
     parser.add_argument("--since", type=_since, metavar="TIME|DURATION")
+    _add_no_liveness(parser)
+
+
+def _add_show(parser: Any) -> None:
+    _agent_id(parser)
+    _add_no_liveness(parser)
+
+
+def _add_no_liveness(parser: Any) -> None:
+    parser.add_argument(
+        "--no-liveness",
+        action="store_true",
+        help="read the stored state only: no liveness check, no probe, no write",
+    )
 
 
 def _add_attach(parser: Any) -> None:
@@ -343,6 +357,12 @@ def _add_cron_install(parser: Any) -> None:
     parser.add_argument("--dry-run", action="store_true")
 
 
+def _add_validate(parser: Any) -> None:
+    parser.add_argument(
+        "--probe", action="store_true", help="also run each lower tool with --version"
+    )
+
+
 def _add_export(parser: Any) -> None:
     parser.add_argument("--since", type=_since, metavar="TIME|DURATION")
     _repeatable(parser, "--action", "ACTION", "match an action (ORed)")
@@ -360,10 +380,37 @@ def _add_supervise(parser: Any) -> None:
     parser.add_argument("--handoff-timeout", metavar="SECONDS")
 
 
+class _VersionAction(argparse.Action):
+    """``--version``: reads the package metadata only when the flag is given."""
+
+    def __init__(
+        self, option_strings: Sequence[str], dest: str = argparse.SUPPRESS, **_: Any
+    ) -> None:
+        super().__init__(
+            option_strings,
+            dest,
+            nargs=0,
+            default=argparse.SUPPRESS,
+            help="show the version and exit",
+        )
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        from . import __version__
+
+        print(f"{PROG} {__version__}")
+        parser.exit()
+
+
 def build_parser() -> SpawnParser:
     """The whole command surface. ``command_parsers`` maps ``label add`` etc. to its parser."""
     parser = SpawnParser(prog=PROG, description=DESCRIPTION)
-    parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
+    parser.add_argument("--version", action=_VersionAction)
     _add_global_flags(parser, top=True)
     commands = parser.add_subparsers(dest="command", metavar="<command>", required=True)
 
@@ -380,7 +427,7 @@ def build_parser() -> SpawnParser:
     add(commands, "resume", "resume", _add_resume, "resume or fork an agent")
     add(commands, "wait", "wait", _add_wait, "wait for an agent to stop running")
     add(commands, "list", "list", _add_list, "list agents")
-    add(commands, "show", "show", _agent_id, "show one agent")
+    add(commands, "show", "show", _add_show, "show one agent")
     add(commands, "attach", "attach", _add_attach, "attach to an agent's window")
     add(commands, "ack", "ack", _agent_id, "clear an agent's needs_attention")
     add(commands, "stop", "stop", _add_stop, "end an agent's current run")
@@ -388,6 +435,7 @@ def build_parser() -> SpawnParser:
     add(commands, "prune", "prune", _add_prune, "tear down old parked agents")
     add(commands, "reconcile", "reconcile", _add_reconcile, "recover from crashes and races")
     add(commands, "export", "export", _add_export, "print audit records")
+    add(commands, "validate", "validate", _add_validate, "check the config and the lower tools")
     add(commands, "browse", "browse", _add_browse, "browse agents in a TUI")
     add(commands, "supervise", "supervise", _add_supervise, None)
 
@@ -604,6 +652,7 @@ def parse_invocation(argv: Sequence[str]) -> Invocation:
         result_file=result_file,
         config=loaded.config,
         config_file=loaded.path,
+        config_files=loaded.files,
     )
 
 
@@ -621,7 +670,7 @@ def _head(argv: Sequence[str]) -> list[str]:
 # The public command names (the first word of each parser key); a test keeps it equal to the parser.
 _COMMAND_NAMES = (
     "ack attach browse cron export label launch list prune reconcile resume show stop "
-    "supervise teardown wait"
+    "supervise teardown validate wait"
 ).split()
 
 
