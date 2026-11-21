@@ -27,7 +27,7 @@ L2 (composite). Works fully standalone; it does not need the `awkit` harness. A 
 | `agent-spawn launch [flags]` | Create and start an agent |
 | `agent-spawn resume (<agent_id> \| --select k=v) [--fork]` | Resume a parked agent, or fork an agent |
 | `agent-spawn wait <agent_id>` | Wait for an agent and exit with its outcome code |
-| `agent-spawn list [filters]` / `show <agent_id>` | Inspect agents |
+| `agent-spawn list [filters]` / `show <agent_id>` | Inspect agents (`--no-liveness`: read the stored state with no check and no side effect) |
 | `agent-spawn attach <agent_id>` | Focus or attach to a live agent's window |
 | `agent-spawn ack <agent_id>` | Clear `needs_attention` |
 | `agent-spawn stop <agent_id>` | End a live agent's run (it parks per its outcome; a stopped run parks `killed`) |

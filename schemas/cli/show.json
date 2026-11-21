@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "agent-spawn/cli/show.json",
   "title": "agent-spawn show --json",
-  "description": "The agent object plus runs, session, supervisor, third_party_run, repo_config_changed and warnings.",
+  "description": "The agent object plus runs, session, supervisor, third_party_run, repo_config_changed and warnings. With --no-liveness the object also carries liveness_checked: false, session, third_party_run and repo_config_changed are null and supervisor.alive is null.",
   "type": "object",
   "properties": {
     "agent": {
@@ -168,7 +168,11 @@
               ]
             },
             "alive": {
-              "type": "boolean"
+              "type": [
+                "boolean",
+                "null"
+              ],
+              "description": "null only with --no-liveness (the process was not probed)."
             },
             "exec_pid": {
               "type": [
@@ -258,6 +262,10 @@
     },
     "warnings": {
       "$ref": "../defs.json#/$defs/warnings"
+    },
+    "liveness_checked": {
+      "const": false,
+      "description": "Present only with --no-liveness: no liveness check ran and nothing was recorded; every field is the stored state."
     }
   },
   "additionalProperties": false,

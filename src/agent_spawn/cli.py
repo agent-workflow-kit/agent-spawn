@@ -286,6 +286,20 @@ def _add_list(parser: Any) -> None:
     parser.add_argument("--mode", choices=("interactive", "headless"))
     parser.add_argument("--forked-from", type=agent_id_arg, metavar="AGENT_ID")
     parser.add_argument("--since", type=_since, metavar="TIME|DURATION")
+    _add_no_liveness(parser)
+
+
+def _add_show(parser: Any) -> None:
+    _agent_id(parser)
+    _add_no_liveness(parser)
+
+
+def _add_no_liveness(parser: Any) -> None:
+    parser.add_argument(
+        "--no-liveness",
+        action="store_true",
+        help="read the stored state only: no liveness check, no probe, no write",
+    )
 
 
 def _add_attach(parser: Any) -> None:
@@ -413,7 +427,7 @@ def build_parser() -> SpawnParser:
     add(commands, "resume", "resume", _add_resume, "resume or fork an agent")
     add(commands, "wait", "wait", _add_wait, "wait for an agent to stop running")
     add(commands, "list", "list", _add_list, "list agents")
-    add(commands, "show", "show", _agent_id, "show one agent")
+    add(commands, "show", "show", _add_show, "show one agent")
     add(commands, "attach", "attach", _add_attach, "attach to an agent's window")
     add(commands, "ack", "ack", _agent_id, "clear an agent's needs_attention")
     add(commands, "stop", "stop", _add_stop, "end an agent's current run")

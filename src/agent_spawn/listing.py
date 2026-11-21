@@ -124,7 +124,9 @@ def list_agents(inv: Invocation) -> Outcome:
         except GrammarError as exc:
             raise CliError.usage(str(exc)) from None
 
-    store = open_existing(inv)
+    # --no-liveness reads the stored state: nothing is migrated, probed or written
+    unchecked: bool = bool(args.no_liveness)
+    store = open_existing(inv, migrate=not unchecked)
     agents: list[dict[str, Any]] = []
     if store is not None:
         try:
@@ -133,7 +135,11 @@ def list_agents(inv: Invocation) -> Outcome:
         except StoreError as error:
             raise store_failed(error) from None
     human = "\n".join(human_line(agent) for agent in agents) if agents else "no agents"
-    return Outcome(0, {"agents": agents}, PayloadKind.COMMAND, human)
+    payload: dict[str, Any] = {"agents": agents}
+    if unchecked:
+        payload["liveness_checked"] = False
+        human += "\n(liveness not checked)"
+    return Outcome(0, payload, PayloadKind.COMMAND, human)
 
 
 def _select(
@@ -174,7 +180,7 @@ def _select(
         # be read is listed as it is: unreadable is an error, never "dead".
         live = liveness_for(inv, store)
         unreadable: list[tuple[str, CliError]] = []
-        for row in store.list_agents(statuses=("launching", "live")):
+        for row in [] if args.no_liveness else store.list_agents(statuses=("launching", "live")):
             try:
                 live.check(row["agent_id"])
             except CliError as error:
