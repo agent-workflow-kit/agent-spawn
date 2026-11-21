@@ -201,7 +201,7 @@ def _show_unchecked(inv: Invocation) -> Outcome:
     probe, no claude-session or wtctl call, nothing written or migrated; what needs one of
     those (``session``, ``supervisor.alive``, ``third_party_run``, ``repo_config_changed``) is
     null."""
-    store = open_existing(inv, migrate=False)
+    store = open_existing(inv, migrate=False, readonly=True)
     try:
         resolved = resolve_existing(store, inv.args.agent_id)
     except BaseException:

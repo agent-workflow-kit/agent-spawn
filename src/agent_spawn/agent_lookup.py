@@ -48,11 +48,15 @@ def store_failed(error: StoreError) -> CliError:
     return CliError("failed", f"the state database could not be used ({type(error).__name__})")
 
 
-def open_existing(inv: Invocation, *, migrate: bool = True) -> Store | None:
+def open_existing(inv: Invocation, *, migrate: bool = True, readonly: bool = False) -> Store | None:
     """The store, or ``None`` when no ``state.db`` exists (nothing is created either way)."""
     try:
         return Store.open(
-            state_dir_of(inv), create=False, migrate=migrate, gateway=gw.get_gateway()
+            state_dir_of(inv),
+            create=False,
+            migrate=migrate,
+            readonly=readonly,
+            gateway=gw.get_gateway(),
         )
     except StoreMissing:
         return None
