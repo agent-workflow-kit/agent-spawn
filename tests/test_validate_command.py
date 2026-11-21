@@ -8,6 +8,7 @@ import os
 import pty
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -604,3 +605,53 @@ def test_schema_rejects_what_it_should() -> None:
         {**good, "warnings": ["a string"]},
     ):
         assert list(schema_registry.validator(SCHEMA).iter_errors(bad))
+
+
+def _walk_in_subprocess(path: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    code = (
+        "import sys\n"
+        "from agent_spawn import checking\n"
+        "try:\n"
+        "    checking.check_state_dir(sys.argv[1])\n"
+        "except Exception as exc:\n"
+        "    print(type(exc).__name__, exc)\n"
+        "    sys.exit(3)\n"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", code, path],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def test_relative_state_dir_walk_ends_with_a_state_dir_failure(tmp_path: Path) -> None:
+    done = _walk_in_subprocess("relhome/.local/state/agent-spawn", tmp_path)
+    assert done.returncode == 3
+    assert "state_dir: no existing directory above" in done.stdout
+
+
+def test_relative_home_without_state_home_exits_12(env: Env, tmp_path: Path) -> None:
+    empty = tmp_path / "emptyxdg"
+    empty.mkdir()
+    environ = {"PATH": "/usr/bin:/bin", "HOME": "relhome", "XDG_CONFIG_HOME": str(empty)}
+    done = subprocess.run(
+        [sys.executable, "-m", "agent_spawn", "validate", "--json"],
+        cwd=tmp_path,
+        env=environ,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert done.returncode == 12
+    assert "state_dir:" in done.stdout
+
+
+def test_relative_state_home_is_ignored(tmp_path: Path) -> None:
+    from agent_spawn.store import default_state_dir
+
+    got = default_state_dir({"XDG_STATE_HOME": "rel", "HOME": "/h"})
+    assert got == Path("/h/.local/state/agent-spawn")

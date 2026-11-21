@@ -63,8 +63,12 @@ def check_state_dir(path: str) -> str:
             raise _failed(f"state_dir: {_show(path)} is a dangling symbolic link") from None
     except OSError as exc:
         raise _failed(f"state_dir: cannot examine {_show(path)}: {exc.strerror}") from None
-    parent = os.path.dirname(path)
-    while True:
+    parent = path
+    for _ in range(path.count(os.sep) + 1):
+        above = os.path.dirname(parent)
+        if not above or above == parent:
+            break
+        parent = above
         try:
             if _usable_dir(parent):
                 return "absent"
@@ -75,9 +79,9 @@ def check_state_dir(path: str) -> str:
         except FileNotFoundError:
             if os.path.lexists(parent):
                 raise _failed(f"state_dir: {_show(parent)} is a dangling symbolic link") from None
-            parent = os.path.dirname(parent)
         except OSError as exc:
             raise _failed(f"state_dir: cannot examine {_show(parent)}: {exc.strerror}") from None
+    raise _failed(f"state_dir: no existing directory above {_show(path)}")
 
 
 def _tuple(version: str) -> tuple[int, ...]:
